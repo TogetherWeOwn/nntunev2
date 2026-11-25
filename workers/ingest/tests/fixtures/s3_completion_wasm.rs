@@ -1,11 +1,11 @@
 use super::{now, Duration, FixtureVersionRemover, S3CompletionSender};
 use crate::multipart::{
     readback_inventory::CompletedReadbackInventory,
-    resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
-    session_completion::SessionCompletion,
+    resume_checkpoint::{matches_checkpoint, CheckpointPart, ResumeBinding, ResumeCheckpoint},
+    session_completion::{DispatchError, SessionCompletion},
     session_upload::DurableUpload,
     sidecar::SidecarPut,
-    Plan, UploadTarget,
+    Plan, UploadPart, UploadTarget, UploadedPart, PART_BYTES,
 };
 use nntune_core::{
     digest_enrollment::DigestEnrollment,
@@ -136,6 +136,9 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         bytes.extend_from_slice(&FLAC[42..]);
         padded = bytes;
         &padded
+    } else if mode == "multipart-resume" {
+        padded = vec![42; PART_BYTES];
+        &padded
     } else if readback {
         FLAC
     } else {
@@ -163,7 +166,7 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         [1, 2, 0xab, 0xcd].map(|value| hex::encode(id(value)));
     let key = format!("media/{object}/{generation}");
     let budget = match mode {
-        "readback-publish" | "readback-playback" => 5000,
+        "readback-publish" | "readback-playback" | "multipart-resume" => 5000,
         "deadline" => 200,
         "expired" | "reconcile-expired" => 0,
         _ => 2000,
@@ -215,24 +218,25 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         .map_or(configuration, |upload| upload.configuration());
     let plan = Plan::new(target, header, plaintext_len).unwrap();
     let mut partition = plan.partition();
+    let mut parts = Vec::new();
     let mut page = None;
     let chunk_count = chunks.len();
     for (index, sealed) in chunks.into_iter().enumerate() {
-        assert!(partition
-            .push(&SealedChunk {
-                digest: Sha256::digest(&sealed.bytes).into(),
-                bytes: sealed.bytes,
-                final_chunk: index + 1 == chunk_count,
-            })
-            .unwrap()
-            .is_none());
+        parts.extend(
+            partition
+                .push(&SealedChunk {
+                    digest: Sha256::digest(&sealed.bytes).into(),
+                    bytes: sealed.bytes,
+                    final_chunk: index + 1 == chunk_count,
+                })
+                .unwrap(),
+        );
         if sealed.page.is_some() {
             assert!(page.is_none());
             page = sealed.page;
         }
     }
-    let part = partition.finish().unwrap().unwrap();
-    let (_, number, bytes, checksum) = part.request();
+    parts.extend(partition.finish().unwrap());
     let binding = ResumeBinding {
         plan: if mode == "part-other" {
             Plan::new(
@@ -259,6 +263,13 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         generation: &generation,
         envelope_scheme: 2,
     };
+    if mode == "multipart-resume" {
+        return resume_multipart(&sender, binding, &context, &parts, until).await;
+    }
+    let [part] = parts.as_slice() else {
+        panic!("expected one fixture part");
+    };
+    let (_, number, bytes, checksum) = part.request();
     let receipt = if mode.starts_with("part") || initiated.is_some() {
         let durable_target = if mode == "part-durable-id" {
             UploadTarget {
@@ -275,7 +286,7 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         };
         let durable = DurableUpload::new(durable_target, &context, durable_session, until);
         let uploaded = sender
-            .put_part(binding, &context, &part, &durable, until)
+            .put_part(binding, &context, part, &durable, until)
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
         if mode.starts_with("part") {
@@ -364,4 +375,78 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         return Err(JsValue::from_str("missing fixture version"));
     };
     Ok(version.clone())
+}
+
+async fn resume_multipart<'a>(
+    sender: &S3CompletionSender,
+    binding: ResumeBinding<'a>,
+    context: &'a EnvelopeContext,
+    parts: &[UploadPart<'a>],
+    until: std::time::SystemTime,
+) -> Result<String, JsValue> {
+    let [first, second] = parts else {
+        panic!("expected two fixture parts");
+    };
+    let dispatch_error = |error| JsValue::from_str(&format!("{error:?}"));
+    let (target, _, _, _) = first.request();
+    let saved_etag;
+    let saved;
+    let mut receipts = {
+        let upload = DurableUpload::new(target, context, binding.session, until);
+        let confirmed = sender
+            .put_part(binding, context, first, &upload, until)
+            .await
+            .map_err(dispatch_error)?;
+        saved_etag = confirmed.etag().to_owned();
+        saved = [checkpoint_part(&confirmed, &saved_etag)];
+        assert!(matches!(
+            sender
+                .put_part(binding, context, second, &upload, until)
+                .await,
+            Err(DispatchError::Unconfirmed(None))
+        ));
+        vec![confirmed]
+    };
+
+    let checkpoint = ResumeCheckpoint {
+        binding,
+        parts: &saved,
+    };
+    // The fixture stands in for the caller's checkpoint store and scoped
+    // handoff. The ciphertext and verified receipt survive the interruption.
+    let upload = DurableUpload::new(target, context, binding.session, until);
+    assert!(matches_checkpoint(binding, &receipts, &checkpoint));
+    for part in &parts[checkpoint.parts.len()..] {
+        receipts.push(
+            sender
+                .put_part(binding, context, part, &upload, until)
+                .await
+                .map_err(dispatch_error)?,
+        );
+    }
+    let second_etag = receipts[1].etag().to_owned();
+    let completed_parts = [saved[0], checkpoint_part(&receipts[1], &second_etag)];
+    let completed_checkpoint = ResumeCheckpoint {
+        binding,
+        parts: &completed_parts,
+    };
+    let completion = SessionCompletion::prepare(binding, context, receipts, &completed_checkpoint)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let completed = sender
+        .complete(completion, until)
+        .await
+        .map_err(dispatch_error)?;
+    let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {
+        return Err(JsValue::from_str("missing fixture version"));
+    };
+    Ok(version.clone())
+}
+
+fn checkpoint_part<'a>(receipt: &UploadedPart<'_>, etag: &'a str) -> CheckpointPart<'a> {
+    CheckpointPart {
+        number: receipt.number,
+        len: receipt.len,
+        etag,
+        digest: receipt.digest,
+    }
 }
