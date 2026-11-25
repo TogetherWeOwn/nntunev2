@@ -11,7 +11,7 @@ const db = 'nntunev2_staging';
 const role = 'trial_cleanup_fixture';
 const uri = `postgresql://${role}:disposable-cleanup-password@127.0.0.1:5432/${db}?sslmode=require`;
 const sha = (raw) => createHash('sha256').update(raw).digest('hex');
-const id = (n) => `10000000-0000-4000-8000-00000000000${n}`;
+const id = (n) => `10000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const keyId = (uuid) => uuid.replaceAll('-', '');
 const provider = {
   environment: id(1), library: id(2), configuration: id(3), root_version: id(4),
@@ -27,28 +27,53 @@ const scope = {
   media_version: 'media/selected+version', page_version: 'page?selected&version',
   cutoff: Math.floor(Date.now() / 1000) - 30,
 };
-const mediaKey = `media/${keyId(scope.object)}/${keyId(scope.generation)}`;
-const pageKey = `media-digests/${keyId(scope.object)}/${keyId(scope.generation)}/${keyId(scope.map)}/00000000`;
-const siblingKey = `media/${keyId(id('b'))}/${keyId(id('c'))}`;
+const selected = {
+  ...scope,
+  provider: { ...provider, environment: id('a'), library: id('b'), configuration: id('c'), root_version: id('d') },
+  object: id('e'), generation: id('f'), map: id(0), track: id('10'), session: id('11'),
+  job: 'cleanup-selected-job', issuer: 'cleanup-selected-issuer', invite: 1932,
+};
+const media = (target) => `media/${keyId(target.object)}/${keyId(target.generation)}`;
+const page = (target) => `media-digests/${keyId(target.object)}/${keyId(target.generation)}/${keyId(target.map)}/00000000`;
+const mediaKey = media(scope);
+const pageKey = page(scope);
+const siblingKey = `media/${keyId(id('12'))}/${keyId(id('13'))}`;
 const psql = (database, ...args) => execFileSync('psql', [
   '-XqAt', '-h', '127.0.0.1', '-p', '5432', '-U', 'postgres', '-d', database,
   '-v', 'ON_ERROR_STOP=1', ...args,
 ], { env: { PATH: process.env.PATH, PGPASSWORD: 'ci-throwaway' }, encoding: 'utf8', timeout: 15_000 }).trim();
 
-test('refuses foreign fixture pins, environment and authority and recovers the same fixture', { timeout: 120_000 }, async () => {
+function seed(target) {
+  const { provider: storage } = target;
+  const vars = {
+    env: storage.environment, lib: storage.library, root: storage.root_version, config: storage.configuration,
+    object: target.object, generation: target.generation, map: target.map, track: target.track, session: target.session,
+    invite: target.invite, issuer: target.issuer, listener: `${target.issuer}-listener`, job: target.job,
+    bucket: storage.bucket, media_key: media(target), media_version: target.media_version, page_version: target.page_version,
+  };
+  psql(db, ...Object.entries(vars).flatMap(([k, v]) => ['-v', `${k}=${v}`]),
+    '-f', join(__dirname, 'private_trial_cleanup_publication.sql'));
+}
+
+function readPublication(target) {
+  return JSON.parse(psql(db, '-c', `SELECT jsonb_build_object(
+    'winner', (SELECT to_jsonb(w) FROM public.storage_validated_digest_winners w WHERE object_id = '${target.object}'),
+    'admission', (SELECT to_jsonb(a) FROM public.private_library_admissions a WHERE object_id = '${target.object}'),
+    'reference', (SELECT to_jsonb(r) FROM public.storage_validated_digest_references r WHERE object_id = '${target.object}'),
+    'source', (SELECT to_jsonb(s) FROM public.catalogue_s3_sources s WHERE object_id = '${target.object}')
+  )`));
+}
+
+test('isolates approved cleanup and recovers the same fixture', { timeout: 120_000 }, async (t) => {
   assert.equal(process.env.GITHUB_ACTIONS, 'true');
   assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
   assert.ok(process.env.PRIVATE_TRIAL_CLEANUP_BUNDLE);
   // The Worker release job clones the migrated schema before the upload fixture runs.
   try {
-    const vars = {
-      env: provider.environment, lib: provider.library, root: provider.root_version, config: provider.configuration,
-      object: scope.object, generation: scope.generation, map: scope.map, track: scope.track, session: scope.session,
-      bucket: provider.bucket, media_key: mediaKey, media_version: scope.media_version, page_version: scope.page_version,
-    };
-    psql(db, ...Object.entries(vars).flatMap(([k, v]) => ['-v', `${k}=${v}`]),
-      '-f', join(__dirname, 'private_trial_cleanup_runner.sql'));
+    psql(db, '-f', join(__dirname, 'private_trial_cleanup_runner.sql'));
+    seed(scope);
     scope.database_role_oid = Number(psql(db, '-c', "SELECT oid FROM pg_roles WHERE rolname = 'trial_cleanup_fixture'"));
+    selected.database_role_oid = scope.database_role_oid;
     assert.ok(scope.database_role_oid > 0);
     const state = () => psql(db, '-c', `SELECT
       (SELECT deleting_at IS NOT NULL FROM public.storage_validated_digest_winners WHERE object_id = '${scope.object}'),
@@ -59,34 +84,36 @@ test('refuses foreign fixture pins, environment and authority and recovers the s
       [pageKey, new Set([scope.page_version, 'other-page'])], [siblingKey, new Set(['sibling-version'])]]);
     const calls = [];
     let interrupt = true;
-    const origin = async (req) => {
+    const storageOrigin = (target, requests, interruptHead = () => false) => async (req) => {
       const url = new URL(req.url);
       assert.equal(url.origin, provider.endpoint);
       const prefix = `/${provider.bucket}/`;
       assert.ok(url.pathname.startsWith(prefix));
       const key = url.pathname.slice(prefix.length);
       const version = url.searchParams.get('versionId');
-      assert.deepEqual([...url.searchParams], [['versionId', key === mediaKey ? scope.media_version : scope.page_version]]);
+      assert.ok(key === media(target) || key === page(target), 'request must target an approved key');
+      assert.deepEqual([...url.searchParams], [['versionId', key === media(target) ? target.media_version : target.page_version]]);
       assert.match(req.headers.get('authorization'), /Credential=FIXTUREACCESS\//);
-      calls.push([req.method, key, version]);
+      requests.push([req.method, key, version]);
       assert.ok(versions.has(key));
       if (req.method === 'DELETE') {
         versions.get(key).delete(version);
         return new Response(null, { status: 204 });
       }
       assert.equal(req.method, 'HEAD');
-      if (key === mediaKey && interrupt) return new Response(null, { status: 503 });
+      if (interruptHead(key)) return new Response(null, { status: 503 });
       return new Response(null, { status: versions.get(key).has(version) ? 200 : 404 });
     };
+    const origin = storageOrigin(scope, calls, (key) => key === mediaKey && interrupt);
     const approvalFor = (selection) => ({
-      provider, scope_sha256: sha(JSON.stringify(selection)), s3_access_key_sha256: sha(cleanupAccessKey),
+      provider: selection.provider, scope_sha256: sha(JSON.stringify(selection)), s3_access_key_sha256: sha(cleanupAccessKey),
     });
-    const run = (selection = scope, overrides = {}) => {
+    const run = (selection = scope, overrides = {}, outbound = origin) => {
       const raw = JSON.stringify(selection);
       return invoke(process.env.PRIVATE_TRIAL_CLEANUP_BUNDLE, {
         CLEANUP_STAGE: 'staging', CLEANUP_SCOPE: raw, CLEANUP_SCOPE_SHA256: sha(raw),
         CLEANUP_APPROVAL: JSON.stringify(approvalFor(scope)), CLEANUP_S3: s3, CLEANUP_DATABASE_URL: uri, ...overrides,
-      }, origin);
+      }, outbound);
     };
     const approved = (selection) => JSON.stringify(approvalFor(selection));
     const wrongVersion = { ...scope, page_version: 'other-page' };
@@ -116,6 +143,47 @@ test('refuses foreign fixture pins, environment and authority and recovers the s
 
     psql(db, '-c', `UPDATE public.storage_validated_digest_winners SET retain_until = '-infinity'
       WHERE object_id = '${scope.object}'`);
+
+    await t.test('retires the approved publication and preserves a second eligible publication', async () => {
+      seed(selected);
+      psql(db, '-c', `UPDATE public.storage_validated_digest_winners SET retain_until = '-infinity'
+        WHERE object_id = '${selected.object}'`);
+      const before = readPublication(selected);
+      const companionBefore = readPublication(scope);
+      for (const [target, publication] of [[selected, before], [scope, companionBefore]]) {
+        assert.equal(publication.winner.deleting_at, null);
+        assert.equal(publication.winner.retain_until, '-infinity');
+        assert.equal(publication.admission.invite_id, target.invite);
+        assert.equal(publication.reference.reference_id, target.track);
+        assert.equal(publication.source.track_id, target.track);
+      }
+      // Opaque version IDs may match across keys. Both scopes have real rows and exact versions.
+      const selectedMedia = media(selected);
+      const selectedPage = page(selected);
+      const companionVersions = structuredClone(versions);
+      versions.set(selectedMedia, new Set([selected.media_version, 'other-media']));
+      versions.set(selectedPage, new Set([selected.page_version, 'other-page']));
+      const requests = [];
+      assert.equal(await run(selected, { CLEANUP_APPROVAL: approved(selected) },
+        storageOrigin(selected, requests)), 'confirmed');
+      assert.deepEqual(requests, [
+        ['DELETE', selectedMedia, selected.media_version], ['HEAD', selectedMedia, selected.media_version],
+        ['DELETE', selectedPage, selected.page_version], ['HEAD', selectedPage, selected.page_version],
+      ]);
+      const after = readPublication(selected);
+      assert.equal(typeof after.winner.deleting_at, 'string');
+      assert.deepEqual(after, {
+        winner: { ...before.winner, deleting_at: after.winner.deleting_at },
+        admission: null, reference: null, source: null,
+      });
+      assert.deepEqual(readPublication(scope), companionBefore);
+      assert.deepEqual(versions, new Map([
+        ...companionVersions,
+        [selectedMedia, new Set(['other-media'])],
+        [selectedPage, new Set(['other-page'])],
+      ]));
+    });
+
     const attempt = [['DELETE', mediaKey, scope.media_version], ['HEAD', mediaKey, scope.media_version],
       ['DELETE', pageKey, scope.page_version], ['HEAD', pageKey, scope.page_version]];
     const partial = attempt.slice(0, 2);
