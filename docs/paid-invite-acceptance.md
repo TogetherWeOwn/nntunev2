@@ -89,6 +89,11 @@ the selected Checkout Session and subscription from signed Checkout through
 synthetic renewal. The loopback runner fixture rehearses closing readback
 before clock retirement.
 
+The offline cancellation fixture checks the Checkout return destination, then
+verifies that the invited listener stays unsubscribed and playback stays gated.
+After the abandoned session expires in the Stripe fixture, the same listener
+can explicitly open a fresh Checkout Session.
+
 The browser Checkout path does not supply a test clock. Before arming the
 protected trial, still verify in the approved Stripe test account that a
 fresh customer can be created under the selected clock, that Checkout uses
