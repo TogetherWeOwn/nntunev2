@@ -130,7 +130,7 @@ refer to evidence in the same protected trial record.
 
 | Evidence | What to check |
 | --- | --- |
-| `<cleanup-owner-ref>` | Before arming, identify the assigned cleanup owner and verify the separate cleanup authority for this trial. Match the direct database host, port, role and role OID and its reviewed grants to the isolated target. Match the cleanup credential to the two fixture keys and the effective policy readback for the reviewed storage route. |
+| `<cleanup-owner-ref>` | Before arming, identify the assigned cleanup owner and verify the separate cleanup authority for this trial. Match the direct database host, port, role and role OID and its reviewed grants to the isolated target. Match the cleanup credential to the two fixture keys and the effective policy readback for the reviewed storage route. At sign-off, verify from the current protected record that the assigned owner is authorized for this same trial scope. |
 | `<fixture-receipt-ref>` and `<scope-ref>` | Link the passing `post-deploy private music journey` job to its recorded run, attempt and build. Match the completed tone A publication and storage receipt to the fixture and provider pins in `PRIVATE_TRIAL_CLEANUP_SCOPE`, including the object, generation, `media_version` and `page_version`. Check that the scope carries the verified cleanup identity pins. |
 | `<cleanup-run-ref>` | Link the successful `Retire the selected private staging fixture` job and its `Retire the selected tone A versions once` step in attempt 1 of the recorded [protected cleanup dispatch](#protected-cleanup-dispatch). Require `Private staging fixture cleanup: confirmed` and match that run's `private_trial_cleanup_scope_sha256` input to the SHA-256 of the exact retained UTF-8 scope bytes. |
 
@@ -142,10 +142,11 @@ supplies qualification evidence. Sign-off requires the cleanup dispatch for
 the completed fixture above.
 
 Mark this fixture's cleanup **Confirmed** only when all three checks pass. In
-the exercise, remove the owner assignment or the exact cleanup run receipt.
-Each leaves sign-off **Pending**. A `confirmed` line from a dispatch with a
-different scope digest, or a scope whose media or page version differs from
-the original receipt, also leaves it **Pending**.
+the exercise, remove the owner assignment after arming, reassign it without
+verified authorization for the new owner, or remove the exact cleanup run
+receipt. Each leaves sign-off **Pending**. A `confirmed` line from a dispatch
+with a different scope digest, or a scope whose media or page version differs
+from the original receipt, also leaves it **Pending**.
 If setup evidence is missing before arming, keep the trial disarmed. At
 closeout, retain the original pins and use the existing reconciliation path
 before clearing the cleanup settings or withdrawing cleanup access.
@@ -379,8 +380,9 @@ the cleanup database. `confirmed` means two verified version absences and a
 committed source finalization. Stop on `refused`,
 `withheld`, `unconfirmed` or missing evidence. Reconcile SQL and provider state
 before a fresh dispatch with the original approved scope and cleanup key.
-Keep those pins until cleanup is confirmed, then clear the cleanup settings in
-custody and withdraw its scoped access.
+Keep those pins while the [sign-off check](#check-cleanup-sign-off) is pending.
+Clear the cleanup settings in custody and withdraw the scoped cleanup access
+after sign-off is **Confirmed**.
 
 After an interruption, reconcile the last run and actual staging state before
 retrying. A grant retry requires the same reviewed overlay bytes and role OIDs.
