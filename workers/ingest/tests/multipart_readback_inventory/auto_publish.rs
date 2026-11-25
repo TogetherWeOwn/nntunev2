@@ -22,7 +22,7 @@ use nntune_ingest::{
     multipart::session_outcome::{CommittedOutcome, CompletionScope},
 };
 use serde_json::json;
-use tokio_postgres::Transaction;
+use tokio_postgres::{error::SqlState, Transaction};
 
 const ALBUM: &str = "Synthetic Signals";
 const RAW_ERROR: &str = "§~synthetic-mirror-error~!";
@@ -406,6 +406,18 @@ pub(super) async fn exercise(
         );
     }
     let release = "ab340000-0000-4000-8000-000000000000";
+    let rows = async || db.query(ROWS, &[&release]).await.unwrap().len();
+    let stored_review = async || {
+        let row = db
+            .query_one(
+                "SELECT view::text, retried_revision FROM public.test_flac_review",
+                &[],
+            )
+            .await
+            .unwrap();
+        let view: JobView = serde_json::from_str(row.get(0)).unwrap();
+        (view, row.get::<_, Option<i64>>(1))
+    };
     let run = async |client: &mut Client,
                      scope,
                      revision,
@@ -449,7 +461,23 @@ pub(super) async fn exercise(
                 let changed = tx.execute("UPDATE public.test_flac_review SET view = $1::text::jsonb,
                     retried_revision = $2 WHERE (view->>'revision')::bigint = $2", &[&view, &prior]).await.unwrap();
                 assert_eq!(changed, 1);
-                if fail_record { Err(BoundaryError::Unavailable) } else { Ok(()) }
+                if result.status == ReviewStatus::Published {
+                    assert_eq!(tx.query(ROWS, &[&release]).await.unwrap().len(), 1);
+                    assert_eq!(rows().await, 0, "staged track must be invisible to readers");
+                    assert_eq!(
+                        stored_review().await,
+                        (expected.view.clone(), expected.retried_revision.map(i64::from)),
+                        "staged receipt must be invisible to readers"
+                    );
+                }
+                if fail_record {
+                    // Force a database error after staging the track and receipt.
+                    let error = tx.execute("UPDATE public.test_flac_review SET view = NULL", &[])
+                        .await.expect_err("the receipt must reject a null view");
+                    assert_eq!(error.code(), Some(&SqlState::NOT_NULL_VIOLATION));
+                    return Err(BoundaryError::Unavailable);
+                }
+                Ok(())
             },
             async |_| {
                 Ok(ResolvedCompletion {
@@ -483,7 +511,6 @@ pub(super) async fn exercise(
         )
         .await
     };
-    let rows = async || db.query(ROWS, &[&release]).await.unwrap().len();
     for (scope, revision, resolved, bad_receipt, fail_record, status) in [
         (READ_SCOPE, 1, 1, false, false, 404),
         (RETRY_SCOPE, 0, 1, false, false, 409),
@@ -568,6 +595,14 @@ pub(super) async fn exercise(
             view,
         )
     };
+
+    // The same committed upload and review revision must recover after rollback.
+    let failure = run(outcome_writer, RETRY_SCOPE, 2, Some(2), false, true, true)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.status, 503);
+    assert_eq!(rows().await, 0);
+    assert_eq!(stored_review().await, (review, Some(1)));
 
     let first = run(writer, RETRY_SCOPE, 2, Some(2), false, true, false)
         .await
