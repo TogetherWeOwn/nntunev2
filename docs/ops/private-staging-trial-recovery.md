@@ -23,7 +23,8 @@ protected custody. Record evidence references and verdicts in the handoff.
 The known partial layout below uses synthetic identifiers. The executor
 stopped after both Access routes and the origin CA upload. The database
 catalog apply, all Hyperdrive creates, serving binds and Environment inputs
-were recorded as unsent. The two containers used the recorded bind mounts.
+were recorded as unsent. No runtime SQL logins had been issued. The two
+containers used the recorded bind mounts.
 
 | Resource | Scoped record at interruption |
 | --- | --- |
@@ -102,9 +103,27 @@ Use the verified current state after an interrupted deletion to work from
 the first remaining item. Confirm absence by an authorized lookup in the
 original scope. A timeout, denial or scope mismatch leaves the item pending.
 
+### Confirm containment and stock-target withdrawal
+
+For the known partial layout, verify from the original record and scoped
+readbacks that no runtime SQL logins were issued, no serving bindings were
+deployed and no fixture activity requires cleanup. Record containment and
+withdrawal as inapplicable only after those checks pass.
+
+If the trial reached serving, complete the applicable [protected fixture
+containment and cleanup](private-staging-trial.md#retire-and-recover) using
+reviewed stock-target access. Keep the selected fixture pins and cleanup
+access until cleanup is confirmed. Verify that all serving bindings are gone.
+If any runtime SQL login was issued, require a separately reviewed
+stock-target procedure and scoped readbacks for fencing, draining and
+withdrawing those roles before infrastructure teardown. The linked `fence`
+and `retire` workflow accepts PlanetScale targets only. Until the stock
+procedure and required evidence are available, keep the trial disarmed,
+record disposal as pending and send the exact blocker to Engineering.
+
 | Order | Targets and required readback |
 | --- | --- |
-| 1 | For a serving trial, complete the applicable [protected containment and withdrawal](private-staging-trial.md#retire-and-recover) first, including required fixture cleanup before losing its access. Verify the serving bindings are gone, then clear trial-specific Environment inputs and verify absence by Environment and name, using secret metadata only. In the known partial layout these actions were unsent. |
+| 1 | Verify [containment and withdrawal](#confirm-containment-and-stock-target-withdrawal) before clearing trial-specific Environment inputs. Check absence by Environment and name, using secret metadata only. The known partial layout has no inputs to clear. |
 | 2 | Remove each verified trial Hyperdrive config and confirm its exact ID is absent in `<account>`. Treat the four entries independently. In the known partial layout all were unsent. If any sent create or deletion is unresolved, pause before step 3 and retain the CA, route, Access and database resources pending reconciliation. Keep the trial disarmed and report the exact pending IDs or requests. |
 | 3 | Stop and remove `<connector-id>`, remove `<op-dns-id>` and `<hd-dns-id>`, then delete `<tunnel-id>` after the connector disconnects. Check the container ID among running and stopped containers on `<docker-host>`, both DNS IDs in `<zone>` and the exact tunnel ID in `<account>` for verified absence or an explicit deleted state. |
 | 4 | Once route removal is verified, remove both Access apps with their app-scoped policies and revoke both service tokens. Verify each app and token ID is absent in `<account>` and confirm its child policy was removed with the app. Remove `<origin-ca-id>` after step 2 is verified and confirm its exact ID is absent. |
