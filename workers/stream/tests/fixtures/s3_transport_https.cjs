@@ -180,7 +180,7 @@ test('versioned digest pages require exact complete response framing', { timeout
 
 test('Stream fetch serves a pinned encrypted seek and settles only written bytes', { timeout: 20_000 }, async (t) => {
   const fixture = make_s3_fixture();
-  const plaintext = Buffer.concat([Buffer.alloc(65_536, 'A'), Buffer.from('Z')]);
+  const plaintext = Buffer.concat([Buffer.alloc(65_534, 'A'), Buffer.from('XYZ')]);
   const expires = Math.floor(Date.now() / 1000) + 90;
   const grantKey = 'fixture-only-play-grant-key-material';
   const custodyKey = 'fixture-only-transport-authentication-key';
@@ -363,7 +363,7 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     const { response, bytes } = await request({}, '/play/track', bearer, { range: 'bytes=65534-65540' });
     assert.equal(response.status, 206);
     assert.equal(response.headers.get('content-range'), 'bytes 65534-65536/65537');
-    assert.deepEqual(bytes, Buffer.from('AAZ'));
+    assert.deepEqual(bytes, Buffer.from('XYZ'));
     assert.deepEqual(fetches.slice(firstFetch), ['media', 'page']);
     assert.deepEqual(reports.slice(firstReport), [{
       user_id: 'member', play_id: play, track_id: 'track', start: 65_534, end: 65_537, file_bytes: 65_537,
