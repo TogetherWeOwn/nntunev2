@@ -244,3 +244,53 @@ async fn load(
     })
     .transpose()
 }
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn connect_stage_role(
+    env: &worker::Env,
+    binding: &str,
+    role: &str,
+) -> Result<Client, TrialError> {
+    use crate::worker_entry::with_deadline;
+    use worker::{SecureTransport, Socket};
+    use TrialError::{Refused, Unconfirmed};
+
+    with_deadline(
+        async {
+            let target = env.hyperdrive(binding).map_err(|_| Unconfirmed)?;
+            let config: tokio_postgres::Config = target
+                .connection_string()
+                .parse()
+                .map_err(|_| Unconfirmed)?;
+            if config.get_dbname() != Some("nntunev2_staging") || config.get_user() != Some(role) {
+                return Err(Refused);
+            }
+            let socket = Socket::builder()
+                .secure_transport(SecureTransport::StartTls)
+                .connect(target.host(), target.port())
+                .map_err(|_| Unconfirmed)?;
+            socket.opened().await.map_err(|_| Unconfirmed)?;
+            let (client, connection) = config
+                .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+                .await
+                .map_err(|_| Unconfirmed)?;
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = connection.await;
+            });
+            let identity = client
+                .query_typed_one(
+                    "SELECT current_user::text = $1 AND current_database() = 'nntunev2_staging'",
+                    &[(&role, Type::TEXT)],
+                )
+                .await
+                .map_err(|_| Unconfirmed)?;
+            if !identity.try_get::<_, bool>(0).map_err(|_| Unconfirmed)? {
+                return Err(Refused);
+            }
+            Ok(client)
+        },
+        3_000,
+        Unconfirmed,
+    )
+    .await
+}
