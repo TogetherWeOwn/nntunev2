@@ -6,14 +6,29 @@ interface and live billing outside this release. Use the existing
 [private listening controls](ops.md#private-listening-qualification).
 
 Record candidate dispatch readiness in the [pinned candidate template](#pinned-candidate-template).
-The private staging job runs Playwright but still needs protected wiring for
-the health proof, the three deployment pins, and the record and upload steps
-for the attempt-bound receipt. A reviewed release path must also resolve when
-staging can safely disable the trial and open the protected app lane, which
-currently refuses promotion in preflight.
-Enroll real Product and QA approval through the reviewed staging policy.
-Production API/data-plane and Access cutover need protected lanes, evidence and
-fallback. A synthetic receipt is for rehearsal only.
+On an armed push to protected `main`, `deploy.yml` binds the Web, API and
+Stream deployments to the same attempt and observes the serving deployments
+before and after the private Playwright journey. The journey checks the serving
+build through `/api/build` and `/healthz` at both ends. The workflow evaluates
+the first-attempt results against the reviewed contract and uploads the
+attempt-bound receipt only when the evaluator returns `satisfied`.
+
+Scoped staging access and a live qualifying attempt remain pending. Follow the
+[protected staging trial runbook](ops/private-staging-trial.md) for setup,
+qualification and cleanup. The admission policy has no approvals, so the
+protected job cannot upload a satisfied receipt and the verifier refuses
+admission. Enroll the exact contract through a reviewed policy change after
+Product approves applicability and QA separately approves the executable
+mapping. Synthetic receipts are for rehearsal only.
+
+Production preflight currently refuses application promotion, even when the
+lane is enabled. Maintenance bootstrap keeps its ordinary staging prerequisites
+and receipt check. If a reviewed path opens the app lane, the staging-evidence
+verifier requires the approved private journey and the exact staging deployment
+evidence. That path must also support timely trial cleanup. Production
+API/data-plane and Access cutover still need protected lanes, evidence and
+fallback. Keep deployment and release approvals pending in the candidate record
+until their evidence is available.
 [Staging deploy](../.github/workflows/deploy.yml) ·
 [Production preflight](../.github/workflows/deploy-production.yml) ·
 [Staging admission policy](../ci/staging-admission-policy.json)
@@ -26,13 +41,14 @@ fallback. A synthetic receipt is for rehearsal only.
    restore evidence. Record required CI check results and each included PR's
    review clearance on the relevant SHA. Main can keep moving.
 2. Pin the successful main-push `deploy.yml` run **and attempt** for that SHA.
-   Match successful health proof, actual Web/API/Stream deploy steps and the
-   `post-deploy private music journey` to it. The ordinary post-deploy smoke
-   is skipped while the private arm is set. Require matching Web, API and
-   Stream Worker version and deployment IDs at both ends of the journey. The
-   [private journey](../e2e/README.md#private-music-journey-preparation) must
-   show upload through Library arrival, play, seek, queue, anonymous and unlisted
-   refusal, revoked or expired refusal, and video off. Record Product approval
+   Match successful health proof, actual Web/API/Stream deploy steps, the
+   `post-deploy private music journey` and its receipt upload to it. The
+   ordinary `post-deploy-e2e` job is skipped while the private arm is set.
+   Require matching Web, API and Stream Worker version and deployment IDs at
+   both ends of the [private journey](../e2e/README.md#private-music-journey-preparation).
+   It must show invite acceptance, upload through Library arrival, play, seek,
+   queue, anonymous and unlisted refusal, revoked or expired refusal, and
+   video off. Record Product approval
    of applicability and separate QA approval of the executable mapping.
    Run again from the reviewed producer and verifier source if that source or
    the enrolled contract changes. [Admission verifier](../ci/staging-admission.md)
