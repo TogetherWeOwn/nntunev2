@@ -333,7 +333,7 @@ pub(crate) async fn verify_publication(
     let lookup = release_lookup(QUERY).unwrap();
     let mut publication = connection().await;
     let mut publish = async |publication: &mut Client, upload_writer: &mut Client| {
-        upload(&ctx, &request, target, async |permit, _| {
+        Box::pin(upload(&ctx, &request, target, async |permit, _| {
             permit.preflight(publication).await?;
             let evidence = MatchEvidence {
                 query: QUERY,
@@ -367,7 +367,7 @@ pub(crate) async fn verify_publication(
                     &mut read_authority,
                 )
                 .await
-        })
+        }))
         .await
     };
     let set_job = async |job: &str| {

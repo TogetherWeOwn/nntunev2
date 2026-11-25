@@ -904,8 +904,10 @@ async fn prove_attempt(
         Err(UploadError::Refused)
     ));
     let track = if publish_fixture {
-        let track = crate::handlers::tests::private_trial_fixture::verify_publication(
-            observer, writer, now, input, auth, prepared, &committed, reload,
+        let track = Box::pin(
+            crate::handlers::tests::private_trial_fixture::verify_publication(
+                observer, writer, now, input, auth, prepared, &committed, reload,
+            ),
         )
         .await;
         crate::handlers::tests::private_trial_fixture::verify_registration(
@@ -928,8 +930,10 @@ async fn prove_attempt(
         Err(UploadError::Refused)
     ));
     if let Some(track) = track {
-        crate::handlers::tests::private_trial_fixture::verify_cleanup(
-            observer, prepared, &track, now,
+        Box::pin(
+            crate::handlers::tests::private_trial_fixture::verify_cleanup(
+                observer, prepared, &track, now,
+            ),
         )
         .await;
         return;
