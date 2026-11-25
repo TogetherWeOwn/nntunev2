@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub mod completed_upload;
+pub mod telemetry;
 
 pub struct ExpectedFile<'a> {
     pub numbering: FileNumbering<'a>,
