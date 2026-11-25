@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import redirect_stderr, redirect_stdout, suppress
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 
 import database_bootstrap_setup as setup
@@ -652,6 +652,32 @@ def prepare_baseline_readers(cluster, names, *, host):
     return pending
 
 
+def start_sql_holder(cluster, plan, role, password):
+    env = setup.tls_environment(cluster.directory, plan, LAUNCH, role, password)
+    env["PGHOSTADDR"] = cluster.address
+    return subprocess.Popen(
+        ["/usr/bin/psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"], env=env,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+
+
+@contextmanager
+def block_fixture_probe(cluster, plan):
+    # A premature row probe needs ACCESS SHARE on the leaf and hits the lock timeout.
+    with start_sql_holder(cluster, plan, "postgres", cluster.passwords["postgres"]) as locker:
+        try:
+            locker.stdin.write(b"BEGIN; LOCK TABLE ONLY reader_scope.leaf IN ACCESS EXCLUSIVE MODE; SELECT 1;\n")
+            locker.stdin.flush()
+            require(select.select([locker.stdout], [], [], 3)[0] and locker.stdout.readline() == b"1\n",
+                    "hold the leaf lock before launching the wrong-OID reader")
+            yield
+            locker.communicate(b"ROLLBACK;\n", timeout=3)
+            require(locker.returncode == 0, "release the synthetic leaf lock")
+        finally:
+            if locker.poll() is None:
+                locker.kill()
+
+
 def prove_reader_lifecycle(cluster, pending, *, scenario):
     lifecycle, oid, env = pending
     launch = {"database": LAUNCH, "role": READER_ISSUER}
@@ -720,7 +746,8 @@ def prove_reader_lifecycle(cluster, pending, *, scenario):
             calls = cluster.directory / "invocations"
             before = calls.stat().st_size
             sessions = f"SELECT FROM pg_stat_activity WHERE usesysid = {oid} AND datid = {database_oid}"
-            with start_caller(env, baseline.__file__) as process:
+            lock = block_fixture_probe(cluster, lifecycle.plan) if scenario == "wrong-oid" else nullcontext()
+            with lock, start_caller(env, baseline.__file__) as process:
                 try:
                     if scenario == "interrupt":
                         wait_for(cluster, "observe the bound reader inside the baseline transaction",
@@ -742,12 +769,7 @@ def prove_reader_lifecycle(cluster, pending, *, scenario):
         if scenario == "success":
             cluster.denied("refuse to rotate an active reader", activate, "reader is no longer pending", **launch)
             cluster.denied("refuse to retire before fencing", lifecycle.retire(raw, oid), "reader retirement refused", **launch)
-            tls = setup.tls_environment(cluster.directory, lifecycle.plan, LAUNCH, lifecycle.name, password)
-            tls["PGHOSTADDR"] = cluster.address
-            holder = subprocess.Popen(
-                ["/usr/bin/psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"], env=tls, stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            )
+            holder = start_sql_holder(cluster, lifecycle.plan, lifecycle.name, password)
             holder.stdin.write(
                 f"SELECT (rolvaliduntil = to_timestamp({expiry}))::int FROM pg_roles WHERE oid = {oid};\n".encode()
             )
