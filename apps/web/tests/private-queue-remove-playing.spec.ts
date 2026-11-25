@@ -1,5 +1,5 @@
 import { fileURLToPath } from 'node:url';
-import { expect, test as base, type Request, type Route } from '@playwright/test';
+import { expect, test as base, type Page, type Request, type Route } from '@playwright/test';
 import { preview } from 'vite';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { privateStagingAudio } from '../../../e2e/helpers/private-staging-fixture.js';
@@ -46,9 +46,8 @@ const test = base.extend<{ origin: string }>({
 
 test.use({ serviceWorkers: 'block' });
 
-test('removing the upcoming private track preserves the playing receipt and skips it on natural end', async ({
-	page, context, origin
-}) => {
+async function openInvitedQueue(page: Page, origin: string) {
+	const context = page.context();
 	const tones = privateStagingAudio();
 	const toneA = tones.find(({ file }) => file === 'tone-a.flac')!.body;
 	const toneB = tones.find(({ file }) => file === 'tone-b.flac')!.body;
@@ -56,15 +55,15 @@ test('removing the upcoming private track preserves the playing receipt and skip
 		id: '00000000-0000-4000-8000-000000000001', title: 'Playing Tone', duration_ms: 14_000,
 		playId: `private_browser_${'a'.repeat(22)}`, body: toneA
 	};
-	const removed = {
+	const upcoming = {
 		id: '00000000-0000-4000-8000-000000000002', title: 'Upcoming Tone', duration_ms: 14_000,
 		playId: `private_browser_${'b'.repeat(22)}`, body: toneA
 	};
-	const survivor = {
+	const later = {
 		id: '00000000-0000-4000-8000-000000000003', title: 'Surviving Tone', duration_ms: 14_000,
 		playId: `private_browser_${'c'.repeat(22)}`, body: toneB
 	};
-	const tracks = [first, removed, survivor];
+	const tracks = [first, upcoming, later];
 	const grantUrl = origin + contract.plays;
 	const mediaPath = (track: Pick<typeof first, 'id' | 'playId'>, tab: string) =>
 		`${contract.plays}/media/${track.id}/${tab}/${track.playId}`;
@@ -85,7 +84,7 @@ test('removing the upcoming private track preserves the playing receipt and skip
 		});
 	});
 	page.on('request', (request) => {
-		if (request.url() === grantUrl) grants.push(request);
+		if (new URL(request.url()).pathname === contract.plays) grants.push(request);
 	});
 	await page.route(grantUrl, async (route) => {
 		const call = route.request();
@@ -123,7 +122,7 @@ test('removing the upcoming private track preserves the playing receipt and skip
 	for (const { id } of tracks) {
 		await rows.and(page.locator(`[${library.id}="${id}"]`)).locator(library.select).click();
 	}
-	await assertQueue([first.id, removed.id, survivor.id]);
+	await assertQueue([first.id, upcoming.id, later.id]);
 	await expect(active).toHaveAttribute(contract.queueId, first.id);
 	await expect(audio).toHaveCount(0);
 	expect(grants).toHaveLength(0);
@@ -134,6 +133,15 @@ test('removing the upcoming private track preserves the playing receipt and skip
 	const firstSource = mediaPath(first, tab);
 	await expect(audio).toHaveAttribute('src', firstSource);
 	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) => !node.paused && node.currentTime > 0.2)).toBe(true);
+	return {
+		first, upcoming, later, grantUrl, grants, mediaPath, tab, firstSource,
+		queue, active, audio, player, assertQueue
+	};
+}
+
+test('removing the upcoming private track preserves the playing receipt and skips it on natural end', async ({ page, origin }) => {
+	const { first, upcoming: removed, later: survivor, grantUrl, grants, mediaPath, tab, firstSource, queue, active, audio, player, assertQueue } =
+		await openInvitedQueue(page, origin);
 
 	const currentAudio = await audio.elementHandle();
 	const beforeRemoval = await currentAudio.evaluate((node: HTMLAudioElement) => {
@@ -176,4 +184,60 @@ test('removing the upcoming private track preserves the playing receipt and skip
 		performance.getEntriesByName(url, 'resource').map((entry) => entry.startTime), grantUrl);
 	expect(grantStarts).toHaveLength(2);
 	expect(grantStarts[1]).toBeGreaterThanOrEqual(completion.at);
+});
+
+test('Next plays the reordered private successor with a fresh grant', async ({ page, origin }) => {
+	const { first, upcoming, later, grantUrl, grants, mediaPath, tab, firstSource, queue, active, audio, player, assertQueue } =
+		await openInvitedQueue(page, origin);
+	const nowPlaying = player.getByTestId('library-now-playing');
+	const next = page.getByTestId(contract.next);
+	// The click and grant fetch use the same browser clock.
+	const nextClick = await next.evaluateHandle((button) => {
+		const click = { at: 0 };
+		button.addEventListener('click', (event) => { click.at = event.timeStamp; }, { capture: true, once: true });
+		return click;
+	});
+	const continuity = await audio.evaluateHandle((node: HTMLAudioElement) => {
+		const interruptions: string[] = [];
+		for (const type of ['pause', 'emptied', 'loadstart', 'seeking', 'ended']) {
+			node.addEventListener(type, () => interruptions.push(type));
+		}
+		return { node, position: node.currentTime, interruptions };
+	});
+	await queue.and(page.locator(`[${contract.queueId}="${later.id}"]`))
+		.getByRole('button', { name: `Move ${later.title} up`, exact: true }).click();
+	const reordered = [first.id, later.id, upcoming.id];
+	await assertQueue(reordered);
+	await expect(queue.filter({ visible: true })).toHaveCount(reordered.length);
+	await expect(active).toHaveAttribute(contract.queueId, first.id);
+	await expect(nowPlaying).toHaveText(first.title);
+	await expect(audio).toHaveAttribute('src', firstSource);
+	await expect.poll(() => continuity.evaluate(({ node, position, interruptions }) => ({
+		connected: node.isConnected,
+		source: node.currentSrc,
+		advancing: !node.paused && !node.ended && !node.error && node.currentTime > position + 0.1,
+		interruptions
+	}))).toEqual({ connected: true, source: origin + firstSource, advancing: true, interruptions: [] });
+	const initialGrant = { track_id: first.id, session_id: tab };
+	expect(grants.map((request) => request.postDataJSON())).toEqual([initialGrant]);
+
+	await next.click();
+	await expect(active).toHaveAttribute(contract.queueId, later.id);
+	await expect(nowPlaying).toHaveText(later.title);
+	const nextSource = mediaPath(later, tab);
+	await expect(audio).toHaveAttribute('src', nextSource);
+	await expect.poll(() => audio.evaluate((node: HTMLAudioElement, source) =>
+		node.currentSrc === source && !node.paused && !node.ended && !node.error && node.currentTime > 0.2,
+		origin + nextSource)).toBe(true);
+	await assertQueue(reordered);
+	expect(await continuity.evaluate(({ interruptions }) => interruptions)).not.toContain('ended');
+	expect(grants.map((request) => request.postDataJSON())).toEqual([
+		initialGrant, { track_id: later.id, session_id: tab }
+	]);
+	const { at } = await nextClick.jsonValue();
+	const grantStarts = await page.evaluate((url) =>
+		performance.getEntriesByName(url, 'resource').map((entry) => entry.startTime), grantUrl);
+	expect(grantStarts).toHaveLength(2);
+	expect(at).toBeGreaterThan(0);
+	expect(grantStarts[1]).toBeGreaterThanOrEqual(at);
 });
