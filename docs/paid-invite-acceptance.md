@@ -6,6 +6,12 @@ invited account and Stripe test mode. Qualify live invoice history and effective
 database privileges before paid activation. Follow the [staging promotion checklist](ops.md#staging-promotion-checklist)
 and [M1 traceability matrix](m1-exit-traceability.md).
 
+The API CI case `paid_invite_signup_to_subscription_cap_and_lapse` rehearses
+the signup, signed Stripe deliveries, recovery of a selected renewal and
+play refusals with the in-memory store and Stripe transport. The recording
+below verifies hourly dispatch and the browser, provider and database on the
+deployed build.
+
 1. Open an owner-issued single-use staging invite to prefill the code.
    Follow [signup arrival](../e2e/tests/signup-arrival.spec.ts) for email-code
    and passkey handling. Confirm a second redemption refuses.
