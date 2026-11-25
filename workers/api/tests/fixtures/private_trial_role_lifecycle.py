@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / ".github/scripts"))
 from apply_migration import transaction_body
 from staging_apply import load_entries
 from staging_trial_role_lifecycle import DATABASE, FIXTURE, NAMES, SCOPE_ENV
-from staging_trial_schema import compose
+from staging_trial_schema import BASELINE, compose
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--disposable-port", required=True, type=int)
@@ -106,6 +106,13 @@ try:
     cmd("grant", success=False)
     sql(f"COMMENT ON DATABASE {DATABASE} IS '{FIXTURE}';")
     assert sql(f"SELECT has_database_privilege('{writer}',current_database(),'CONNECT');") == "f"
+    applied = next(e["sha256"] for e in entries if e["file"] == BASELINE)
+    sql(f"UPDATE public.schema_migrations SET sha256 = repeat('0', 64) WHERE file = '{BASELINE}';")
+    report = cmd("grant", success=False)
+    assert "staging CONNECT passed" not in report
+    assert sql(f"""SELECT bool_or(has_database_privilege(rolname,current_database(),'CONNECT'))
+                   FROM pg_roles WHERE rolname IN ('{reader}','{writer}');""") == "f"
+    sql(f"UPDATE public.schema_migrations SET sha256 = '{applied}' WHERE file = '{BASELINE}';")
     sql("GRANT CONNECT ON DATABASE template1 TO PUBLIC;")
     cmd("grant", success=False)
     sql("REVOKE CONNECT ON DATABASE template1 FROM PUBLIC;")
