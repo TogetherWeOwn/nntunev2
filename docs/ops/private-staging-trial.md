@@ -118,7 +118,8 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    and its receipt remain for data reconciliation. Remove retired credentials
    from custody and withdraw any temporary executor grants through their original
    grantor. If withdrawal refuses, reconcile with the grant owner while both
-   logins stay fenced.
+   logins stay fenced. Rehearse conflicting evidence in the
+   [retirement readback tabletop](#tabletop-for-conflicting-role-retirement-readbacks).
 
 ### Isolated database catalog preflight
 
@@ -199,6 +200,26 @@ the same plan for `restore-ambient`. The inverse restores normalized grants,
 including grantors and grant options. Supported PostgreSQL DDL may leave an
 explicit ACL where `datacl` was previously NULL. Confirm normalized equality
 and record any raw representation difference privately.
+
+### Tabletop for conflicting role retirement readbacks
+
+Use synthetic evidence for one selected isolated database. In both cases the
+initial role inventory matches the original target and scope. It lists
+`nntune_trial_reader` at OID `71001` and `nntune_trial_writer` at OID `71002`.
+The bindings are gone, and the primary `retire` report for that scope shows
+`role retirement passed`.
+
+Compare that report with a final `pg_roles` inventory from a separate read-only
+session on the same pinned database. Check both names and both OIDs, including
+roles with `NOLOGIN`.
+
+| Independent final inventory | Expected role withdrawal verdict |
+| --- | --- |
+| The reader is absent. `nntune_trial_writer` at OID `71002` is still present with `NOLOGIN`. | **Pending.** Record the discrepancy against the original scope. Keep the trial disarmed and reconcile with the grant owner before closing withdrawal. |
+| Neither pinned role name nor either pinned OID appears. | **Verified.** The inventory agrees with the primary report and satisfies the role absence check. |
+
+Walk both cases using the recorded evidence. Keep the initial inventory and
+primary report identical when switching to the clean control.
 
 ### Protected cleanup dispatch
 
