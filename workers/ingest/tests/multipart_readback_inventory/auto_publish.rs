@@ -9,7 +9,8 @@ use nntune_ingest::{
     },
     admin_review::{
         completed::{retry_completed, ResolvedCompletion, ReviewTarget},
-        Authorization, BoundaryError, ObjectRef, ReviewJob, ReviewStatus, READ_SCOPE, RETRY_SCOPE,
+        Authorization, BoundaryError, JobView, ObjectRef, ReviewJob, ReviewStatus, READ_SCOPE,
+        RETRY_SCOPE,
     },
     catalogue_publication::{PublicationError, PublishedObject},
     matching::{
@@ -361,7 +362,13 @@ pub(super) async fn exercise(
         );
     }
     let release = "ab340000-0000-4000-8000-000000000000";
-    let mut run = async |scope, revision, resolved, bad_receipt, match_found: bool, fail_record| {
+    let run = async |client: &mut Client,
+                     scope,
+                     revision,
+                     resolved: Option<u32>,
+                     bad_receipt,
+                     match_found: bool,
+                     fail_record| {
         use nntune_ingest::caller_auth::issue;
         const KEY: &str = "synthetic-review-receiver-fixture-key";
         let bearer = format!("Bearer {}", issue(job.owner_id, scope, 10, KEY.as_bytes()));
@@ -373,7 +380,7 @@ pub(super) async fn exercise(
                 secret: Some(KEY),
                 now: 1,
             },
-            writer,
+            client,
             ReviewTarget {
                 job_id: job.job_id,
                 body: body.as_bytes(),
@@ -392,6 +399,7 @@ pub(super) async fn exercise(
                 }))
             },
             async |tx, expected, result| {
+                assert!(resolved.is_some(), "replay must not record a new outcome");
                 let view = serde_json::to_string(result).unwrap();
                 let prior = i64::from(expected.view.revision);
                 let changed = tx.execute("UPDATE public.test_flac_review SET view = $1::text::jsonb,
@@ -402,7 +410,7 @@ pub(super) async fn exercise(
             async |_| {
                 Ok(ResolvedCompletion {
                     job_id: job.job_id,
-                    revision: resolved,
+                    revision: resolved.expect("replay must not resolve the upload"),
                     upload: uploads[usize::from(bad_receipt)],
                     numbering: files[0].numbering,
                     query: ALBUM,
@@ -414,6 +422,7 @@ pub(super) async fn exercise(
                 })
             },
             async |scope| {
+                assert!(resolved.is_some(), "replay must not reread upload evidence");
                 Ok(db
                     .query_opt(READ, &[&&scope_key(scope)[..]])
                     .await?
@@ -438,23 +447,99 @@ pub(super) async fn exercise(
         (RETRY_SCOPE, 1, 1, true, false, 409),
         (RETRY_SCOPE, 1, 1, false, true, 503),
     ] {
-        let error = run(scope, revision, resolved, bad_receipt, true, fail_record)
-            .await
-            .unwrap_err();
+        let error = run(
+            writer,
+            scope,
+            revision,
+            Some(resolved),
+            bad_receipt,
+            true,
+            fail_record,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.status, status);
         assert_eq!(rows().await, 0);
     }
-    let review = run(RETRY_SCOPE, 1, 1, false, false, false).await.unwrap();
+    let review = run(writer, RETRY_SCOPE, 1, Some(1), false, false, false)
+        .await
+        .unwrap();
     assert_eq!(review.status, ReviewStatus::NeedsReview);
     assert_eq!(review.revision, 2);
     assert_eq!(review.reason, Some(NeedsReview::SearchEvidence));
-    let replay = run(RETRY_SCOPE, 1, 0, true, true, true).await.unwrap();
+    let replay = run(writer, RETRY_SCOPE, 1, None, true, true, true)
+        .await
+        .unwrap();
     assert_eq!(replay, review);
     assert_eq!(rows().await, 0);
-    let result = run(RETRY_SCOPE, 2, 2, false, true, false).await.unwrap();
-    let replay = run(RETRY_SCOPE, 2, 0, true, false, true).await.unwrap();
-    let published = (ReviewStatus::Published, 3);
-    assert_eq!((result.status, result.revision), published);
-    assert_eq!(replay, result);
-    assert_eq!(rows().await, 1);
+
+    let receipt = &both[0].receipt;
+    let S3Binding::VersionId(version) = receipt.locator.binding() else {
+        panic!("fixture must pin an immutable media version");
+    };
+    let publication = async || {
+        // Read from the canonical track side so a duplicate track or a missing
+        // source cannot be hidden by filtering for the expected object.
+        let row = db
+            .query_one(
+                "SELECT t.id::text AS track_id, s.source_job_id, s.accepted_seq,
+                        s.object_id::text, m.map_id::text, l.s3_bucket, l.s3_key,
+                        l.s3_version_id, p.media_version, p.page_versions, r.view::text, r.retried_revision
+                 FROM public.tracks t
+                 LEFT JOIN public.catalogue_s3_sources s ON s.track_id = t.id
+                 LEFT JOIN public.storage_s3_locator_intents l USING (object_id)
+                 LEFT JOIN public.storage_digest_map_intents m USING (object_id)
+                 LEFT JOIN public.storage_digest_inventory_intents p USING (map_id)
+                 CROSS JOIN public.test_flac_review r
+                 WHERE t.release_id = $1::text::uuid",
+                &[&release],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, &str>("source_job_id"), job.job_id);
+        assert_eq!(
+            row.get::<_, String>("object_id").replace('-', ""),
+            hex::encode(receipt.intent.identities[2]),
+            "publication must still point at the committed object"
+        );
+        assert_eq!(
+            row.get::<_, String>("map_id").replace('-', ""),
+            hex::encode(receipt.intent.map_id)
+        );
+        assert_eq!(row.get::<_, &str>("s3_bucket"), receipt.locator.bucket());
+        assert_eq!(row.get::<_, &str>("s3_key"), receipt.locator.key());
+        assert_eq!(row.get::<_, &str>("s3_version_id"), version);
+        assert_eq!(row.get::<_, &str>("media_version"), version);
+        assert_eq!(
+            row.get::<_, Vec<String>>("page_versions"),
+            receipt.page_versions
+        );
+        assert_eq!(row.get::<_, i64>("retried_revision"), 2);
+        let view: JobView = serde_json::from_str(row.get("view")).unwrap();
+        assert_eq!(view.job_id, job.job_id);
+        assert_eq!((view.status, view.revision), (ReviewStatus::Published, 3));
+        (
+            row.get::<_, String>("track_id"),
+            row.get::<_, i64>("accepted_seq"),
+            view,
+        )
+    };
+
+    let first = run(writer, RETRY_SCOPE, 2, Some(2), false, true, false)
+        .await
+        .unwrap();
+    let (track_id, accepted_seq, view) = publication().await;
+    assert_eq!(
+        first, view,
+        "first response must match the committed receipt"
+    );
+
+    // Discard the response after checking it at the receiver. The retry
+    // still has only the original revision and a separate connection.
+    drop(first);
+    let replay = run(outcome_writer, RETRY_SCOPE, 2, None, true, false, true)
+        .await
+        .unwrap();
+    assert_eq!(replay, view);
+    assert_eq!(publication().await, (track_id, accepted_seq, view));
 }
