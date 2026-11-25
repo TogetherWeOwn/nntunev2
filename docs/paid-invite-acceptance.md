@@ -81,12 +81,23 @@ Hosted CI runs this contract on disposable fixtures and runs #1803's signed
 subscription and playback-cap journey. A protected staging run still needs
 candidate-specific #1809 compatibility, effective billing privileges, approved
 test-mode credentials, synthetic playback and the protected Actions job.
-The selectable Stripe prices are monthly. The browser Checkout path supplies
-no test clock today. Before arming the trial, qualify a staging-only way to
-bind the synthetic Stripe customer to a test clock before Checkout and
-advance the selected monthly invoices within the protected window. Preserve
-the checkout and subscription for the closing readback before retiring the
-test clock.
+The selectable Stripe prices are monthly. Hosted fixtures rehearse a fresh
+customer created with the selected test clock before Checkout, with paid
+dispatch off. The rehearsal refuses an existing binding, an unrelated
+customer and a live or mismatched clock response. It follows the selected
+Checkout Session and subscription through synthetic renewal and rehearses
+closing readback before clock retirement.
+
+The browser Checkout path does not supply a test clock. Before arming the
+protected trial, still verify in the approved Stripe test account that a
+fresh customer can be created under the selected clock, that Checkout uses
+that exact customer and that advancing the clock renews the same monthly
+subscription inside the staging window. Record the clock, customer,
+Checkout Session and subscription IDs privately. Close paid dispatch first,
+cancel the selected subscription and complete the runner's closing
+readback while its Stripe records are still available. Retire the clock
+after that readback. The fixture does not exercise Stripe clock timing or
+deletion against the provider.
 
 ## Record the staging journey
 
