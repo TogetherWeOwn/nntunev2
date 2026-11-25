@@ -97,7 +97,7 @@ identity, migration and rollback evidence, and review and merge gates. Follow
 for release evidence. Explicitly state what was not run.
 
 Post newly available CI results and independent reviews in the PR conversation.
-Run `python3 scripts/post_pr_evidence.py PR_NUMBER HEAD_SHA --job success JOB_URL TESTED_SHA`
+Run `python3 scripts/post_pr_evidence.py PR_NUMBER HEAD_SHA --job success 'JOB_URL' TESTED_SHA`
 with the verified conclusion, full GitHub Actions job URL and actual commit
 the run tested. Use the synthetic merge SHA when the run tested a PR merge.
 Repeat `--job` for each result. Use `--general-review-cleared` or
