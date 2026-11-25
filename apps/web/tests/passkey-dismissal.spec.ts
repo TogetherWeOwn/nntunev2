@@ -1,4 +1,4 @@
-import { expect, test, type BrowserContext, type Page } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 
 /**
@@ -278,7 +278,13 @@ function privateSignupFixture() {
 	let revoked = false;
 	let finishPosts = 0;
 
-	async function install(page: Page) {
+	async function install(page: Page, baseURL: string | undefined) {
+		const origin = new URL(baseURL ?? 'about:blank');
+		if (!['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) {
+			throw new Error('Private invite signup requires a loopback browser fixture');
+		}
+		await page.context().route('**/*', (route) =>
+			new URL(route.request().url()).origin === origin.origin ? route.continue() : route.abort());
 		await installCreateDouble(page, {});
 		await page.route(registerStart, (route) => {
 			const input = route.request().postDataJSON();
@@ -305,6 +311,7 @@ function privateSignupFixture() {
 			if (revoked) return route.fulfill({ status: 403, json: { code: 'forbidden' } });
 			return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: [{ id: 'fixture-track', title: 'Synthetic track' }] });
 		});
+		return origin;
 	}
 
 	async function openInvite(page: Page) {
@@ -332,10 +339,10 @@ function privateSignupFixture() {
 	};
 }
 
-test('private listening invite opens Library and refusal clears it', async ({ page }) => {
+test('private listening invite opens Library and refusal clears it', async ({ page, baseURL }) => {
 	const { signup, library } = PRIVATE_MUSIC;
 	const fixture = privateSignupFixture();
-	await fixture.install(page);
+	await fixture.install(page, baseURL);
 	await page.goto(signup.path);
 	await page.getByTestId(signup.email).fill(fixture.email);
 	await page.getByTestId(signup.submit).click();
@@ -364,7 +371,7 @@ for (const phase of ['start', 'finish'] as const) {
 		page.on('request', (request) => { leakedUrl ||= request.url().includes(fixture.code); });
 		page.on('console', (message) => { leakedDiagnostic ||= message.text().includes(fixture.code); });
 		page.on('pageerror', (error) => { leakedDiagnostic ||= error.message.includes(fixture.code); });
-		await fixture.install(page);
+		await fixture.install(page, baseURL);
 		await page.route(new URL(endpoint, origin).href, (route) => {
 			const request = route.request();
 			submissions.push({ method: request.method(), body: request.postDataJSON() });
@@ -392,24 +399,16 @@ for (const phase of ['start', 'finish'] as const) {
 	});
 }
 
-test('a spent private invite refuses signup in a second browser context', async ({ page, context, browser, baseURL }) => {
+test('a spent private invite refuses signup in a second browser context', async ({ page, browser, baseURL }) => {
 	const { signup, library } = PRIVATE_MUSIC;
-	const origin = new URL(baseURL ?? 'about:blank');
-	if (!['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) {
-		throw new Error('Private invite signup requires a loopback browser fixture');
-	}
 	const fixture = privateSignupFixture();
-	const restrictToFixture = (context: BrowserContext) =>
-		context.route('**/*', (route) => new URL(route.request().url()).origin === origin.origin ? route.continue() : route.abort());
-	await restrictToFixture(context);
-	await fixture.install(page);
+	const origin = await fixture.install(page, baseURL);
 	await fixture.redeem(page);
 
 	const secondContext = await browser.newContext({ baseURL, serviceWorkers: 'block' });
 	try {
-		await restrictToFixture(secondContext);
 		const secondPage = await secondContext.newPage();
-		await fixture.install(secondPage);
+		await fixture.install(secondPage, baseURL);
 		// Use the invited address again so the only refusal is the spent code.
 		await fixture.openInvite(secondPage);
 		const registerStartUrl = new URL(fixture.registerStart, origin).href;
@@ -452,13 +451,8 @@ test.describe('same-browser private invite retry', () => {
 
 	test('retries an interrupted private signup finish in the same tab', async ({ page, context, baseURL }) => {
 		const { signup, library } = PRIVATE_MUSIC;
-		const origin = new URL(baseURL ?? 'about:blank');
-		if (!['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) {
-			throw new Error('Private invite signup requires a loopback browser fixture');
-		}
-		await context.route('**/*', (route) => new URL(route.request().url()).origin === origin.origin ? route.continue() : route.abort());
 		const fixture = privateSignupFixture();
-		await fixture.install(page);
+		const origin = await fixture.install(page, baseURL);
 		const startUrl = new URL(fixture.registerStart, origin).href;
 		const finishUrl = new URL(fixture.registerFinish, origin).href;
 		const startRequests: unknown[] = [];
