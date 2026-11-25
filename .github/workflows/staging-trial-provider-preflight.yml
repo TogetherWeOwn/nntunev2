@@ -1,0 +1,80 @@
+name: staging-trial-provider-preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Full reviewed commit at protected main
+        type: string
+        required: true
+      scope_sha256:
+        description: Recorded SHA-256 of the exact disposable scope JSON
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Qualify disposable staging storage
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' && github.repository == 'TogetherWeOwn/nntunev2' &&
+          github.ref == 'refs/heads/main' && github.ref_protected &&
+          github.workflow_sha == github.sha && github.run_attempt == 1 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: staging
+      deployment: false
+    concurrency:
+      group: staging-trial-provider-preflight
+      cancel-in-progress: false
+    steps:
+      - name: Admit the reviewed dispatch
+        env:
+          REVIEWED_REF: ${{ inputs.ref }}
+          SCOPE_SHA256: ${{ inputs.scope_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$REVIEWED_REF" =~ ^[0-9a-f]{40}$ && "$REVIEWED_REF" == "$GITHUB_SHA" ]]
+          [[ "$SCOPE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.3"
+          package-manager-cache: false
+      - name: Install pinned Worker tools
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/worker_rust_provenance.py rust
+          python3 -I .github/scripts/worker_tools.py install
+      - name: Build the standalone probe
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          probe_dir="$RUNNER_TEMP/trial-provider-preflight"
+          cargo build --locked --manifest-path workers/ingest/Cargo.toml \
+            --target wasm32-unknown-unknown --no-default-features --features fixture-provider-preflight \
+            --target-dir "$probe_dir/target"
+          "$WASM_BINDGEN_BIN" --target nodejs --out-dir "$probe_dir" \
+            "$probe_dir/target/wasm32-unknown-unknown/debug/nntune_ingest.wasm"
+          git diff --exit-code -- workers/ingest/Cargo.lock
+      - name: Run the bound disposable provider probe
+        env:
+          PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH: >-
+            ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT != '' &&
+                vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT == secrets.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT &&
+                vars.PRIVATE_PLAYBACK_STAGING_S3_REGION != '' &&
+                vars.PRIVATE_PLAYBACK_STAGING_S3_REGION == secrets.PRIVATE_PLAYBACK_STAGING_S3_REGION }}
+          PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: ${{ inputs.scope_sha256 }}
+          PRIVATE_TRIAL_PREFLIGHT_SCOPE: ${{ secrets.PRIVATE_TRIAL_PREFLIGHT_SCOPE }}
+          PRIVATE_TRIAL_PREFLIGHT_S3: ${{ secrets.PRIVATE_TRIAL_PREFLIGHT_S3 }}
+          PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: ${{ secrets.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT }}
+          PRIVATE_PLAYBACK_STAGING_S3_REGION: ${{ secrets.PRIVATE_PLAYBACK_STAGING_S3_REGION }}
+        run: |
+          exec timeout -k 2s 30s node .github/scripts/private_trial_provider_preflight.cjs \
+            --provider-dispatch "$RUNNER_TEMP/trial-provider-preflight/nntune_ingest.js" 2>/dev/null
