@@ -268,7 +268,10 @@ function privateSignupFixture() {
 	const cookieName = 'fixture_private_session';
 	const session = `${cookieName}=synthetic`;
 	const registerStart = '/v1/auth/passkey/register/start';
+	const registerFinish = '/v1/auth/passkey/register/finish';
 	const sessionCheck = '/v1/me/likes/session';
+	const challenge = 'Y2hhbGxlbmdl';
+	const emailCode = 'fixture-code';
 	const refused = { status: 401, json: { error: 'check your email and try again' } };
 	const hasSession = (cookie: string | null) => cookie?.split('; ').includes(session);
 	let redeemed = false;
@@ -277,27 +280,27 @@ function privateSignupFixture() {
 
 	async function install(page: Page) {
 		await installCreateDouble(page, {});
-		await page.route(`**${registerStart}`, (route) => {
+		await page.route(registerStart, (route) => {
 			const input = route.request().postDataJSON();
 			return !redeemed && input.email === email && input.invite_code === code
-				? route.fulfill({ json: { challenge: 'Y2hhbGxlbmdl', user_id: 'dXNlcg', rp_id: 'localhost' } })
+				? route.fulfill({ json: { challenge, user_id: 'dXNlcg', rp_id: 'localhost' } })
 				: route.fulfill(refused);
 		});
-		await page.route('**/v1/auth/passkey/register/finish', (route) => {
+		await page.route(registerFinish, (route) => {
 			finishPosts += 1;
 			if (redeemed) return route.fulfill(refused);
-			expect(route.request().postDataJSON()).toMatchObject({ invite_code: code, magic_token: 'fixture-code' });
+			expect(route.request().postDataJSON()).toMatchObject({ invite_code: code, magic_token: emailCode, challenge });
 			redeemed = true;
 			return route.fulfill({
 				headers: { 'set-cookie': `${session}; Path=/; HttpOnly; SameSite=Lax` },
 				json: { ok: true, private_listening: true }
 			});
 		});
-		await page.route(`**${sessionCheck}`, async (route) => {
+		await page.route(sessionCheck, async (route) => {
 			if (!hasSession(await route.request().headerValue('cookie'))) return route.fulfill({ status: 401 });
 			return route.fulfill({ json: { session_binding: binding } });
 		});
-		await page.route(`**${library.api}`, async (route) => {
+		await page.route(library.api, async (route) => {
 			if (!hasSession(await route.request().headerValue('cookie'))) return route.fulfill({ status: 401 });
 			if (revoked) return route.fulfill({ status: 403, json: { code: 'forbidden' } });
 			return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: [{ id: 'fixture-track', title: 'Synthetic track' }] });
@@ -315,14 +318,15 @@ function privateSignupFixture() {
 	async function redeem(page: Page) {
 		await openInvite(page);
 		await page.getByTestId(signup.submit).click();
-		await page.getByLabel(signup.emailCode, { exact: true }).fill('fixture-code');
+		await page.getByLabel(signup.emailCode, { exact: true }).fill(emailCode);
 		await page.getByRole('button', { name: signup.finish, exact: true }).click();
 		await expect(page).toHaveURL(library.path);
 		await expect(track(page)).toBeVisible();
 	}
 
 	return {
-		install, openInvite, redeem, track, code, email, cookieName, registerStart, sessionCheck,
+		install, openInvite, redeem, track, code, email, emailCode, challenge, cookieName,
+		registerStart, registerFinish, sessionCheck,
 		revoke: () => { revoked = true; },
 		get finishPosts() { return finishPosts; }
 	};
@@ -441,6 +445,75 @@ test('a spent private invite refuses signup in a second browser context', async 
 	} finally {
 		await secondContext.close();
 	}
+});
+
+test.describe('same-browser private invite retry', () => {
+	test.use({ serviceWorkers: 'block' });
+
+	test('retries an interrupted private signup finish in the same tab', async ({ page, context, baseURL }) => {
+		const { signup, library } = PRIVATE_MUSIC;
+		const origin = new URL(baseURL ?? 'about:blank');
+		if (!['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) {
+			throw new Error('Private invite signup requires a loopback browser fixture');
+		}
+		await context.route('**/*', (route) => new URL(route.request().url()).origin === origin.origin ? route.continue() : route.abort());
+		const fixture = privateSignupFixture();
+		await fixture.install(page);
+		const startUrl = new URL(fixture.registerStart, origin).href;
+		const finishUrl = new URL(fixture.registerFinish, origin).href;
+		const startRequests: unknown[] = [];
+		page.on('request', (request) => {
+			if (request.url() === startUrl && request.method() === 'POST') startRequests.push(request.postDataJSON());
+		});
+
+		const release = Promise.withResolvers<void>();
+		// Drop the first request before it reaches the registration fixture, so
+		// the Worker would still have an unspent invite, challenge and email code.
+		await page.route(finishUrl, async (route) => {
+			await release.promise;
+			await route.abort('connectionreset');
+		}, { times: 1 });
+
+		await fixture.openInvite(page);
+		await page.getByTestId(signup.submit).click();
+		const emailCode = page.getByLabel(signup.emailCode, { exact: true });
+		const inviteCode = page.getByLabel(/invite code/i);
+		const finish = page.getByRole('button', { name: signup.finish, exact: true });
+		await emailCode.fill(fixture.emailCode);
+		try {
+			const [interrupted] = await Promise.all([
+				page.waitForRequest((request) => request.url() === finishUrl && request.method() === 'POST'),
+				finish.click()
+			]);
+			expect(interrupted.postDataJSON()).toMatchObject({
+				challenge: fixture.challenge, invite_code: fixture.code, magic_token: fixture.emailCode
+			});
+			await expect(page.getByRole('button', { name: 'Creating…', exact: true })).toBeDisabled();
+		} finally {
+			release.resolve();
+		}
+		await expect(page.getByRole('alert')).toHaveText(SIGNUP_GENERIC);
+		await expect(page).toHaveURL(signup.path);
+		await expect(emailCode).toHaveValue(fixture.emailCode);
+		await expect(inviteCode).toHaveValue(fixture.code);
+		expect(fixture.finishPosts).toBe(0);
+		expect(await page.evaluate(async (path) => (await fetch(path)).status, fixture.sessionCheck)).toBe(401);
+
+		const [completed, allowedLibrary] = await Promise.all([
+			page.waitForResponse((response) => response.url() === finishUrl && response.request().method() === 'POST'),
+			page.waitForResponse(new URL(library.api, origin).href),
+			finish.click()
+		]);
+		expect(completed.status()).toBe(200);
+		expect(allowedLibrary.status()).toBe(200);
+		await expect(page).toHaveURL(library.path);
+		await expect(fixture.track(page)).toBeVisible();
+		expect(startRequests).toEqual([{ email: fixture.email, invite_code: fixture.code }]);
+		expect(fixture.finishPosts).toBe(1);
+		expect(await context.cookies()).toEqual(expect.arrayContaining([
+			expect.objectContaining({ name: fixture.cookieName, httpOnly: true })
+		]));
+	});
 });
 
 test('signup: a genuine finish failure keeps the exact current code message', async ({
