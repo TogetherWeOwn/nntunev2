@@ -90,6 +90,18 @@ test('synthetic publications bind two exact FLAC inputs to invitee Library IDs',
   expect(() => assertCuratedLibrary([digests[0]!, digests[0]!], published, library)).toThrow('distinct FLAC');
 });
 
+test('curated Library rejects a canonical track ID shared by two fixture digests', () => {
+  const [firstAudio, secondAudio] = privateStagingAudio();
+  const first = { sha256: firstAudio!.sha256, trackId: '00000000-0000-4000-8000-000000000001' };
+  const second = { sha256: secondAudio!.sha256, trackId: '00000000-0000-4000-8000-000000000002' };
+  const digests = [first.sha256, second.sha256];
+  const library = [second.trackId, first.trackId];
+
+  expect(assertCuratedLibrary(digests, [first, second], library)).toEqual(library);
+  expect(() => assertCuratedLibrary(digests, [first, { ...second, trackId: first.trackId }], [first.trackId]))
+    .toThrow('The invitee Library must render every published track exactly once');
+});
+
 test('synthetic transport observations require advancement, paused seek and queue Next', () => {
   const order = ['fixture-track-1', 'fixture-track-0'];
   // These observations model longer audio. The 93 ms upload clips above
