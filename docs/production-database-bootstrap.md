@@ -238,8 +238,8 @@ attempted creation is uncertain. The caller stops without retry or deletion.
 The [baseline workflow](../.github/workflows/deploy-database-baseline.yml)
 shares setup's lock and uses a separate `production-db-baseline` Environment.
 Verify that exact Environment's independent reviewer, self-review and bypass
-settings, and the sole typed `main` branch policy before setting
-`DATABASE_BASELINE_CANDIDATE_SHA` to the approved main SHA. Dispatch from
+settings, and the sole typed `main` branch policy before setting the repository
+variable `DATABASE_BASELINE_CANDIDATE_SHA` to the approved main SHA. Dispatch from
 `main` with zero inputs. The staging preflight rejects any baseline authorization
 visible outside the protected Environment.
 
@@ -281,12 +281,12 @@ Serialize lifecycle calls and hold schema and grant custody until retirement.
 After success, refusal or cancellation, remove the candidate variable, all
 seven Environment secrets and the 0600 connection reference from secure
 custody. The runner holds only the reader credential, closes its own client
-and removes the temporary CA. The separate authorized SQL custodian fences the reader
-from maintenance using the private issuance OID, then retires it on the pinned
-launch database to drain sessions and revoke grants. Require SQL success and
-the fixed retired result, and read back credential removal and role and session
-absence. If activation never granted access, maintenance retirement also
-works, including after interrupted setup.
+and removes the temporary CA. The separate authorized SQL custodian fences
+the reader from maintenance using the private issuance OID. Use the exact
+activation plan to retire it on the pinned launch database, drain sessions
+and revoke grants. Require SQL success and the fixed retired result, and
+read back credential removal and role and session absence. If activation never
+granted access, maintenance retirement also works, including after interrupted setup.
 
 After cancellation or an uncertain result, verify the job stopped and fence
 the reader even if the launch route is unavailable. Keep the role fenced while
