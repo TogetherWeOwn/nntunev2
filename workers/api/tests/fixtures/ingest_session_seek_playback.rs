@@ -7,12 +7,13 @@ use nntune_core::{
     s3_locator::{S3Binding, S3Locator, S3MediaMetadata},
 };
 use nntune_stream::{
-    delivered::DeliveredInterval,
+    delivered::{parse_delivered_report, DeliveredInterval},
     enrolled_playback::{
         route::{serve, CatalogueMedia, PrivateSource},
         EnrolledMedia, S3Get, S3GetReply,
     },
     grant::Grant,
+    meter_sink::{MeterBook, WindowReport},
     original_play::OriginalWriter,
     play_route::PlayRouteRequest,
 };
@@ -25,6 +26,7 @@ use std::{
 const USER: &str = "synthetic-seek-listener";
 const PLAY: &str = "synthetic-seek-play";
 const TRACK: &str = "synthetic-seek-track";
+const NOW: u64 = 60;
 
 struct Source<'a> {
     replay: &'a CommittedOutcome,
@@ -189,11 +191,12 @@ pub(super) async fn verify(
     };
     let mut output = Vec::new();
     let mut reports = Vec::new();
+    let mut meter = MeterBook::new(USER);
     serve(
         &request,
         secret,
         Some(&source),
-        || UNIX_EPOCH + Duration::from_secs(60),
+        || UNIX_EPOCH + Duration::from_secs(NOW),
         |head| {
             assert_eq!(head.status, 206);
             assert_eq!(head.len, 60_351);
@@ -203,7 +206,12 @@ pub(super) async fn verify(
             );
             Ok(Some(Writer(&mut output)))
         },
-        |report| reports.push(report),
+        |report| {
+            let body = serde_json::to_vec(&report).unwrap();
+            let interval = parse_delivered_report(&body, USER).unwrap();
+            assert!(meter.record(&interval, NOW));
+            reports.push(report);
+        },
     )
     .await
     .unwrap();
@@ -217,6 +225,17 @@ pub(super) async fn verify(
             start: 68_861,
             end: 129_212,
             file_bytes: Some(177_175),
+        }]
+    );
+    assert_eq!(
+        meter.pending_windows(),
+        [WindowReport {
+            user_id: USER.into(),
+            play_id: PLAY.into(),
+            track_id: TRACK.into(),
+            union_bytes: 60_351,
+            file_bytes: Some(177_175),
+            started_at: NOW,
         }]
     );
 }
