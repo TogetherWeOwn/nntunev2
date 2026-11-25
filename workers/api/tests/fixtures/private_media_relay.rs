@@ -201,12 +201,7 @@ fn browser_issue_selects_only_armed_verified_sessions_and_projects_five_fields()
     assert_eq!(h.store.browser_playback_opens.get(), 3);
 }
 
-#[test]
-fn production_media_relay_and_legacy_routes_fence_the_browser_lease() {
-    use crate::worker_entry::{relay_media, CollectedBody};
-    use serde_json::json;
-
-    let (h, mut request, headers) = media_relay_fixture();
+fn install_browser_play(h: &Harness, request: &mut Request) -> (LeaseRow, String) {
     let play = format!(
         "{}{}",
         crate::private_playback::browser::PREFIX,
@@ -229,10 +224,21 @@ fn production_media_relay_and_legacy_routes_fence_the_browser_lease() {
         .playback_leases
         .borrow_mut()
         .insert("member".into(), lease.clone());
-    h.store.meter_meta.borrow_mut().clear();
     let expected = crate::play_grant::bearer(&receipt.grant.token);
     h.store.browser_receipt.replace(Some(receipt));
     request.path = format!("/v1/plays/media/track/tab-1/{play}");
+    (lease, expected)
+}
+
+#[test]
+fn production_media_relay_and_legacy_routes_fence_the_browser_lease() {
+    use crate::worker_entry::{relay_media, CollectedBody};
+    use serde_json::json;
+
+    let (h, mut request, headers) = media_relay_fixture();
+    let (lease, expected) = install_browser_play(&h, &mut request);
+    let play = &lease.play_id;
+    h.store.meter_meta.borrow_mut().clear();
 
     let ctx = media_relay_context(&h);
     let serve = |req: &Request| {
@@ -287,4 +293,115 @@ fn production_media_relay_and_legacy_routes_fence_the_browser_lease() {
     }
     shorten_media_relay_lease(&h);
     assert_eq!(serve(&request), 404);
+}
+
+#[test]
+fn browser_grants_and_media_refuse_a_removed_cohort_member() {
+    use crate::worker_entry::{handle_with_transport_headers, relay_media, CollectedBody};
+    use serde_json::json;
+
+    let (mut h, mut media, mut media_headers) = media_relay_fixture();
+    h.config.private_listening = crate::private_listening::PrivateListening::parse(
+        r#"{"owner_user_id":"owner","invite_ids":[1],"expires_at":220}"#,
+    );
+    let mut invite = InviteRecord::new_issued(
+        "synthetic-invite".into(),
+        Some("owner".into()),
+        crate::auth::INVITE_KIND_ADMIN,
+        Some("test@example.com".into()),
+        1,
+        200,
+    );
+    invite.id = 1;
+    invite.used = true;
+    invite.redeemed_by = Some("member".into());
+    invite.redeemed_at = Some(2);
+    h.store
+        .invites
+        .borrow_mut()
+        .insert(invite.code_hash.clone(), invite);
+    h.store.browser_playback_armed.set(true);
+
+    let (lease, bearer) = install_browser_play(&h, &mut media);
+    let issue = |h: &Harness, browser: &Request, input: serde_json::Value| {
+        let ctx = media_relay_context(h);
+        let (claims, _) = block_on(ctx.authenticate(browser, false)).unwrap();
+        let headers = HashMap::from([
+            ("x-nntune-browser-playback".into(), "1".into()),
+            (SESSION_BINDING_HEADER.into(), session_binding(&claims)),
+        ]);
+        let req = Request {
+            method: "POST".into(),
+            path: "/v1/plays".into(),
+            origin: Some(ORIGIN.into()),
+            body: input.to_string().into_bytes(),
+            ..browser.clone()
+        };
+        block_on(handle_with_transport_headers(&ctx, req, &headers))
+    };
+    let start = json!({"track_id": "track", "session_id": "tab-1"});
+    let retry = json!({"track_id": "track", "session_id": "tab-1", "play_id": lease.play_id});
+    let before = issue(&h, &media, start.clone());
+    assert_eq!(before.status, 200);
+    let projection: serde_json::Value = serde_json::from_str(&before.body).unwrap();
+    assert_eq!(projection["playId"], lease.play_id);
+    assert_eq!(issue(&h, &media, retry.clone()).body, before.body);
+    let body = CollectedBody::Complete(Vec::new());
+    let first = block_on(relay_media(
+        &media_relay_context(&h),
+        &media,
+        &body,
+        &media_headers,
+        async |get| {
+            assert_eq!(get.path, "/play/track");
+            assert!(get
+                .headers()
+                .eq([("authorization", bearer.as_str()), ("range", MEDIA_RANGE)]));
+            206
+        },
+    ));
+    assert_eq!(first.unwrap().ok(), Some(206));
+
+    // Remove only the invite from the configured cohort. The cookie and
+    // committed receipt are still live at the same clock time.
+    h.config
+        .private_listening
+        .as_mut()
+        .unwrap()
+        .invite_ids
+        .clear();
+    let refused = issue(&h, &media, start);
+    assert_eq!(refused.status, 403);
+    let refused_retry = issue(&h, &media, retry.clone());
+    assert_eq!(refused_retry.status, 403);
+    assert_eq!(refused_retry.body, refused.body);
+    media_headers.insert("range".into(), "bytes=8-".into());
+    let seek = |request: &Request| {
+        let result: Option<Result<(), Response>> = block_on(relay_media(
+            &media_relay_context(&h),
+            request,
+            &body,
+            &media_headers,
+            async |_| panic!("a refused seek reached Stream"),
+        ));
+        result.unwrap().unwrap_err()
+    };
+    assert_eq!(seek(&media).status, 403);
+
+    media.cookie = block_on(media_relay_context(&h).start_session("member"))
+        .unwrap()
+        .set_cookie;
+    assert_eq!(issue(&h, &media, retry).status, 403);
+    assert_eq!(
+        issue(
+            &h,
+            &media,
+            json!({"track_id": "track", "session_id": "new-tab"})
+        )
+        .status,
+        403
+    );
+    assert_eq!(seek(&media).status, 403);
+    assert_eq!(h.store.browser_playback_opens.get(), 2);
+    assert_eq!(h.store.playback_leases.borrow()["member"], lease);
 }
