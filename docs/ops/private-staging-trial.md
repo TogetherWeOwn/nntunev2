@@ -525,13 +525,28 @@ against the Zero Trust plan and that one eligible account-scoped credential
 covers Tunnel, Access and Hyperdrive writes. Cloudflare documents the serving
 features individually. Their use together on this origin still needs hosted
 evidence.
-[Tunnel and Access](https://developers.cloudflare.com/hyperdrive/configuration/connect-to-private-database/)
+[Hyperdrive config list](https://developers.cloudflare.com/api/resources/hyperdrive/subresources/configs/methods/list/)
+· [Tunnel and Access](https://developers.cloudflare.com/hyperdrive/configuration/connect-to-private-database/)
 · [Origin TLS](https://developers.cloudflare.com/hyperdrive/configuration/tls-ssl-certificates-for-hyperdrive/)
 · [Cache settings](https://developers.cloudflare.com/hyperdrive/concepts/query-caching/#disable-caching)
 
 For the dedicated stock PostgreSQL route, use the
 [stock PostgreSQL preflight](stock-postgresql-trial-preflight.md) for the Access
 and Tunnel capacity readback and the separate operator connection.
+
+The [offline C0 reporter](../../scripts/staging_trial_c0_readback.py) reads a
+redacted JSON summary on stdin. Use the fields in the
+[synthetic summary](../../scripts/fixtures/staging_trial_c0/synthetic.json).
+Use `null` for an incomplete inventory, unknown limit or unconfirmed scope or TLS
+support. The report gives each observation its own verdict. Exit 0 means the
+report was printed, including any pending rows.
+
+To rehearse Hyperdrive pagination offline, pass `--hyperdrive-pages <synthetic-json>`
+and the same summary on stdin. The file holds a JSON array of synthetic list
+response bodies in page order. Keep `success`, `errors`, `result_info` and the
+`id` field of each `result` entry. This mode derives the count from those pages
+and leaves it pending when the continuation fails or is unavailable. Use
+synthetic responses only. Keep actual provider responses in protected custody.
 
 C1 provisioning waits for completed C0, a passing disposable rehearsal from
 the merged source and the staging writer handoff after storage qualification.
