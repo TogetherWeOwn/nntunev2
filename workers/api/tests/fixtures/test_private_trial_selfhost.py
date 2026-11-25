@@ -204,6 +204,8 @@ class Qualification(unittest.TestCase):
             self.assertNotEqual(cluster.psql(owner | invalid, "SELECT 1;").returncode, 0)
 
     def exercise_acl(self, cluster, pins, owner):
+        self.assertEqual(cluster.admin("SELECT datistemplate AND NOT datallowconn "
+                                       "FROM pg_database WHERE datname = 'template0';"), "t")
         before = json.loads(cluster.admin(SELFHOST_CATALOG))
         postgres_id = next(entry[0] for entry in before["databases"] if entry[1] == "postgres")
         template_id = next(entry[0] for entry in before["databases"] if entry[1] == "template0")
