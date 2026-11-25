@@ -33,6 +33,7 @@ export type MediaSelection = {
 };
 
 const REPEAT_KEY = 'nntune:library-repeat:v1';
+const PREVIOUS_RESTART_SECONDS = 3;
 // Native played snapshots are static and normalized (ordered, disjoint, non-touching ranges).
 function playedNewTail(before: TimeRanges, after: TimeRanges, end: number, duration: number): boolean {
 	for (let i = 0, j = 0; i < (after?.length ?? 0); i++) {
@@ -235,7 +236,28 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			selection.commit({ ...next, tracks });
 		}
 	}
-	const queueTransport = { playCurrent, pauseCurrent, onNext: () => navigateQueue(nextTrack), onPrevious: () => navigateQueue(previousTrack) };
+
+	function previousFromTransport(): void {
+		const transport = selection?.prepare ? transportTarget() : undefined;
+		if (!transport) return navigateQueue(previousTrack);
+		const base = queue.snapshot;
+		const { audio, matches } = transport;
+		const sameQueue = () => queue.snapshot === base;
+		if (!matches(sameQueue)) return;
+		const playing = !audio.paused && !audio.ended && !audio.error;
+		const position = audio.currentTime;
+		if (!matches(sameQueue)) return;
+		if (!playing) return navigateQueue(previousTrack);
+		if (position >= PREVIOUS_RESTART_SECONDS) return restart();
+		if (pendingGrant !== undefined) return;
+		const previous = previousTrack(base);
+		if (previous === base) return;
+		const target = currentTrack(previous);
+		const source = target && queue.sourceForQueuedPlay(target.id);
+		if (source) void playSelected(previous, previous.currentIndex, source);
+	}
+
+	const queueTransport = { playCurrent, pauseCurrent, onNext: () => navigateQueue(nextTrack), onPrevious: previousFromTransport };
 
 	function clearJumpFeedback(): void {
 		const feedback = get(seekFeedback);
