@@ -2259,6 +2259,8 @@ jobs:
           set -euo pipefail
           command -v psql >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client)
           bash workers/api/tests/run_migration_tests.sh --migrate-only
+          # Snapshot the disposable schema before this fixture writes its own data.
+          PGPASSWORD=ci-throwaway psql -X -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE nntunev2_staging TEMPLATE nntune_ci'
           cargo build --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features catalogue-playback-wasm-test --target-dir "$RUNNER_TEMP/staging-body-target"
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/catalogue-playback-js" "$RUNNER_TEMP/staging-body-target/wasm32-unknown-unknown/debug/nntune_api.wasm"
           # The stream and ingest lockfiles pin different wasm-bindgen versions.

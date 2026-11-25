@@ -36,7 +36,7 @@ test('refuses foreign fixture pins, environment and authority and recovers the s
   assert.equal(process.env.GITHUB_ACTIONS, 'true');
   assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
   assert.ok(process.env.PRIVATE_TRIAL_CLEANUP_BUNDLE);
-  psql('postgres', '-c', 'CREATE DATABASE nntunev2_staging TEMPLATE nntune_ci');
+  // The Worker release job clones the migrated schema before the upload fixture runs.
   try {
     const vars = {
       env: provider.environment, lib: provider.library, root: provider.root_version, config: provider.configuration,
@@ -117,7 +117,7 @@ test('refuses foreign fixture pins, environment and authority and recovers the s
     assert.deepEqual([...versions.get(mediaKey)], ['other-media']);
     assert.deepEqual([...versions.get(pageKey)], ['other-page']);
   } finally {
-    psql('postgres', '-c', 'DROP DATABASE nntunev2_staging WITH (FORCE)');
+    psql('postgres', '-c', 'DROP DATABASE IF EXISTS nntunev2_staging WITH (FORCE)');
     psql('postgres', '-c', 'DROP ROLE IF EXISTS trial_cleanup_fixture');
   }
 });
