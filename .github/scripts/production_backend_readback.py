@@ -14,7 +14,9 @@ def report(*, candidate_sha: str, account: str, api: WorkerPin, stream: WorkerPi
 
     The injected reader must be silent, use uncached provider GETs, return a
     decoded result object, and enforce the shared absolute monotonic deadline
-    through connection and body read. There is no default reader. In particular,
+    through connection and body read. Use the existing staging_api_identity.decode
+    semantics to preserve decimal allocations such as 100.0 as Decimal values.
+    There is no default reader. In particular,
     the staging reader's socket inactivity timeout cannot enforce this contract.
     """
     if not (
