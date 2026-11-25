@@ -1,6 +1,7 @@
 """End-to-end regression against a disposable PostgreSQL service with synthetic logins."""
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -418,19 +419,46 @@ try:
         forward = ambient("restrict-ambient")
         reliant = "ambient_fixture_reliant"
         sql(f"CREATE ROLE {reliant} LOGIN PASSWORD '{password}';")
-        session = subprocess.Popen(["psql", "-XqAtw"], text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL,
-                                   env={**base, "PGDATABASE": "template1", "PGUSER": reliant, "PGCONNECT_TIMEOUT": "5"})
+
+        @contextmanager
+        def public_client():
+            session = subprocess.Popen(["psql", "-XqAtw"], text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL,
+                                       env={**base, "PGDATABASE": "template1", "PGUSER": reliant, "PGCONNECT_TIMEOUT": "5"})
+            try:
+                session.stdin.write("SELECT 1;\n")
+                session.stdin.flush()
+                assert session.stdout.readline().strip() == "1"
+                yield
+            finally:
+                if session.poll() is None:
+                    session.terminate()
+                session.wait(timeout=10)
+
         try:
-            session.stdin.write("SELECT 1;\n")
-            session.stdin.flush()
-            assert session.stdout.readline().strip() == "1"
-            refused(forward)
-            assert json.loads(sql(ambient_acl.CATALOG)) == initial
+            with public_client():
+                refused(forward)
+                assert json.loads(sql(ambient_acl.CATALOG)) == initial
+
+            # Wait for the first session scan, then connect while PUBLIC still has CONNECT.
+            prefix, boundary, rest = forward.partition("\\if :change_needed\n")
+            assert boundary
+            cutover = subprocess.Popen(["psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"], text=True,
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       env={**base, "PGDATABASE": DATABASE, "PGCONNECT_TIMEOUT": "5"})
+            try:
+                cutover.stdin.write(prefix + "SELECT 'precheck passed';\n")
+                cutover.stdin.flush()
+                assert any(line.strip() == "precheck passed" for line in cutover.stdout)
+                with public_client():
+                    _, error = cutover.communicate(boundary + rest, timeout=15)
+                    assert cutover.returncode != 0 and "contract refused" in error
+                    assert json.loads(sql(ambient_acl.CATALOG)) == initial
+            finally:
+                if cutover.poll() is None:
+                    cutover.terminate()
+                cutover.wait(timeout=10)
         finally:
-            if session.poll() is None:
-                session.terminate()
-            session.wait(timeout=10)
             sql(f"DROP ROLE {reliant};")
         changed = forward.replace("\\gexec\n", "\\gexec\nSELECT 1/0;\n", 1)
         assert changed != forward
@@ -457,7 +485,7 @@ try:
 finally:
     sql(f"""
     DROP DATABASE {DATABASE} WITH (FORCE);
-    REVOKE CONNECT ON DATABASE template1 FROM {executor};
+    REVOKE CONNECT, TEMP ON DATABASE template1 FROM {executor};
     DROP ROLE IF EXISTS {reader}, {writer}, {executor}, {owner};
     GRANT CONNECT, TEMP ON DATABASE nntune_ci, postgres, template1 TO PUBLIC;
     """, database="nntune_ci")
