@@ -17,6 +17,9 @@ use nntune_ingest::{
 use private_trial::{upload, MatchEvidence, Target};
 use tokio_postgres::{Client, NoTls};
 
+#[path = "../support/blocker_observer.rs"]
+mod blocker_observer;
+
 const RECIPIENT: &str = "synthetic-trial-listener";
 const OUTSIDER: &str = "synthetic-trial-outsider";
 const RELEASE: &str = "ab340000-0000-4000-8000-000000000000";
@@ -328,7 +331,12 @@ pub(crate) async fn verify_publication(
     request.body[0] ^= 1;
     assert_eq!(deny(&request, target).await, 400);
     request.body[0] ^= 1;
-    assert_eq!(handle(&ctx, &library).await.body, "[]");
+    let assert_hidden = async |phase| {
+        let response = handle(&ctx, &library).await;
+        assert_eq!(response.status, 200, "{phase}");
+        assert_eq!(response.body, "[]", "{phase}");
+    };
+    assert_hidden("before publication").await;
 
     let lookup = release_lookup(QUERY).unwrap();
     let mut publication = connection().await;
@@ -428,7 +436,45 @@ pub(crate) async fn verify_publication(
         .batch_execute("DROP TRIGGER fixture_refusal ON public.private_library_admissions")
         .await
         .unwrap();
-    let first = publish(&mut publication, upload_writer, None).await;
+    assert_hidden("after refused publication").await;
+
+    // Hold the real commit after the admission is staged. PostgreSQL must
+    // report the publisher blocked here before the separate Library read.
+    observer
+        .batch_execute(
+            "CREATE FUNCTION public.fixture_hold_trial_publication() RETURNS trigger
+         LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+         BEGIN
+             PERFORM pg_advisory_xact_lock(1752);
+             RETURN NEW;
+         END $$;
+         CREATE CONSTRAINT TRIGGER fixture_hold_trial_publication
+         AFTER INSERT ON public.private_library_admissions DEFERRABLE INITIALLY DEFERRED
+         FOR EACH ROW EXECUTE FUNCTION public.fixture_hold_trial_publication();",
+        )
+        .await
+        .unwrap();
+    let first = {
+        let mut gate = connection().await;
+        let gate = gate.transaction().await.unwrap();
+        let gate_pid = gate
+            .query_one("SELECT pg_backend_pid(), pg_advisory_xact_lock(1752)", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let publication_pid = publication
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let mut pending = std::pin::pin!(publish(&mut publication, upload_writer, None));
+        blocker_observer::observe_blocked(observer, gate_pid, publication_pid, pending.as_mut())
+            .await
+            .unwrap();
+        assert_hidden("while the publication commit is blocked").await;
+        gate.commit().await.unwrap();
+        pending.await
+    };
     assert_eq!(first.status, 200);
     let body: serde_json::Value = serde_json::from_str(&first.body).unwrap();
     let track = body["trackId"].as_str().unwrap();
@@ -442,6 +488,13 @@ pub(crate) async fn verify_publication(
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["id"], track);
     assert_eq!(entries[0]["duration_ms"], 14_000);
+    observer
+        .batch_execute(
+            "DROP TRIGGER fixture_hold_trial_publication ON public.private_library_admissions;
+             DROP FUNCTION public.fixture_hold_trial_publication();",
+        )
+        .await
+        .unwrap();
     // The database clone already contains references from the reservation race fixture.
     let exact_reference = async || {
         observer.query_one(
