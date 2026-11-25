@@ -373,6 +373,24 @@ test('a successful first release hands its original intent to recovery preparati
   const candidatePin = 'DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}';
   assert.ok(verify.includes(candidatePin));
   const production = deploy.split('\n  bootstrap-maintenance:\n')[0];
+  const staging = readFileSync(new URL('../.github/workflows/deploy.yml', import.meta.url), 'utf8')
+    .split('\n  post-deploy-private-music:\n')[1];
+  const runAttempt = '${{ github.run_id }}-${{ github.run_attempt }}';
+  const uploads = [
+    [staging, 'Upload candidate admission receipt',
+      'staging-admission-${{ github.sha }}-' + runAttempt + '-private-music', 'staging-admission.json'],
+    [production, 'Preserve sealed rollback intent before shifting traffic',
+      'production-rollback-intent-' + runAttempt, '${{ runner.temp }}/' + intentFile],
+    [production, 'Upload production promotion proof',
+      'production-promotion-${{ needs.preflight.outputs.sha }}-' + runAttempt, '${{ runner.temp }}/promotion.json'],
+  ];
+  for (const [job, step, name, path] of uploads) {
+    const upload = job.split(`\n      - name: ${step}\n`)[1]?.split('\n      - ')[0];
+    assert.ok(upload, `missing upload step: ${step}`);
+    assert.match(upload, /^ {8}uses: actions\/upload-artifact@/m);
+    assert.ok(upload.split('\n').includes(`          name: ${name}`), `wrong artifact name: ${step}`);
+    assert.ok(upload.split('\n').includes(`          path: ${path}`), `wrong artifact path: ${step}`);
+  }
   const [pin, publication] = production.split('      - name: Record successful production promotion\n');
   assert.match(pin, /PROMOTED_VERSION: \$\{\{ steps\.gradual\.outputs\.promoted-version-id \}\}/);
   const [recordStep] = publication.split('      - name: Upload production promotion proof\n');
