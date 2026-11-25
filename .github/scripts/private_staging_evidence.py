@@ -159,11 +159,11 @@ def observe(pins, read):
     return observed
 
 
-def attach_observations(report, observations):
+def attach_observations(report, deployments):
     xml = read_bounded(report, admission.MAX_XML)
     admission.require(b"<!DOCTYPE" not in xml and b"<!ENTITY" not in xml, "unsafe private staging XML")
     suite = ET.fromstring(xml)
-    for phase, deployments in observations.items():
+    for phase in admission.IDENTITY_PHASES:
         properties = suite.findall(f"./testcase[@classname='private-music'][@name='{phase}']"
                                    "/properties/property[@name='candidate-identity']")
         admission.require(len(properties) == 1, "missing private staging identity")
@@ -180,15 +180,15 @@ def main(command):
     runner = Path(os.environ["RUNNER_TEMP"])
     if command in LANES:
         return capture(command, sha, runner)
-    pins, expected = deployment_pins(sha)
+    pins, deployments = deployment_pins(sha)
     if command == "observe":
-        return observe(expected, provider(os.environ.get("SUBSONIC_STAGING_WORKERS_READ_TOKEN", "")))
+        return observe(pins, provider(os.environ.get("SUBSONIC_STAGING_WORKERS_READ_TOKEN", "")))
     if command == "assemble":
-        observations = {phase: admission.parse_json(read_bounded(runner / f"{phase}.json", PIN_LIMIT), PIN_LIMIT)
-                        for phase in admission.IDENTITY_PHASES}
-        admission.require(all(observation == expected for observation in observations.values()),
-                          "private staging boundary pins differ")
-        attach_observations(REPORT, observations)
+        # Check the attempt before projecting the provider identities into JUnit.
+        for phase in admission.IDENTITY_PHASES:
+            observation = admission.parse_json(read_bounded(runner / f"{phase}.json", PIN_LIMIT), PIN_LIMIT)
+            admission.require(observation == pins, "private staging boundary pins differ")
+        attach_observations(REPORT, deployments)
         return pins
     raise ValueError
 
