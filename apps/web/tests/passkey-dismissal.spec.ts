@@ -1,4 +1,5 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type BrowserContext, type Page } from '@playwright/test';
+import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 
 /**
  * Acceptance: dismissing the passkey prompt must be told apart from a
@@ -257,54 +258,143 @@ test('login: retry after dismissal signs in', async ({ page }) => {
 	expect(traffic.finishPosts).toBe(1);
 });
 
-test('private listening invite opens Library and refusal clears it', async ({ page }) => {
-	await installCreateDouble(page, {});
+function privateSignupFixture() {
+	const { signup, library } = PRIVATE_MUSIC;
 	const code = 'synthetic_invite_codeA';
 	const email = 'friend@example.test';
 	const binding = 'A'.repeat(43);
-	const session = 'fixture_private_session=synthetic';
+	const cookieName = 'fixture_private_session';
+	const session = `${cookieName}=synthetic`;
+	const registerStart = '/v1/auth/passkey/register/start';
+	const sessionCheck = '/v1/me/likes/session';
+	const refused = { status: 401, json: { error: 'check your email and try again' } };
+	const hasSession = (cookie: string | null) => cookie?.split('; ').includes(session);
+	let redeemed = false;
 	let revoked = false;
-	await page.route('**/v1/auth/passkey/register/start', (route) => {
-		const input = route.request().postDataJSON();
-		return input.email === email && input.invite_code === code
-			? route.fulfill({ json: { challenge: 'Y2hhbGxlbmdl', user_id: 'dXNlcg', rp_id: 'localhost' } })
-			: route.fulfill({ status: 401, json: { error: 'check your email and try again' } });
-	});
-	await page.route('**/v1/auth/passkey/register/finish', (route) => {
-		expect(route.request().postDataJSON()).toMatchObject({ invite_code: code, magic_token: 'fixture-code' });
-		return route.fulfill({
-			headers: { 'set-cookie': `${session}; Path=/; HttpOnly; SameSite=Lax` },
-			json: { ok: true, private_listening: true }
+	let finishPosts = 0;
+
+	async function install(page: Page) {
+		await installCreateDouble(page, {});
+		await page.route(`**${registerStart}`, (route) => {
+			const input = route.request().postDataJSON();
+			return !redeemed && input.email === email && input.invite_code === code
+				? route.fulfill({ json: { challenge: 'Y2hhbGxlbmdl', user_id: 'dXNlcg', rp_id: 'localhost' } })
+				: route.fulfill(refused);
 		});
-	});
-	await page.route('**/v1/me/likes/session', async (route) => {
-		if (!(await route.request().headerValue('cookie'))?.includes(session)) return route.fulfill({ status: 401 });
-		return route.fulfill({ json: { session_binding: binding } });
-	});
-	await page.route('**/api/library', async (route) => {
-		if (!(await route.request().headerValue('cookie'))?.includes(session)) return route.fulfill({ status: 401 });
-		if (revoked) return route.fulfill({ status: 403, json: { code: 'forbidden' } });
-		return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: [{ id: 'fixture-track', title: 'Synthetic track' }] });
-	});
-	await page.goto('/signup');
-	await page.getByTestId('signup-email').fill(email);
-	await page.getByTestId('signup-submit').click();
-	await expect(page.getByTestId('signup-error')).toBeVisible();
-	await expect(page.getByLabel('Email code')).toHaveCount(0);
-	await page.goto(`/signup#invite=${code}`);
-	await expect(page.getByLabel(/invite code/i)).toHaveValue(code);
-	await expect(page).toHaveURL(/\/signup$/);
-	await page.getByTestId('signup-email').fill(email);
-	await page.getByTestId('signup-submit').click();
-	await page.getByLabel('Email code').fill('fixture-code');
-	await page.getByRole('button', { name: 'Finish creating account' }).click();
-	await expect(page).toHaveURL(/\/library$/);
-	const track = page.getByTestId('library-item').filter({ hasText: 'Synthetic track' });
-	await expect(track).toBeVisible();
-	revoked = true;
-	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-	await expect(page.getByText('You do not have access to this library.')).toBeVisible();
-	await expect(track).toHaveCount(0);
+		await page.route('**/v1/auth/passkey/register/finish', (route) => {
+			finishPosts += 1;
+			if (redeemed) return route.fulfill(refused);
+			expect(route.request().postDataJSON()).toMatchObject({ invite_code: code, magic_token: 'fixture-code' });
+			redeemed = true;
+			return route.fulfill({
+				headers: { 'set-cookie': `${session}; Path=/; HttpOnly; SameSite=Lax` },
+				json: { ok: true, private_listening: true }
+			});
+		});
+		await page.route(`**${sessionCheck}`, async (route) => {
+			if (!hasSession(await route.request().headerValue('cookie'))) return route.fulfill({ status: 401 });
+			return route.fulfill({ json: { session_binding: binding } });
+		});
+		await page.route(`**${library.api}`, async (route) => {
+			if (!hasSession(await route.request().headerValue('cookie'))) return route.fulfill({ status: 401 });
+			if (revoked) return route.fulfill({ status: 403, json: { code: 'forbidden' } });
+			return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: [{ id: 'fixture-track', title: 'Synthetic track' }] });
+		});
+	}
+
+	async function openInvite(page: Page) {
+		await page.goto(`${signup.path}#invite=${code}`);
+		await expect(page.getByLabel(/invite code/i)).toHaveValue(code);
+		await expect(page).toHaveURL(signup.path);
+		await page.getByTestId(signup.email).fill(email);
+	}
+
+	const track = (page: Page) => page.getByTestId(library.item).filter({ hasText: 'Synthetic track' });
+	async function redeem(page: Page) {
+		await openInvite(page);
+		await page.getByTestId(signup.submit).click();
+		await page.getByLabel(signup.emailCode, { exact: true }).fill('fixture-code');
+		await page.getByRole('button', { name: signup.finish, exact: true }).click();
+		await expect(page).toHaveURL(library.path);
+		await expect(track(page)).toBeVisible();
+	}
+
+	return {
+		install, openInvite, redeem, track, code, email, cookieName, registerStart, sessionCheck,
+		revoke: () => { revoked = true; },
+		get finishPosts() { return finishPosts; }
+	};
+}
+
+test('private listening invite opens Library and refusal clears it', async ({ page }) => {
+	const { signup, library } = PRIVATE_MUSIC;
+	const fixture = privateSignupFixture();
+	await fixture.install(page);
+	await page.goto(signup.path);
+	await page.getByTestId(signup.email).fill(fixture.email);
+	await page.getByTestId(signup.submit).click();
+	await expect(page.getByTestId(signup.error)).toBeVisible();
+	await expect(page.getByLabel(signup.emailCode, { exact: true })).toHaveCount(0);
+	await fixture.redeem(page);
+	fixture.revoke();
+	await page.getByRole('button', { name: library.refresh, exact: true }).click();
+	await expect(page.getByText(library.forbidden, { exact: true })).toBeVisible();
+	await expect(fixture.track(page)).toHaveCount(0);
+});
+
+test('a spent private invite refuses signup in a second browser context', async ({ page, context, browser, baseURL }) => {
+	const { signup, library } = PRIVATE_MUSIC;
+	const origin = new URL(baseURL ?? 'about:blank');
+	if (!['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) {
+		throw new Error('Private invite signup requires a loopback browser fixture');
+	}
+	const fixture = privateSignupFixture();
+	const restrictToFixture = (context: BrowserContext) =>
+		context.route('**/*', (route) => new URL(route.request().url()).origin === origin.origin ? route.continue() : route.abort());
+	await restrictToFixture(context);
+	await fixture.install(page);
+	await fixture.redeem(page);
+
+	const secondContext = await browser.newContext({ baseURL, serviceWorkers: 'block' });
+	try {
+		await restrictToFixture(secondContext);
+		const secondPage = await secondContext.newPage();
+		await fixture.install(secondPage);
+		// Use the invited address again so the only refusal is the spent code.
+		await fixture.openInvite(secondPage);
+		const registerStartUrl = new URL(fixture.registerStart, origin).href;
+		const refusal = secondPage.waitForResponse((response) =>
+			response.url() === registerStartUrl && response.request().method() === 'POST');
+		await secondPage.getByTestId(signup.submit).click();
+		const response = await refusal;
+		expect(response.request().postDataJSON()).toEqual({ email: fixture.email, invite_code: fixture.code });
+		expect(response.status()).toBe(401);
+		await expect(secondPage.getByTestId(signup.error)).toHaveText('Something went wrong. Try again.');
+		await expect(secondPage.getByLabel(signup.emailCode, { exact: true })).toHaveCount(0);
+		await expect(secondPage).toHaveURL(signup.path);
+		expect((await secondContext.cookies()).map(({ name }) => name)).not.toContain(fixture.cookieName);
+		expect(await secondPage.evaluate(async (path) => (await fetch(path)).status, fixture.sessionCheck)).toBe(401);
+
+		const libraryUrl = new URL(library.api, origin).href;
+		const [deniedLibrary] = await Promise.all([
+			secondPage.waitForResponse(libraryUrl),
+			secondPage.goto(library.path)
+		]);
+		expect(deniedLibrary.status()).toBe(401);
+		await expect(secondPage.getByText('You are signed out or do not have access to this library.', { exact: true })).toBeVisible();
+		await expect(secondPage.getByTestId(library.item)).toHaveCount(0);
+		expect(fixture.finishPosts).toBe(1);
+
+		const [allowedLibrary] = await Promise.all([
+			page.waitForResponse(libraryUrl),
+			page.reload()
+		]);
+		expect(allowedLibrary.status()).toBe(200);
+		await expect(page).toHaveURL(library.path);
+		await expect(fixture.track(page)).toBeVisible();
+	} finally {
+		await secondContext.close();
+	}
 });
 
 test('signup: a genuine finish failure keeps the exact current code message', async ({
