@@ -351,6 +351,16 @@ test('invited playback grants the next track on natural end and stops at the que
 	await expect(page.getByTestId('player-repeat')).toHaveValue('off');
 	await expect(audio).toHaveCount(0);
 	expect(grants).toHaveLength(0);
+	// Count native play calls even if a replay reuses the grant and is immediately paused.
+	const playCalls = await page.evaluateHandle(() => {
+		const sources: (string | null)[] = [];
+		const nativePlay = HTMLMediaElement.prototype.play;
+		HTMLMediaElement.prototype.play = function (this: HTMLMediaElement) {
+			if (this instanceof HTMLAudioElement) sources.push(this.getAttribute('src'));
+			return nativePlay.call(this);
+		};
+		return sources;
+	});
 	const firstGrant = page.waitForRequest(grantUrl);
 	await play.click();
 	const tab: string = (await firstGrant).postDataJSON().session_id;
@@ -362,6 +372,8 @@ test('invited playback grants the next track on natural end and stops at the que
 	await expect(play).toBeEnabled();
 	// Let the ended handler and the resulting render settle before checking the request log.
 	await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+	expect(await playCalls.jsonValue(), 'native playback starts only once for each queued track')
+		.toEqual([mediaPath(first, tab), mediaPath(last, tab)]);
 	await expect(active).toHaveAttribute(contract.queueId, last.id);
 	await expect(audio).toHaveAttribute('src', mediaPath(last, tab));
 	await expect(audio).toHaveJSProperty('ended', true);
