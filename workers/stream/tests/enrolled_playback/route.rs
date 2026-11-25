@@ -7,6 +7,12 @@ mod fixture;
 use fixture::{Fault, Source, Writer, FLAC};
 
 const TOKEN: &str = include_str!("../../../../fixtures/play-grant/private-enrolled.token");
+// Pre-signed synthetic v4 grant for Fixture::new(), expiring at Unix 12.
+const BROWSER_TOKEN: &str = concat!(
+    "v4.bWVtYmVyfHRyYWNrfHByaXZhdGVfYnJvd3Nlcl9BQUFBQUFBQUFBQUFBQUFBQUFBQUFBfDQyfDEyf",
+    "GNmMjQ0ZjZkYzYxYWI3ZTU3MTI4MzYwODM2NGZmZGViZTAzZjBiNGZmMGE2MDcyNDE5MDFmOTUzZWE5MDY2ZGE.",
+    "5OZv4_yGbRpUk6HYDXTckBYY046ImHeyN71sQOoZ0MA",
+);
 
 #[tokio::test]
 async fn private_route_authenticates_flac_and_accounts_for_writer_prefixes() {
@@ -74,18 +80,55 @@ async fn private_route_authenticates_flac_and_accounts_for_writer_prefixes() {
 }
 
 #[tokio::test]
-async fn browser_stream_aborts_at_the_next_chunk_after_lease_revocation() {
-    let key = b"test only, not a deployed secret";
-    // Pre-signed synthetic v4 grant for Fixture::new(), expiring at Unix 12.
-    let token = concat!(
-        "v4.bWVtYmVyfHRyYWNrfHByaXZhdGVfYnJvd3Nlcl9BQUFBQUFBQUFBQUFBQUFBQUFBQUFBfDQyfDEyf",
-        "GNmMjQ0ZjZkYzYxYWI3ZTU3MTI4MzYwODM2NGZmZGViZTAzZjBiNGZmMGE2MDcyNDE5MDFmOTUzZWE5MDY2ZGE.",
-        "5OZv4_yGbRpUk6HYDXTckBYY046ImHeyN71sQOoZ0MA",
-    );
+async fn open_ended_range_delivers_plaintext_through_eof() {
     let source = Source::browser();
     let request = PlayRouteRequest {
         track_id: "track".into(),
-        token: Some(token.into()),
+        token: Some(BROWSER_TOKEN.into()),
+        range: Some("bytes=65534-".into()),
+        trace_id: None,
+    };
+    let output = RefCell::new(Vec::new());
+    let aborted = Cell::new(false);
+    let mut delivered = None;
+    serve(
+        &request,
+        b"test only, not a deployed secret",
+        Some(&source),
+        || source.time(),
+        |head| {
+            assert_eq!(head.status, 206);
+            assert_eq!(head.len, 3);
+            assert_eq!(
+                head.content_range.as_deref(),
+                Some("bytes 65534-65536/65537")
+            );
+            Ok(Some(Writer {
+                output: &output,
+                fault: Fault::None,
+                aborted: &aborted,
+                revoke_on_write: None,
+            }))
+        },
+        |interval| delivered = Some(interval),
+    )
+    .await
+    .unwrap();
+
+    assert!(!aborted.get());
+    assert_eq!(output.into_inner(), b"AYZ");
+    let receipt = delivered.expect("successful write records delivery");
+    assert_eq!(receipt.start..receipt.end, 65_534..LEN);
+    assert_eq!(receipt.file_bytes, Some(LEN));
+}
+
+#[tokio::test]
+async fn browser_stream_aborts_at_the_next_chunk_after_lease_revocation() {
+    let key = b"test only, not a deployed secret";
+    let source = Source::browser();
+    let request = PlayRouteRequest {
+        track_id: "track".into(),
+        token: Some(BROWSER_TOKEN.into()),
         range: Some("bytes=65535-65536".into()),
         trace_id: None,
     };
