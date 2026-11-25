@@ -4,7 +4,7 @@ import { fixtureCookie, hasFixtureSession, serveFlac } from '../helpers/private-
 
 const listener = 'synthetic-listener';
 const binding = 'A'.repeat(43);
-const playId = '00000000-0000-4000-8000-000000000003';
+const playId = `private_browser_${'a'.repeat(22)}`;
 
 type LibraryTrack = { id: string; title: string; duration_ms: number };
 
