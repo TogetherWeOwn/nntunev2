@@ -1,0 +1,63 @@
+{
+	admin off
+	auto_https off
+	persist_config off
+	servers {
+		protocols h1
+		max_header_size 16KB
+		timeouts {
+			read_header 5s
+			read_body 5s
+			write 15s
+			idle 15s
+		}
+	}
+}
+
+:8080 {
+	handle_errors {
+		header Cache-Control no-store
+		respond {http.error.status_code}
+	}
+
+	route {
+		header >Cache-Control no-store
+
+		# orig_uri is the original HTTP request target, including absolute-form
+		# targets. Caddy's path matcher and normalized URL are unsuitable here.
+		# Escapes must be complete and canonical printable bytes as signed by
+		# the client. This also excludes alternate encodings of the null version.
+		@allowed expression `
+			{http.request.proto} == "HTTP/1.1" &&
+			({method} == "HEAD" || {method} == "DELETE") &&
+			{http.request.orig_uri}.matches(r'^(?:@PATHS@)\?versionId=[A-Za-z0-9._%-]+$') &&
+			{http.request.orig_uri.query}.size() <= 1034 &&
+			{http.request.orig_uri.query}.matches(r'^versionId=(?:[A-Za-z0-9._-]|%(?:2[1-9ABD-Fabd-f]|3[A-Fa-f]|40|5[B-Db-d]|60|7[B-Db-d]))+$') &&
+			{http.request.orig_uri.query} != "versionId=null" &&
+			{http.request.header.Authorization}.matches(r'^AWS4-HMAC-SHA256 Credential=@ACCESS@/[0-9]{8}/[a-z0-9-]{1,64}/s3/aws4_request, SignedHeaders=[a-z0-9-]+(?:;[a-z0-9-]+)*, Signature=[0-9a-f]{64}$') &&
+			(!header({"Content-Length": "*"}) || {http.request.header.Content-Length} == "0") &&
+			!header({"Transfer-Encoding": "*"}) &&
+			!header({"Trailer": "*"}) &&
+			!header({"Expect": "*"}) &&
+			!header({"Upgrade": "*"}) &&
+			!header({"X-HTTP-Method": "*"}) &&
+			!header({"X-HTTP-Method-Override": "*"}) &&
+			!header({"X-Method-Override": "*"}) &&
+			!header({"X-Forwarded-Prefix": "*"}) &&
+			!header({"X-Forwarded-Port": "*"}) &&
+			(!header({"Connection": "*"}) || {http.request.header.Connection}.matches(r'(?i)^(close|keep-alive)$'))
+		`
+		reverse_proxy @allowed backend:8333 {
+			header_down -X-NNTune-Boundary
+			transport http {
+				versions 1.1
+				compression off
+				dial_timeout 3s
+				response_header_timeout 10s
+			}
+		}
+
+		header X-NNTune-Boundary deny
+		respond 403
+	}
+}

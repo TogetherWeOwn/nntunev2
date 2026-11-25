@@ -1,0 +1,28 @@
+{
+	admin off
+	auto_https off
+	persist_config off
+	servers {
+		log_credentials
+	}
+}
+
+:8333 {
+	log {
+		output stdout
+		format json
+	}
+	route {
+		header Cache-Control public
+		header X-NNTune-Boundary deny
+		@forbidden query versionId=backend-forbidden
+		respond @forbidden "backend forbidden" 403
+		@unavailable query versionId=backend-unavailable
+		respond @unavailable "backend unavailable" 503
+		@gone query versionId=backend-gone
+		respond @gone 404
+		@head method HEAD
+		respond @head 200
+		respond 204
+	}
+}

@@ -193,10 +193,16 @@ Provision two non-member versions of one disposable key on the dedicated staging
 provider and fixture bucket. Use `media/00000000000040008000000000000000/<generation>`
 with a fresh compact lowercase UUIDv4 generation. Reserve that object ID for
 qualification. Take both version IDs from the protected provisioning receipt.
-Independently read back the disposable credential's policy. Require the cleanup
-policy shape on this single key, with version-specific HEAD and DELETE and no
-listing, bulk delete, unversioned delete or broad key grant. The probe sends
-DELETE only for the selected version. Keep provisioning separate.
+For the [SeaweedFS fixture boundary](../../ops/staging-s3-boundary/README.md),
+read back the managed policy and its attachment with the provisioner inside
+the private backend container. Independently hash the Caddy configuration
+mounted in the boundary container and compare it with the reviewed render for
+that access key ID and exact key. Record both readbacks for the second
+reviewer. The effective policy must allow version-specific HEAD and DELETE
+on this single key and deny listing, bulk delete, unversioned access and
+other keys. The launcher sends DELETE for the selected version only.
+Run the disposable boundary qualification before the protected provider
+dispatch. Keep provisioning and its credentials inside the private backend.
 After recording the proof, withdraw the credential and retire the sibling using
 the provisioning identity and its exact version pin. Verify the trial cleanup
 credential's two-key policy separately.
