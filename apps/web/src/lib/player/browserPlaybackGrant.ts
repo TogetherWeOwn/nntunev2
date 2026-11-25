@@ -21,7 +21,7 @@ export function createBrowserPlaybackGrant(owner: AccountSession, sessionBinding
 		dispose: () => lifetime.abort(),
 		async open(
 			{ trackId, playId }: Target, cancellation: AbortSignal, isCurrent: () => boolean,
-			publish: (source: BrowserPlaybackSource, durationMs: number) => void
+			publish: (source: BrowserPlaybackSource, durationMs: number) => void, onDiscarded?: () => void
 		): Promise<boolean> {
 			const signal = AbortSignal.any([owner.signal, lifetime.signal, cancellation]);
 			const ownsAccount = () => !signal.aborted && owner.isCurrent();
@@ -42,7 +42,12 @@ export function createBrowserPlaybackGrant(owner: AccountSession, sessionBinding
 					(playId !== undefined && reply.playId !== playId) || !Number.isSafeInteger(reply.durationMs) || reply.durationMs <= 0) return false;
 				const { playId: issuedPlayId, durationMs } = reply;
 				return (await owner.run(() => {
-					if (!current()) return false;
+					if (!ownsAccount()) return false;
+					if (!isCurrent()) {
+						// The verified new receipt may already have replaced the previous lease.
+						onDiscarded?.();
+						return false;
+					}
 					publish({ streamUrl: `/v1/plays/media/${trackId}/${playbackSessionId}/${issuedPlayId}`, trackId, playId: issuedPlayId, isCurrent: ownsAccount }, durationMs);
 					return true;
 				})) ?? false;

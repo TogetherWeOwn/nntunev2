@@ -40,11 +40,21 @@ const test = base.extend<{ origin: string }>({
 	}
 });
 
-for (const restart of [false, true]) {
-	test(`private Previous ${restart ? 'restarts the authorized source after three seconds' : 'plays the live queue predecessor near track start'}`, async ({ page, context, origin }) => {
+const scenarios = {
+	previous: 'plays the live queue predecessor near track start',
+	restart: 'restarts the authorized source after three seconds',
+	blocked: 'keeps the predecessor grant available when autoplay is blocked',
+	edit: 'leaves the edited queue playable after a superseding grant is discarded'
+} as const;
+
+for (const [scenario, title] of Object.entries(scenarios)) {
+	test(`private Previous ${title}`, async ({ page, context, origin }) => {
+		const restart = scenario === 'restart';
 		const playsUrl = origin + player.plays;
 		const grants: Request[] = [];
-		const issued = new Map<string, Buffer>();
+		let currentLease: { url: string; body: Buffer } | undefined;
+		const previousIssued = Promise.withResolvers<void>();
+		const releasePrevious = Promise.withResolvers<void>();
 		const mediaRequests = new Set<string>();
 		const isListener = async (request: Request) => hasFixtureSession(await request.headerValue('cookie'), listener);
 		await context.route('**/*', (route) => {
@@ -68,14 +78,18 @@ for (const restart of [false, true]) {
 				return route.fulfill({ status: 400 });
 			}
 			const playId = `previous_fixture_${grants.length}`;
-			issued.set(`${playsUrl}/media/${track_id}/${session_id}/${playId}`, body);
+			currentLease = { url: `${playsUrl}/media/${track_id}/${session_id}/${playId}`, body };
+			if (scenario === 'edit' && grants.length === 2) {
+				previousIssued.resolve();
+				await releasePrevious.promise;
+			}
 			return route.fulfill({ json: { trackId: track_id, playbackSessionId: session_id,
 				sessionBinding: binding, playId, durationMs: duration } });
 		});
 		await page.route(`${playsUrl}/media/**`, async (route) => {
 			const request = route.request();
 			mediaRequests.add(request.url());
-			const body = issued.get(request.url());
+			const body = request.url() === currentLease?.url ? currentLease.body : undefined;
 			if (request.method() !== 'GET' || !body || !await isListener(request)) return route.fulfill({ status: 404 });
 			const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers()['range'] ?? '');
 			const start = range ? Number(range[1]) : 0;
@@ -115,6 +129,17 @@ for (const restart of [false, true]) {
 		const order = [decoy.id, predecessor.id, selected.id];
 		await expect.poll(queueIds).toEqual(order);
 		await expect(active).toHaveAttribute(player.queueId, selected.id);
+		const previousSource = `${playsUrl}/media/${predecessor.id}/${tab}/previous_fixture_2`;
+		if (scenario === 'blocked') {
+			await page.evaluate((source) => {
+				const play = HTMLMediaElement.prototype.play;
+				HTMLMediaElement.prototype.play = function () {
+					if (this.src !== source) return play.call(this);
+					HTMLMediaElement.prototype.play = play;
+					return Promise.reject(new DOMException('Autoplay blocked by fixture', 'NotAllowedError'));
+				};
+			}, previousSource);
+		}
 
 		const native = await audio.elementHandle();
 		if (restart) await expect.poll(() => native.evaluate((node: HTMLAudioElement) => node.currentTime)).toBeGreaterThan(4);
@@ -142,9 +167,35 @@ for (const restart of [false, true]) {
 			await expect(active).toHaveAttribute(player.queueId, selected.id);
 			expect(grants.map((request) => request.postDataJSON())).toEqual([{ track_id: selected.id, session_id: tab }]);
 			expect([...mediaRequests]).toEqual([source]);
+		} else if (scenario === 'edit') {
+			await previousIssued.promise;
+			try {
+				await queue.getByRole('button', { name: `Remove ${predecessor.title} from queue`, exact: true }).click();
+				order.splice(1, 1);
+				await expect.poll(queueIds).toEqual(order);
+				// The new lease committed before its reply and already supersedes the old URL.
+				expect(await page.evaluate(async (url) => (await fetch(url)).status, source)).toBe(404);
+			} finally {
+				releasePrevious.resolve();
+			}
+			await expect(audio).toHaveCount(0);
+			expect(await native.evaluate((node: HTMLAudioElement) => !node.isConnected && node.paused)).toBe(true);
+			await expect(active).toHaveAttribute(player.queueId, selected.id);
+			await transport.getByRole('button', { name: 'Play', exact: true }).click();
+			const resumedSource = `${playsUrl}/media/${selected.id}/${tab}/previous_fixture_3`;
+			await expectPlaying(resumedSource);
+			expect(grants.map((request) => request.postDataJSON())).toEqual([
+				{ track_id: selected.id, session_id: tab }, { track_id: predecessor.id, session_id: tab },
+				{ track_id: selected.id, session_id: tab }
+			]);
+			expect([...mediaRequests]).toEqual([source, resumedSource]);
 		} else {
-			const previousSource = `${playsUrl}/media/${predecessor.id}/${tab}/previous_fixture_2`;
 			await expect(active).toHaveAttribute(player.queueId, predecessor.id);
+			if (scenario === 'blocked') {
+				await expect(page.getByTestId('queue-announcement')).toHaveText(`Selected ${predecessor.title}, paused: playback was blocked.`);
+				await expect(audio).toHaveJSProperty('paused', true);
+				await transport.getByRole('button', { name: 'Play', exact: true }).click();
+			}
 			await expect(audio).toHaveJSProperty('currentSrc', previousSource);
 			await expectPlaying(previousSource);
 			expect(await native.evaluate((node: HTMLAudioElement) => !node.isConnected && node.paused)).toBe(true);
