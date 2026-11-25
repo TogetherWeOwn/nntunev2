@@ -123,6 +123,7 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         .to_string());
     }
     let readback = mode.starts_with("readback");
+    let multipart_resume = mode == "multipart-resume";
     let padded;
     let plaintext: &[u8] = if matches!(mode, "readback-publish" | "readback-playback") {
         // Add one FLAC PADDING block so the suffix crosses into a second
@@ -136,7 +137,7 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         bytes.extend_from_slice(&FLAC[42..]);
         padded = bytes;
         &padded
-    } else if mode == "multipart-resume" {
+    } else if multipart_resume {
         padded = vec![42; PART_BYTES];
         &padded
     } else if readback {
@@ -222,15 +223,18 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
     let mut page = None;
     let chunk_count = chunks.len();
     for (index, sealed) in chunks.into_iter().enumerate() {
-        parts.extend(
-            partition
-                .push(&SealedChunk {
-                    digest: Sha256::digest(&sealed.bytes).into(),
-                    bytes: sealed.bytes,
-                    final_chunk: index + 1 == chunk_count,
-                })
-                .unwrap(),
+        let part = partition
+            .push(&SealedChunk {
+                digest: Sha256::digest(&sealed.bytes).into(),
+                bytes: sealed.bytes,
+                final_chunk: index + 1 == chunk_count,
+            })
+            .unwrap();
+        assert!(
+            multipart_resume || part.is_none(),
+            "expected a part only on finish"
         );
+        parts.extend(part);
         if sealed.page.is_some() {
             assert!(page.is_none());
             page = sealed.page;
@@ -263,7 +267,7 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         generation: &generation,
         envelope_scheme: 2,
     };
-    if mode == "multipart-resume" {
+    if multipart_resume {
         return resume_multipart(&sender, binding, &context, &parts, until).await;
     }
     let [part] = parts.as_slice() else {
