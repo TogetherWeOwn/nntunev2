@@ -28,7 +28,7 @@ JOIN fixture_tracks t ON t.handle = e->>'track_public_id' WHERE e->>'status' = '
 UNION ALL SELECT 9002, 1, 'not-the-original-ref', id FROM fixture_tracks WHERE handle = 'new-track';
 CREATE TEMP TABLE fixture_memberships AS
 SELECT 'fixture-user-owner'::text AS owner_id, id AS track_id FROM fixture_tracks
-WHERE handle IN ('new-track', 'trkRpRepeat00000000000', 'trkFrAlpha000000000000')
+WHERE handle IN ('new-track', 'trkRpRepeat00000000000', 'trkFrAlpha000000000000', 'trkFrGamma000000000000')
 UNION ALL SELECT 'fixture-user-other', id FROM fixture_tracks WHERE handle IN ('new-track', 'trkRpMiddle00000000000');
 CREATE TEMP TABLE sequence_before AS SELECT last_value, is_called FROM public.playlists_id_seq;
 SAVEPOINT applied_legacy;
