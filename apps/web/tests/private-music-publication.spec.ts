@@ -1,4 +1,4 @@
-import { expect } from '@playwright/test';
+import { expect, type Request } from '@playwright/test';
 import { fixtureCookie, hasFixtureSession, serveFlac, test } from './helpers/private-music-fixture.js';
 import { assertCuratedLibrary, PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { freshTrialPublication, privateStagingAudio, PRIVATE_TRIAL_UPLOAD } from '../../../e2e/helpers/private-staging-fixture.js';
@@ -265,4 +265,115 @@ test('invited playback keeps the arranged queue and seek position across Library
 		error: node.error?.code ?? null
 	}), native)).toEqual({ sameNode: true, source: origin + authorizedMediaPath, error: null });
 	expect(grants, 'Resume should reuse the original playback grant').toEqual([selected.id]);
+});
+
+test('invited playback grants the next track on natural end and stops at the queue tail', async ({ page, context, origin }) => {
+	const tones = privateStagingAudio();
+	const first = {
+		id: uploadedId, title: 'First Tone', duration_ms: 14_000,
+		playId: `private_browser_${'a'.repeat(22)}`,
+		body: tones.find(({ file }) => file === 'tone-a.flac')!.body
+	};
+	const last = {
+		id: companionId, title: 'Second Tone', duration_ms: 14_000,
+		playId: `private_browser_${'b'.repeat(22)}`,
+		body: tones.find(({ file }) => file === 'tone-b.flac')!.body
+	};
+	const tracks = [first, last];
+	const { library, player: contract } = PRIVATE_MUSIC;
+	const grantUrl = origin + contract.plays;
+	const mediaPath = (track: Pick<typeof first, 'id' | 'playId'>, tab: string) =>
+		`${contract.plays}/media/${track.id}/${tab}/${track.playId}`;
+	const grants: Request[] = [];
+	let media: { path: string; body: Buffer } | undefined;
+	await context.route('**/*', (route) => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
+	await context.addCookies([{ name: fixtureCookie, value: 'synthetic-listener', url: origin, httpOnly: true }]);
+	await page.route(`${origin}/v1/me/likes/session`, async (route) => {
+		if (!isListener(await route.request().headerValue('cookie'))) return route.fulfill({ status: 401 });
+		return route.fulfill({ json: { session_binding: binding } });
+	});
+	await page.route(origin + library.api, async (route) => {
+		if (!isListener(await route.request().headerValue('cookie'))) return route.fulfill({ status: 401 });
+		return route.fulfill({
+			headers: { 'x-nntune-session-binding': binding },
+			json: tracks.map(({ id, title, duration_ms }) => ({ id, title, duration_ms }))
+		});
+	});
+	page.on('request', (request) => {
+		if (request.url() === grantUrl) grants.push(request);
+	});
+	await page.route(grantUrl, async (route) => {
+		const call = route.request();
+		if (call.method() !== 'POST' || !isListener(await call.headerValue('cookie')) ||
+			await call.headerValue('x-nntune-browser-playback') !== '1' ||
+			await call.headerValue('x-nntune-session-binding') !== binding) return route.fulfill({ status: 400 });
+		const { track_id, session_id, play_id } = call.postDataJSON() ?? {};
+		const track = tracks.find(({ id }) => id === track_id);
+		if (!track || typeof session_id !== 'string' || !/^[0-9a-f-]{36}$/.test(session_id) ||
+			play_id !== undefined) return route.fulfill({ status: 400 });
+		media = { path: mediaPath(track, session_id), body: track.body };
+		return route.fulfill({ json: {
+			trackId: track.id, playbackSessionId: session_id, sessionBinding: binding,
+			playId: track.playId, durationMs: track.duration_ms
+		} });
+	});
+	await page.route(`${grantUrl}/media/**`, async (route) => {
+		const call = route.request();
+		const cookie = await call.headerValue('cookie');
+		if (!media || call.url() !== origin + media.path || !isListener(cookie)) return route.fulfill({ status: 404 });
+		return serveFlac(route, media.body);
+	});
+
+	const rows = page.getByTestId(library.item);
+	const active = page.locator(contract.currentQueueItem);
+	const player = page.getByRole('region', { name: 'Player', exact: true });
+	const play = player.getByRole('button', { name: 'Play', exact: true });
+	const audio = page.getByTestId(contract.audio);
+	const finish = async (path: string) => {
+		await expect(audio).toHaveAttribute('src', path);
+		await expect.poll(() => audio.evaluate((node: HTMLAudioElement) =>
+			!node.paused && node.currentTime > 0.2 && Number.isFinite(node.duration) && node.seekable.length > 0
+		)).toBe(true);
+		// Shorten the wait while still letting Chromium play through to its own ended event.
+		const end = await audio.evaluate((node: HTMLAudioElement) => new Promise<{ trusted: boolean; at: number }>((resolve) => {
+			node.addEventListener('ended', (event) => resolve({ trusted: event.isTrusted, at: event.timeStamp }), { once: true });
+			node.currentTime = node.duration - 2;
+		}));
+		expect(end.trusted).toBe(true);
+		return end.at;
+	};
+
+	await page.goto(origin + library.path);
+	for (const { id } of tracks) {
+		await rows.and(page.locator(`[${library.id}="${id}"]`)).locator(library.select).click();
+	}
+	await expect(active).toHaveAttribute(contract.queueId, first.id);
+	await expect(page.getByTestId('player-repeat')).toHaveValue('off');
+	await expect(audio).toHaveCount(0);
+	expect(grants).toHaveLength(0);
+	const firstGrant = page.waitForRequest(grantUrl);
+	await play.click();
+	const tab: string = (await firstGrant).postDataJSON().session_id;
+	const firstEndedAt = await finish(mediaPath(first, tab));
+
+	await expect(active).toHaveAttribute(contract.queueId, last.id);
+	await expect(player.getByTestId('library-now-playing')).toHaveText(last.title);
+	await finish(mediaPath(last, tab));
+	await expect(play).toBeEnabled();
+	// Let the ended handler and the resulting render settle before checking the request log.
+	await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+	await expect(active).toHaveAttribute(contract.queueId, last.id);
+	await expect(audio).toHaveAttribute('src', mediaPath(last, tab));
+	await expect(audio).toHaveJSProperty('ended', true);
+	await expect(audio).toHaveJSProperty('paused', true);
+	expect(grants.map((request) => request.postDataJSON())).toEqual([
+		{ track_id: first.id, session_id: tab },
+		{ track_id: last.id, session_id: tab }
+	]);
+	// Compare fetch starts and the native ended event on the same browser clock.
+	const grantStarts = await page.evaluate((url) =>
+		performance.getEntriesByName(url, 'resource').map((entry) => entry.startTime), grantUrl);
+	expect(grantStarts).toHaveLength(2);
+	expect(grantStarts[1], 'the next grant must start after the first track ends')
+		.toBeGreaterThanOrEqual(firstEndedAt);
 });
