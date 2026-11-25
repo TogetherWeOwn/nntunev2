@@ -334,6 +334,12 @@ pending deployments.
 | `#evidence-bootstrap-200-1`, citing `#evidence-staging-100-1` | `DATABASE_BOOTSTRAP_CANDIDATE_SHA` is `<sha>`. The bootstrap Environment binds `BOOTSTRAP_SHA` to `<sha>` and `BOOTSTRAP_RUN_ID` to `200`, with the approved setup plan's exact bytes and SHA-256 in `BOOTSTRAP_PLAN_B64` and `BOOTSTRAP_PLAN_DIGEST`. |
 | `#evidence-baseline-201-1`, citing `#evidence-staging-100-1` and the verified setup readback | `DATABASE_BASELINE_CANDIDATE_SHA` is `<sha>` while that exact candidate remains eligible. The baseline Environment binds `BASELINE_SHA` to `<sha>` and `BASELINE_RUN_ID` to `201`, with its separately approved plan's exact bytes and SHA-256 in `BASELINE_PLAN_B64` and `BASELINE_PLAN_DIGEST`. The plan uses the verified launch database OID and the separately issued reader OID. |
 
+Both preflights require the approved SHA to be the dispatched `main` tip.
+If `main` advances between successful setup and baseline dispatch, retain the
+original setup approval and verified database OID. Qualify the new tip in
+staging and obtain fresh baseline approval for that SHA and the exact baseline
+plan before enabling baseline. The earlier receipt stays bound to its own SHA.
+
 Both workflows dispatch with zero inputs. The evidence references stay in the
 private release record. The protected runners consume their own Environment's
 authorization. Bootstrap uses `BOOTSTRAP_EXPIRY` and `BOOTSTRAP_SETUP_PASSWORD`.
