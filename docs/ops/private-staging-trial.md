@@ -241,12 +241,38 @@ HEAD against the now-absent version and require the same status, body and
 optional version header checks. Treat HTTP 403, ambiguity or a policy that
 needs list access as a stop. Keep the scope and credentials in protected custody.
 
+#### Tabletop for a refused shared ingress reload
+
+In this offline example, the trial is disarmed and hosted qualification has
+yet to be dispatched. Engineering is undoing the fixture ingress in the
+protected rollout's shared-writer window. The exact fixture DNS record has
+been removed and its absence recorded. The shared Caddy server is serving
+synthetic revision A, which includes the fixture route and an unrelated route
+update. Revision B on disk removes only the fixture route.
+
+1. The process launcher rejects the reload before the Caddy reload process
+   starts. Record the refusal and the completed DNS step separately.
+2. Engineering restores and verifies revision A on disk from the copy taken
+   before writing revision B. An independent readback from the running server
+   confirms revision A is still serving both routes. Record the disk and
+   serving results separately. The fixture route is still active, so ingress
+   rollback remains pending.
+3. If that live readback is unavailable, inconclusive or mismatched, record
+   what was observed and leave recovery pending even if the disk copy matches
+   revision A.
+
+Keep the trial disarmed and hosted qualification pending. Engineering owns
+diagnosis and any retry through the existing protected rollout, including
+reconciling DNS and serving state before retrying.
+
 #### Provider-only preflight
 
 For a hosted run, use [staging-trial-provider-preflight](../../.github/workflows/staging-trial-provider-preflight.yml).
 For the fixture boundary, provision and verify a reachable HTTPS ingress
 forwarding to its loopback listener through the protected rollout. The
-disposable qualification uses a runner-local endpoint.
+disposable qualification uses a runner-local endpoint. See the [offline
+tabletop](#tabletop-for-a-refused-shared-ingress-reload) for a refused shared
+ingress reload during rollback.
 Prepare the two disposable versions and read back the credential policy as
 described below. Supply the four settings below as secrets in the existing
 `staging` Environment for this run. The endpoint and region secrets must match
