@@ -72,45 +72,42 @@ launcher verdict.
 ## Check DNS convergence for the disposable ingress
 
 For an authorized attempt, import [the read-only policy](dns_convergence.py)
-in the separate protected executor. Use its REST readback, DNS transport,
-clock and receipt callbacks on the existing post-create and post-delete
-paths for the single run-owned record.
+in the protected executor on the post-create and post-delete paths for the
+single run-owned record. Keep the existing exclusive writer held from the
+provider write through convergence and closeout. If that scope is lost,
+stop and reconcile the record's identity before any further change.
 
 1. After creation, read back the recorded ID and require exactly that one
    record by exact name, matching the approved type, origin, proxy state, TTL,
    tags and comment. After deletion, require `404` by recorded ID and an empty
-   exact-name provider list. Pass both results and their completion time from
-   the executor's monotonic clock as `Readback`.
+   exact-name provider list. Bind both results to the change direction,
+   exact name and record ID in `Readback` and use the original monotonic
+   completion time. Invoke the check once per provider write.
 2. Use the two distinct authorities from the approved zone inputs. Pin each
-   server and its query endpoint before the write. The `read_pair` callback
-   sends one `IN A` query for the exact name directly to each pinned endpoint
-   with recursion disabled. Start the queries together every two seconds.
-   Match the response to the query and server and enforce the supplied timeout
-   on the whole round. Return an observation for each attempt, including a
-   non-authoritative failure observation when a valid response is unavailable.
-   Count A answers for the exact owner. Proxied answers are edge IPs.
+   query endpoint before the write. Every two seconds `read_pair` sends one
+   direct, non-recursive `IN A` query to each endpoint within the round timeout.
+   Match each reply to its query and server. Return one observation per
+   attempt, using a non-authoritative failure if a valid reply is unavailable.
+   Count exact-owner A answers. Proxied answers are edge IPs.
 3. For create, require `NOERROR` with at least one exact-owner A answer on two
    consecutive reads from each authority before the 90-second deadline. Only
    then continue to existing HTTPS readiness. A missed deadline or stop
    leaves the trial disarmed and goes to scoped disposal and full closeout.
 4. For delete, require `NXDOMAIN` with zero answers on two consecutive reads
-   from each authority before the same 90-second deadline, measured from
-   the delete readback. If that deadline is missed, continue DNS reads for
-   containment up to 300 seconds total from that readback. Keep the writer
-   held and return the receipt to Engineering even if both authorities later
-   converge. Containment does not turn the missed qualification into a pass.
-   A stopped or incomplete delete also leaves the writer held. Keep the
-   existing exact provider absence proof and perform no second create or delete.
+   from each authority before 90 seconds from delete readback. On a miss,
+   keep reading for containment up to 300 seconds total from that readback.
+   Keep the writer held and return the receipt to Engineering even if both
+   authorities later converge. Keep exact provider absence proof throughout
+   and perform no second create or delete.
 5. In either direction, stop when an authority regresses after two matching
    reads, sends a non-authoritative response, reports `SERVFAIL` or `REFUSED`,
-   or otherwise cannot supply a valid observation for the scoped name. Query
-   and record both servers in every round until the verdict. Log each read's
-   UTC time, server, response code, AA flag, answer count and seconds since
-   REST readback to the protected receipt. Record the exact merged SHA and
-   SHA-256 of the executor diff used by the operator. If the check or recording
-   fails during delete, keep DNS cleanup pending and retain the writer.
-   Continue scoped closeout of other resources through the existing recovery
-   path.
+   or otherwise cannot supply a valid observation. Log each read's UTC time,
+   server, response code, AA flag, answer count and seconds since REST readback
+   to the protected receipt. Use the reply arrival time for qualification.
+   Record the merged SHA and SHA-256 of the executor diff. If the callbacks
+   fail or the executor is interrupted, keep the trial disarmed. Keep DNS
+   cleanup pending and retain the writer on delete failure while other scoped
+   closeout continues.
 
 Exercise the policy with synthetic observations only.
 
@@ -163,8 +160,9 @@ If DNS deletion succeeded and the Caddy reload failed, resume with Caddy only
 in the rollout owner's shared-writer window. Match the deletion receipt to
 `<record-id>` and `<zone>`, then confirm that ID and the fixture hostname are
 both absent in the DNS control plane. Stop on missing proof or a replacement
-record. Step 3 still requires the authoritative absence evidence for DNS
-closeout. Read the latest Caddy source and active route. If the rollout block is
+record. Carry forward the original delete verdict and authoritative receipt
+for step 3. A Caddy-only resume cannot start a new DNS qualification window.
+Read the latest Caddy source and active route. If the rollout block is
 already absent from both, continue to step 3. Otherwise require the active
 site to match the rollout receipt and the source to show either that same
 block or its recorded removal. Stop on unexplained differences between source
