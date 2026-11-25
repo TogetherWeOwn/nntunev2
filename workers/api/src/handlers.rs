@@ -13542,8 +13542,8 @@ pub(crate) mod tests {
         assert_eq!(pending.grace_until_unix, Some(grace));
         assert_eq!(*h.store.invoice_history.borrow(), history);
 
-        // A later hourly pass still sees the open invoice. The account
-        // keeps its paid plan through renewal grace beyond settlement.
+        // The renewal invoice is still open, so the hourly pass gets only
+        // the prior paid invoice. Grace keeps the paid plan past settlement.
         ctx.now = (paid_end + 4 * 3_600) as u64;
         block_on(reconcile_paid_targets(
             &ctx,
