@@ -17,11 +17,13 @@ export async function assertStagingPlaybackProbe({
   trackId: string;
   fixtureSha256: string;
 }): Promise<void> {
-  const path = sourceUrl.slice(STAGING_ORIGIN.length);
-  const match = MEDIA_PATH.exec(path);
-  if (!sourceUrl.startsWith(STAGING_ORIGIN) || !match || match[0] !== path || match[1] !== trackId) {
+  const source = URL.parse(sourceUrl);
+  const match = source && MEDIA_PATH.exec(source.pathname);
+  if (source?.origin !== STAGING_ORIGIN || !match || match[1] !== trackId ||
+      sourceUrl !== `${STAGING_ORIGIN}${match[0]}`) {
     throw new Error('Staging playback probe requires the selected track’s staging media relay');
   }
+  const relayUrl = `${STAGING_ORIGIN}${match[0]}`;
   const fixture = privateStagingAudio().find(({ sha256 }) => sha256 === fixtureSha256);
   if (!fixture || fixture.body.length <= SEEK_END) {
     throw new Error('Staging playback probe requires a published synthetic FLAC fixture');
@@ -37,11 +39,11 @@ export async function assertStagingPlaybackProbe({
     range?: { request: string; response: string },
   ) => {
     const label = `staging-playback-${phase}`;
-    const response = await apiGet(request, sourceUrl, range ? { ...headers, Range: range.request } : headers, label);
+    const response = await apiGet(request, relayUrl, range ? { ...headers, Range: range.request } : headers, label);
     try {
       const responseHeaders = response.headers();
       const status = response.status();
-      assertNoAccessWall({ status, headers: responseHeaders, bodyText: '', url: sourceUrl }, label);
+      assertNoAccessWall({ status, headers: responseHeaders, bodyText: '', url: relayUrl }, label);
       if (status !== (range ? 206 : 200)) {
         throw new Error(`[${label}] unexpected media status ${status}`);
       }

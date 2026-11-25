@@ -75,6 +75,8 @@ test('probe refuses mismatched tracks, non-staging and noncanonical sources befo
   for (const candidate of [
     '', `${origin}/api/demo/audio`, `https://nntune.com${new URL(sourceUrl).pathname}`,
     sourceUrl.replace(origin, `${origin}.example.test`),
+    sourceUrl.replace(origin, `${origin}:443`),
+    sourceUrl.replace('staging.nntune.com', 'STAGING.NNTUNE.COM'),
     sourceUrl.replace('staging.nntune.com', 'user@staging.nntune.com'),
     sourceUrl.replace('fixture-track', 'other-track'),
     sourceUrl.replace('fixture-tab', '%66ixture-tab'), sourceUrl.replace('private_browser_', 'private_'),

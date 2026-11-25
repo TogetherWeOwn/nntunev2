@@ -281,9 +281,12 @@ checks the request and response contract without making staging requests.
    together as the [rollback target](../docs/ops.md#staging-deploy-lock-cutover-and-rollback).
 4. Before retiring the routes, verify that each remaining local browser case
    still has its accepted product coverage or a recorded deferral. Keep the
-   demo's Axe cases until removal and preserve the loaded product scans, the
-   bundle cap, and the decoder and Media Session teardown coverage in
-   `security-auth-transition.spec.ts` and `library-system-transport.spec.ts`.
+   demo Axe cases until removal, retain the populated Library scan, and add a
+   loaded Now Playing scan ([Axe route matrix](../apps/web/tests/accessibility-axe.spec.ts)).
+   Keep the current [advisory client-JS bundle budget](../.github/scripts/check_web_bundle_budget.py).
+   Preserve decoder and Media Session teardown coverage on supported exit
+   surfaces ([decoder](../apps/web/tests/security-auth-transition.spec.ts),
+   [Media Session](../apps/web/tests/library-system-transport.spec.ts)).
    In the retirement change, move the two anonymous `/library` and `/api/library`
    tests from [demo-media-sessionless.spec.ts](tests/demo-media-sessionless.spec.ts)
    into a dedicated Library spec with their request setup and assertion bodies
