@@ -75,6 +75,11 @@ services:
     image: {boundary_image}
     env_file: !reset []
     command: [caddy, run, --config, /etc/caddy/Caddyfile]
+    healthcheck:
+      test: [CMD, nc, -z, -w, "1", 127.0.0.1, "8333"]
+      interval: 250ms
+      timeout: 2s
+      retries: 20
     volumes: !override
       - "{RECORDING_CONFIG}:/etc/caddy/Caddyfile:ro"
 """)
@@ -117,7 +122,7 @@ volumes:
         return run(args, self.compose_env, data=request, timeout=12).stdout
 
     def start(self):
-        self.run("up", "-d", timeout=180)
+        self.run("up", "-d", "--wait", "--wait-timeout", "25", timeout=180)
         address = self.run("port", "boundary", "8080").strip()
         require(address.startswith("127.0.0.1:"), "boundary is not bound to loopback")
         self.port = int(address.rsplit(":", 1)[1])
