@@ -1,0 +1,226 @@
+"""Exercise Playwright and the actual receipt step without browser or network access."""
+
+from hashlib import sha256
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+from unittest.mock import patch
+import xml.etree.ElementTree as ET
+
+ROOT = Path(__file__).resolve().parents[3]
+HELPER = ROOT / ".github/scripts/private_staging_evidence.py"
+SPEC = importlib.util.spec_from_file_location("private_staging_evidence", HELPER)
+evidence = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(evidence)
+admission = evidence.admission
+VERSION = "11111111-1111-4111-8111-111111111111"
+DEPLOYMENT = "22222222-2222-4222-8222-222222222222"
+PRIVATE_DETAIL = "https://private.example.invalid/listen?token=disposable-canary&account=account@example.invalid"
+PRIVATE_MARKERS = (b"private.example.invalid", b"disposable-canary", b"account@example.invalid")
+TRACK_FILE = "fixtures/synthetic-flac/private-staging/tone-a.flac"
+TRACK = b"disposable synthetic track"
+
+
+def write(root, name, contents):
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(contents)
+
+
+def setup(root, env):
+    for name in ("e2e/package.json", "e2e/playwright.private-staging.config.ts", "e2e/helpers/private-staging-admission-reporter.ts",
+                 "ci/staging_admission.py", ".github/scripts/private_staging_evidence.py",
+                 ".github/scripts/staging_api_identity.py"):
+        write(root, name, (ROOT / name).read_bytes())
+    (root / "e2e/node_modules").symlink_to(ROOT / "e2e/node_modules", target_is_directory=True)
+    write(root, "migrations/manifest.toml", b"# disposable manifest\n")
+    write(root, TRACK_FILE, TRACK)
+    # The production CLI binds the audio to the candidate's Git object.
+    def git(*args):
+        return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                                        "-c", "core.hooksPath=/dev/null", *args], cwd=root,
+                                       env={"PATH": env["PATH"], "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+                                       text=True, timeout=10).strip()
+    git("init", "--quiet", "--template=")
+    git("add", "--", TRACK_FILE)
+    git("commit", "--quiet", "-m", "Synthetic fixture")
+    sha = git("rev-parse", "HEAD")
+    env.update(GITHUB_SHA=sha, GITHUB_WORKFLOW_SHA=sha, API_SOURCE_SHA=sha)
+    required_criteria = sorted(admission.PRIVATE_CRITERIA | {"invite-acceptance"})
+    criteria = [{"id": key, "applicable": True,
+                 "evidence": [{"classname": "private-music", "name": key, "outcome": "passed"}]}
+                for key in required_criteria]
+    contract = json.dumps({"schema": 1, "evaluator": "junit-map-v1", "journey": "private-music",
+                           "spec_revision": "fixture", "criteria": criteria}).encode()
+    write(root, admission.CONTRACT, contract)
+    write(root, admission.POLICY, json.dumps({"schema": 1, "evaluator": "junit-map-v1", "approvals": [{
+        "sha256": sha256(contract).hexdigest(), "spec_revision": "fixture",
+        "product_approval": "fixture", "qa_approval": "fixture",
+    }]}).encode())
+    proof = {"track_id": VERSION, "sha256": sha256(TRACK).hexdigest(), "build_sha": sha,
+             "run_id": env["GITHUB_RUN_ID"], "run_attempt": env["GITHUB_RUN_ATTEMPT"], "ignored": PRIVATE_DETAIL}
+    names = ["private-publication", "private-library", "private-play", "private-anonymous-refusal",
+             "private-unlisted-refusal", "private-cutoff-refusal"]
+    write(root, "e2e/private-staging/fixture.spec.ts", f"""
+import {{ test }} from '@playwright/test';
+const detail = {json.dumps(PRIVATE_DETAIL)};
+test(detail, async ({{}}, info) => {{
+  console.log(detail);
+  console.error(detail);
+  if (process.env.FIXTURE_OUTCOME === 'expected') test.fail();
+  if (['failure', 'expected'].includes(process.env.FIXTURE_OUTCOME ?? '')) throw new Error(detail);
+  if (process.env.FIXTURE_OUTCOME === 'retry' && info.retry === 0) throw new Error(detail);
+  info.annotations.push({{ type: 'ignored', description: detail }});
+  await info.attach(detail, {{ body: detail, contentType: 'text/plain' }});
+  const phases = {json.dumps(admission.IDENTITY_PHASES)};
+  for (const [index, phase] of phases.entries()) {{
+    await test.step(phase, async () => info.annotations.push({{
+      type: 'candidate-identity', description: JSON.stringify({{
+        phase, web: '{sha}', api: '{sha}', expected: '{sha}',
+        observed_at: `2025-01-01T00:00:0${{index}}.000Z`, ignored: detail,
+      }}),
+    }}));
+    if (index === 0) for (const name of {json.dumps(required_criteria)}) {{
+      const title = name === 'invite-acceptance' ? 'invite redemption and Library arrival' : name;
+      if (name === 'invite-acceptance' && process.env.FIXTURE_OUTCOME === 'skip') await test.step.skip(title, async () => {{}});
+      else await test.step(title, async () => {{}});
+    }}
+  }}
+  for (const type of {json.dumps(names)})
+    info.annotations.push({{ type, description: JSON.stringify({json.dumps(proof)}) }});
+}});
+""".encode())
+
+
+def receipt_step():
+    workflow = (ROOT / admission.WORKFLOW).read_text()
+
+    def job(name):
+        section = workflow.split(f"\n  {name}:\n", 1)[1]
+        return re.split(r"\n  [\w-]+:\n", section, maxsplit=1)[0]
+
+    qualify = job("post-deploy-private-music")
+    qualify_settings, _ = qualify.split("\n    steps:\n", 1)
+    assert "needs: [staging-web, staging-api, staging-stream]" in qualify_settings
+    for lane in evidence.LANES:
+        settings, steps = job(f"staging-{lane}").split("\n    steps:\n", 1)
+        assert "      private_pin: ${{ steps.private-pin.outputs.pin }}\n" in settings + "\n"
+        assert f"      {lane.upper()}_PIN: ${{{{ needs.staging-{lane}.outputs.private_pin }}}}" in qualify_settings
+        bind = steps.split("        id: private-pin\n", 1)[1].split("\n      - ", 1)[0]
+        assert "if: vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true'" in bind
+        assert "printf 'pin=%s\\n' \"$pin\" >> \"$GITHUB_OUTPUT\"" in bind
+        if lane == "web":
+            assert "PRIVATE_MUSIC_STAGING_JOURNEY: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true' && 'true' || 'false' }}" in steps
+            assert 'private_staging_evidence.py web > "$RUNNER_TEMP/staging-web-pin.json"' in steps
+            assert 'pin=$(cat "$RUNNER_TEMP/staging-web-pin.json")' in bind
+        else:
+            assert f"private_staging_evidence.py {lane})" in bind
+    record, upload = qualify.split("\n      - name: Upload candidate admission receipt\n")
+    assert upload.count("          path:") == 1 and "          path: staging-admission.json\n" in upload
+    assert "retention-days: 7" in upload and "${{ github.run_attempt }}-private-music" in upload
+    return textwrap.dedent(record.rsplit("\n        run: |\n", 1)[1])
+
+
+def provider_response(deployment, version=VERSION):
+    return {"deployments": [{"id": deployment, "strategy": "percentage",
+                             "versions": [{"version_id": version, "percentage": 100}]}]}
+
+
+def require_refusal(action, reason):
+    try:
+        action()
+    except (admission.Refused, evidence.identity.Unavailable):
+        return
+    raise AssertionError(reason)
+
+
+def capture_pins(root, env):
+    readback = {"build_sha": env["GITHUB_SHA"], "version_id": VERSION, "deployment_id": DEPLOYMENT}
+    api = {"identity": "matched", **readback}
+    stream = {**api, "worker": "nntune-stream-staging", "private_playback_enabled": True}
+    stream_file = "staging-stream-identity.json"
+    write(root, stream_file, json.dumps(stream).encode())
+    wrangler = {"type": "deploy", "version": 1, "worker_name": "nntune-web-staging",
+                "wrangler_environment": "staging", "version_id": VERSION}
+    write(root, "wrangler/wrangler-output-fixture.json", (json.dumps(wrangler) + "\n").encode())
+    capture_env = env | {"WRANGLER_OUTPUT_FILE_DIRECTORY": str(root / "wrangler"), "API_IDENTITY": json.dumps(api)}
+
+    with patch.dict(os.environ, capture_env, clear=True), patch.object(evidence, "provider") as provider:
+        reader = provider.return_value
+        reader.return_value = provider_response(DEPLOYMENT)
+        pins = {lane: evidence.main(lane) for lane in evidence.LANES}
+        reader.assert_called_once_with("nntune-web-staging")
+        assert pins == {lane: {**readback, "worker": f"nntune-{lane}-staging",
+                               "run_id": env["GITHUB_RUN_ID"], "run_attempt": env["GITHUB_RUN_ATTEMPT"]}
+                        for lane in evidence.LANES}
+
+        reader.return_value = provider_response(DEPLOYMENT, version=DEPLOYMENT)
+        require_refusal(lambda: evidence.main("web"), "Web captured a different serving version")
+        for invalid_api in ({"identity": "unavailable"}, {"build_sha": "b" * 40}):
+            os.environ["API_IDENTITY"] = json.dumps(api | invalid_api)
+            require_refusal(lambda: evidence.main("api"), "API captured an unavailable or wrong-build identity")
+        for invalid_stream in ({"private_playback_enabled": False}, {"worker": "nntune-api-staging"}):
+            write(root, stream_file, json.dumps(stream | invalid_stream).encode())
+            require_refusal(lambda: evidence.main("stream"), "Stream captured an unarmed or wrong-Worker identity")
+    return {f"{lane.upper()}_PIN": json.dumps(pin) for lane, pin in pins.items()}
+
+
+def run_fixture(root):
+    env = {"PATH": os.environ["PATH"], "CI": "1", "RUNNER_TEMP": str(root),
+           "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "2",
+           "GITHUB_REPOSITORY": "TogetherWeOwn/nntunev2", "GITHUB_EVENT_NAME": "push",
+           "GITHUB_REF": "refs/heads/main", "API_DEPLOYED": "true", "API_DEPLOY_OUTCOME": "deployed"}
+    setup(root, env)
+    command = ["bash", "-c", receipt_step()]
+    env.update(capture_pins(root, env))
+
+    def run(args, env_overrides=None):
+        process = subprocess.run(args, cwd=root, env=env | (env_overrides or {}), capture_output=True, timeout=15)
+        assert all(marker not in process.stdout + process.stderr for marker in PRIVATE_MARKERS)
+        return process
+
+    def playwright(kind):
+        args = [sys.argv[1], "e2e/node_modules/playwright/cli.js", "test", "--config=e2e/playwright.private-staging.config.ts"]
+        if kind == "retry":
+            args.append("--retries=1")
+        return run(args, {"FIXTURE_OUTCOME": kind})
+
+    report = root / "e2e/private-staging-results/admission.xml"
+    for refusal in ("failure", "skip", "expected", "retry"):
+        assert playwright(refusal).returncode != 0 and not report.exists()
+    result = playwright("pass")
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert {case.attrib["retry"] for case in ET.parse(report).iter("testcase")} == {"0"}
+    assert all(marker not in report.read_bytes() for marker in PRIVATE_MARKERS)
+
+    with patch.dict(os.environ, env, clear=True), patch.object(evidence, "provider") as provider:
+        provider.return_value.return_value = provider_response(DEPLOYMENT)
+        for phase in admission.IDENTITY_PHASES:
+            write(root, f"{phase}.json", json.dumps(evidence.main("observe")).encode())
+        assert provider.return_value.call_count == 6
+        provider.return_value.return_value = provider_response(VERSION)
+        require_refusal(lambda: evidence.main("observe"), "drifted provider deployment accepted")
+
+    receipt = root / "staging-admission.json"
+    mismatched = json.loads(env["API_PIN"]) | {"run_attempt": "1"}
+    for bad_pins in ({"WEB_PIN": ""}, {"API_PIN": json.dumps(mismatched)}):
+        assert run(command, bad_pins).returncode != 0 and not receipt.exists()
+    result = run(command)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    saved = receipt.read_bytes()
+    assert all(marker not in saved for marker in PRIVATE_MARKERS)
+    assert json.loads(saved)["result"] == "satisfied"
+    write(root, admission.POLICY, b'{"schema":1,"evaluator":"junit-map-v1","approvals":[]}')
+    assert run(command).returncode != 0 and json.loads(receipt.read_bytes())["result"] == "incomplete"
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory(prefix="private-staging-admission-") as temp:
+        run_fixture(Path(temp))

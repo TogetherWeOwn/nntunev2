@@ -11,11 +11,11 @@ name: deploy
 #   still deploying.
 # - Deploy jobs bind the protected `staging` GitHub Environment, so
 #   push-to-main deployment records land only in `staging`. The deploy
-#   credentials remain repository-scoped. Store the dedicated Workers
-#   read token and database observer URL only in `staging`; this workflow
-#   passes them only to the `staging-api` Subsonic readback step, never to
-#   Wrangler or other deploy steps. Production records land only in
-#   `production` via deploy-production.yml.
+#   credentials remain repository-scoped. Store the Workers read token and
+#   database observer URL only in `staging`. Subsonic readback uses both.
+#   The private journey's two deployment observations use the read token.
+#   These credentials are scoped to the observation steps. Production
+#   records land only in `production` via deploy-production.yml.
 # - Push deploys need the repo Actions secrets CLOUDFLARE_API_TOKEN and
 #   CLOUDFLARE_ACCOUNT_ID (names only; the full account ID stays private).
 #   When the token is absent, the jobs skip via the `gate` job below
@@ -142,6 +142,8 @@ jobs:
     environment:
       name: staging
       url: https://staging.nntune.com
+    outputs:
+      private_pin: ${{ steps.private-pin.outputs.pin }}
     defaults:
       run:
         working-directory: apps/web
@@ -177,6 +179,8 @@ jobs:
         run: pnpm build
       - name: Deploy to staging
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        env:
+          PRIVATE_MUSIC_STAGING_JOURNEY: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true' && 'true' || 'false' }}
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -184,6 +188,18 @@ jobs:
           packageManager: pnpm
           workingDirectory: apps/web
           command: deploy --env staging
+          postCommands: >-
+            if [ "$PRIVATE_MUSIC_STAGING_JOURNEY" = true ]; then
+            timeout -k 2s 30s python3 -I ../../.github/scripts/private_staging_evidence.py web > "$RUNNER_TEMP/staging-web-pin.json";
+            fi
+      - name: Bind private Web deployment to this attempt
+        id: private-pin
+        if: vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true'
+        run: |
+          set -euo pipefail
+          pin=$(cat "$RUNNER_TEMP/staging-web-pin.json")
+          test -n "$pin"
+          printf 'pin=%s\n' "$pin" >> "$GITHUB_OUTPUT"
 
   # Api Worker staging lane (staging only; stream/repair/transcode are
   # follow-up jobs, each with its own evidence; mb/ingest lanes follow
@@ -213,6 +229,7 @@ jobs:
       deployed: ${{ steps.deployment.outputs.deployed }}
       outcome: ${{ steps.deployment.outputs.outcome }}
       source_sha: ${{ steps.deployment.outputs.source_sha }}
+      private_pin: ${{ steps.private-pin.outputs.pin }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -582,6 +599,15 @@ jobs:
             printf '\n### staging-api provider identity\n%s\n' "$receipt"
           } >> "$GITHUB_STEP_SUMMARY"
           printf 'staging-api provider identity: %s\n' "$receipt"
+      - name: Bind private API deployment to this attempt
+        id: private-pin
+        if: vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true'
+        env:
+          API_IDENTITY: ${{ steps.deployment.outputs.identity_pin }}
+        run: |
+          set -euo pipefail
+          pin=$(python3 -I .github/scripts/private_staging_evidence.py api)
+          printf 'pin=%s\n' "$pin" >> "$GITHUB_OUTPUT"
       - name: Read staging off and drained state after API deploy
         id: subsonic_readback
         if: >-
@@ -1100,6 +1126,7 @@ jobs:
       url: https://staging.nntune.com
     outputs:
       source_sha: ${{ steps.identity.outputs.source_sha }}
+      private_pin: ${{ steps.private-pin.outputs.pin }}
     steps:
       - name: Require staging Stream and API deployment gates
         env:
@@ -1162,6 +1189,13 @@ jobs:
           test -s "$RUNNER_TEMP/staging-stream-identity.json"
           cat "$RUNNER_TEMP/staging-stream-identity.json" >> "$GITHUB_STEP_SUMMARY"
           echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+      - name: Bind armed Stream deployment to this attempt
+        id: private-pin
+        if: vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true'
+        run: |
+          set -euo pipefail
+          pin=$(python3 -I .github/scripts/private_staging_evidence.py stream)
+          printf 'pin=%s\n' "$pin" >> "$GITHUB_OUTPUT"
 
   # Post-deploy staging E2E (same run, same revision as the deploys above).
   # Check the two direct deploy results explicitly. An ordinary push may
@@ -1208,6 +1242,10 @@ jobs:
     if: ${{ github.event_name == 'push' && vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      WEB_PIN: ${{ needs.staging-web.outputs.private_pin }}
+      API_PIN: ${{ needs.staging-api.outputs.private_pin }}
+      STREAM_PIN: ${{ needs.staging-stream.outputs.private_pin }}
     environment:
       name: staging
     steps:
@@ -1218,6 +1256,10 @@ jobs:
           STREAM_SOURCE_SHA: ${{ needs.staging-stream.outputs.source_sha }}
         run: |
           set -euo pipefail
+          test "$GITHUB_REPOSITORY" = TogetherWeOwn/nntunev2
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_REF_PROTECTED" = true
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
           test "$API_DEPLOYED" = true
           test "$API_SOURCE_SHA" = "$GITHUB_SHA"
           test "$STREAM_SOURCE_SHA" = "$GITHUB_SHA"
@@ -1231,6 +1273,11 @@ jobs:
       - name: Install the private journey runner
         working-directory: e2e
         run: npm ci && npx playwright install --with-deps chromium
+      - name: Observe opening private staging deployments
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SUBSONIC_STAGING_WORKERS_READ_TOKEN: ${{ secrets.SUBSONIC_STAGING_WORKERS_READ_TOKEN }}
+        run: timeout -k 2s 30s python3 -I .github/scripts/private_staging_evidence.py observe > "$RUNNER_TEMP/build-identity.json"
       - name: Qualify private listening
         working-directory: e2e
         env:
@@ -1241,4 +1288,32 @@ jobs:
           PRIVATE_MUSIC_STAGE_FIXTURE: ${{ secrets.PRIVATE_MUSIC_STAGE_FIXTURE }}
           EXPECTED_BUILD_SHA: ${{ github.sha }}
           API_DEPLOY_OUTCOME: ${{ needs.staging-api.outputs.outcome }}
-        run: npx playwright test --config=playwright.private-staging.config.ts
+        run: |
+          if ! npx playwright test --config=playwright.private-staging.config.ts > /dev/null 2>&1; then
+            echo '::error::Private staging qualification failed.'
+            exit 1
+          fi
+      - name: Observe closing private staging deployments
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SUBSONIC_STAGING_WORKERS_READ_TOKEN: ${{ secrets.SUBSONIC_STAGING_WORKERS_READ_TOKEN }}
+        run: timeout -k 2s 30s python3 -I .github/scripts/private_staging_evidence.py observe > "$RUNNER_TEMP/build-identity-final.json"
+      - name: Record candidate admission receipt
+        env:
+          API_DEPLOYED: ${{ needs.staging-api.outputs.deployed }}
+          API_DEPLOY_OUTCOME: ${{ needs.staging-api.outputs.outcome }}
+          API_SOURCE_SHA: ${{ needs.staging-api.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          PRIVATE_STAGING_DEPLOYMENTS=$(python3 -I .github/scripts/private_staging_evidence.py assemble)
+          export PRIVATE_STAGING_DEPLOYMENTS
+          python3 -I ci/staging_admission.py produce-private
+          test "$(wc -c < staging-admission.json)" -le 262144
+          jq -e '.journey == "private-music" and .result == "satisfied"' staging-admission.json > /dev/null
+      - name: Upload candidate admission receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-admission-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-private-music
+          path: staging-admission.json
+          if-no-files-found: error
+          retention-days: 7
