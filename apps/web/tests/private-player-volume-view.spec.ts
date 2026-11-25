@@ -20,15 +20,15 @@ test('keyboard volume follows private playback between Library and Now Playing',
 	const mini = page.getByTestId('mini-player').getByRole('link', { name: /Now Playing/ });
 	const main = page.getByRole('main');
 
-	const expectVolume = async (percent: number) => {
+	const expectSavedVolume = async (percent: number) => {
 		await expect(volume).toBeVisible();
 		await expect(volume).toBeEnabled();
 		await expect(volume).toHaveValue(String(percent));
 		await expect(volume).toHaveAccessibleName(`Volume ${percent}%`);
 		await expect(audio).toHaveJSProperty('volume', percent / 100);
+		await expect.poll(() => page.evaluate((key) =>
+			JSON.parse(localStorage.getItem(key) ?? 'null')?.volume, SOUND_PREFERENCE_STORAGE_KEY)).toBe(percent / 100);
 	};
-	const savedVolume = () => page.evaluate((key) =>
-		JSON.parse(localStorage.getItem(key) ?? 'null')?.volume, SOUND_PREFERENCE_STORAGE_KEY);
 	const openNowPlaying = async () => {
 		await expect(mini).toBeVisible();
 		await mini.press('Enter');
@@ -41,21 +41,20 @@ test('keyboard volume follows private playback between Library and Now Playing',
 	await page.getByRole('button', { name: 'Play displayed from the top', exact: true }).click();
 	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) => node.readyState >= node.HAVE_CURRENT_DATA)).toBe(true);
 	await expect(audio).toHaveJSProperty('currentSrc', origin + fixture.mediaPath(track.id));
-	await expectVolume(100);
+	await expect(volume).toBeEnabled();
+	await expect(volume).toHaveValue('100');
 	await volume.press('Home');
 	await volume.press('ArrowRight');
-	await expectVolume(1);
-	await expect.poll(savedVolume).toBe(0.01);
+	await expectSavedVolume(1);
 
 	await openNowPlaying();
-	await expectVolume(1);
+	await expectSavedVolume(1);
 	await volume.press('ArrowRight');
-	await expectVolume(2);
-	await expect.poll(savedVolume).toBe(0.02);
+	await expectSavedVolume(2);
 
 	await main.getByRole('button', { name: 'Back', exact: true }).click();
 	await expect(page).toHaveURL(origin + library.path);
-	await expectVolume(2);
+	await expectSavedVolume(2);
 	await openNowPlaying();
-	await expectVolume(2);
+	await expectSavedVolume(2);
 });
