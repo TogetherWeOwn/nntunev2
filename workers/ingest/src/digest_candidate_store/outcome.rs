@@ -1,4 +1,6 @@
-use tokio_postgres::{Client, IsolationLevel, Transaction};
+use std::time::SystemTime;
+
+use tokio_postgres::{Client, IsolationLevel, Row, Transaction};
 
 use super::{stage_completed_candidate, uuid, CandidateIntent, InventoryAppendError};
 use crate::multipart::{
@@ -17,6 +19,22 @@ pub enum OutcomeError {
     Refused,
     Publication(InventoryAppendError),
     Indeterminate,
+}
+
+/// Exact committed pins with a bounded fence against winner deletion.
+pub struct ProtectedReuse {
+    outcome: CommittedOutcome,
+    usable_until: SystemTime,
+}
+
+impl ProtectedReuse {
+    pub fn outcome(&self) -> &CommittedOutcome {
+        &self.outcome
+    }
+
+    pub fn usable_until(&self) -> SystemTime {
+        self.usable_until
+    }
 }
 
 impl CompletionScope<'_> {
@@ -106,6 +124,21 @@ pub async fn read_completion(
     scope: &CompletionScope<'_>,
     authorize: impl AsyncFnOnce(&Transaction<'_>, &CompletionScope<'_>) -> Result<i64, OutcomeError>,
 ) -> Result<Option<CommittedOutcome>, OutcomeError> {
+    let tx = begin(db).await?;
+    scope.lock(&tx, None).await?;
+    let until = authorize(&tx, scope).await?;
+    // READ COMMITTED takes a fresh snapshot after waiting on the session.
+    let row = tx
+        .query_opt(READ, &[&scope.session, &until])
+        .await
+        .map_err(|_| Indeterminate)?
+        .ok_or(Refused)?;
+    let result = decode_outcome(&row).map_err(|_| Indeterminate)?;
+    tx.commit().await.map_err(|_| Indeterminate)?;
+    Ok(result)
+}
+
+async fn begin(db: &mut Client) -> Result<Transaction<'_>, OutcomeError> {
     let tx = db
         .build_transaction()
         .isolation_level(IsolationLevel::ReadCommitted)
@@ -115,29 +148,61 @@ pub async fn read_completion(
     tx.batch_execute(BOUND_TX)
         .await
         .map_err(|_| Indeterminate)?;
+    Ok(tx)
+}
+
+/// Protect the exact winner of an authorized completed session. Authenticate
+/// the caller before entering, then use `authorize` for a current reuse grant
+/// and its expiry after both locks. Pins confer no provider access or authority
+/// to bind another reference. Consumers must stop at the returned deadline.
+pub async fn protect_completion_reuse(
+    db: &mut Client,
+    scope: &CompletionScope<'_>,
+    authorize: impl AsyncFnOnce(&CompletionScope<'_>) -> Result<i64, OutcomeError>,
+    now: impl Fn() -> SystemTime,
+) -> Result<ProtectedReuse, OutcomeError> {
+    let tx = begin(db).await?;
     scope.lock(&tx, None).await?;
-    let until = authorize(&tx, scope).await?;
-    // READ COMMITTED takes a fresh snapshot after waiting on the session.
     let row = tx
-        .query_opt(READ, &[&scope.session, &until])
+        .query_opt(include_str!("reuse_lock.sql"), &[&scope.session])
         .await
         .map_err(|_| Indeterminate)?
         .ok_or(Refused)?;
-    let map: Option<String> = row.try_get(0).map_err(|_| Indeterminate)?;
-    let result = map
-        .map(|map| {
-            Ok::<_, tokio_postgres::Error>(CommittedOutcome {
-                map,
-                object: row.try_get(1)?,
-                generation: row.try_get(2)?,
-                configuration: row.try_get(3)?,
-                root_version: row.try_get(4)?,
-                media_version: row.try_get(5)?,
-                page_versions: row.try_get(6)?,
-            })
-        })
-        .transpose()
+    let outcome = decode_outcome(&row)
+        .map_err(|_| Indeterminate)?
+        .ok_or(Refused)?;
+    let until = authorize(scope).await?;
+    let usable_until = tx
+        .query_opt(
+            include_str!("reuse_protect.sql"),
+            &[&scope.session, &outcome.object, &until],
+        )
+        .await
+        .map_err(|_| Indeterminate)?
+        .ok_or(Refused)?
+        .try_get(0)
         .map_err(|_| Indeterminate)?;
     tx.commit().await.map_err(|_| Indeterminate)?;
-    Ok(result)
+    if now() >= usable_until {
+        return Err(Refused);
+    }
+    Ok(ProtectedReuse {
+        outcome,
+        usable_until,
+    })
+}
+
+fn decode_outcome(row: &Row) -> Result<Option<CommittedOutcome>, tokio_postgres::Error> {
+    let Some(map) = row.try_get(0)? else {
+        return Ok(None);
+    };
+    Ok(Some(CommittedOutcome {
+        map,
+        object: row.try_get(1)?,
+        generation: row.try_get(2)?,
+        configuration: row.try_get(3)?,
+        root_version: row.try_get(4)?,
+        media_version: row.try_get(5)?,
+        page_versions: row.try_get(6)?,
+    }))
 }
