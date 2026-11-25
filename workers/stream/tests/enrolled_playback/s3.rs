@@ -31,6 +31,57 @@ impl ReadbackBody for ControlledBody<'_> {
 }
 
 #[tokio::test]
+async fn bounded_range_delivers_in_order_across_two_full_chunks() {
+    let mut plaintext = vec![b'A'; 131_072];
+    plaintext[65_534..65_539].copy_from_slice(b"vwxyz");
+    let f = Fixture::from_plaintext(&plaintext);
+    let sealed = [&f.context.header[..], &f.first, &f.last].concat();
+
+    let (outcome, play) =
+        EnrolledPlayback::start(Some("bytes=65534-65538"), f.pins(), f.media_input(), now())
+            .unwrap();
+    let RangeOutcome::Partial(range) = outcome else {
+        panic!("expected 206");
+    };
+    assert_eq!(
+        content_range_value(range, 131_072),
+        "bytes 65534-65538/131072"
+    );
+    assert_eq!(range.len(), 5);
+
+    let mut play = play
+        .unwrap()
+        .open_s3(now, async |get| {
+            assert_eq!(get.range, 0..131_152);
+            assert_eq!(get.sealed_len, 131_152);
+            Ok(S3GetReply {
+                status: 206,
+                version: Some("media-v1".into()),
+                content_range: Some("bytes 0-131151/131152".into()),
+                content_length: Some(131_152),
+                has_content_encoding: false,
+                body: Body(&sealed),
+            })
+        })
+        .await
+        .unwrap();
+
+    let first = play.next(f.page(), now).await.unwrap().unwrap();
+    assert_eq!(first.as_slice(), b"vw");
+    assert_eq!(play.served_bytes(), 0);
+    play.written(first.as_slice().len()).unwrap();
+    assert_eq!(play.served_bytes(), 2);
+
+    let second = play.next(f.page(), now).await.unwrap().unwrap();
+    assert_eq!(second.as_slice(), b"xyz");
+    assert_eq!(play.served_bytes(), 2);
+    play.written(second.as_slice().len()).unwrap();
+    assert_eq!(play.served_bytes(), range.len());
+    assert!(play.next(f.page(), now).await.unwrap().is_none());
+    play.finish().unwrap();
+}
+
+#[tokio::test]
 async fn pinned_media_play_seek_and_refusals_preserve_written_prefix() {
     use PlaybackError::{Binding, Expired, Response, Stopped};
     use S3RangeResponseError::{Length, ObjectIdentity};
