@@ -208,6 +208,15 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         # still records evidence.
         self.assertIn("if: always() && steps.apply.conclusion != 'skipped'", apply)
 
+    def test_private_trial_schema_requires_a_protected_single_dispatch(self):
+        text = (WORKFLOWS / "migrations-staging-apply.yml").read_text()
+        apply = job(text, "apply")
+        self.assertIn('"$MIGRATION_FILE" == private-trial && "$APPLY_MODE" == single', apply)
+        self.assertIn("steps.apply.conclusion != 'skipped' && inputs.file != 'private-trial'", apply)
+        for name in ("deploy.yml", "deploy-production.yml"):
+            self.assertNotIn("staging_trial_schema", (WORKFLOWS / name).read_text())
+            self.assertNotIn("migrations-staging-apply.yml", (WORKFLOWS / name).read_text())
+
     def test_staging_readback_is_observation_only(self):
         text = (WORKFLOWS / "migrations-staging-readback.yml").read_text()
         triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)

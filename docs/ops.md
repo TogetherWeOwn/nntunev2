@@ -420,6 +420,26 @@ comparison, not PR text, is the source of truth for what staging has:
 merging a migration that staging lacks turns `staging-api` red until it
 is applied and recorded.
 
+#### Private trial schema
+
+For an authorized private trial, dispatch `migrations-staging-apply` from
+protected `main` with `file=private-trial`, `mode=single`, the reviewed full
+commit and the usual approval and operator inputs. The review covers the
+overlay recipe and the locator, publication and admission SQL it reads.
+The protected driver requires those files to match the reviewed ref and
+checks the recorded 0063 app baseline before installing the overlay.
+Configure `PRIVATE_TRIAL_SCHEMA_WRITER_ROLE` and
+`PRIVATE_TRIAL_SCHEMA_READER_ROLE` in the protected staging Environment
+with the already provisioned caller and reader roles. The overlay grants
+those roles access only to its three new tables. Existing base-table
+permissions, protected caller routing and serving arms are managed separately.
+
+The overlay applies in one transaction. The job summary records its bundle
+SHA-256. The admission table comment records the bundle and chosen roles so
+an identical retry skips the DDL and any conflicting prior install fails.
+Ordinary staging and production deploys do not invoke the overlay. It leaves
+the app migration ledger and serving arms unchanged.
+
 For a separately authorized observation, `migrations-staging-readback` accepts
 an exact data commit, app migration basename and expected SHA256, dispatched
 from protected `main` under the same staging environment policy. It checks the
