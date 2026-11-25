@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
+import { fixtureCookie, hasFixtureSession, test as privateMusicTest } from './helpers/private-music-fixture.js';
 
 /**
  * Acceptance: dismissing the passkey prompt must be told apart from a
@@ -258,6 +259,67 @@ test('login: retry after dismissal signs in', async ({ page }) => {
 	await page.waitForURL('/library');
 
 	expect(traffic.finishPosts).toBe(1);
+});
+
+privateMusicTest('a signed-out invitee returns to bookmarked Library after passkey sign-in', async ({
+	page, context, origin
+}) => {
+	const { library } = PRIVATE_MUSIC;
+	const email = 'bookmarked-listener@example.test';
+	const listener = 'synthetic-bookmarked-listener';
+	const binding = 'A'.repeat(43);
+	const challenge = 'Y2hhbGxlbmdl';
+	const track = { id: '00000000-0000-4000-8000-000000000001', title: 'Synthetic Bookmark Prelude' };
+	const startPath = '/v1/auth/passkey/login/start';
+	const finishPath = '/v1/auth/passkey/login/finish';
+	const verifierPath = '/v1/me/likes/session';
+
+	await installGetDouble(page, {});
+	await context.route('**/*', async (route) => {
+		const request = route.request();
+		const url = new URL(request.url());
+		if (url.origin !== origin) return route.abort();
+		const path = url.pathname;
+		const method = request.method();
+		if (method === 'POST' && path === startPath) {
+			expect(request.postDataJSON()).toEqual({ email });
+			return route.fulfill({ json: { challenge, allow_credentials: [], rp_id: url.hostname } });
+		}
+		if (method === 'POST' && path === finishPath) {
+			expect(request.postDataJSON()).toMatchObject({ challenge, credential_id: 'fixture-credential' });
+			return route.fulfill({
+				headers: { 'set-cookie': `${fixtureCookie}=${listener}; Path=/; HttpOnly; SameSite=Lax` },
+				json: { ok: true }
+			});
+		}
+		if (method === 'GET' && (path === library.api || path === verifierPath)) {
+			if (!hasFixtureSession(await request.headerValue('cookie'), listener)) return route.fulfill({ status: 401 });
+			return path === library.api
+				? route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: [track] })
+				: route.fulfill({ json: { session_binding: binding } });
+		}
+		if (method !== 'GET' || path.startsWith('/api/') || path.startsWith('/v1/')) return route.fulfill({ status: 404 });
+		return route.continue();
+	});
+
+	const bookmark = origin + library.path;
+	const rows = page.getByTestId(library.item);
+	await page.goto(bookmark);
+	const signIn = page.getByRole('link', { name: 'Sign in', exact: true });
+	await expect(signIn).toBeVisible();
+	await expect(page).toHaveURL(bookmark);
+	await expect(rows).toHaveCount(0);
+	await signIn.click();
+	await expect(page).toHaveURL(`${origin}/login`);
+	await page.getByRole('textbox', { name: 'Email', exact: true }).fill(email);
+	const finished = page.waitForResponse(`${origin}${finishPath}`);
+	await page.getByRole('button', { name: 'Sign in with passkey', exact: true }).click();
+	expect((await finished).ok()).toBe(true);
+
+	await expect(page).toHaveURL(bookmark);
+	await expect(rows).toHaveCount(1);
+	await expect(rows).toHaveAttribute(library.id, track.id);
+	await expect(rows.getByRole('button', { name: track.title, exact: true })).toBeVisible();
 });
 
 function privateSignupFixture() {
