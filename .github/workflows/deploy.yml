@@ -83,6 +83,7 @@ jobs:
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
       browser_playback: ${{ steps.trial.outputs.browser_playback || '0' }}
+      private_trial_upload: ${{ steps.trial.outputs.private_trial_upload || '0' }}
     steps:
       - id: check
         env:
@@ -100,14 +101,20 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '') }}
+        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '' || vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED != '') }}
         with:
           persist-credentials: false
       - name: Validate private staging trial settings
         id: trial
-        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '') }}
+        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '' || vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED != '') }}
         env:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
+          HYPERDRIVE_ID_MB: ${{ vars.HYPERDRIVE_ID_MB }}
+          PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED: ${{ vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED }}
+          PRIVATE_TRIAL_UPLOAD_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_UPLOAD_DB_STAGING_ID }}
+          PRIVATE_TRIAL_AUTH_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_AUTH_DB_STAGING_ID }}
+          PRIVATE_TRIAL_PUBLISH_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_PUBLISH_DB_STAGING_ID }}
+          PRIVATE_TRIAL_ENROLL_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_ENROLL_DB_STAGING_ID }}
           API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
           API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
           STREAM_SERVICE_STAGING: ${{ vars.STREAM_SERVICE_STAGING }}
@@ -241,10 +248,16 @@ jobs:
       - name: Build api with canonical tools
         if: steps.config.outputs.configured == 'true'
         working-directory: workers/api
+        env:
+          PRIVATE_TRIAL_BUILD: ${{ needs.gate.outputs.private_trial_upload }}
         run: |
           set -euo pipefail
           cargo metadata --locked --format-version 1 > /dev/null
-          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-api.log"
+          if [[ "$PRIVATE_TRIAL_BUILD" == 1 ]]; then
+            worker-build --release -- --locked --features encrypted-upload-caller 2>&1 | tee "$RUNNER_TEMP/worker-api.log"
+          else
+            worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-api.log"
+          fi
           python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-api.log"
           git diff --exit-code -- Cargo.lock
       - name: Hyperdrive cache-disabled gate
@@ -273,6 +286,13 @@ jobs:
           PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION }}
           PRIVATE_PLAYBACK_STAGING_S3_BUCKET: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_BUCKET }}
           PRIVATE_PLAYBACK_STAGING_ROOT_VERSION: ${{ vars.PRIVATE_PLAYBACK_STAGING_ROOT_VERSION }}
+          PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT }}
+          PRIVATE_PLAYBACK_STAGING_S3_REGION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_REGION }}
+          PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED: ${{ needs.gate.outputs.private_trial_upload == '1' && 'true' || 'false' }}
+          PRIVATE_TRIAL_UPLOAD_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_UPLOAD_DB_STAGING_ID }}
+          PRIVATE_TRIAL_AUTH_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_AUTH_DB_STAGING_ID }}
+          PRIVATE_TRIAL_PUBLISH_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_PUBLISH_DB_STAGING_ID }}
+          PRIVATE_TRIAL_ENROLL_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_ENROLL_DB_STAGING_ID }}
           API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
           API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
         run: |
@@ -332,10 +352,7 @@ jobs:
               assert stream_service == "nntune-stream-staging", \
                   "STREAM_SERVICE_STAGING must equal the staging stream Worker name"
           PY
-          private_playback=""
-          if [ "${PRIVATE_PLAYBACK_STAGING_ENABLED:-}" = true ]; then
-            private_playback=$(python3 -I ../../.github/scripts/staging_stream_config.py --api-vars)
-          fi
+          private_playback=$(python3 -I ../../.github/scripts/staging_stream_config.py --api-vars)
           # Generated, never committed: bindings + public vars only, no
           # secrets. HYPERDRIVE_CACHING_DISABLED=1 is set here only because
           # the gate step above passed for this env's Hyperdrive config
@@ -423,6 +440,7 @@ jobs:
           binding = "HYPERDRIVE"
           id = "${HYPERDRIVE_ID_STAGING}"
           EOF
+          python3 -I ../../.github/scripts/staging_stream_config.py --trial-db-bindings >> wrangler.toml
           if [ -n "${HYPERDRIVE_ID_MB:-}" ]; then
             # Shared MusicBrainz read mirror for the catalogue slice-1 probes.
             cat >> wrangler.toml <<EOF
@@ -453,6 +471,27 @@ jobs:
           else
             echo "stream: absent (Subsonic stream answers error 70)" >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Require uncached private trial connections
+        if: steps.config.outputs.configured == 'true' && needs.gate.outputs.private_trial_upload == '1'
+        working-directory: workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          ids=$(python3 -I - <<'PY'
+          from pathlib import Path
+          import tomllib
+          bindings = tomllib.loads(Path("wrangler.toml").read_text())["env"]["staging"]["hyperdrive"]
+          ids = [item["id"] for item in bindings if item["binding"].startswith("PRIVATE_TRIAL_")]
+          if len(ids) != 4:
+              raise SystemExit("Missing dedicated private trial connections")
+          print("\n".join(ids))
+          PY
+          )
+          while IFS= read -r id; do
+            ./check_hyperdrive_cache.sh --config-id "$id"
+          done <<< "$ids"
       - name: Ensure staging schema-check client
         if: steps.config.outputs.configured == 'true'
         run: |

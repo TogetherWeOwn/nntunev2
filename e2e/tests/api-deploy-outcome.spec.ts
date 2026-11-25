@@ -233,6 +233,8 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
       const apiDir = join(probe, 'workers/api');
       mkdirSync(apiDir, { recursive: true });
       mkdirSync(join(probe, '.github/scripts'), { recursive: true });
+      const renderer = '.github/scripts/staging_stream_config.py';
+      writeFileSync(join(probe, renderer), readFileSync(new URL(`../../${renderer}`, import.meta.url)));
       writeFileSync(join(probe, '.github/scripts/binding_manifest.toml'), `
 [[worker]]
 name = "api"

@@ -33,6 +33,63 @@ def steps(section):
 
 
 class WorkerBuildWorkflowTests(unittest.TestCase):
+    def test_private_upload_uses_the_gate_and_checks_all_connections_before_deploy(self):
+        text = (ROOT / ".github/workflows/deploy.yml").read_text()
+        gate = job(text, "gate")
+        self.assertIn("private_trial_upload: ${{ steps.trial.outputs.private_trial_upload || '0' }}", gate)
+        items = steps(job(text, "staging-api"))
+        build, generate, cache, deploy = (
+            next(i for i, step in enumerate(items) if name in step)
+            for name in ("Build api with canonical tools", "Generate staging wrangler.toml",
+                         "Require uncached private trial connections", "id: deploy\n")
+        )
+        self.assertIn('if [[ "$PRIVATE_TRIAL_BUILD" == 1 ]]; then', items[build])
+        self.assertIn(BUILD + " --features encrypted-upload-caller 2>&1 | tee", items[build])
+        self.assertIn("else\n            " + BUILD + " 2>&1 | tee", items[build])
+        self.assertIn("          private_playback=$(python3 -I ../../.github/scripts/staging_stream_config.py --api-vars)", items[generate])
+        self.assertIn("--trial-db-bindings >> wrangler.toml", items[generate])
+        self.assertLess(generate, cache)
+        self.assertLess(cache, deploy)
+        self.assertIn("needs.gate.outputs.private_trial_upload == '1'", items[cache])
+        self.assertIn("if len(ids) != 4:", items[cache])
+        self.assertIn('while IFS= read -r id; do\n            ./check_hyperdrive_cache.sh --config-id "$id"', items[cache])
+
+    def test_private_upload_is_default_off_and_uses_distinct_staging_bindings(self):
+        self.assertEqual(STREAM_CONFIG.api_vars({}), [])
+        self.assertEqual(STREAM_CONFIG.trial_db_bindings({}), [])
+        armed = {"PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED": "true"}
+        with self.assertRaisesRegex(ValueError, "staged playback"):
+            STREAM_CONFIG.api_vars(armed)
+        env = armed | {
+            "PRIVATE_PLAYBACK_STAGING_ENABLED": "true",
+            "PRIVATE_MUSIC_STAGING_JOURNEY": "true",
+            "STREAM_STAGING_DEPLOY_ENABLED": "true",
+            "STREAM_SERVICE_STAGING": "nntune-stream-staging",
+            "PRIVATE_PLAYBACK_STAGING_ENVIRONMENT": "11111111-1111-4111-8111-111111111111",
+            "PRIVATE_PLAYBACK_STAGING_LIBRARY": "22222222-2222-4222-8222-222222222222",
+            "PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION": "33333333-3333-4333-8333-333333333333",
+            "PRIVATE_PLAYBACK_STAGING_ROOT_VERSION": "44444444-4444-4444-8444-444444444444",
+            "PRIVATE_PLAYBACK_STAGING_S3_BUCKET": STREAM_CONFIG.FIXTURE_BUCKET,
+            "PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT": "https://objects.example.test",
+            "PRIVATE_PLAYBACK_STAGING_S3_REGION": "test-region",
+            "HYPERDRIVE_ID_MB": "d" * 32,
+        }
+        bindings = {
+            f"PRIVATE_TRIAL_{role}_DB_STAGING_ID": str(index) * 32
+            for index, role in enumerate(STREAM_CONFIG.TRIAL_DATABASES, 1)
+        }
+        variables = tomllib.loads("\n".join(STREAM_CONFIG.api_vars(env)))
+        self.assertEqual(variables["PRIVATE_TRIAL_UPLOAD_ENABLED"], "true")
+        self.assertEqual(variables["PRIVATE_TRIAL_S3_ENDPOINT"], "https://objects.example.test")
+        config = tomllib.loads("\n".join(STREAM_CONFIG.trial_db_bindings(env | bindings)))
+        self.assertEqual(set(config["env"]), {"staging"})
+        self.assertEqual(len(config["env"]["staging"]["hyperdrive"]), 4)
+        manifest = tomllib.loads((ROOT / ".github/scripts/binding_manifest.toml").read_text())
+        ordinary = next(w for w in manifest["worker"] if w["name"] == "api")["binding"][0]
+        for invalid in ("", "1" * 32, ordinary["prod"], ordinary["staging"]):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "distinct scoped binding"):
+                STREAM_CONFIG.trial_db_bindings(env | bindings | {"PRIVATE_TRIAL_AUTH_DB_STAGING_ID": invalid})
+
     def test_stream_config_is_internal_and_uses_the_dedicated_fixture_bucket(self):
         source = tomllib.loads((ROOT / "workers/stream/wrangler.toml").read_text())
         off = tomllib.loads(STREAM_CONFIG.render(source, {}))
@@ -114,10 +171,13 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
             manifest = source / UPLOAD.MANIFEST
             manifest.parent.mkdir(parents=True)
             manifest.write_text("worker = []\n")
+            renderer = source / UPLOAD.PRIVATE_CONFIG
+            renderer.write_bytes((ROOT / UPLOAD.PRIVATE_CONFIG).read_bytes())
             with patch.object(UPLOAD, "ROOT", source):
                 tree, wdir = UPLOAD.fixture(base, "api", "fixture")
             self.assertEqual(wdir, tree / "workers/api")
             self.assertEqual((tree / UPLOAD.MANIFEST).read_bytes(), manifest.read_bytes())
+            self.assertEqual((tree / UPLOAD.PRIVATE_CONFIG).read_bytes(), renderer.read_bytes())
             for name, content in files.items():
                 self.assertEqual((wdir / "build" / name).read_bytes(), content)
 
@@ -139,7 +199,11 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
                 self.assertLess(build, upload)
                 for step in (items[install], items[build]):
                     self.assertNotIn("secrets.", step)
-                    self.assertNotIn("env:", step)
+                    if worker == "api" and step == items[build]:
+                        self.assertEqual(step.split("        env:\n")[1].split("        run:")[0],
+                                         "          PRIVATE_TRIAL_BUILD: ${{ needs.gate.outputs.private_trial_upload }}\n")
+                    else:
+                        self.assertNotIn("env:", step)
                     self.assertIn("if: steps.config.outputs.configured == 'true'", step)
                     if worker == "ingest":
                         self.assertIn("steps.config.outputs.enabled == 'true'", step)
