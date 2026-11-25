@@ -5,6 +5,11 @@ import appConfig from '../vite.config';
 const target = normalizePath(fileURLToPath(new URL('../src/routes/demo/player/+page.svelte', import.meta.url)));
 const anchor = '\t\trefreshRecent();\n\t\ttry {\n\t\t\tqueue = restoreQueue';
 const injection = `
+		const listenFixture = new AbortController();
+		if (new URLSearchParams(location.search).get('fixture') === 'listen-events') {
+			void import('../../../../tests/fixtures/listen-event-browser.js').then(({ mountListenEventFixture }) =>
+				mountListenEventFixture(listenFixture.signal));
+		}
 		const fixtureStore = recentStore;
 		if (!fixtureStore) throw new Error('history fixture store not initialized');
 		let fixtureActive = true;
@@ -26,6 +31,7 @@ const injection = `
 		window.__nntuneHistoryFixture = fixture;
 `;
 const teardown = `			fixtureActive = false;
+			listenFixture.abort();
 			if (window.__nntuneHistoryFixture === fixture) delete window.__nntuneHistoryFixture;
 `;
 
