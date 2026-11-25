@@ -222,6 +222,16 @@ class TrialConnectionReadbackTests(unittest.TestCase):
         for invalid in ({"version_id": "latest"}, {"build_sha": "main"}, {"database_oid": 0}):
             with self.subTest(invalid=invalid):
                 self.assertEqual(preflight.read_binding_identities(**{**scope, **invalid}, query=query), pending)
+
+        unpinned = {binding: {**evidence, "role": None} for binding, evidence in pending.items()}
+        for case, invalid_pins in (
+            ("missing role pin", {binding: pin for binding, pin in pins.items() if binding != auth}),
+            ("duplicate role oid", {**pins, auth: (pins[auth][0], pins[publish][1])}),
+            ("public role", {**pins, auth: ("public", pins[auth][1])}),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(preflight.read_binding_identities(**{**scope, "role_pins": invalid_pins},
+                                                                 query=query), unpinned)
         self.assertEqual(calls, [])
 
     def test_binding_readback_leaves_unverified_results_pending(self):
