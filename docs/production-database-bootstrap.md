@@ -434,8 +434,13 @@ python3 -IB .github/scripts/database_bootstrap_reader_evidence.py < evidence.jso
   `reader_oid`). Record `result: passed` only for a completed, successful
   privilege check. Use JSON integers for OIDs and lowercase hex for digests.
 
-Use the same inventory representation for each digest. Record observed pins
-from the underlying evidence before comparing them with the approved values.
+The protected baseline emits a fixed verdict. It does not emit an inventory
+digest. For `reader_privileges`, use a retained private readback that records
+the observed role identity, effective privilege result and covered inventory in
+the same read-only catalog snapshot. Hash that inventory using the same
+representation as the reviewed and saved inventories. If this readback is
+unavailable, omit `reader_privileges` so the evidence stays pending.
+
 Keep the baseline evidence pending if the check exits nonzero with `pending`,
 including when the catalog matches but the privilege result belongs to a
 different reader. `consistent` confirms the supplied evidence agrees. The

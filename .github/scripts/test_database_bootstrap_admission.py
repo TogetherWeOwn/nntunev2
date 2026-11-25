@@ -152,6 +152,9 @@ def check_reader_privilege_binding():
         "privileges checked against another inventory": {"inventory_sha256": "b" * 64},
     }.items():
         check(case, record | {"reader_privileges": privileges | override})
+    check("saved inventory differs from review and privileges", record | {
+        "inventory": inventory | {"inventory_sha256": "b" * 64},
+    })
     check("missing privilege evidence", {"review": review, "inventory": inventory})
     check("duplicate privilege object", b'{"reader_privileges": null, ' + json.dumps(record).encode()[1:])
     check("oversized record", json.dumps(record).encode().ljust(4097))
