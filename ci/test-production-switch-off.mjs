@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { finalSmokeFixture, recoveryFixture } from './fixtures/production-worker-transport.mjs';
@@ -125,4 +125,41 @@ test('operator switch-off requires complete readback of the pinned maintenance a
       assert.deepEqual(transport.calls.slice(-4), ['POST', 'GET', 'GET', 'GET']);
     });
   }
+});
+
+test('operator switch-off resumes read-only after incomplete deployment history', async (t) => {
+  let incompleteHistory = true;
+  const transport = finalSmokeFixture(t, {
+    ...fixture,
+    deploymentReadback(receipt) {
+      if (incompleteHistory) receipt.result_info.total_count += 1;
+      return receipt;
+    },
+  });
+  await transport.run('record');
+  transport.shift();
+  const rollout = structuredClone(transport.rows);
+  const { enter, fresh } = recoveryFixture(t, transport, 'success');
+  const incomplete = /deployments on a complete first page/;
+  await assert.rejects(enter(fresh('13')), incomplete);
+  const { calls, rows } = transport;
+  assert.deepEqual(calls.slice(calls.indexOf('POST')), ['POST', 'GET', 'GET', 'GET']);
+  assert.deepEqual(rows[0].versions, [{ version_id: version, percentage: 100 }]);
+  assert.deepEqual(rows.slice(1), rollout);
+  const restoredHistory = structuredClone(rows);
+
+  const pending = fresh('14');
+  let before = calls.length;
+  await assert.rejects(enter(pending), incomplete);
+  assert.match(readFileSync(pending.GITHUB_OUTPUT, 'utf8'), /^allow-submit=false$/m);
+  assert.deepEqual(calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
+  assert.deepEqual(rows, restoredHistory);
+
+  incompleteHistory = false;
+  const resume = fresh('15');
+  before = calls.length;
+  assert.equal(await enter(resume), 'Recorded maintenance allocation already verified');
+  assert.match(readFileSync(resume.GITHUB_OUTPUT, 'utf8'), /^allow-submit=false$/m);
+  assert.deepEqual(calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
+  assert.deepEqual(rows, restoredHistory);
 });
