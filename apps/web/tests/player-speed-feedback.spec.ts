@@ -22,8 +22,8 @@ test('keeps failure feedback through its matching native ratechange', async ({ p
 	const player = page.getByRole('region', { name: 'Player', exact: true });
 	await player.getByRole('button', { name: 'Play', exact: true }).click();
 	const audio = player.getByTestId(PRIVATE_MUSIC.player.audio);
-	await expect(audio).toHaveAttribute('src', fixture.mediaPath(track.id));
 	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.currentTime)).toBeGreaterThan(0);
+	await expect(audio).toHaveAttribute('src', fixture.mediaPath(track.id));
 	await player.getByRole('button', { name: 'Pause', exact: true }).click();
 	await expect(audio).toHaveJSProperty('paused', true);
 	const speed = page.getByRole('combobox', { name: 'Playback speed', exact: true });
