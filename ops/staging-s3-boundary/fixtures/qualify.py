@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE))
@@ -25,7 +26,10 @@ DOCKER = ["docker", "--host", "unix:///var/run/docker.sock"]
 
 
 def run(command, env, *, data=None, check=True, timeout=90):
-    result = subprocess.run(command, input=data, capture_output=True, env=env, timeout=timeout)
+    try:
+        result = subprocess.run(command, input=data, capture_output=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{Path(command[0]).name} command exceeded its deadline") from None
     if check and result.returncode:
         raise RuntimeError(f"{' '.join(command[:2])} command failed with exit {result.returncode}")
     return result
@@ -33,6 +37,18 @@ def run(command, env, *, data=None, check=True, timeout=90):
 
 def credential(prefix):
     return prefix + secrets.token_hex(8), secrets.token_hex(20)
+
+
+def verify_timeout_redaction(env):
+    marker = "synthetic-private-argument"
+    try:
+        run([sys.executable, "-c", "import time; time.sleep(1)", marker], env, timeout=0.05)
+    except RuntimeError:
+        trace = traceback.format_exc()
+        require("command exceeded its deadline" in trace and marker not in trace,
+                "subprocess timeout exposes arguments")
+        return
+    raise RuntimeError("timeout redaction control did not time out")
 
 
 def wait_for(operation, label):
@@ -175,6 +191,7 @@ def qualify(recording, bundle):
         stack = Stack(Path(directory), recording)
         try:
             if recording:
+                verify_timeout_redaction(stack.env)
                 recording_contract(stack, stack.start())
             else:
                 from storage import Storage

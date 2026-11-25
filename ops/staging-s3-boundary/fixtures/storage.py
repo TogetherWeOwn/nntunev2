@@ -58,31 +58,22 @@ class Storage:
     def __init__(self, stack):
         self.stack = stack
 
-    def curl(self, method, target, fields, body):
-        args = ["exec", "-T", "backend", "curl", "-q", "--http1.1", "--silent", "--show-error",
-                "--max-time", "8", "--include", "--path-as-is", "--request", method]
-        for name, value in fields:
-            args.extend(("--header", f"{name}: {value}"))
-        if body or method == "POST":
-            args.extend(("--data-binary", "@-"))
-        return response(self.stack.run(*args, "http://" + ENDPOINT + target, data=body).encode())
+    def request(self, method, target, fields, body):
+        wire = self.stack.backend_wire(request_bytes(method, target, fields, body))
+        return response(wire, decode_body=method not in ("HEAD", "DELETE"))
 
     def iam_reply(self, action, **fields):
         body = urlencode({"Action": action, "Version": "2010-05-08", **fields}).encode()
         headers = signed("POST", "/", ENDPOINT, self.stack.admin, body,
                          (("content-type", "application/x-www-form-urlencoded"),), service="iam")
-        return self.curl("POST", "/", headers, body)
+        return self.request("POST", "/", headers, body)
 
     def iam(self, action, **fields):
         return ET.fromstring(expect_status(self.iam_reply(action, **fields), 200, action))
 
     def s3(self, method, target, body=b"", *, identity=None, extra=()):
         fields = signed(method, target, ENDPOINT, identity or self.stack.admin, body, extra)
-        if method in ("HEAD", "DELETE"):
-            # Check the actual backend reply to connection close. HTTP clients
-            # can discard bytes following the headers of HEAD and 204 replies.
-            return response(self.stack.backend_wire(request_bytes(method, target, fields, body)))
-        return self.curl(method, target, fields, body)
+        return self.request(method, target, fields, body)
 
     def upload(self, body):
         reply = self.s3("PUT", PATH, body)

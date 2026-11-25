@@ -3,6 +3,8 @@
 from datetime import datetime, timezone
 from hashlib import sha256
 import hmac
+from http.client import HTTPResponse
+from io import BytesIO
 import socket
 from urllib.parse import parse_qsl, quote
 
@@ -34,7 +36,7 @@ def signed(method, target, host, credential, body=b"", extra=(), service="s3"):
     return list(headers.items())
 
 
-def response(wire):
+def response(wire, *, decode_body=False):
     fields, separator, body = wire.partition(b"\r\n\r\n")
     if not separator or not fields.startswith(b"HTTP/1."):
         raise RuntimeError("invalid HTTP response framing")
@@ -43,6 +45,16 @@ def response(wire):
     for line in lines:
         name, value = line.split(":", 1)
         headers.setdefault(name.lower(), []).append(value.strip())
+    if decode_body and headers.get("transfer-encoding") == ["chunked"]:
+        # Use the HTTP decoder for chunked XML. HEAD and DELETE keep the
+        # actual wire bytes so the caller can detect stray payloads.
+        class CapturedSocket:
+            def makefile(self, _mode):
+                return BytesIO(wire)
+
+        with HTTPResponse(CapturedSocket()) as reply:
+            reply.begin()
+            body = reply.read()
     return int(status.split()[1]), headers, body
 
 
@@ -62,6 +74,8 @@ def read_to_close(stream):
 def request_bytes(method, target, headers, body=b"", protocol="HTTP/1.1"):
     lines = [f"{method} {target} {protocol}", "Connection: close"]
     lines.extend(f"{name}: {value}" for name, value in headers)
+    if body and not any(name.lower() in ("content-length", "transfer-encoding") for name, _ in headers):
+        lines.append(f"Content-Length: {len(body)}")
     return "\r\n".join([*lines, "", ""]).encode("ascii") + body
 
 
