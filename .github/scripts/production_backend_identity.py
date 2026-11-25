@@ -32,9 +32,11 @@ def readback(
 ) -> dict[str, str]:
     """Compare reviewed pins for one cutover SHA and return only outcome fields.
 
-    The caller supplies the reviewed account and a silent, bounded, uncached
-    provider GET reader such as staging_api_identity.provider_result with its
-    token supplied by the caller. The reader returns the decoded result object.
+    The caller supplies the reviewed account and a silent, uncached provider GET
+    reader that returns the decoded result object. The caller must enforce one
+    elapsed-time deadline across the entire readback, including in-flight reads,
+    and treat expiry as unavailable. The staging provider_result socket timeout
+    only limits inactivity.
     Both serving allocations bracket the immutable version reads. This is
     point-in-time allocation evidence. Route health and access are separate.
     """
