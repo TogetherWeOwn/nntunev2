@@ -11,8 +11,8 @@ from apply_migration import ADVISORY_LOCK_KEY, ApplyError
 from staging_apply import StagingApplyError, evidence_child_env, load_entries, quote_literal
 from staging_trial_isolated import CONFIG_ENV, ROUTES, SHARED_OID, authority, overlay, routines, target_config
 from staging_trial_role_acl import (
-    GUARD, LOCK_TABLES, WINNERS, WRITER, audit, change, grants, identities, isolated_extensions,
-    other_database_connections, require,
+    GUARD, ISOLATED_EXTENSION_CATALOG, LOCK_TABLES, WINNERS, WRITER, audit, change, grants, identities,
+    isolated_extensions, other_database_connections, require,
 )
 from staging_trial_role_preflight import BASELINE, DATABASE, LOGIN_RE, SCOPE_ENV, oid, parse_scope
 from staging_trial_schema import read_source
@@ -41,13 +41,18 @@ def connection(key, fixture, isolated):
     return env
 
 
-def psql(env, sql, stage):
+def psql_output(env, sql, stage):
     proc = subprocess.run(
         ["psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"], input=sql,
         capture_output=True, text=True, env=env, timeout=60,
     )
     if proc.returncode:
         raise StagingApplyError(stage)
+    return proc.stdout
+
+
+def psql(env, sql, stage):
+    psql_output(env, sql, stage)
     print(f"{stage} passed")
 
 
@@ -65,6 +70,25 @@ def baseline():
     digest, = (e["sha256"] for e in load_entries(ROOT) if e["file"] == BASELINE and e["target"] == "app")
     return require(f"""SELECT count(*) = 1 AND bool_and(sha256 = '{digest}')
                        FROM public.schema_migrations WHERE file = '{BASELINE}'""")
+
+
+def check_catalog(isolated, fixture):
+    owner = connection("OWNER", fixture, isolated)
+    executor = connection("EXECUTOR", fixture, isolated)
+    begin = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n"
+    psql(owner, begin + target(isolated, owner["PGUSER"], fixture)
+         + require("SELECT datdba = to_regrole(current_user)::oid FROM pg_database "
+                   "WHERE datname = current_database()") + "COMMIT;\n", "isolated owner identity")
+    stage = "isolated executor identity or migration baseline"
+    verdict = psql_output(executor, begin + target(isolated, executor["PGUSER"], fixture)
+                          + require(f"to_regrole(current_user)::oid = {isolated['executor_oid']}") + baseline()
+                          + f"SELECT ({ISOLATED_EXTENSION_CATALOG}) IS TRUE;\nCOMMIT;\n", stage)
+    if verdict == "f\n":
+        raise StagingApplyError("isolated catalog extensions differ from policy; see "
+                                "docs/ops/private-staging-trial.md#isolated-database-catalog-preflight")
+    if verdict != "t\n":
+        raise StagingApplyError("isolated catalog eligibility could not be read")
+    print("isolated catalog preflight passed (identity, migration baseline and extension set)")
 
 
 def lock_contract(scope, action):
@@ -213,7 +237,7 @@ AND EXISTS (SELECT FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
 
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument("action", choices=("check", "grant", "verify", "verify-overlay", "fence", "retire"))
+    cli.add_argument("action", choices=("check-catalog", "check", "grant", "verify", "verify-overlay", "fence", "retire"))
     pins = cli.add_mutually_exclusive_group()
     pins.add_argument("--target", choices=[TARGET])
     pins.add_argument("--isolated", action="store_true")
@@ -221,6 +245,14 @@ def main():
     args = cli.parse_args()
     fixture = args.fixture_only_oid is not None
     try:
+        if args.action == "check-catalog":
+            if not args.isolated:
+                raise ValueError
+            isolated = target_config(os.environ[CONFIG_ENV], None, fixture)
+            if fixture and isolated["database_oid"] != args.fixture_only_oid:
+                raise ValueError
+            check_catalog(isolated, fixture)
+            return 0
         scope = parse_scope(os.environ[SCOPE_ENV])
         if (not (args.target or args.isolated or fixture) or args.target and fixture
                 or args.action == "check" and not args.isolated or args.action == "verify" and args.isolated

@@ -21,7 +21,8 @@ def target_config(raw, scope, fixture):
     keys = {"database_oid", "executor_oid", "direct", "direct_port", "routed", "routed_port",
             *(key.lower() for key in ROUTES)}
     if (not isinstance(config, dict) or config.keys() != keys
-            or not oid(config["database_oid"]) or config["database_oid"] != scope["database_oid"]
+            or not oid(config["database_oid"])
+            or (scope is not None and config["database_oid"] != scope["database_oid"])
             or config["database_oid"] == SHARED_OID or not oid(config["executor_oid"])):
         raise ValueError
     for route in ("direct", "routed"):
@@ -37,7 +38,8 @@ def target_config(raw, scope, fixture):
         if not isinstance(login, str) or not LOGIN_RE.fullmatch(login):
             raise ValueError
     if (not fixture and config["owner"].partition(".")[0] != "postgres"
-            or any(config[key].partition(".")[0] != scope[key][0] for key in ("reader", "writer"))):
+            or (scope is not None and any(config[key].partition(".")[0] != scope[key][0]
+                                          for key in ("reader", "writer")))):
         raise ValueError
     return config
 
