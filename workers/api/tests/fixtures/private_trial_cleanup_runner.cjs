@@ -35,6 +35,10 @@ const selected = {
 };
 const media = (target) => `media/${keyId(target.object)}/${keyId(target.generation)}`;
 const page = (target) => `media-digests/${keyId(target.object)}/${keyId(target.generation)}/${keyId(target.map)}/00000000`;
+const expectedRequests = (target) => [
+  ['DELETE', media(target), target.media_version], ['HEAD', media(target), target.media_version],
+  ['DELETE', page(target), target.page_version], ['HEAD', page(target), target.page_version],
+].map(([method, key, version]) => ({ method, key, version, valid: true }));
 const mediaKey = media(scope);
 const pageKey = page(scope);
 const siblingKey = `media/${keyId(id('12'))}/${keyId(id('13'))}`;
@@ -89,19 +93,21 @@ test('isolates approved cleanup and recovers the same fixture', { timeout: 120_0
       const prefix = `/${provider.bucket}/`;
       const key = url.pathname.slice(prefix.length);
       const version = url.searchParams.get('versionId');
-      // Record attempts even when the mock rejects them and the Worker ignores the failure.
-      requests.push([req.method, key, version]);
+      // A rejected attempt stays visible and cannot stand in for a valid request.
+      const attempt = { method: req.method, key, version, valid: false };
+      requests.push(attempt);
       assert.equal(url.origin, provider.endpoint);
       assert.ok(url.pathname.startsWith(prefix));
       assert.ok(version);
       assert.deepEqual([...url.searchParams], [['versionId', version]]);
       assert.match(req.headers.get('authorization'), /Credential=FIXTUREACCESS\//);
       assert.ok(versions.has(key));
+      assert.ok(req.method === 'DELETE' || req.method === 'HEAD');
+      attempt.valid = true;
       if (req.method === 'DELETE') {
         versions.get(key).delete(version);
         return new Response(null, { status: 204 });
       }
-      assert.equal(req.method, 'HEAD');
       if (interruptHead(key)) return new Response(null, { status: 503 });
       return new Response(null, { status: versions.get(key).has(version) ? 200 : 404 });
     };
@@ -167,10 +173,7 @@ test('isolates approved cleanup and recovers the same fixture', { timeout: 120_0
       const requests = [];
       assert.equal(await run(selected, { CLEANUP_APPROVAL: approved(selected) },
         storageOrigin(requests)), 'confirmed');
-      assert.deepEqual(requests, [
-        ['DELETE', selectedMedia, selected.media_version], ['HEAD', selectedMedia, selected.media_version],
-        ['DELETE', selectedPage, selected.page_version], ['HEAD', selectedPage, selected.page_version],
-      ]);
+      assert.deepEqual(requests, expectedRequests(selected));
       const after = readPublication(selected);
       assert.equal(typeof after.winner.deleting_at, 'string');
       assert.deepEqual(after, {
@@ -185,8 +188,7 @@ test('isolates approved cleanup and recovers the same fixture', { timeout: 120_0
       ]));
     });
 
-    const attempt = [['DELETE', mediaKey, scope.media_version], ['HEAD', mediaKey, scope.media_version],
-      ['DELETE', pageKey, scope.page_version], ['HEAD', pageKey, scope.page_version]];
+    const attempt = expectedRequests(scope);
     const partial = attempt.slice(0, 2);
     assert.equal(await run(), 'unconfirmed');
     assert.deepEqual(calls, partial);
