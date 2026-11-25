@@ -198,7 +198,7 @@ jobs:
           cargo build --locked -p nntune-stream --target wasm32-unknown-unknown --features s3-transport-fixture
           "$RUNNER_TEMP/$bindgen/wasm-bindgen" --target nodejs --out-dir "$RUNNER_TEMP/s3-fixture" target/wasm32-unknown-unknown/debug/nntune_stream.wasm
           export NODE_EXTRA_CA_CERTS="$RUNNER_TEMP/s3-fixture/loopback.crt" S3_FIXTURE_KEY="$RUNNER_TEMP/s3-fixture/loopback.key"
-          openssl req -x509 -newkey rsa:2048 -noenc -days 1 -subj /CN=localhost -addext subjectAltName=IP:127.0.0.1,IP:::1 -keyout "$S3_FIXTURE_KEY" -out "$NODE_EXTRA_CA_CERTS"
+          openssl req -x509 -newkey rsa:2048 -noenc -days 1 -subj /CN=localhost -addext subjectAltName=IP:127.0.0.1 -keyout "$S3_FIXTURE_KEY" -out "$NODE_EXTRA_CA_CERTS"
           S3_FIXTURE_WASM="$RUNNER_TEMP/s3-fixture/nntune_stream.js" node --test workers/stream/tests/fixtures/s3_transport_https.cjs
       # The YouTube measurement Worker entry (YtExtract Durable Object) only
       # compiles on wasm32: check and lint it on the target it deploys to.
@@ -2277,7 +2277,7 @@ jobs:
           cargo build --locked -p nntune-stream --target wasm32-unknown-unknown --features s3-transport-fixture --target-dir "$RUNNER_TEMP/stream-wasm-target"
           "$RUNNER_TEMP/$bindgen/wasm-bindgen" --target nodejs --out-dir "$RUNNER_TEMP/s3-fixture" "$RUNNER_TEMP/stream-wasm-target/wasm32-unknown-unknown/debug/nntune_stream.wasm"
           export NODE_EXTRA_CA_CERTS="$RUNNER_TEMP/s3-fixture/loopback.crt" S3_FIXTURE_KEY="$RUNNER_TEMP/s3-fixture/loopback.key"
-          openssl req -x509 -newkey rsa:2048 -noenc -days 1 -subj /CN=localhost -addext subjectAltName=IP:127.0.0.1 -keyout "$S3_FIXTURE_KEY" -out "$NODE_EXTRA_CA_CERTS"
+          openssl req -x509 -newkey rsa:2048 -noenc -days 1 -subj /CN=localhost -addext subjectAltName=IP:127.0.0.1,IP:::1 -keyout "$S3_FIXTURE_KEY" -out "$NODE_EXTRA_CA_CERTS"
           INGEST_WASM_JS="$RUNNER_TEMP/ingest-wasm-js/nntune_ingest.js" CATALOGUE_PLAYBACK_WASM_JS="$RUNNER_TEMP/catalogue-playback-js/nntune_api.js" S3_FIXTURE_WASM="$RUNNER_TEMP/s3-fixture/nntune_stream.js" node --test workers/ingest/tests/fixtures/s3_upload_playback_https.cjs
       - name: Exercise the standalone provider preflight with a synthetic version
         run: |
