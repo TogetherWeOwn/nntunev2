@@ -38,15 +38,16 @@ test('reopening Now Playing keeps the private track playing on its original gran
 	const playback = await audio.evaluateHandle((node: HTMLAudioElement) => {
 		// Catch brief interruptions even if playback has recovered by the next assertion.
 		const interruptions: string[] = [];
-		for (const event of ['pause', 'seeking', 'emptied', 'loadstart']) {
+		for (const event of ['pause', 'seeking', 'emptied', 'loadstart', 'waiting']) {
 			node.addEventListener(event, () => interruptions.push(event));
 		}
 		return { node, interruptions };
 	});
 	const position = () => playback.evaluate(({ node }) => node.currentTime);
-	let previous = await position();
 	const expectContinuedPlayback = async () => {
-		await expect.poll(position).toBeGreaterThan(previous + 0.1);
+		// The caller has reached the destination. Only count progress from this point.
+		const arrivedAt = await position();
+		await expect.poll(position).toBeGreaterThan(arrivedAt + 0.1);
 		expect(await audio.evaluate((node: HTMLAudioElement, playback) => ({
 			sameNode: node === playback.node,
 			source: node.currentSrc,
@@ -54,7 +55,6 @@ test('reopening Now Playing keeps the private track playing on its original gran
 			interruptions: playback.interruptions
 		}), playback)).toEqual({ sameNode: true, source, playing: true, interruptions: [] });
 		expect(grants).toEqual([{ method: 'POST', trackId: track.id }]);
-		previous = await position();
 	};
 	const openNowPlaying = async () => {
 		await expect(mini).toContainText(track.title);
