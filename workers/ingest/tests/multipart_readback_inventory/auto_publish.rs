@@ -1,8 +1,11 @@
 use super::Client;
+use nntune_core::s3_locator::S3Binding;
 use nntune_ingest::{
     admin_auto_publish::{
         completed_upload::{stage_completed_release, VerifiedUpload},
-        stage, AuthorizedRelease, CommittedFlac, ExpectedFile, StageOutcome,
+        stage,
+        telemetry::matcher_counter,
+        AuthorizedRelease, CommittedFlac, ExpectedFile, StageOutcome,
     },
     admin_review::{
         completed::{retry_completed, ResolvedCompletion, ReviewTarget},
@@ -21,6 +24,7 @@ use serde_json::json;
 use tokio_postgres::Transaction;
 
 const ALBUM: &str = "Synthetic Signals";
+const RAW_ERROR: &str = "§~synthetic-mirror-error~!";
 const RELEASE: &str = "ab320000-0000-4000-8000-000000000000";
 const TRACKS: [&str; 2] = [
     "ab320000-0000-4000-8000-000000000001",
@@ -82,6 +86,37 @@ pub(super) async fn exercise(
         artist_name: None,
         artist_mbid: None,
         score: 0.9,
+    };
+    let assert_counter = |result: &Result<StageOutcome, PublicationError>, labels| {
+        let counter = serde_json::to_value(matcher_counter(result)).unwrap();
+        assert_eq!(
+            counter,
+            json!({
+                "name": "nntune_ingest_admin_match_attempts_total",
+                "labels": labels,
+                "increment": 1,
+            })
+        );
+        // Inspect the complete output, including metric and label names.
+        let wire = counter.to_string();
+        for marker in [job.job_id, job.owner_id, ALBUM, RELEASE, RAW_ERROR]
+            .into_iter()
+            .chain(TRACKS)
+            .chain(both.iter().flat_map(|flac| {
+                let locator = flac.receipt.locator;
+                let S3Binding::VersionId(version) = locator.binding() else {
+                    panic!("publication fixture requires a versioned locator");
+                };
+                [locator.bucket(), locator.key(), version.as_str()]
+                    .into_iter()
+                    .chain(flac.receipt.page_versions.iter().copied())
+            }))
+        {
+            assert!(!wire.contains(marker));
+        }
+        if let Ok(StageOutcome::Staged(ids)) = result {
+            assert!(ids.iter().all(|id| !wire.contains(id)));
+        }
     };
     let apply =
         async |tx: &mut Transaction<'_>, media: ReleaseFixtureEvidence<'_>, rival, second_disc| {
@@ -148,6 +183,22 @@ pub(super) async fn exercise(
         };
 
     let mut tx = writer.transaction().await.unwrap();
+    let malformed = format!(r#"{{"error":"{RAW_ERROR}","recordings":[}}"#);
+    for recordings in [(503, RAW_ERROR), (200, malformed.as_str())] {
+        let candidates = CompleteReleaseCandidates {
+            lookup: &lookup,
+            hits: vec![hit(RELEASE)],
+        };
+        let result = stage(&mut tx, &job, &both, ALBUM, Some(candidates), recordings).await;
+        assert_eq!(
+            result,
+            Ok(StageOutcome::NeedsReview(NeedsReview::RecordingEvidence))
+        );
+        assert_counter(
+            &result,
+            json!({"outcome": "needs_review", "reason": "recording_evidence"}),
+        );
+    }
     for (rival, second_disc, reason, code) in [
         (
             true,
@@ -157,10 +208,9 @@ pub(super) async fn exercise(
         ),
         (false, 1, NeedsReview::PositionMismatch, "position_mismatch"),
     ] {
-        assert_eq!(
-            apply(&mut tx, Receipt(&both), rival, second_disc).await,
-            Ok(StageOutcome::NeedsReview(reason))
-        );
+        let result = apply(&mut tx, Receipt(&both), rival, second_disc).await;
+        assert_eq!(result, Ok(StageOutcome::NeedsReview(reason)));
+        assert_counter(&result, json!({"outcome": "needs_review", "reason": code}));
         assert_eq!(serde_json::to_value(reason).unwrap(), code);
         assert!(tx.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
     }
@@ -178,10 +228,9 @@ pub(super) async fn exercise(
         },
     ];
     for media in [&both[..1], &swapped, &incomplete] {
-        assert_eq!(
-            apply(&mut tx, Receipt(media), false, 2).await,
-            Err(PublicationError::Refused)
-        );
+        let result = apply(&mut tx, Receipt(media), false, 2).await;
+        assert_eq!(result, Err(PublicationError::Refused));
+        assert_counter(&result, json!({"outcome": "refused"}));
     }
     assert!(tx.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
     tx.commit().await.unwrap();
@@ -273,10 +322,9 @@ pub(super) async fn exercise(
         );
         assert!(tx.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
     }
-    assert_eq!(
-        apply(&mut tx, Indeterminate(&uploads), false, 2).await,
-        Err(PublicationError::Indeterminate)
-    );
+    let result = apply(&mut tx, Indeterminate(&uploads), false, 2).await;
+    assert_eq!(result, Err(PublicationError::Indeterminate));
+    assert_counter(&result, json!({"outcome": "indeterminate"}));
     assert!(tx.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
 
     // Simulate a lost acknowledgement on either side of COMMIT. One retry
@@ -287,17 +335,17 @@ pub(super) async fn exercise(
     ));
     tx.rollback().await.unwrap();
     let mut tx = writer.transaction().await.unwrap();
-    let StageOutcome::Staged(ids) = apply(&mut tx, Scoped(&uploads), false, 2).await.unwrap()
-    else {
+    let result = apply(&mut tx, Scoped(&uploads), false, 2).await;
+    assert_counter(&result, json!({"outcome": "staged"}));
+    let StageOutcome::Staged(ids) = result.unwrap() else {
         panic!("exact multi-disc match must stage both tracks");
     };
     assert!(db.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
     tx.commit().await.unwrap();
     let mut tx = writer.transaction().await.unwrap();
-    assert_eq!(
-        apply(&mut tx, Scoped(&uploads), false, 2).await,
-        Ok(StageOutcome::Staged(ids.clone()))
-    );
+    let replay = apply(&mut tx, Scoped(&uploads), false, 2).await;
+    assert_eq!(replay, Ok(StageOutcome::Staged(ids.clone())));
+    assert_counter(&replay, json!({"outcome": "staged"}));
     tx.commit().await.unwrap();
     let rows = db.query(ROWS, &[&RELEASE]).await.unwrap();
     assert_eq!(rows.len(), 2);
