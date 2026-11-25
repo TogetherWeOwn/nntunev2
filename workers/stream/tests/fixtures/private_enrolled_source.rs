@@ -366,6 +366,7 @@ pub(super) struct Writer<'a> {
     pub(super) output: &'a RefCell<Vec<u8>>,
     pub(super) fault: Fault,
     pub(super) aborted: &'a Cell<bool>,
+    pub(super) closed: Option<&'a Cell<bool>>,
     pub(super) revoke_on_write: Option<&'a Cell<bool>>,
 }
 impl OriginalWriter for Writer<'_> {
@@ -387,6 +388,9 @@ impl OriginalWriter for Writer<'_> {
         Poll::Ready(Ok(1))
     }
     fn poll_close(&mut self, _: &mut Context<'_>) -> Poll<Result<(), SourceError>> {
+        if let Some(closed) = self.closed {
+            closed.set(true);
+        }
         Poll::Ready(Ok(()))
     }
     fn abort(&mut self) {
