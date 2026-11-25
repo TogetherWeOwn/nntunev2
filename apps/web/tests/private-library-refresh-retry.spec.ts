@@ -41,11 +41,12 @@ test('Retry refreshes the invited Library Find results and keeps the current tra
 	const rows = main.getByTestId(library.item);
 	const trackButton = (id: string) => rows.and(page.locator(`[${library.id}="${id}"]`))
 		.locator(library.select);
-	const expectTracks = async (tracks: typeof initial) => {
+	const expectTracks = async (tracks: typeof initial, queuedIds: string[] = []) => {
 		await expect(rows).toHaveCount(tracks.length);
 		for (const { id, title } of tracks) {
-			await expect(trackButton(id)).toBeVisible();
-			await expect(trackButton(id)).toContainText(title);
+			const button = trackButton(id);
+			await expect(button).toBeVisible();
+			await expect(button).toHaveAccessibleName(queuedIds.includes(id) ? `${title} — Queued` : title);
 		}
 	};
 	const find = main.getByRole('searchbox', { name: 'Find in loaded tracks', exact: true });
@@ -70,12 +71,12 @@ test('Retry refreshes the invited Library Find results and keeps the current tra
 	await expect(stale).toBeVisible();
 	await expect(find).toBeVisible();
 	await expect(find).toHaveValue('harbor');
-	await expectTracks([first, selected]);
+	await expectTracks([first, selected], [first.id, selected.id]);
 	await expect(current).toHaveAttribute(player.queueId, selected.id);
 	expect(listingReads).toBe(2);
 
 	await retry.click();
-	await expectTracks([added, selected]);
+	await expectTracks([added, selected], [selected.id]);
 	await expect(find).toBeVisible();
 	await expect(find).toHaveValue('harbor');
 	await expect(refresh).toBeVisible();
