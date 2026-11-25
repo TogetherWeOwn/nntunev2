@@ -272,6 +272,15 @@ function privateSignupFixture() {
 	const sessionCheck = '/v1/me/likes/session';
 	const challenge = 'Y2hhbGxlbmdl';
 	const emailCode = 'fixture-code';
+	const finishBody = {
+		challenge,
+		// Expected wire encoding of the synthetic credential from installCreateDouble.
+		credential_id: 'fixture-credential',
+		attestation_object: 'Aw',
+		client_data_json: 'Ag',
+		magic_token: emailCode,
+		invite_code: code
+	};
 	const refused = { status: 401, json: { error: 'check your email and try again' } };
 	const hasSession = (cookie: string | null) => cookie?.split('; ').includes(session);
 	let redeemed = false;
@@ -295,7 +304,8 @@ function privateSignupFixture() {
 		await page.route(registerFinish, (route) => {
 			finishPosts += 1;
 			if (redeemed) return route.fulfill(refused);
-			expect(route.request().postDataJSON()).toMatchObject({ invite_code: code, magic_token: emailCode, challenge });
+			expect(route.request().method()).toBe('POST');
+			expect(route.request().postDataJSON()).toEqual(finishBody);
 			redeemed = true;
 			return route.fulfill({
 				headers: { 'set-cookie': `${session}; Path=/; HttpOnly; SameSite=Lax` },
@@ -332,7 +342,7 @@ function privateSignupFixture() {
 	}
 
 	return {
-		install, openInvite, redeem, track, code, email, emailCode, challenge, cookieName,
+		install, openInvite, redeem, track, code, email, emailCode, finishBody, cookieName,
 		registerStart, registerFinish, sessionCheck,
 		revoke: () => { revoked = true; },
 		get finishPosts() { return finishPosts; }
@@ -479,9 +489,7 @@ test.describe('same-browser private invite retry', () => {
 				page.waitForRequest((request) => request.url() === finishUrl && request.method() === 'POST'),
 				finish.click()
 			]);
-			expect(interrupted.postDataJSON()).toMatchObject({
-				challenge: fixture.challenge, invite_code: fixture.code, magic_token: fixture.emailCode
-			});
+			expect(interrupted.postDataJSON()).toEqual(fixture.finishBody);
 			await expect(page.getByRole('button', { name: 'Creating…', exact: true })).toBeDisabled();
 		} finally {
 			release.resolve();
