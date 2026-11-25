@@ -1,7 +1,5 @@
 //! Worker-only adapter for the synthetic trial target.
 
-use std::time::{Duration, UNIX_EPOCH};
-
 use nntune_core::media_envelope::EnvelopeContext;
 use nntune_ingest::{
     digest_candidate_store::CandidateIntent,
@@ -12,6 +10,7 @@ use nntune_ingest::{
     multipart::{s3_completion::S3CompletionSender, session_outcome::CompletionScope},
 };
 use serde::Deserialize;
+use std::time::{Duration, UNIX_EPOCH};
 use tokio_postgres::{types::Type, Client};
 use worker::Env;
 use zeroize::Zeroizing;
@@ -75,20 +74,12 @@ pub(crate) fn selected(env: &Env) -> Option<Selection> {
     {
         return None;
     }
-    let selection = secret(env, "PRIVATE_TRIAL_UPLOAD_TARGET").ok()?;
-    if selection.len() > 2_048 {
-        return None;
-    }
-    let selected: Selection = serde_json::from_str(&selection).ok()?;
-    if selected.invite_id <= 0
-        || selected.title.len() > 128
-        || selected.credential_id.is_empty()
-        || selected.credential_id.len() > 64
-        || !crate::meter_sink::is_uuid_shaped(&selected.release_mbid)
-    {
-        return None;
-    }
-    Some(selected)
+    let raw = secret(env, "PRIVATE_TRIAL_UPLOAD_TARGET")
+        .ok()
+        .filter(|value| value.len() <= 2_048)?;
+    serde_json::from_str::<Selection>(&raw)
+        .ok()
+        .filter(|target| (1..=64).contains(&target.credential_id.len()))
 }
 
 impl Selection {
@@ -105,10 +96,9 @@ impl Selection {
         permit: Permit<'_>,
         body: &[u8],
     ) -> Result<CommittedPublication, TrialError> {
+        let cutoff = permit.policy.expires_at.min(permit.actor.expires_at);
         let until = UNIX_EPOCH
-            .checked_add(Duration::from_secs(
-                permit.policy.expires_at.min(permit.actor.expires_at),
-            ))
+            .checked_add(Duration::from_secs(cutoff))
             .ok_or(Refused)?;
         let retain = i64::try_from(permit.policy.expires_at).map_err(|_| Refused)?;
         let scope = |name| uuid(&var(env, name)?);
@@ -145,7 +135,6 @@ impl Selection {
             secret(env, "PRIVATE_TRIAL_S3_SECRET_ACCESS_KEY")?.to_string(),
         )
         .map_err(|_| Unconfirmed)?;
-
         let bindings = [
             "PRIVATE_TRIAL_UPLOAD_DB",
             "PRIVATE_TRIAL_AUTH_DB",
@@ -163,9 +152,7 @@ impl Selection {
         let reader = connect_stage_role(env, bindings[1], &roles[1]).await?;
         let mut publisher = connect_stage_role(env, bindings[2], &roles[2]).await?;
         permit.preflight(&mut publisher).await?;
-
-        let attempt = uuid(self.session_id.as_str()).ok_or(Refused)?;
-        let session = uuid_text(attempt);
+        let session = uuid_text(uuid(&self.session_id).ok_or(Refused)?);
         let object = uuid(&self.object_id).ok_or(Refused)?;
         let generation = uuid(&self.generation_id).ok_or(Refused)?;
         let map = uuid(&self.map_id).ok_or(Refused)?;
@@ -206,10 +193,10 @@ impl Selection {
             now_millis() / 1000,
         )
         .await?;
-        let stored =
-            registered_header(&reader, &upload_scope, identities, map, &self.job_id).await?;
-        let (fixture, mirror) = if stored.is_some() {
-            (None, None)
+        let (header, sealed) = if let Some(header) =
+            registered_header(&reader, &upload_scope, identities, map, &self.job_id).await?
+        {
+            (header, None)
         } else {
             let mirror = self.mirror(env)?;
             let mut registrar = connect_stage_role(env, bindings[3], &roles[3]).await?;
@@ -222,7 +209,7 @@ impl Selection {
             let fixture = enrollment
                 .register(&mut registrar, body, identities, map, root_version, &root)
                 .await?;
-            (Some(fixture), Some(mirror))
+            (fixture.context.header, Some((fixture, mirror)))
         };
         let current = load_authority(&reader, &self.credential_id, &upload_scope)
             .await
@@ -234,9 +221,6 @@ impl Selection {
             bearer: &bearer,
             peppers: &peppers,
         };
-        let header = stored
-            .or_else(|| fixture.as_ref().map(|sealed| sealed.context.header))
-            .ok_or(Unconfirmed)?;
         let context = EnvelopeContext {
             identities: [
                 root_version,
@@ -254,9 +238,9 @@ impl Selection {
             plaintext_len: context.plaintext_len,
             map_id: map,
             header,
-            reservation_generation: fixture
+            reservation_generation: sealed
                 .as_ref()
-                .map_or(1, |sealed| sealed.intent.reservation_generation),
+                .map_or(1, |(f, _)| f.intent.reservation_generation),
         };
         let prepared = PreparedUpload {
             scope: upload_scope,
@@ -267,7 +251,7 @@ impl Selection {
         };
         let reload =
             async |id: &str, scope: &CompletionScope<'_>| load_authority(&reader, id, scope).await;
-        let (Some(fixture), Some(mirror)) = (fixture, mirror) else {
+        let Some((fixture, mirror)) = sealed else {
             return permit
                 .replay(&mut publisher, &mut writer, BUCKET, auth, prepared, reload)
                 .await;

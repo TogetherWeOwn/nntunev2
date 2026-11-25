@@ -8521,6 +8521,15 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     // `GET /healthz` reports the same normalized identity the log lines carry.
     let config = config.with_build_sha(Some(build_sha.as_str()));
+    #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
+    let trial = if req.method() == Method::Post && req.path() == handlers::private_trial::PATH {
+        let Some(selection) = handlers::private_trial::worker::selected(&env) else {
+            return render(&handlers::not_found(), &[], &trace_id);
+        };
+        Some(selection)
+    } else {
+        None
+    };
     // Classify the body source from the actual runtime request, then
     // collect through the tested seam: a legitimate bodyless request
     // (`inner().body()` is `None`; `stream()` would error for it too) is
@@ -8550,20 +8559,11 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     // Per-route collection bound: the in-handler gate re-checks the
     // same bound as defense in depth, so the two cannot drift apart.
-    let request_path = req.path();
-    let body_cap = handlers::max_body_bytes(req.method().as_ref(), &request_path);
+    let body_cap = handlers::max_body_bytes(req.method().as_ref(), &req.path());
     #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
-    let trial = if req.method() == Method::Post && request_path == handlers::private_trial::PATH {
-        handlers::private_trial::worker::selected(&env)
-    } else {
-        None
-    };
-    #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
-    let body_cap = if trial.is_some() {
-        handlers::private_trial::FIXTURE_BYTES
-    } else {
-        body_cap
-    };
+    let body_cap = trial
+        .as_ref()
+        .map_or(body_cap, |_| handlers::private_trial::FIXTURE_BYTES);
     let collected = collect_body_with_cap(declared_len, source, body_cap).await;
     let headers_map: HashMap<String, String> = req
         .headers()
