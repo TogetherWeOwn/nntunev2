@@ -344,6 +344,15 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   assert.equal(full.response.headers.get('content-type'), 'audio/flac');
   assert.equal(full.response.headers.get('content-range'), null);
   assert.equal(full.bytes.length, plaintextLength);
+  assert.equal(full.bytes.toString('ascii', 0, 4), 'fLaC');
+  assert.equal(full.bytes[4] & 0x7f, 0, 'the first metadata block is STREAMINFO');
+  assert.equal(full.bytes.readUIntBE(5, 3), 34, 'STREAMINFO payload length');
+  // STREAMINFO packs the sample format and count into one big-endian word.
+  const streamInfo = full.bytes.readBigUInt64BE(18);
+  assert.equal(Number(streamInfo >> 44n), 44_100, 'sample rate in Hz');
+  assert.equal(Number((streamInfo >> 41n) & 7n) + 1, 1, 'channels');
+  assert.equal(Number((streamInfo >> 36n) & 31n) + 1, 8, 'bits per sample');
+  assert.equal(Number(streamInfo & ((1n << 36n) - 1n)), 19, 'total samples');
   assert.equal(sha256(full.bytes), plaintextHash);
   assert.deepEqual(operations.splice(0), ['GET range', 'GET page']);
   assert.deepEqual(custody.splice(0), ['resolve', 'lease', 'lease', 'lease']);
