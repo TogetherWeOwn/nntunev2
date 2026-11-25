@@ -24,14 +24,17 @@ class TestPreservedSourceGraphWorkflow(unittest.TestCase):
             text,
         )
         job = split_jobs(text)["synthetic-graph"]
+        self.assertIn("\n    if: >-\n", job)
         condition = job.split("\n    if: >-\n", 1)[1].split("\n    runs-on:", 1)[0]
         condition = " ".join(line.strip() for line in condition.splitlines())
         predicate = (
-            "(contains(fromJSON('[\"opened\",\"synchronize\",\"reopened\"]'), github.event.action) || "
-            "contains(fromJSON('[1072,1075]'), github.event.pull_request.number) || "
-            "(github.event.action == 'edited' && github.event.changes.base.ref.from != '') || "
+            "(contains(fromJSON('[\"opened\",\"synchronize\",\"reopened\",\"ready_for_review\"]'), github.event.action) || "
+            "(github.event.action == 'edited' && "
+            "!(github.event.sender.login == 'cubic-dev-ai[bot]' && github.event.changes.body != null && "
+            "github.event.changes.title == null && github.event.changes.base == null)) || "
             "(contains(fromJSON('[\"labeled\",\"unlabeled\"]'), github.event.action) && "
-            "!contains(fromJSON('[\"size/S\",\"size/M\",\"size/L\",\"size/XL\"]'), github.event.label.name)))"
+            "!(github.event.sender.type == 'Bot' && "
+            "contains(fromJSON('[\"size/S\",\"size/M\",\"size/L\",\"size/XL\"]'), github.event.label.name))))"
         )
         self.assertEqual("${{ " + predicate + " }}", condition)
         concurrency = text.split("\nconcurrency:\n", 1)[1].split("\njobs:", 1)[0]
