@@ -1171,8 +1171,11 @@ the Stream job summary alongside the browser run. To restore the default, clear
 `PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED` in the protected staging Environment and
 keep `STREAM_STAGING_DEPLOY_ENABLED=true` for the next protected deploy.
 Remove `PRIVATE_PLAYBACK_STAGING_ENABLED` and follow the [private journey
-cleanup](../e2e/README.md#private-music-journey-preparation). After the
-Stream receipt confirms `private_playback_enabled=false`, unset
+cleanup](../e2e/README.md#private-music-journey-preparation). Cancel queued or
+in-progress armed deploys and use a fresh protected push to `main` so the
+staging gate reads the cleared settings. A partial rerun can reuse the armed
+gate output. Verify that the fresh run deployed the staging API and that its
+Stream receipt confirms `private_playback_enabled=false`, then unset
 `STREAM_STAGING_DEPLOY_ENABLED`.
 
 If Wrangler uploads Stream but the version readback fails, treat the
