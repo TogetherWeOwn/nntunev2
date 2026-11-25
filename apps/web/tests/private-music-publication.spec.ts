@@ -222,6 +222,7 @@ test('invited playback keeps the arranged queue and seek position across Library
 	await expect(audio).toHaveCount(0);
 	await player.getByRole('button', { name: 'Play', exact: true }).click();
 	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) => !node.paused && node.currentTime > 0.2)).toBe(true);
+	const authorizedMediaPath = mediaPath!;
 	await player.getByRole('button', { name: 'Pause', exact: true }).click();
 	await waitForPaused(audio, true, 5_000, 'Player did not pause');
 	await expect(seek).toBeEnabled();
@@ -240,9 +241,10 @@ test('invited playback keeps the arranged queue and seek position across Library
 	expect(start).toBeCloseTo(1.4, 2);
 	const assertPlayback = async (position: number, clock: string) => {
 		await expect(audio).toHaveCount(1);
-		await expect(audio).toHaveAttribute('src', mediaPath!);
+		await expect(audio).toHaveAttribute('src', authorizedMediaPath);
 		await expect(player.getByTestId('library-now-playing')).toHaveText(selected.title);
 		await expect(seek).toHaveAttribute('aria-valuetext', `${clock} of 0:14`);
+		await expect.poll(() => native.evaluate((node: HTMLAudioElement) => node.seeking)).toBe(false);
 		expect(await native.evaluate((node: HTMLAudioElement) => ({
 			sameNode: node === document.querySelector('[data-testid="audio-player"]'),
 			paused: node.paused,
@@ -269,5 +271,33 @@ test('invited playback keeps the arranged queue and seek position across Library
 	await player.getByRole('button', { name: 'Back 10 seconds', exact: true }).click();
 	await expect(feedback).toHaveText('Back 10 seconds, now at 0:01.');
 	await assertPlayback(start, '0:01');
-	expect(grants).toEqual([selected.id]);
+
+	// Sample from before Play so a rewind fails even if the clock later passes the target.
+	const resume = await native.evaluateHandle((node: HTMLAudioElement) => {
+		const observed = { playTime: null as number | null, minimumTime: node.currentTime };
+		const sample = () => { observed.minimumTime = Math.min(observed.minimumTime, node.currentTime); };
+		node.addEventListener('play', () => {
+			observed.playTime = node.currentTime;
+			sample();
+		}, { once: true });
+		for (const event of ['playing', 'seeking', 'timeupdate']) node.addEventListener(event, sample);
+		return observed;
+	});
+	await player.getByRole('button', { name: 'Play', exact: true }).click();
+	await expect.poll(() => native.evaluate((node: HTMLAudioElement, target) =>
+		!node.paused && node.currentTime > target + 0.2, start), {
+		message: 'Native playback should advance beyond the paused seek target'
+	}).toBe(true);
+	const { playTime, minimumTime } = await resume.jsonValue();
+	expect(playTime, 'Native Play should start at the seek target').toBeCloseTo(start, 0);
+	expect(minimumTime, 'Native playback should stay at or beyond the seek target').toBeGreaterThanOrEqual(start - 0.05);
+	await assertQueue();
+	await expect(player.getByTestId('library-now-playing')).toHaveText(selected.title);
+	await expect(audio).toHaveCount(1);
+	expect(await audio.evaluate((node: HTMLAudioElement, original) => ({
+		sameNode: node === original,
+		source: node.currentSrc,
+		error: node.error?.code ?? null
+	}), native)).toEqual({ sameNode: true, source: origin + authorizedMediaPath, error: null });
+	expect(grants, 'Resume should reuse the original playback grant').toEqual([selected.id]);
 });
