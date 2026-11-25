@@ -822,6 +822,8 @@ jobs:
         run: bash workers/api/tests/test_migration_runner.sh
       - name: Exercise first-launch catalog preflight on disposable PostgreSQL
         run: python3 .github/scripts/test_database_bootstrap_preflight_postgres.py
+      - name: Exercise read-only invoice history preflight on disposable PostgreSQL
+        run: python3 .github/scripts/test_billing_history_preflight_postgres.py
       - name: Run migration tests and verify the scoped reservation fixture
         run: |
           set -euo pipefail
