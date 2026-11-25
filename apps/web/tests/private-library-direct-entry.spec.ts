@@ -1,6 +1,6 @@
 import { expect } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
-import { fixtureCookie, hasFixtureSession, test } from './helpers/private-music-fixture.js';
+import { fixtureCookie, hasFixtureSession, observeMediaSources, test } from './helpers/private-music-fixture.js';
 
 test('a signed-in invitee can open Library directly and queue a track without playback', async ({
 	page, context, origin
@@ -39,6 +39,7 @@ test('a signed-in invitee can open Library directly and queue a track without pl
 	const response = await page.goto(libraryUrl);
 	expect(response?.status()).toBe(200);
 	const documentTimeOrigin = await page.evaluate(() => performance.timeOrigin);
+	const mediaSources = await observeMediaSources(page);
 	const rows = page.getByTestId(library.item);
 	await expect(rows).toHaveCount(1);
 	await expect(rows).toHaveAttribute(library.id, track.id);
@@ -61,5 +62,6 @@ test('a signed-in invitee can open Library directly and queue a track without pl
 	await expect(page).toHaveURL(libraryUrl);
 	expect([...visitedPaths]).toEqual([library.path]);
 	expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentTimeOrigin);
+	expect(await mediaSources.evaluate((sources) => [...sources].filter(Boolean))).toEqual([]);
 	expect(playbackRequests).toEqual([]);
 });
