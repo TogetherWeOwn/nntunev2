@@ -137,11 +137,13 @@ test('removing the upcoming private track preserves the playing receipt and skip
 
 	const currentAudio = await audio.elementHandle();
 	const beforeRemoval = await currentAudio.evaluate((node: HTMLAudioElement) => {
-		const reloads: string[] = [];
-		for (const type of ['emptied', 'loadstart']) node.addEventListener(type, () => reloads.push(type));
+		const interruptions: string[] = [];
+		for (const type of ['emptied', 'loadstart', 'seeking']) {
+			node.addEventListener(type, () => interruptions.push(type));
+		}
 		node.addEventListener('ended', (event) => {
 			node.dataset.fixtureCompletion = JSON.stringify({
-				trusted: event.isTrusted, source: node.currentSrc, reloads, at: event.timeStamp
+				trusted: event.isTrusted, source: node.currentSrc, interruptions, at: event.timeStamp
 			});
 		}, { once: true });
 		return node.currentTime;
@@ -164,7 +166,7 @@ test('removing the upcoming private track preserves the playing receipt and skip
 	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) => !node.paused && node.currentTime > 0.2)).toBe(true);
 	const completion = await currentAudio.evaluate((node: HTMLAudioElement) =>
 		JSON.parse(node.dataset.fixtureCompletion ?? 'null'));
-	expect(completion).toMatchObject({ trusted: true, source: origin + firstSource, reloads: [] });
+	expect(completion).toMatchObject({ trusted: true, source: origin + firstSource, interruptions: [] });
 	expect(grants.map((request) => request.postDataJSON())).toEqual([
 		{ track_id: first.id, session_id: tab },
 		{ track_id: survivor.id, session_id: tab }
