@@ -127,11 +127,11 @@ test('invited Library playback opens a fresh receipt to repeat the current track
 		expect(end.duration).toBeCloseTo(14, 2);
 		expect(end.position).toBeCloseTo(end.duration, 2);
 
+		const replayPath = pathFor(first.id, tab, 2);
+		await expectPlayingNearStart(replayPath);
 		await expect(active, 'natural completion keeps the first track selected').toHaveAttribute(contract.queueId, first.id);
 		await expect(player.getByTestId('library-now-playing')).toHaveText(first.title);
 		await expect.poll(queueIds).toEqual([first.id, successor.id]);
-		const replayPath = pathFor(first.id, tab, 2);
-		await expectPlayingNearStart(replayPath);
 		expect([...mediaRequests]).toEqual([initialPath, replayPath]);
 		// A repeat is a fresh start for the same tab, with no retry play ID.
 		expect(grants.map((request) => request.postDataJSON())).toEqual([
