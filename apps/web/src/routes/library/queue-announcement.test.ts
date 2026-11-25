@@ -4,7 +4,7 @@ import * as queueFunctions from '#lib/player/queue.js';
 import { createQueueShare } from '#lib/player/queueShare.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
 import { createFavoritesExport } from './favoritesExport.js';
-import { createLibraryRefresher } from '#lib/library/refresh.js';
+import { createLibraryRefresher, LIBRARY_REQUEST_TIMEOUT_MS } from '#lib/library/refresh.js';
 import { loadFavorites, favoritesKey, clearFavoritesAtAuthBoundary, selectFavoriteItems, updateStoredFavorites } from '#lib/library/favorites.js';
 import {
 	clearRecentFindsAtAuthBoundary,
@@ -140,6 +140,7 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 	return new Function(...Object.keys(bindings), `${compiled}
 		return {
 			refresh, selectTrack, moveQueuedTrack: player.moveQueuedTrack, toggleFavorite,
+			selectInteractionRow, applyRecentFind, setView,
 			dispose: refresher.dispose, subscribeQueue: queueController.subscribe,
 			handleAuthTransition: (event) => {
 				if (event.key === LIBRARY_AUTH_TRANSITION_KEY) player.purgeAtAuthBoundary();
@@ -147,7 +148,7 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 			},
 			handleLocalAuthTransition: () => { player.purgeAtAuthBoundary(); handleLocalAuthTransition(); },
 			unstarFromShelf, confirmClearFavorites,
-			read: () => ({ queue, announcement: player.queueAnnouncement.text, items, loadError }),
+			read: () => ({ queue, announcement: player.queueAnnouncement.text, items, loadError, selectedIds, findQuery, view }),
 			readFavorites: () => ({ favorites, announcement: favoritesAnnouncement }),
 			// Fixture setup only: do not call a non-move page edit, which would
 			// clear the announcement before the handler under test ever runs.
@@ -164,6 +165,9 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		dispose: () => void;
 		subscribeQueue: (listener: (queue: queueFunctions.QueueState) => void) => () => void;
 		selectTrack: (id: string) => void;
+		selectInteractionRow: (id: string, extend: boolean) => void;
+		applyRecentFind: (query: string) => void;
+		setView: (view: 'selected') => void;
 		moveQueuedTrack: (from: number, to: number) => void;
 		toggleFavorite: (id: string) => void;
 		unstarFromShelf: (id: string) => void;
@@ -177,6 +181,9 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 			announcement: string;
 			items: { id: string; title?: string }[];
 			loadError: string | null;
+			selectedIds: string[];
+			findQuery: string;
+			view: string;
 		};
 		readFavorites: () => {
 			favorites: string[];
@@ -186,6 +193,59 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 }
 
 afterEach(() => vi.unstubAllGlobals());
+
+test('an older Library response arriving after a successful refresh preserves newer rows and selection', async () => {
+	vi.useFakeTimers();
+	const page = pageScript();
+	try {
+		const [kept, removed, queued] = ITEMS;
+		const freshItems = [queued, { ...kept, title: 'Updated Mike Song' }];
+		const older = Promise.withResolvers<Response>();
+		const newer = Promise.withResolvers<Response>();
+		const fetch = vi.fn<typeof globalThis.fetch>()
+			.mockResolvedValueOnce(Response.json(ITEMS))
+			.mockReturnValueOnce(older.promise)
+			.mockReturnValueOnce(newer.promise);
+		vi.stubGlobal('fetch', fetch);
+		await page.refresh();
+		page.selectTrack(kept.id);
+		page.selectTrack(queued.id);
+		page.selectInteractionRow(kept.id, false);
+		page.selectInteractionRow(removed.id, false);
+		page.applyRecentFind('Song');
+		page.setView('selected');
+		expect(page.read().selectedIds).toEqual([kept.id, removed.id]);
+
+		const expired = page.refresh();
+		expect(fetch).toHaveBeenCalledTimes(2);
+		// A mounted route admits one refresh at a time. Expire it while the
+		// synthetic transport keeps the old response pending despite abort.
+		await vi.advanceTimersByTimeAsync(LIBRARY_REQUEST_TIMEOUT_MS);
+		await expired;
+		expect(fetch.mock.calls[1][1]?.signal?.aborted).toBe(true);
+
+		const refresh = page.refresh();
+		expect(fetch).toHaveBeenCalledTimes(3);
+		newer.resolve(Response.json(freshItems));
+		await refresh;
+		const expected = { items: freshItems, selectedIds: [kept.id], findQuery: 'Song', view: 'selected', loadError: null };
+		expect(page.read()).toMatchObject(expected);
+		const { queue } = page.read();
+		expect(queue.tracks.map(({ id }) => id)).toEqual([kept.id, queued.id]);
+		expect(queueFunctions.currentTrack(queue)?.id).toBe(kept.id);
+
+		const staleResponse = Response.json([removed]);
+		const cancel = vi.spyOn(staleResponse.body!, 'cancel');
+		older.resolve(staleResponse);
+		await older.promise;
+		expect(cancel).toHaveBeenCalledOnce();
+		expect(page.read()).toMatchObject(expected);
+		expect(page.read().queue).toBe(queue);
+	} finally {
+		page.dispose();
+		vi.useRealTimers();
+	}
+});
 
 test.each(['handleLocalAuthTransition', 'dispose'] as const)(
 	'a deferred response cannot publish to the Library route after %s',
