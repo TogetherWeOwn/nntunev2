@@ -56,6 +56,11 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    version absence using separate, scoped cleanup access. Record a separate
    reuse or retirement disposition for the prepublished companion and its trial
    admission. Stop if any binding, identity or cleanup path is missing.
+   Before arming, confirm a reviewed drill entry point can use an authorized
+   synthetic session after companion admission and before cutoff. Confirm the
+   selected staging origin can pace delivery so ciphertext remains outstanding
+   after the first plaintext chunk reaches the unbuffered relay client. Stop
+   if either prerequisite is missing.
    See [#1816](https://github.com/TogetherWeOwn/nntunev2/pull/1816) and the
    [staging binding instructions](../ops.md#private-stream-staging).
 5. **Arm and qualify one synthetic journey (77c).** Follow the
