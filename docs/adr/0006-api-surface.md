@@ -307,6 +307,15 @@ above is still required. [Publication integration](https://github.com/TogetherWe
 [Source binding](../../workers/ingest/src/catalogue_publication/source.sql) ·
 [Browser projection](../../workers/api/src/private_library_page.sql)
 
+The S3 publisher records this proof in `catalogue_s3_sources`. Before using
+it for membership, specify how the S3 binding satisfies the curated-source
+requirement in [ADR 0002](0002-data-model.md), which describes `track_sources`.
+For any admitted local release, the same transaction must also follow ADR
+0002's release serializer and conditional art invalidation rules. Under that
+serializer, compare the selected artwork source before and after membership
+insertion. Invalidate the cached artwork pointer in the membership transaction
+only when that selection changes.
+
 Once a producer is specified, prove the handoff in disposable PostgreSQL with
 synthetic data. Start with a committed publication and two empty Libraries
 owned by the same account. Lock the active account, then the selected active
@@ -315,8 +324,11 @@ the [deletion rules](0002-data-model.md). Create exactly one
 `(library_id, track_id)` row in the selected Library. An authorized retry
 while that row exists preserves `added_at`. Check that an expired action,
 account or Library deletion marker, superseded source, or rolled-back write
-leaves both Libraries empty when they started empty. Playlist edits and
-foreign-member refusals remain covered by the playlist contract.
+leaves both Libraries empty when they started empty. For local releases,
+exercise both artwork cases with synthetic rows. A selection change clears
+the cached pointer in the membership commit, and an unchanged selection
+preserves it. Playlist edits and foreign-member refusals remain covered by
+the playlist contract.
 [Playlist persistence rehearsal](https://github.com/TogetherWeOwn/nntunev2/pull/1526) ·
 [Unmounted playlist store](https://github.com/TogetherWeOwn/nntunev2/pull/1570) ·
-[Exact occurrence rehearsal](https://github.com/TogetherWeOwn/nntunev2/pull/1984)
+[Companion exact occurrence rehearsal](https://github.com/TogetherWeOwn/nntunev2/pull/1984)
