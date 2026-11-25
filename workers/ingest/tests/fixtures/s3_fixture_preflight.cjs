@@ -3,7 +3,9 @@
 const assert = require('node:assert/strict');
 const { execFile, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
-const { readFileSync } = require('node:fs');
+const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+const { join } = require('node:path');
 const { test } = require('node:test');
 const { createServer } = require('node:tls');
 const { promisify } = require('node:util');
@@ -223,6 +225,53 @@ test('the hosted entry refuses provider-setting drift and scope mismatches befor
     assert.equal(child.stdout, 'Private staging fixture provider preflight: refused.\n');
     assert.equal(child.stderr, '');
   }
+});
+
+test('a hosted retry refuses the earlier cleanup scope before loading the probe', (t) => {
+  const earlier = { bucket, endpoint, region, generation, version, sibling_version: sibling };
+  const current = {
+    ...earlier,
+    generation: 'edededededed40ed80ededededededed',
+    version: 'retry-selected',
+    sibling_version: 'retry-sibling',
+  };
+  const currentScope = JSON.stringify(current);
+  const scratch = mkdtempSync(join(tmpdir(), 'fixture-scope-retry-'));
+  t.after(() => rmSync(scratch, { recursive: true }));
+  const bundle = join(scratch, 'probe.cjs');
+  // Observe entry into the storage probe without making any provider requests.
+  writeFileSync(bundle, `
+    console.log('Synthetic probe loaded.');
+    exports.qualify_disposable_version = (_endpoint, _region, scope) => {
+      console.log(scope);
+      return 'qualified';
+    };
+  `);
+  const runRetry = (scope) => spawnSync(process.execPath, [launcher, '--provider-dispatch', bundle], {
+    encoding: 'utf8',
+    timeout: 5_000,
+    env: {
+      PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: endpoint,
+      PRIVATE_PLAYBACK_STAGING_S3_REGION: region,
+      PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH: 'true',
+      PRIVATE_TRIAL_PREFLIGHT_SCOPE: scope,
+      PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: sha256(currentScope),
+      PRIVATE_TRIAL_PREFLIGHT_S3: JSON.stringify(credential),
+    },
+  });
+
+  const stale = runRetry(JSON.stringify(earlier));
+  assert.equal(stale.status, 1);
+  assert.equal(stale.stderr, '');
+  assert.equal(stale.stdout, 'Private staging fixture provider preflight: refused.\n');
+
+  const matching = runRetry(currentScope);
+  assert.equal(matching.status, 0);
+  assert.equal(matching.stderr, '');
+  const [loaded, admittedScope, verdict] = matching.stdout.trimEnd().split('\n');
+  assert.equal(loaded, 'Synthetic probe loaded.');
+  assert.equal(admittedScope, currentScope);
+  assert.match(verdict, /^Private staging fixture provider preflight: qualified\./);
 });
 
 test('a protected scope match without a disposable credential fails closed', () => {
