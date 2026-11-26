@@ -93,7 +93,7 @@ deployment above.
 
 | Maintenance probe job | Switch-off verdict | Next action |
 | --- | --- | --- |
-| `cancelled` before a result was recorded | **Pending.** Maintenance health proof is missing. | Keep the writer freeze and reconcile the recorded recovery evidence. Repeat the authorized maintenance readback for the pinned deployment before closing switch-off. |
+| `cancelled` before a result was recorded | **Pending.** Maintenance health proof is missing. | Keep the writer freeze and reconcile the recorded recovery evidence. Repeat the authorized maintenance readback for serving deployment `33333333-3333-4333-8333-333333333333` before closing switch-off. |
 | `success` with `503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex` | **Complete.** The recorded recovery job, serving allocation and denial evidence agree. | Record the completed switch-off and retire the temporary release-window controls. |
 
 Keep run `102/1` and the observed write when the probe is cancelled. Do not
