@@ -231,10 +231,15 @@ test('keyboard Refresh and Retry keep focus and update one live status', async (
 		await expectCatalogue(page, [first]);
 		await refresh.focus();
 		await expect(refresh).toBeFocused();
+		const statusesBeforeRefresh = await main.getByRole('status').elementHandles();
 		await page.keyboard.press('Enter');
 		await expect(loading).toBeVisible();
 		await expect(refresh).toBeFocused();
 		const liveStatus = await loading.elementHandle();
+		expect(
+			await liveStatus.evaluate((node, previous) => previous.includes(node), statusesBeforeRefresh),
+			'the loading status was already mounted before Refresh'
+		).toBe(true);
 		failed.resolve(503);
 		await expect(retry).toBeFocused();
 		await expect(stale).toHaveText(/^stale — updated /);
