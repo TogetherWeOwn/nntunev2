@@ -141,8 +141,8 @@ test('the FLAC picker stays locked during a file read and accepts the next selec
 	await upload.click();
 	await readStarted.promise;
 	try {
-		await expect(picker).toBeDisabled();
-		await expect(upload).toBeDisabled();
+		await expect(picker).toHaveJSProperty('disabled', true);
+		await expect(upload).toHaveJSProperty('disabled', true);
 		await expect(results).toHaveText(['fixture-1.flac · Uploading']);
 		expect(received).toHaveLength(0);
 	} finally {
