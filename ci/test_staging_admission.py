@@ -1135,6 +1135,19 @@ class VerifyTests(Base):
         w.jobs[0]["head_sha"] = OTHER_SHA
         self.assertWorldRefused(w, "required job did not pass")
 
+    def test_completed_required_journey_requires_success_conclusion(self):
+        world = World()
+        journey = world.jobs[-1]
+        reason = "^required job did not pass in selected attempt$"
+
+        del journey["conclusion"]
+        self.assertWorldRefused(world, reason)
+        journey["conclusion"] = None
+        self.assertWorldRefused(world, reason)
+
+        journey["conclusion"] = "success"
+        self.assertEqual(world.verify(), world.receipt)
+
     def test_step_ordering_and_outcomes(self):
         w = World()
         steps = w.jobs[2]["steps"]
