@@ -554,6 +554,22 @@ The release operator calls a stop while the job is still waiting.
 | On the pinned launch database `41001`, retirement commits with `retired`, the grants are revoked, and the role and its sessions are absent. | Record cleanup complete. The canceled attempt still has no baseline. |
 | Run `102`, attempt `1`, is proposed for the same setup target. | Require fresh approval, run-bound authorization and a new reader role. Verify a new baseline for the same database and branch before using it in the existing release handoff. |
 
+Rehearse the cleanup decision with the
+[offline receipt check](../.github/scripts/database_bootstrap_reader_cleanup.py).
+Run `python3 -B .github/scripts/database_bootstrap_reader_cleanup.py` from the
+repository root. Pass one JSON object on stdin with `reviewed` pins from the exact activation plan
+and a `receipt` from the separate retirement readback. Both objects carry
+`branch_id`, `launch`, `database_oid`, `reader_role` and `reader_oid` for their
+own target. Use integer OIDs. Set the receipt's `status` to `absent` only after
+recording committed retirement, cleared credentials, and absence of grants,
+the role and its sessions. A bare SQL verdict cannot supply those target pins.
+
+For the tabletop exercise, use `fixture_launch` and `fixture_reader` with the
+branch and OIDs above. A receipt from database OID `41002` or from reader OID
+`42002` leaves cleanup pending. Retry the comparison with the exact matching
+receipt to get the `consistent` verdict. The check compares saved records
+locally. The SQL custodian still performs the retirement and readback above.
+
 #### Interpret incomplete readback after setup
 
 Record setup and the read-only baseline separately in the private release
