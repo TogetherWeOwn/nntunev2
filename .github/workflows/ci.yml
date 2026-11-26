@@ -814,7 +814,7 @@ jobs:
         env:
           BOOTSTRAP_VERDICT: ${{ steps.bootstrap.outputs.verdict }}
         run: test "$BOOTSTRAP_VERDICT" = passed
-      - name: Compare offline Reader evidence for inherited SELECT
+      - name: Compare inherited SELECT grant paths and offline Reader receipts
         run: exec python3 -B .github/scripts/test_database_bootstrap_inherited_select.py
 
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,

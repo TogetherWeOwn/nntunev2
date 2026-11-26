@@ -9,7 +9,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-from test_database_bootstrap_isolation import Cluster, FixtureFailure, checked, remember_signal, require
+from test_database_bootstrap_isolation import (
+    Cluster, FixtureFailure, check_interruption, checked, remember_signal, require,
+)
 
 
 def readback(cluster, granting_group):
@@ -50,24 +52,30 @@ def check_inherited_select(cluster):
     require(alternate == control[:-1] + ["membership_alternate"],
             "verify equal effective SELECT with the reviewed grant absent")
 
-    # The offline checker reconciles a retained result. The fixture's catalog
-    # readback establishes whether the reviewed grant supported that result.
     def evidence(snapshot):
-        database_oid, reader_oid, relation, _, _, granting_group = snapshot
+        database_oid, reader_oid, relation, effective_select, _, _ = snapshot
         inventory = {"branch_id": cluster.branch_id, "database_oid": int(database_oid),
                      "inventory_sha256": hashlib.sha256(relation.encode("ascii")).hexdigest()}
         reader = inventory | {"reader_role": "membership_reader", "reader_oid": int(reader_oid)}
-        return inventory, reader | {"result": "passed" if granting_group == "membership_reviewed" else "failed"}
+        return {"inventory": inventory, "reader_privileges": reader | {
+            "result": "passed" if effective_select == "t" else "failed",
+        }}
 
-    _, control_privileges = evidence(control)
-    review = {key: value for key, value in control_privileges.items() if key != "result"}
+    control_evidence = evidence(control)
+    alternate_evidence = evidence(alternate)
+    review = {key: value for key, value in control_evidence["reader_privileges"].items() if key != "result"}
     checker = Path(__file__).with_name("database_bootstrap_reader_evidence.py")
-    for snapshot, expected in (
-        (control, (0, b"database-bootstrap-reader-evidence: consistent\n", b"")),
-        (alternate, (1, b"", b"database-bootstrap-reader-evidence: pending\n")),
+    consistent = (0, b"database-bootstrap-reader-evidence: consistent\n", b"")
+    pending = (1, b"", b"database-bootstrap-reader-evidence: pending\n")
+    # Effective access alone produces the same receipt for both grant paths.
+    # A review that requires the reviewed group has no matching privilege
+    # receipt for the alternate observation, so it submits the inventory alone.
+    for observed, expected in (
+        (control_evidence, consistent),
+        (alternate_evidence, consistent),
+        ({"inventory": alternate_evidence["inventory"]}, pending),
     ):
-        inventory, privileges = evidence(snapshot)
-        record = {"review": review, "inventory": inventory, "reader_privileges": privileges}
+        record = {"review": review, **observed}
         result = subprocess.run([sys.executable, "-IB", checker], input=json.dumps(record).encode(),
                                 capture_output=True, timeout=5)
         require((result.returncode, result.stdout, result.stderr) == expected,
@@ -87,8 +95,10 @@ if __name__ == "__main__":
                 check_inherited_select(cluster)
             finally:
                 cluster.teardown()
+        require(not Path(directory).exists(), "verify generated files were removed")
+        check_interruption()
     except FixtureFailure as error:
         sys.exit(f"database-bootstrap-inherited-select: failed to {error}")
     except Exception:
         sys.exit("database-bootstrap-inherited-select: failed")
-    print("database-bootstrap-inherited-select: reviewed grant and alternate grant distinguished")
+    print("database-bootstrap-inherited-select: catalog grant paths and offline receipt verdicts verified")
