@@ -16,6 +16,7 @@ use nntune_core::{
     s3_locator::S3Binding,
 };
 use sha2::{Digest, Sha256};
+use worker::js_sys::Function;
 use worker::wasm_bindgen::{self, prelude::*};
 
 #[path = "catalogue_upload_wasm.rs"]
@@ -34,13 +35,16 @@ fn id(value: u8) -> [u8; 16] {
 }
 
 #[wasm_bindgen]
-pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
+pub async fn s3_completion_test(
+    mode: String,
+    read_page: Option<Function>,
+) -> Result<String, JsValue> {
     let endpoint = match mode.as_str() {
         "http" => "http://fixture.test:8443",
         "path" => "https://fixture.test:8443/api",
         _ => "https://fixture.test:8443",
     };
-    run(&mode, endpoint).await
+    run(&mode, endpoint, read_page).await
 }
 
 #[wasm_bindgen]
@@ -70,10 +74,10 @@ pub async fn upload_for_playback(endpoint: String, publish: bool) -> Result<Stri
     } else {
         "readback-playback"
     };
-    run(mode, &endpoint).await
+    run(mode, &endpoint, None).await
 }
 
-async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
+async fn run(mode: &str, endpoint: &str, read_page: Option<Function>) -> Result<String, JsValue> {
     let configuration = id(7);
     let bucket = "fixture-bucket";
     let sender = S3CompletionSender::new(
@@ -268,7 +272,7 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         envelope_scheme: 2,
     };
     if multipart_resume {
-        return resume_multipart(&sender, binding, &context, &parts, until).await;
+        return resume_multipart(&sender, binding, &context, &parts, until, read_page).await;
     }
     let [part] = parts.as_slice() else {
         panic!("expected one fixture part");
@@ -387,6 +391,7 @@ async fn resume_multipart<'a>(
     context: &'a EnvelopeContext,
     parts: &[UploadPart<'a>],
     until: std::time::SystemTime,
+    read_page: Option<Function>,
 ) -> Result<String, JsValue> {
     let [first, second] = parts else {
         panic!("expected two fixture parts");
@@ -401,14 +406,25 @@ async fn resume_multipart<'a>(
             .put_part(binding, context, first, &upload, until)
             .await
             .map_err(dispatch_error)?;
+        let second = sender
+            .put_part(binding, context, second, &upload, until)
+            .await;
+        if let Some(read_page) = read_page {
+            let receipts = [confirmed, second.map_err(dispatch_error)?];
+            let saved = receipts
+                .each_ref()
+                .map(|part| checkpoint_part(part, part.etag()));
+            let checkpoint = ResumeCheckpoint {
+                binding,
+                parts: &saved,
+            };
+            let first = inventory_status(&read_page, target, binding, &receipts, &checkpoint)?;
+            let retry = inventory_status(&read_page, target, binding, &receipts, &checkpoint)?;
+            return Ok(serde_json::json!({ "first": first, "retry": retry }).to_string());
+        }
+        assert!(matches!(second, Err(DispatchError::Unconfirmed(None))));
         saved_etag = confirmed.etag().to_owned();
         saved = [checkpoint_part(&confirmed, &saved_etag)];
-        assert!(matches!(
-            sender
-                .put_part(binding, context, second, &upload, until)
-                .await,
-            Err(DispatchError::Unconfirmed(None))
-        ));
         vec![confirmed]
     };
 
@@ -444,6 +460,66 @@ async fn resume_multipart<'a>(
         return Err(JsValue::from_str("missing fixture version"));
     };
     Ok(version.clone())
+}
+
+#[derive(PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct InventoryPart {
+    number: u32,
+    len: usize,
+    etag: String,
+    digest: String,
+}
+
+#[derive(serde::Deserialize)]
+struct InventoryPage {
+    next_marker: Option<u32>,
+    parts: Vec<InventoryPart>,
+}
+
+fn inventory_status(
+    read_page: &Function,
+    target: UploadTarget<'_>,
+    binding: ResumeBinding<'_>,
+    receipts: &[UploadedPart<'_>],
+    checkpoint: &ResumeCheckpoint<'_>,
+) -> Result<serde_json::Value, JsValue> {
+    // The callback models only the fixture's two-page status read for this upload.
+    let page = |marker: JsValue| -> Result<InventoryPage, JsValue> {
+        let reply = read_page.call4(
+            &JsValue::UNDEFINED,
+            &JsValue::from_str(target.bucket),
+            &JsValue::from_str(target.key),
+            &JsValue::from_str(target.upload_id),
+            &marker,
+        )?;
+        serde_wasm_bindgen::from_value(reply).map_err(|error| JsValue::from_str(&error.to_string()))
+    };
+    let first = page(JsValue::NULL)?;
+    let marker = first
+        .next_marker
+        .ok_or_else(|| JsValue::from_str("missing fixture continuation marker"))?;
+    let last = page(JsValue::from(marker))?;
+    assert!(last.next_marker.is_none());
+
+    let saved: Vec<_> = checkpoint
+        .parts
+        .iter()
+        .map(|part| InventoryPart {
+            number: part.number,
+            len: part.len,
+            etag: part.etag.into(),
+            digest: hex::encode(part.digest),
+        })
+        .collect();
+    // Compare the full ordered observation before any map or deduplication can
+    // hide a repeated receipt. Only the independently verified PUTs back resume.
+    let coherent = first.parts.iter().chain(&last.parts).eq(&saved);
+    let status = if coherent && matches_checkpoint(binding, receipts, checkpoint) {
+        "resumable"
+    } else {
+        "pending"
+    };
+    Ok(serde_json::json!({ "status": status, "upload_id": target.upload_id, "parts": saved }))
 }
 
 fn checkpoint_part<'a>(receipt: &UploadedPart<'_>, etag: &'a str) -> CheckpointPart<'a> {
