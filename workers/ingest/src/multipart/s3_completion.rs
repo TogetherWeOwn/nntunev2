@@ -177,8 +177,8 @@ impl S3CompletionSender {
             .map_err(|error| DispatchError::Unconfirmed(Some(error)))
     }
 
-    /// The caller authorizes the live session and supplies its dispatch deadline.
-    pub async fn complete(
+    #[cfg(feature = "s3-completion-wasm-test")]
+    async fn complete_fixture(
         &self,
         completion: SessionCompletion<'_>,
         usable_until: SystemTime,
@@ -190,7 +190,7 @@ impl S3CompletionSender {
 
     /// Complete once under the durable upload lease. Retry only by reading
     /// back the completed object when the transport loses the response.
-    pub async fn complete_durable(
+    pub async fn complete(
         &self,
         upload: &DurableUpload<'_>,
         completion: SessionCompletion<'_>,
@@ -198,7 +198,12 @@ impl S3CompletionSender {
         completion
             .dispatch_durable(
                 upload,
-                async |request, until| self.send(request, until).await,
+                async |request, until| {
+                    // Leave time for reconciliation without extending the lease.
+                    let remaining = until.duration_since(now()).unwrap_or_default();
+                    self.send(request, until - (remaining / 4).min(Duration::from_secs(5)))
+                        .await
+                },
                 async |request, until| self.read_completion_head(request, until).await,
             )
             .await

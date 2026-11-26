@@ -175,7 +175,6 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         _ => 2000,
     };
     let until = now() + Duration::from_millis(budget);
-    let recover_completion = mode == "init-completion-response-lost";
     if mode.starts_with("reconcile") {
         let id = if mode == "reconcile-replay" {
             "new+/=?".into()
@@ -208,7 +207,11 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
         assert_eq!(upload.configuration(), configuration);
-        if mode != "init-upload-completion-head" && !readback && !recover_completion {
+        if !matches!(
+            mode,
+            "init-upload-completion-head" | "init-completion-response-lost"
+        ) && !readback
+        {
             return Ok(upload.target().upload_id.into());
         }
         Some(upload)
@@ -331,11 +334,11 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
     };
     let completion =
         SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint).unwrap();
-    let completed = if recover_completion {
+    let completed = if initiated.is_some() {
         let durable = DurableUpload::new(target, &context, binding.session, until);
-        sender.complete_durable(&durable, completion).await
+        sender.complete(&durable, completion).await
     } else {
-        sender.complete(completion, until).await
+        sender.complete_fixture(completion, until).await
     }
     .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     if mode == "head-context" {
@@ -465,7 +468,7 @@ async fn resume_multipart<'a>(
     let completion = SessionCompletion::prepare(binding, context, receipts, &completed_checkpoint)
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     let completed = sender
-        .complete(completion, until)
+        .complete(&upload, completion)
         .await
         .map_err(dispatch_error)?;
     let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {

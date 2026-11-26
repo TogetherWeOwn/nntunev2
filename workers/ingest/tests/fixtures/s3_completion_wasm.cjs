@@ -88,6 +88,7 @@ test('signs the exact multipart POST once and collects its version and body', as
 
 for (const [scenario, overriddenHeaders, failure] of [
   ['matching HEAD', {}, null],
+  ['stalled response body', {}, null],
   ['foreign initiation', { [completionMarker]: 'different-attempt' }, transportFailure],
   ['different checksum', { 'x-amz-checksum-sha256': 'different-checksum' }, transportFailure],
   ['wrong length', { 'content-length': String(ciphertextLength + 1) }, transportFailure],
@@ -98,6 +99,7 @@ for (const [scenario, overriddenHeaders, failure] of [
     let marker;
     let partChecksum;
     let committed;
+    let stalledSignal;
     t.mock.method(globalThis, 'fetch', async (request) => {
       const query = new URL(request.url).search.slice(1);
       operations.push(`${request.method} ${query}`);
@@ -124,10 +126,15 @@ for (const [scenario, overriddenHeaders, failure] of [
           'x-amz-checksum-type': 'COMPOSITE',
           'x-amz-checksum-sha256': /<ChecksumSHA256>([^<]+)/.exec(receipt)[1],
         };
+        if (scenario === 'stalled response body') {
+          stalledSignal = request.signal;
+          return new Response(new ReadableStream(), { headers: { 'x-amz-version-id': version } });
+        }
         throw new Error('completion response lost after storing the version');
       }
       assert.ok(committed);
       if (query === '') {
+        if (stalledSignal) assert.equal(stalledSignal.aborted, true);
         await verifySignedRequest(request, 'HEAD', '', { 'x-amz-checksum-mode': 'ENABLED' });
         return new Response(null, { headers: { ...committed, ...overriddenHeaders } });
       }
