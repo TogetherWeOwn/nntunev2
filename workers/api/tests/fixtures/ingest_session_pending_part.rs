@@ -145,23 +145,38 @@ pub(super) async fn resume<'a>(
     let retry_plan = Plan::new(recovered.target(), header, length).unwrap();
     assert!(retry_plan == binding.plan);
     let rebuilt = partition(retry_plan, sealed);
-    let [missing] = &rebuilt[checkpoint.parts.len()..] else {
+    let (prefix, suffix) = rebuilt.split_at(checkpoint.parts.len());
+    let [missing] = suffix else {
         panic!("resume must only send the uncommitted part");
     };
     assert!(SystemTime::now() < recovered.usable_until());
-    let (_, confirmed) = provider.put(missing);
+    let (retry_ack, confirmed) = provider.put(missing);
     saved.push(confirmed);
 
-    // The late original acknowledgement can stand in for the retry response
-    // only when it matches the now-confirmed checkpoint.
     let checkpoint = ResumeCheckpoint {
         binding,
         parts: &saved,
     };
+    let retry_prefix = prefix.iter().zip(&saved).map(|(part, record)| {
+        part.verify_reply(record.etag.into(), &STANDARD.encode(record.digest))
+            .unwrap()
+    });
+    let retry_receipts: Vec<_> = retry_prefix.chain([retry_ack]).collect();
+    let retry_binding = ResumeBinding {
+        plan: retry_plan,
+        ..binding
+    };
+    assert!(matches_checkpoint(
+        retry_binding,
+        &retry_receipts,
+        &checkpoint
+    ));
+
+    // The late original acknowledgement must match the same checkpoint.
     let mut conflicting = saved.clone();
     conflicting[2].etag = "\"different-last\"";
     receipts.push(late_ack);
-    assert!(matches_checkpoint(binding, &receipts, &checkpoint,));
+    assert!(matches_checkpoint(binding, &receipts, &checkpoint));
     assert!(!matches_checkpoint(
         binding,
         &receipts,
