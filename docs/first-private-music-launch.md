@@ -257,6 +257,26 @@ and its scheduled UTC time in the private release handoff. For example, “The
 Stream error threshold readback scheduled for 12:15 UTC is `Pending`. The
 release disposition is `Pending`.”
 
+### Rehearse the artifact handoff offline
+
+Keep the staging and production run IDs distinct. Each carries its own attempt
+number and artifact digest. Retain the complete staging receipt and the
+verified staging pins in the candidate record.
+
+| Artifact | File | Handoff |
+| --- | --- | --- |
+| `staging-admission-<candidate-sha>-<staging-run-id>-<staging-attempt>-private-music` | `staging-admission.json` | The staging verifier binds the candidate SHA to the attempt, serving deployments and contract. The protected rollout uses that same candidate SHA. |
+| `production-promotion-<candidate-sha>-<original-rollout-run-id>-1` | `promotion.json` | After final smoke, the receipt records the promoted version UUID. Its `sha` and `run_id` are the existing recovery inputs `sha` and `recovery_run_id` for the successful rollout. |
+| `production-rollback-intent-<original-rollout-run-id>-1` | `production-rollback-intent.sealed` | `recover-worker` uses `admit-recovery` to verify and load the original artifact. `prepare-recovery` uses its sealed candidate and maintenance identities with the original custody and checks the current allocation. |
+
+The [staging admission fixture](../ci/test_staging_admission.py) verifies the
+private staging pins, and the [first-release handoff fixture](../ci/test-production-maintenance.mjs)
+uses the production receipt writer and the existing recovery caller with
+synthetic IDs. The fixture checks that recovery receives the original sealed
+bytes and prepares the allocation without a write. Keep artifact links and
+the protected custody reference in the release record. The current application
+promotion preflight is closed.
+
 ### Personal-use exit assessment
 
 Complete this assessment in the protected release thread. Use the **Staging
