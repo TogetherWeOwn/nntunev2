@@ -213,6 +213,54 @@ test('Selected only survives a failed invited Library refresh and successful Ret
 	expect(fixture.listingAccounts).toEqual([listener.account, listener.account, listener.account]);
 });
 
+test('keyboard Refresh and Retry keep focus and update one live status', async ({ page, origin }) => {
+	const failed = Promise.withResolvers<503>();
+	const recovered = Promise.withResolvers<Track[]>();
+	const replies = [[first], failed.promise, recovered.promise];
+	const fixture = await mockCatalogue(page, origin, () => replies.shift() ?? 503);
+	await fixture.signIn();
+	const main = page.getByRole('main');
+	const refresh = main.getByRole('button', { name: 'Refresh', exact: true });
+	const retry = main.getByRole('button', { name: 'Retry', exact: true });
+	const loading = main.getByRole('status').filter({ hasText: /^Loading your library…$/ });
+	const stale = main.getByRole('status').and(main.getByTestId('library-stale-badge'));
+	const refreshed = main.getByRole('status').filter({ hasText: /^Library refreshed\.$/ });
+
+	try {
+		await page.goto(origin + library.path);
+		await expectCatalogue(page, [first]);
+		await refresh.focus();
+		await expect(refresh).toBeFocused();
+		await page.keyboard.press('Enter');
+		await expect(loading).toBeVisible();
+		await expect(refresh).toBeFocused();
+		const liveStatus = await loading.elementHandle();
+		failed.resolve(503);
+		await expect(retry).toBeFocused();
+		await expect(stale).toHaveText(/^stale — updated /);
+		expect(await stale.evaluate((node, previous) => node === previous, liveStatus)).toBe(true);
+
+		await page.keyboard.press('Space');
+		await expect(loading).toBeVisible();
+		await expect(retry).toBeFocused();
+		recovered.resolve([added]);
+		await expectCatalogue(page, [added]);
+		await expect(refresh).toBeFocused();
+		await expect(stale).toHaveCount(0);
+		await expect(refreshed).toHaveCount(1);
+		expect(await refreshed.evaluate((node, previous) => node === previous, liveStatus)).toBe(true);
+
+		await page.keyboard.press('Tab');
+		await expect(main.getByRole('combobox', { name: 'Repeat', exact: true })).toBeFocused();
+		await page.keyboard.press('Shift+Tab');
+		await expect(refresh).toBeFocused();
+		expect(fixture.listingAccounts).toEqual([listener.account, listener.account, listener.account]);
+	} finally {
+		failed.resolve(503);
+		recovered.resolve([added]);
+	}
+});
+
 test('returning to Library shows the new track and keeps the current selection', async ({ page, origin }) => {
 	let catalogue = [first, selected];
 	const fixture = await mockCatalogue(page, origin, () => catalogue);

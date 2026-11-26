@@ -154,6 +154,7 @@
 	let recentFindsAnnouncement = $state('');
 	let recentFindsEmpty: HTMLParagraphElement | null = $state(null);
 	let staleAt: string | null = $state(null);
+	let recoveredFromStale = $state(false);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
@@ -377,6 +378,8 @@
 				preserveTrackFocus(isCurrent);
 			}
 			items = state.items;
+			recoveredFromStale = staleAt !== null && authoritative && !authBoundary &&
+				!state.libraryUnavailable && !state.loadError;
 			staleAt = state.staleAt;
 			loading = state.loading;
 			loadError = state.loadError;
@@ -1733,11 +1736,18 @@
 	{:else}
 		<!-- Keep the Tracks DOM and controller state while browsing; the queue stays visible. -->
 		<div hidden={!showingTracks}>
-		{#if loading}
-			<p role="status">Loading your library…</p>
+		{#if items.length > 0 || staleAt || recoveredFromStale}
+			<!-- Update the mounted status so loading, failure and recovery can be announced. -->
+			<p role="status" class:nt-visually-hidden={!loading && !staleAt}
+				data-testid={!loading && staleAt ? 'library-stale-badge' : undefined}>
+				{#if loading}Loading your library…
+				{:else if staleAt}{staleLabel(staleAt)}
+				{:else if recoveredFromStale}Library refreshed.
+				{/if}
+			</p>
 		{/if}
-		{#if staleAt}
-			<p data-testid="library-stale-badge" role="status">{staleLabel(staleAt)}</p>
+		{#if loading && staleAt}
+			<p data-testid="library-stale-badge">{staleLabel(staleAt)}</p>
 		{/if}
 
 		<section data-testid="favorites-section" aria-label="Favorites" bind:this={shelfSection}>
