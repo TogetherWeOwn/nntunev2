@@ -434,6 +434,7 @@ async fn final_frame_verification_failure_preserves_acknowledged_delivery() {
                     output: &output,
                     fault: Fault::None,
                     aborted: &aborted,
+                    closed: None,
                     revoke_on_write: None,
                 }))
             },
@@ -642,10 +643,10 @@ async fn dropping_a_partial_encrypted_read_leaves_the_other_caller_live() {
     let live_output = RefCell::new(Vec::new());
     let cancelled_closed = Cell::new(false);
     let live_closed = Cell::new(false);
+    let cancelled_aborted = Cell::new(false);
+    let live_aborted = Cell::new(false);
     let reports = RefCell::new(Vec::new());
-    let aborted = Cell::new(false);
-    let read = |request, output, closed, range: &'static str, len| {
-        let aborted = &aborted;
+    let read = |request, output, closed, aborted, range: &'static str, len| {
         serve(
             request,
             b"test only, not a deployed secret",
@@ -681,6 +682,7 @@ async fn dropping_a_partial_encrypted_read_leaves_the_other_caller_live() {
         &cancelled,
         &cancelled_output,
         &cancelled_closed,
+        &cancelled_aborted,
         "bytes 65534-65536/65537",
         3,
     ));
@@ -694,6 +696,7 @@ async fn dropping_a_partial_encrypted_read_leaves_the_other_caller_live() {
         &live,
         &live_output,
         &live_closed,
+        &live_aborted,
         "bytes 65535-65536/65537",
         2,
     ));
@@ -707,6 +710,7 @@ async fn dropping_a_partial_encrypted_read_leaves_the_other_caller_live() {
     assert!(!live_tail.dropped.get());
     assert!(!cancelled_closed.get());
     assert!(!live_closed.get());
+    assert!(!live_aborted.get());
     assert_eq!(*cancelled_output.borrow(), b"AY");
     assert_eq!(*live_output.borrow(), b"Y");
     assert_eq!(*reports.borrow(), [receipt(65_534, 65_536)]);
@@ -716,7 +720,9 @@ async fn dropping_a_partial_encrypted_read_leaves_the_other_caller_live() {
         futures_util::poll!(&mut live),
         Poll::Ready(Ok(()))
     ));
+    assert!(live_tail.dropped.get());
     assert!(live_closed.get());
+    assert!(!live_aborted.get());
     assert_eq!(*live_output.borrow(), b"YZ");
     assert_eq!(
         *reports.borrow(),
