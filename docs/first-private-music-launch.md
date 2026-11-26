@@ -79,8 +79,10 @@ until their evidence is available.
    on the pinned production branch and logical database. Require `empty` and
    confirm there are no live users or member data in the launch scope. Ledger
    and reference rows count as data. An unknown, incomplete or refused result
-   stops the release. With `rows-present`, use the normal fresh backup, isolated
-   restore and exact undo rehearsal for a schema or data change.
+   stops the release. [Check the saved manifest digest](#check-the-baseline-manifest-offline)
+   before carrying the baseline forward. With `rows-present`, use the normal
+   fresh backup, isolated restore and exact undo rehearsal for a schema or data
+   change.
 5. For a verified empty first release, take or qualify a fresh provider snapshot
    of the exact branch and scope before the first schema change, under the
    same write fence. Read back completion, capture time, expiry and coverage
@@ -99,6 +101,54 @@ until their evidence is available.
    the decision. This is separate from the PR reviewers' source approval.
    Dispatch only through the supported protected workflow with the existing
    environment and credential custodians. [Production release gates](../CONTRIBUTING.md#production-releases)
+
+### Check the baseline manifest offline
+
+Verify the protected baseline job's run, attempt, successful conclusion and
+`empty` verdict. The [baseline job](../.github/workflows/deploy-database-baseline.yml)
+checks out the run's source SHA. Set `baseline_source_sha` to that full SHA
+under **Production baseline**. Use a full local clone containing both pinned
+commits and manifest blobs. Define this helper in the Bash shell used for each
+step.
+
+```bash
+manifest_digest() (
+  [[ ${1-} =~ ^[0-9a-f]{40}$ ]] || exit 1
+  set -o pipefail
+  manifest_hash=$(git --no-replace-objects cat-file blob \
+    "${1}:migrations/manifest.toml" | sha256sum) || exit 1
+  printf '%s\n' "${manifest_hash%% *}"
+)
+```
+
+Record the successful output of `manifest_digest "${baseline_source_sha:?}"`
+as the manifest digest under **Production baseline**.
+
+To verify the handoff, set `candidate_sha` to the full commit under **Candidate**
+and `baseline_manifest_sha256` to the saved digest. Verify the saved digest
+against both the protected run's source and the candidate commit.
+
+```bash
+(
+  baseline_digest=$(manifest_digest "${baseline_source_sha:?}") || exit 1
+  candidate_digest=$(manifest_digest "${candidate_sha:?}") || exit 1
+  test "$baseline_digest" = "${baseline_manifest_sha256:?}" &&
+    test "$candidate_digest" = "$baseline_manifest_sha256"
+)
+```
+
+For a synthetic rehearsal, keep the candidate, protected run and attempt,
+branch, database OID, reader, required catalog objects and successful `empty`
+verdict fixed. Compare two saved handoffs against the same candidate.
+
+| Saved manifest digest | Result and next step |
+| --- | --- |
+| Digest from an earlier manifest revision with the same required catalog objects. | The comparison exits nonzero. Keep baseline evidence pending and migration closed. Read the pinned attempt's job and source SHA and repeat the offline capture. Correct the saved digest only if the verified attempt's digest matches the candidate and the saved value was recorded in error. |
+| Digest of the manifest at both `baseline_source_sha` and `candidate_sha`. | The comparison exits zero. With the other baseline evidence verified, carry it forward to snapshot verification. |
+
+Keep the handoff pending if either pinned manifest cannot be read. A digest
+match verifies the manifest pin. The protected run's verdict and provenance,
+catalog coverage and reader retirement still require their existing evidence.
 
 ### Offline handoff example after a rerun
 
