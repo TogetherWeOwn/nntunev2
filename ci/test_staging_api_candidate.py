@@ -7,10 +7,11 @@ from pathlib import Path
 import stat
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 from staging_admission import Refused, digest
-from staging_api_candidate import CI_WORKFLOW, DRY_RUN, JOB, PREPARE, REPOSITORY, UPLOAD, prepare, verified_candidate
+from staging_api_candidate import CI_WORKFLOW, DRY_RUN, JOB, PREPARE, REPOSITORY, UPLOAD, prepare, prepare_ci, verified_candidate
 
 SHA = "a" * 40
 REPO_ID = 10
@@ -90,15 +91,23 @@ class ApiCandidateTests(unittest.TestCase):
     def test_prepares_only_the_runtime_bundle_and_verifies_the_same_bytes(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            build = root / "build"
+            build = root / "workers/api/build"
             (build / "worker").mkdir(parents=True)
             for name, data in (FILES | {"index_bg.wasm.map": b"source-map fixture"}).items():
                 (build / name).write_bytes(data)
-            payload = root / "payload"
-            prepare(build, payload)
+            step_outputs = root / "step-outputs"
+            env = {
+                "GITHUB_SHA": SHA, "GITHUB_RUN_ID": str(RUN), "GITHUB_RUN_ATTEMPT": "1",
+                "RUNNER_TEMP": temp, "GITHUB_OUTPUT": str(step_outputs),
+            }
+            with patch("staging_api_candidate.subprocess.check_output", return_value=SHA + "\n"):
+                prepare_ci(root, env)
+            outputs = dict(line.split("=", 1) for line in step_outputs.read_text().splitlines())
+            payload = Path(outputs["path"])
             files = {path.relative_to(payload).as_posix(): path.read_bytes()
                      for path in payload.rglob("*") if path.is_file()}
             actions = ActionsFixture()
+            actions.artifacts[0]["name"] = outputs["name"]
             actions.set_archive(make_archive(files))
             self.assertEqual(verify(actions), FILES)
             self.assertEqual(actions.downloads, 1)

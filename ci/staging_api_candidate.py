@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import zipfile
+import zlib
 
 from staging_admission import ROOT, SHA, Refused, decimal, digest, require, require_steps, timestamp
 
@@ -29,6 +30,10 @@ FILES = {
     "worker/shim.mjs": 4096,
 }
 ARTIFACT_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def artifact_name(sha, run_id):
+    return f"staging-api-ordinary-v1-{sha}-{run_id}-1"
 
 
 def prepare(source, destination):
@@ -65,7 +70,7 @@ def read_bundle(data):
                 with archive.open(entry) as member:
                     files[name] = member.read(limit + 1)
                 require(len(files[name]) == entry.file_size, "build archive member length mismatch")
-    except (OSError, RuntimeError, ValueError, EOFError, zipfile.BadZipFile):
+    except (OSError, RuntimeError, ValueError, EOFError, zipfile.BadZipFile, zlib.error):
         raise Refused("unreadable build archive") from None
     return files
 
@@ -116,8 +121,7 @@ def verified_candidate(actions, *, repository_id, sha, private_trial_upload):
     require_steps(job, ("Build ordinary Worker release bundles", DRY_RUN, PREPARE, UPLOAD),
                   "required candidate build steps did not pass in order")
     artifacts = actions.listing(f"runs/{run_id}/artifacts", "artifacts")
-    name = f"staging-api-ordinary-v1-{sha}-{run_id}-1"
-    matches = matching(artifacts, "name", name)
+    matches = matching(artifacts, "name", artifact_name(sha, run_id))
     require(len(matches) == 1, "missing or ambiguous API build artifact")
     artifact = matches[0]
     producer = artifact.get("workflow_run")
@@ -137,10 +141,19 @@ def verified_candidate(actions, *, repository_id, sha, private_trial_upload):
     return files
 
 
+def prepare_ci(root, env):
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True, timeout=10).strip()
+    require(SHA.fullmatch(head) and head == env["GITHUB_SHA"], "checkout disagrees with CI SHA")
+    require(decimal(env["GITHUB_RUN_ATTEMPT"]) == "1", "unexpected CI attempt")
+    name = artifact_name(head, decimal(env["GITHUB_RUN_ID"]))
+    path = Path(env["RUNNER_TEMP"]) / "staging-api-candidate"
+    prepare(root / "workers/api/build", path)
+    with Path(env["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+        print(f"name={name}\npath={path}", file=output)
+
+
 if __name__ == "__main__":
     try:
-        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, timeout=10).strip()
-        require(SHA.fullmatch(head) and head == os.environ["GITHUB_SHA"], "checkout disagrees with CI SHA")
-        prepare(ROOT / "workers/api/build", Path(os.environ["RUNNER_TEMP"]) / "staging-api-candidate")
+        prepare_ci(ROOT, os.environ)
     except (Refused, OSError, KeyError, subprocess.SubprocessError):
         sys.exit("ordinary staging API candidate preparation failed")
