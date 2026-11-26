@@ -195,6 +195,27 @@ test('operator switch-off requires complete readback of the pinned maintenance a
   }
 });
 
+test('operator distinguishes pending empty rollback jobs from missing terminal verification', () => {
+  const attempt = '/repos/example/fixture/actions/runs/102/attempts/1';
+  const listing = { total_count: 0, jobs: [] };
+  const example = readFileSync(new URL('../docs/first-private-music-launch.md', import.meta.url), 'utf8')
+    .split('### Read the recorded rollback attempt before jobs appear\n')[1]?.split('\n## ')[0];
+  assert.ok(example, 'document the readback of the exact attempt before job creation');
+  for (const path of [attempt, `${attempt}/jobs`]) {
+    assert.ok(example.includes(`\`GET ${path}\``), `read the recorded attempt at ${path}`);
+  }
+  assert.ok(example.includes(`\`${JSON.stringify(listing)}\``), 'use a complete empty jobs response');
+  assert.match(example, /Keep switch-off \*\*Pending\*\*, the recorded run and attempt, and the writer\s+freeze in both cases/);
+  assert.match(example, /Do not dispatch another recovery or rerun the workflow/);
+
+  const rows = example.split('\n').filter((line) => line.startsWith('|'));
+  const pending = rows.find((row) => row.startsWith('| `pending` |'));
+  const terminal = rows.find((row) => row.startsWith('| `completed` |'));
+  assert.ok(pending && terminal, 'cover both run statuses with the same empty listing');
+  assert.match(pending, /\*\*Pending\*\*.*Repeat the status and jobs reads for `102\/1`/);
+  assert.match(terminal, /\*\*Missing required verification\*\*.*Reconcile the missing `recover-worker` evidence/);
+});
+
 test('operator switch-off resumes read-only after incomplete deployment history', async (t) => {
   let incompleteHistory = true;
   const transport = finalSmokeFixture(t, {
