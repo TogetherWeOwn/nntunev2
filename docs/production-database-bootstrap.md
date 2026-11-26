@@ -441,11 +441,18 @@ the same read-only catalog snapshot. Hash that inventory using the same
 representation as the reviewed and saved inventories. If this readback is
 unavailable, omit `reader_privileges` so the evidence stays pending.
 
-Keep the baseline evidence pending if the check exits nonzero with `pending`,
-including when the catalog matches but the privilege result belongs to a
-different reader. `consistent` confirms the supplied evidence agrees. The
-protected run's `empty` verdict, provenance and retirement evidence are still
-required. Keep credentials and raw SQL results out of the normalized record.
+Both pending messages leave baseline evidence pending. A plain `pending`
+covers absent or unusable readback and other evidence failures, including
+a privilege result for a different reader. Recover any missing private
+readback for the same attempt. `pending (inventory-mismatch)` means a
+complete inventory record identifies the reviewed branch and database OID
+and has a different digest. Use the separately authorized read-only catalog
+check to compare the expected and observed objects on that database. A
+digest difference establishes disagreement, and the catalog comparison
+identifies any omitted objects. Keep migration closed pending reconciliation.
+`consistent` confirms the supplied evidence agrees. The protected run's
+`empty` verdict, provenance and retirement evidence are still required.
+Keep credentials and raw SQL results out of the normalized record.
 
 ### Carry verified staging evidence into database approval
 
