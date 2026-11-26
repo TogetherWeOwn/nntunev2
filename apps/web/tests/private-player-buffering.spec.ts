@@ -86,6 +86,7 @@ for (const pauseDuringBuffering of [true, false]) {
 			const native = await audio.evaluateHandle((node: HTMLAudioElement) => {
 				const events = {
 					waitingAt: null as number | null, pausedAt: null as number | null,
+					resumeClick: null as { paused: boolean; position: number; alreadyResumed: boolean } | null,
 					play: [] as number[], playing: [] as number[], interruptions: [] as string[]
 				};
 				node.addEventListener('waiting', (event) => {
@@ -127,12 +128,21 @@ for (const pauseDuringBuffering of [true, false]) {
 						.some((index) => node.buffered.start(index) <= position && node.buffered.end(index) > position + 0.5), resumeAt), {
 					message: 'Audio must be buffered beyond the paused point before pressing Play'
 				}).toBe(true);
-				const paused = await native.evaluate(({ node, events }) => ({
-					paused: node.paused, position: node.currentTime, play: events.play, playing: events.playing
-				}));
-				expect(paused).toEqual({ paused: true, position: resumeAt, play: [], playing: [] });
 				await expect(play).toBeEnabled();
+				await play.evaluate((button, { node, events }) => {
+					// Observe the decoder at the trusted gesture, before the Player handles the click.
+					button.addEventListener('click', (event) => {
+						if (!event.isTrusted) return;
+						events.resumeClick = {
+							paused: node.paused, position: node.currentTime,
+							alreadyResumed: events.play.length > 0 || events.playing.length > 0
+						};
+					}, { capture: true, once: true });
+				}, native);
 				await play.press('Enter');
+				const click = await native.evaluate(({ events }) => events.resumeClick);
+				expect(click).toMatchObject({ paused: true, alreadyResumed: false });
+				expect(click?.position).toBeCloseTo(resumeAt, 1);
 			}
 
 			await expect.poll(() => native.evaluate(({ node, events }, position) =>
