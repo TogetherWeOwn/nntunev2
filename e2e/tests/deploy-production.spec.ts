@@ -298,7 +298,6 @@ const DISPATCH_RUN: RunRow = {
 const HEALTHY_JOBS: JobRow[] = [
   { name: 'staging-api', conclusion: 'success' },
   { name: 'staging-web', conclusion: 'success' },
-  { name: 'post-deploy-e2e / synthetic smoke (health)', conclusion: 'success' },
   {
     name: 'post-deploy-e2e / full journey (signup → library → meter → limits)',
     conclusion: 'success',
@@ -324,7 +323,7 @@ test.describe('staging job prerequisites (not receipt acceptance, stubbed API)',
     evidenceStub.lastRunsUrl = '';
   });
 
-  test('accepts prefixed called-workflow e2e job names on a push run', async () => {
+  test('accepts the single successful called-workflow journey job on a push run', async () => {
     evidenceStub.runs = [PUSH_RUN];
     evidenceStub.jobsByRun.set(100, HEALTHY_JOBS);
     const result = await runEvidence(base);

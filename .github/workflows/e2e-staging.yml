@@ -4,8 +4,8 @@ name: e2e-staging
 # Runs the Playwright suite in e2e/ against STAGING_BASE_URL (behind
 # Cloudflare Access via the QA service-token pair).
 #
-# Sequencing: this workflow no longer triggers on push. The full journey
-# (`e2e` job) runs only when deploy.yml calls this workflow with
+# Sequencing: the full journey runs after smoke passes in the same job,
+# and only when deploy.yml calls this workflow with
 # `post_deploy: true` from a job that `needs` successful `staging-web` and
 # `staging-api` jobs of the same run/revision — a skipped or failed deploy therefore
 # cannot produce a full-journey PASS. Scheduled and manually dispatched
@@ -94,10 +94,12 @@ concurrency:
   queue: max
 
 jobs:
-  synthetic:
-    name: synthetic smoke (health)
+  e2e:
+    # The release readers consume this exact called-job name. A separate
+    # skipped monitoring job in the call would fail the release prerequisites.
+    name: ${{ inputs.post_deploy && 'full journey (signup → library → meter → limits)' || 'synthetic smoke (health)' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: ${{ inputs.post_deploy && 40 || 10 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -106,19 +108,23 @@ jobs:
       - name: Check staging configuration
         id: staging
         env:
+          POST_DEPLOY: ${{ inputs.post_deploy && 'true' || 'false' }}
           STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
           set -euo pipefail
           if [ -z "${STAGING_BASE_URL:-}" ]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::STAGING_BASE_URL not configured (pre-deploy) — synthetic smoke skips."
-          else
-            if [ -z "${CF_ACCESS_CLIENT_ID:-}" ] || [ -z "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
-              echo "::error::Configured staging requires CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET."
+            if [ "$POST_DEPLOY" = true ]; then
+              echo "::error::Post-deploy full journey requires STAGING_BASE_URL; refusing to pass without running."
               exit 1
             fi
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::STAGING_BASE_URL not configured (pre-deploy) — synthetic smoke skips."
+          elif [ -z "${CF_ACCESS_CLIENT_ID:-}" ] || [ -z "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+            echo "::error::Configured staging requires CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET."
+            exit 1
+          else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -141,210 +147,24 @@ jobs:
         run: npx playwright install --with-deps --only-shell chromium
 
       - name: Run synthetic smoke
-        if: steps.staging.outputs.configured == 'true'
+        id: smoke
+        if: success() && steps.staging.outputs.configured == 'true'
+        timeout-minutes: 10
         working-directory: e2e
         env:
+          POST_DEPLOY: ${{ inputs.post_deploy && 'true' || 'false' }}
           STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
-        run: npm run e2e:smoke
-
-      - name: Publish signup-path evidence summary
-        id: signup-path-summary
-        if: always() && steps.staging.outputs.configured == 'true'
-        working-directory: e2e
         run: |
           set -euo pipefail
-          # Green runs upload nothing, and the list reporter does not print
-          # test annotations, so without this step a passing run would retain
-          # no record of which signup path produced it. Publish only the
-          # bounded signup-path labels (fixed values, never account data) plus
-          # static test names to the run summary. Whitelist-only output: even
-          # though this reads pre-sanitize junit.xml, no other file content
-          # (and no secret) can pass through. Never fails the job.
-          {
-            echo "## Signup-path evidence"
-            echo ""
-            if [ ! -f test-results/junit.xml ]; then
-              echo "No junit evidence (test-results/junit.xml absent) — no signup-path label recorded."
-            else
-              python3 - <<'PY' || echo "Could not parse junit evidence — no signup-path label recorded."
-          import xml.etree.ElementTree as ET
-          allowed = {'public-ui-signup', 'api-minted-account'}
-          rows = []
-          for case in ET.parse('test-results/junit.xml').getroot().iter('testcase'):
-              name = case.get('name', '(unnamed test)')
-              label = None
-              props = case.find('properties')
-              if props is not None:
-                  for prop in props.findall('property'):
-                      if prop.get('name') == 'signup-path' and prop.get('value') in allowed:
-                          label = prop.get('value')
-              rows.append(f"- {name}: `{label}`" if label else f"- {name}: (no signup-path label)")
-          if rows:
-              print('Signup-path labels recorded at the test-account seam branch (fixed values only):')
-              print()
-              for row in rows:
-                  print(row)
-          else:
-              print('No test cases in junit evidence — no signup-path label recorded.')
-          PY
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Sanitize failure artifacts (strip credential-bearing snapshots)
-        id: sanitize
-        if: failure() && steps.staging.outputs.configured == 'true'
-        working-directory: e2e
-        env:
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-          QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
-          SYNTHETIC_NNTP_HOST: ${{ secrets.SYNTHETIC_NNTP_HOST }}
-          SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
-          SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
-        run: |
-          set -euo pipefail
-          # Playwright 1.55 writes test-results/**/error-context.md on any failed
-          # page test — an ARIA snapshot rendering filled input values — and
-          # the junit reporter embeds failure messages (e.g. toHaveValue
-          # Received strings) that can carry the same filled secrets.
-          # Belt-and-braces: delete error-context.md AND the whole
-          # playwright-report/ dir, then scrub secret values from every remaining
-          # file under test-results/ (junit.xml) so the uploaded artifact can
-          # never carry secrets. Only test-results/ (junit) is uploaded below.
-          # Fail closed: any cleanup/read/write failure exits nonzero, and the
-          # upload step gates on steps.sanitize.outcome == 'success', so a
-          # failed, skipped or cancelled sanitizer can never publish.
-          rm -rf playwright-report
-          if [ ! -e test-results ]; then
-            echo "test-results absent: nothing to sanitize or upload"
-            exit 0
+          npm run e2e:smoke
+          # Retain failed smoke and standalone monitoring diagnostics. In a
+          # post-deploy call, only the full journey may supply JUnit evidence.
+          if [ "$POST_DEPLOY" = true ] && [ -e test-results/junit.xml ]; then
+            rm -- test-results/junit.xml
           fi
-          if [ ! -d test-results ]; then
-            echo "::error::test-results exists but is not a directory; failing closed"
-            exit 1
-          fi
-          python3 - <<'PY'
-          import os
-          import pathlib
-          import shutil
-          import sys
-          root = pathlib.Path("test-results")
-          values = [
-              os.environ.get("CF_ACCESS_CLIENT_ID", ""),
-              os.environ.get("CF_ACCESS_CLIENT_SECRET", ""),
-              os.environ.get("QA_AUTH_TOKEN", ""),
-              os.environ.get("SYNTHETIC_NNTP_HOST", ""),
-              os.environ.get("SYNTHETIC_NNTP_USER", ""),
-              os.environ.get("SYNTHETIC_NNTP_PASS", ""),
-          ]
-          values = [v for v in values if v]
-          def fail_closed(action, path, exc):
-              # Names and error codes only — never file contents or secret values.
-              print(f"::error::sanitize {action} failed for {path} ({type(exc).__name__} errno={exc.errno}); failing closed", file=sys.stderr)
-              sys.exit(1)
-          def glob_all(pattern):
-              try:
-                  return list(root.rglob(pattern))
-              except OSError as exc:
-                  fail_closed("scan", root, exc)
-          for path in glob_all("error-context.md"):
-              try:
-                  if path.is_dir() and not path.is_symlink():
-                      shutil.rmtree(path)
-                  else:
-                      path.unlink()
-              except OSError as exc:
-                  fail_closed("cleanup", path, exc)
-          if glob_all("error-context.md"):
-              print("::error::error-context.md remains after cleanup; failing closed", file=sys.stderr)
-              sys.exit(1)
-          if pathlib.Path("playwright-report").exists():
-              print("::error::playwright-report remains after cleanup; failing closed", file=sys.stderr)
-              sys.exit(1)
-          for path in glob_all("*"):
-              if not path.is_file():
-                  continue
-              try:
-                  data = path.read_bytes()
-              except OSError as exc:
-                  fail_closed("read", path, exc)
-              for value in values:
-                  data = data.replace(value.encode(), b"***REDACTED***")
-              try:
-                  path.write_bytes(data)
-              except OSError as exc:
-                  fail_closed("write", path, exc)
-          PY
-          echo "sanitized: error-context.md and playwright-report/ removed, test-results scrubbed"
-
-      - name: Upload failure artifacts
-        if: failure() && steps.staging.outputs.configured == 'true' && steps.sanitize.outcome == 'success'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-synthetic-report
-          path: |
-            e2e/test-results/
-          retention-days: 7
-
-  # Full-journey promotion evidence. Runs only on the post-deploy call
-  # from deploy.yml (inputs.post_deploy); scheduled/manual runs skip this
-  # job entirely. Never add always()/!cancelled() here: the implicit
-  # success() on `needs` is what stops a failed synthetic smoke — and,
-  # through the deploy.yml caller, a skipped/failed deploy — from
-  # producing a full-journey PASS.
-  e2e:
-    name: full journey (signup → library → meter → limits)
-    needs: [synthetic]
-    if: ${{ inputs.post_deploy }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Check staging configuration
-        id: staging
-        env:
-          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-        run: |
-          set -euo pipefail
-          if [ -z "${STAGING_BASE_URL:-}" ]; then
-            # This job runs only on the post-deploy call, after staging-web
-            # deployed. A skipped journey here would be a green run that
-            # staging-evidence accepts as promotion evidence, so fail closed.
-            echo "::error::Post-deploy full journey requires STAGING_BASE_URL; refusing to pass without running."
-            exit 1
-          else
-            if [ -z "${CF_ACCESS_CLIENT_ID:-}" ] || [ -z "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
-              echo "::error::Configured staging requires CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET."
-              exit 1
-            fi
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: steps.staging.outputs.configured == 'true'
-        with:
-          # Keep in sync with @types/node major in e2e/package.json.
-          node-version: 26
-          cache: npm
-          cache-dependency-path: e2e/package-lock.json
-
-      - name: Install dependencies
-        if: steps.staging.outputs.configured == 'true'
-        working-directory: e2e
-        run: npm ci
-
-      - name: Install Playwright Chromium headless shell
-        if: steps.staging.outputs.configured == 'true'
-        working-directory: e2e
-        run: npx playwright install --with-deps --only-shell chromium
 
       # No NZB is staged for this run: the secret-held real-NZB leg is
       # retired under the CC0-only fixture rule
@@ -357,7 +177,9 @@ jobs:
       # 430 control; the gate below budgets the parked skips.
 
       - name: Run full journey
-        if: steps.staging.outputs.configured == 'true'
+        id: journey
+        if: success() && inputs.post_deploy && steps.smoke.outcome == 'success'
+        timeout-minutes: 30
         working-directory: e2e
         env:
           STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
@@ -387,15 +209,14 @@ jobs:
 
       - name: Enforce journey evidence gate (all-skipped must fail)
         id: journey-gate
-        # always(): publishes ran/skipped/failed counts even when the journey
-        # failed, and turns an all-skipped green run red. Unconfigured
-        # staging never reaches here: the preflight fails the job. The skip
+        # Publish counts even when the journey failed, and turn an all-skipped
+        # green run red. There is no journey evidence when smoke fails. The skip
         # budget covers the recording_mbids test.fixme, the nine parked
         # user-NZB legs, capped stream leg and the shared-catalogue park;
         # the last allowance ends when publication is enabled.
         # REQUIRE_QA_AUTH_TOKEN keeps a configured run red until the QA
         # test-account seam pair is provisioned (presence only, never values).
-        if: always() && steps.staging.outputs.configured == 'true'
+        if: ${{ !cancelled() && (steps.journey.outcome == 'success' || steps.journey.outcome == 'failure') }}
         working-directory: e2e
         env:
           MAX_ALLOWED_SKIPS: '12'
@@ -409,7 +230,8 @@ jobs:
       # acceptance. Only fixed labels, hashes and live identities are uploaded;
       # raw JUnit, account data and failure diagnostics stay out of this artifact.
       - name: Record candidate admission receipt
-        if: always() && inputs.post_deploy
+        id: receipt
+        if: ${{ !cancelled() && (steps.journey-gate.outcome == 'success' || steps.journey-gate.outcome == 'failure') }}
         env:
           API_DEPLOYED: ${{ inputs.api_deployed }}
           API_DEPLOY_OUTCOME: ${{ inputs.api_deploy_outcome }}
@@ -418,7 +240,7 @@ jobs:
         run: python3 -I ci/staging_admission.py produce
 
       - name: Upload candidate admission receipt
-        if: ${{ success() && inputs.post_deploy }}
+        if: ${{ success() && steps.journey-gate.outcome == 'success' && steps.receipt.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: staging-admission-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -558,7 +380,7 @@ jobs:
         if: failure() && steps.staging.outputs.configured == 'true' && steps.sanitize.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: e2e-journey-report
+          name: ${{ inputs.post_deploy && steps.smoke.outcome == 'success' && 'e2e-journey-report' || 'e2e-synthetic-report' }}
           path: |
             e2e/test-results/
           retention-days: 7

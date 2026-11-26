@@ -487,11 +487,13 @@ How the suite uses them:
   Manual dispatch and the 6-hour schedule run the synthetic smoke only
   (monitoring, not post-deploy promotion evidence); dispatch defines no
   `post_deploy` input, so it cannot mint that evidence by hand.
+  On a post-deploy call, the same job runs smoke and then the full journey
+  with one runner setup. Smoke failure stops the journey and receipt.
   Missing `STAGING_BASE_URL` → the synthetic smoke skips with notice
   (pre-deploy); the post-deploy full journey fails in preflight, because a
   skipped journey after a real `staging-web` deploy would otherwise pass
   green and be accepted as promotion evidence.
-  Both jobs require the Access pair in preflight before activating tests;
+  The shared preflight requires the Access pair before activating tests;
   configured staging never skips for missing credentials. The full journey
   additionally runs the evidence gate
   (`e2e/scripts/enforce-journey-evidence.mjs`): a configured run with no
@@ -514,7 +516,7 @@ How the suite uses them:
   helper/workflow self-tests, `playwright test --list`, and the
   traceability-matrix check (`docs/m1-exit-traceability.md` must cite every
   listed spec). Runs on every PR
-  with no staging needed. Offline tests execute both checked-in preflights
+  with no staging needed. Offline tests execute both modes of the staging preflight
   and the aggregate gate with dummy inputs; failures, cancellations and skips
   of required jobs make `ci-ok` red.
 - **Prod promotion gate (required integration):** the deployment lane must
