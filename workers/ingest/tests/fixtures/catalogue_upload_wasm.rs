@@ -1,4 +1,5 @@
 use nntune_core::media_envelope::EnvelopeContext;
+use tokio_postgres::Transaction;
 
 use super::now;
 use crate::{
@@ -199,16 +200,6 @@ pub(super) async fn publish(
         }],
     };
     let lookup = release_lookup(ALBUM).unwrap();
-    let candidates = CompleteReleaseCandidates {
-        lookup: &lookup,
-        hits: vec![MbSearchHit {
-            mbid: RELEASE.into(),
-            title: ALBUM.into(),
-            artist_name: None,
-            artist_mbid: None,
-            score: 0.9,
-        }],
-    };
     let mut tx = writer.transaction().await.unwrap();
     let occurrence = VerifiedOccurrence {
         job_id: job.job_id,
@@ -235,6 +226,45 @@ pub(super) async fn publish(
             Err(PublicationError::Refused),
         );
     }
+    let mut stage_upload = async |tx: &mut Transaction<'_>, expected_version: Option<&str>| {
+        let candidates = CompleteReleaseCandidates {
+            lookup: &lookup,
+            hits: vec![MbSearchHit {
+                mbid: RELEASE.into(),
+                title: ALBUM.into(),
+                artist_name: None,
+                artist_mbid: None,
+                score: 0.9,
+            }],
+        };
+        stage_completed_release(
+            tx,
+            &job,
+            &[upload],
+            ALBUM,
+            Some(candidates),
+            (200, include_str!("review_retry_recordings.json")),
+            async |scope| {
+                let mut outcome =
+                    read_completion(&mut outcomes, scope, async |_, _| Ok(retain_until))
+                        .await
+                        .map_err(|_| PublicationError::Indeterminate)?
+                        .expect("the scoped upload must be completed");
+                if let Some(version) = expected_version {
+                    assert_ne!(outcome.media_version, version);
+                    outcome.media_version = version.into();
+                }
+                Ok(Some(outcome))
+            },
+        )
+        .await
+    };
+    // Keep the authenticated upload and its locator intact. A different
+    // version in the expected receipt must stop the handoff before staging.
+    assert_eq!(
+        stage_upload(&mut tx, Some("synthetic-other-media-version")).await,
+        Err(PublicationError::Refused)
+    );
     assert!(tx
         .query_one(
             "SELECT NOT EXISTS (SELECT FROM public.tracks WHERE release_id = $1::text::uuid)",
@@ -243,21 +273,7 @@ pub(super) async fn publish(
         .await
         .unwrap()
         .get::<_, bool>(0));
-    let StageOutcome::Staged(tracks) = stage_completed_release(
-        &mut tx,
-        &job,
-        &[upload],
-        ALBUM,
-        Some(candidates),
-        (200, include_str!("review_retry_recordings.json")),
-        async |scope| {
-            read_completion(&mut outcomes, scope, async |_, _| Ok(retain_until))
-                .await
-                .map_err(|_| PublicationError::Indeterminate)
-        },
-    )
-    .await
-    .unwrap() else {
+    let StageOutcome::Staged(tracks) = stage_upload(&mut tx, None).await.unwrap() else {
         panic!("expected the committed FLAC to publish");
     };
     let [track] = tracks.as_slice() else {
