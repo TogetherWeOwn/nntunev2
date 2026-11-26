@@ -245,7 +245,8 @@ test('Next plays the reordered private successor with a fresh grant', async ({ p
 test('keyboard moves to the queue boundary keep focus on the moved track during playback and pause', async ({ page, origin }) => {
 	const { first, upcoming, later, grants, tab, firstSource, queue, active, audio, player, assertQueue } =
 		await openInvitedQueue(page, origin);
-	const move = (track: typeof first, direction: 'up' | 'down' | 'to bottom') => queue.and(page.locator(`[${contract.queueId}="${track.id}"]`))
+	const move = (track: typeof first, direction: 'up' | 'down' | 'to top' | 'to bottom') => queue
+		.and(page.locator(`[${contract.queueId}="${track.id}"]`))
 		.getByRole('button', { name: `Move ${track.title} ${direction}`, exact: true });
 	const status = page.getByRole('status').and(page.getByTestId('queue-announcement'));
 	const playback = await audio.evaluateHandle((node: HTMLAudioElement) => {
@@ -283,6 +284,15 @@ test('keyboard moves to the queue boundary keep focus on the moved track during 
 	await expect(status).toHaveText(`${later.title} moved to 1 of 3`);
 	await expect(move(later, 'up')).toBeDisabled();
 	await expect(move(later, 'down')).toBeFocused();
+
+	await move(first, 'up').focus();
+	await page.keyboard.press('Tab');
+	await expect(move(first, 'to top')).toBeFocused();
+	await page.keyboard.press('Enter');
+	await assertQueue([first.id, later.id, upcoming.id]);
+	await expect(status).toHaveText(`${first.title} moved to 1 of 3`);
+	await expect(move(first, 'to top')).toBeDisabled();
+	await expect(move(first, 'down')).toBeFocused();
 	await expect(active).toHaveAttribute(contract.queueId, first.id);
 	await expect(player.getByTestId('library-now-playing')).toHaveText(first.title);
 	await expect(player.getByRole('button', { name: 'Play', exact: true })).toBeVisible();
