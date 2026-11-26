@@ -247,6 +247,34 @@ def check_reader_privilege_binding():
 
     check("missing privilege evidence", {"review": review, "inventory": inventory})
     check("duplicate privilege object", b'{"reader_privileges": null, ' + json.dumps(record).encode()[1:])
+    over = privileges | {"result": "failed", "extra_grants": ["UPDATE ON fixture_catalog.required"]}
+    check("readback shows an extra table grant", record | {"reader_privileges": over},
+          "pending (extra-grant: UPDATE ON fixture_catalog.required)")
+    for grant in (
+        "UPDATE (id) ON fixture_catalog.required",
+        "UPDATE ON LARGE OBJECT 900001",
+        "UPDATE ON fixture_catalog.required WITH GRANT OPTION",
+        "SELECT ON fixture_catalog.required WITH GRANT OPTION",
+    ):
+        check(f"readback names {grant}", record | {"reader_privileges": over | {"extra_grants": [grant]}},
+              f"pending (extra-grant: {grant})")
+    mixed = ["UPDATE (id) ON fixture_catalog.required", "UPDATE ON LARGE OBJECT 900001"]
+    check("readback names mixed table grant forms", record | {"reader_privileges": over | {"extra_grants": mixed}},
+          f"pending (extra-grant: {', '.join(mixed)})")
+    check("extra grant from another inventory", record | {"reader_privileges": over | {"inventory_sha256": "b" * 64}})
+    for case, override in {
+        "extra grant beside a passed result": {"result": "passed"},
+        "extra grant for another reader": {"reader_oid": 17003},
+        "empty extra grant list": {"extra_grants": []},
+        "repeated extra grant": {"extra_grants": ["UPDATE ON fixture_catalog.required"] * 2},
+        "unnamed extra grant": {"extra_grants": ["UPDATE"]},
+        "large object OID exceeds PostgreSQL range": {"extra_grants": ["UPDATE ON LARGE OBJECT 4294967296"]},
+        "column list has an empty name": {"extra_grants": ["UPDATE () ON fixture_catalog.required"]},
+        "column grant targets a large object": {"extra_grants": ["UPDATE (id) ON LARGE OBJECT 900001"]},
+        "column grant uses a table-only privilege": {"extra_grants": ["DELETE (id) ON fixture_catalog.required"]},
+        "large object grant uses a table-only privilege": {"extra_grants": ["DELETE ON LARGE OBJECT 900001"]},
+    }.items():
+        check(case, record | {"reader_privileges": over | override})
     check("oversized record", json.dumps(record).encode().ljust(4097))
 
     unscoped_inventory = inventory.copy()

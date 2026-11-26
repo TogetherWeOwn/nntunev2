@@ -436,6 +436,16 @@ python3 -IB .github/scripts/database_bootstrap_reader_evidence.py < evidence.jso
   role name and OID that the result actually checked (`reader_role` and
   `reader_oid`). Record `result: passed` only for a completed, successful
   privilege check. Use JSON integers for OIDs and lowercase hex for digests.
+  If the readback shows a reader grant beyond the reviewed least-privilege
+  inventory, record `result: failed` and list each one in `extra_grants`
+  in one of these bounded forms: `<PRIVILEGE> ON <schema>.<object>` for a
+  relation grant, `<PRIVILEGE> (<column>[, <column>...]) ON
+  <schema>.<object>` for a column grant, or `<PRIVILEGE> ON LARGE OBJECT
+  <oid>` for a large-object grant. Column grants use PostgreSQL's `SELECT`,
+  `INSERT`, `UPDATE`, or `REFERENCES` privileges. Large-object grants use
+  `SELECT` or `UPDATE`. Append `WITH GRANT OPTION` when the readback includes
+  that option. For example, `UPDATE ON grant_tracks.tracks`, `UPDATE (id) ON
+  grant_tracks.tracks`, and `UPDATE ON LARGE OBJECT 900001` are valid entries.
 
 The protected baseline emits only a fixed verdict. Arrange a separate authorized
 read-only catalog capture in advance. Take the snapshot while the scoped reader
@@ -449,7 +459,7 @@ observed for each readback.
 If the privilege readback is unavailable, omit `reader_privileges` so the
 evidence stays pending.
 
-Both pending messages leave baseline evidence pending. A plain `pending`
+Every pending message leaves baseline evidence pending. A plain `pending`
 covers absent or unusable readback and other evidence failures, including
 a privilege result for a different reader. Recover any missing private
 readback for the same attempt. `pending (inventory-mismatch)` means a complete,
@@ -463,6 +473,12 @@ rerun the offline check. After reader retirement, use only a retained matched
 readback from the same attempt. If it is unavailable, keep the baseline pending
 and migration closed. The reader preparation helper requires an absent launch
 database.
+`pending (extra-grant: ...)` names each extra grant the reader holds. Keep the
+migration closed until the authority that issued that grant, or another
+custodian with separately verified authority for that exact grant type and
+object, revokes it. Do not infer revocation authority from the reader issuer's
+CONNECT, schema USAGE, or SELECT evidence. Record the revocation readback and
+repeat the privilege check.
 `consistent` confirms the supplied evidence agrees. The protected run's
 `empty` verdict, provenance and retirement evidence are still required.
 Keep credentials and raw SQL results out of the normalized record.
