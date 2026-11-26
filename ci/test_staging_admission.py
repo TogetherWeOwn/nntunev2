@@ -1532,7 +1532,9 @@ class SourceBindingTests(Base):
                                   b'classname="journey"', b'classname="signup.spec.ts"'))
             actions = FakeActions(world.routes(), hook=actions_hook)
         env = make_env(GITHUB_SHA=trusted, DEPLOY_SHA=candidate, GITHUB_EVENT_NAME="workflow_dispatch",
-                       GITHUB_REPOSITORY_ID=str(REPO_ID), GITHUB_TOKEN="synthetic-token", DEPLOY_MODE=mode)
+                       GITHUB_REPOSITORY_ID=str(REPO_ID), GITHUB_TOKEN="synthetic-token", DEPLOY_MODE=mode,
+                       STAGING_BASE_URL="https://staging.example.invalid", CF_ACCESS_CLIENT_ID="synthetic-id",
+                       CF_ACCESS_CLIENT_SECRET="synthetic-secret")
         with patch.object(sa, "ROOT", self.root), patch.dict(sa.os.environ, env, clear=True), \
                 patch.object(sa.sys, "argv", ["staging_admission.py", "verify"]), \
                 patch.object(sa, "Actions", return_value=actions), \
@@ -1550,7 +1552,7 @@ class SourceBindingTests(Base):
             with patch.object(sa, "git", wraps=sa.git) as source_git:
                 try:
                     sa.main()
-                except sa.Refused:
+                except (sa.Refused, SystemExit):
                     self.assertEqual(output.getvalue(), "")
                     raise
             live.assert_called_once_with(sa.os.environ, candidate)
@@ -1728,6 +1730,48 @@ class SourceBindingTests(Base):
 
                 self.run_main(private=True, mode="promote", world_factory=pending, cli_refusal=generic,
                               actions_hook=change_run)
+
+    def test_private_main_reports_late_build_drift_for_the_selected_attempt(self):
+        self.install_private_contract()
+        current_identity = sa.current_identity
+        origin = "https://staging.example.invalid"
+        paths = ("/api/build", "/healthz")
+
+        for drift in (None, "Web", "API"):
+            with self.subTest(drift=drift), patch("sys.stderr", new=io.StringIO()) as errors, \
+                    patch.object(sa.urllib.request, "build_opener") as opener:
+                selected = []
+
+                def readback(env, sha):
+                    selected.append(sha)
+                    responses = ({"sha": OTHER_SHA if drift == "Web" else sha},
+                                 {"ok": True, "build_sha": OTHER_SHA if drift == "API" else sha})
+                    bodies = [io.BytesIO(json.dumps(response).encode()) for response in responses]
+                    for body in bodies:
+                        body.status = 200
+                    opener.return_value.open.side_effect = bodies
+                    current_identity(env, sha)
+
+                if drift is None:
+                    world, lines = self.run_main(private=True, mode="promote", live_error=readback)
+                    pins = json.loads(lines[0])["verified_private_music_staging"]
+                    self.assertEqual((pins["sha"], pins["run_id"], pins["run_attempt"]),
+                                     (selected[0], str(RUN_ID), "1"))
+                    self.assertEqual(pins["deployments"], world.receipt["deployments"])
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    with self.assertRaises(SystemExit) as refused:
+                        self.run_main(private=True, mode="promote", live_error=readback)
+                    self.assertEqual(refused.exception.code, 1)
+                    message = errors.getvalue()
+                    self.assertIn(f"Candidate admission pending for {selected[0]}, "
+                                  f"staging run {RUN_ID}, attempt 1.", message)
+                    self.assertIn(f"The live {drift} build differs from the selected build.", message)
+                    self.assertIn("authorized read-only deployment records to compare the current "
+                                  "Web, API and Stream build, version and deployment IDs", message)
+                    self.assertNotIn(OTHER_SHA, message)
+                self.assertEqual([call.args[0].full_url for call in opener.return_value.open.call_args_list],
+                                 [origin + path for path in (paths[:1] if drift == "Web" else paths)])
 
     def test_private_producer_cli_binds_candidate_audio(self):
         fixture = self.install_private_contract()
@@ -2011,11 +2055,22 @@ class TransportTests(Base):
             def read(self, limit):
                 return json.dumps(self.data).encode()
         with patch.object(sa.urllib.request, "build_opener") as opener:
-            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"build_sha": SHA})]
+            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"ok": True, "build_sha": SHA})]
             sa.current_identity(env, SHA)
             self.assertEqual(opener.return_value.open.call_count, 2)
-            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"build_sha": OTHER_SHA})]
+            opener.return_value.open.side_effect = [
+                Response({"sha": SHA}), Response({"ok": True, "build_sha": OTHER_SHA})]
             self.refused("current staging identity drift", sa.current_identity, env, SHA)
+            opener.return_value.open.side_effect = [
+                Response({"sha": SHA}), Response({"ok": True, "build_sha": "unknown"})]
+            self.refused("invalid staging build identity", sa.current_identity, env, SHA)
+            for bad_api in ({"build_sha": OTHER_SHA}, {"ok": False, "build_sha": OTHER_SHA},
+                            {"ok": 1, "build_sha": OTHER_SHA}, {"ok": True, "build_sha": OTHER_SHA, "extra": True}):
+                with self.subTest(api=bad_api):
+                    opener.return_value.open.side_effect = [Response({"sha": SHA}), Response(bad_api)]
+                    self.refused("invalid API identity shape", sa.current_identity, env, SHA)
+            opener.return_value.open.side_effect = [Response({"sha": OTHER_SHA, "extra": True})]
+            self.refused("invalid web identity shape", sa.current_identity, env, SHA)
         for origin in ("http://staging.example.invalid", "https://user:pass@staging.example.invalid",
                        "https://staging.example.invalid/?token=x", ""):
             self.refused("invalid staging identity origin", sa.current_identity,
