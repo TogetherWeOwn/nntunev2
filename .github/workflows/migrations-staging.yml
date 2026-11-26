@@ -39,7 +39,15 @@ concurrency:
 jobs:
   migrations-staging:
     name: migrations-staging
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.run_attempt == 1
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.actor)
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.triggering_actor)
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.event.pull_request.user.login)
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 5
     # The data checkout has action-created Git config. Keep hooks and
     # filesystem monitors disabled when inspecting or switching its commits.

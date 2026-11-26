@@ -42,7 +42,8 @@ class CoverageTests(unittest.TestCase):
                  ["api", "api-migrations", "rust-ingest", "rust-test", "rust-mb", "web-checks"], []),
                 *[([path], SELECTABLE, []) for path in
                   (".github/workflows/new.yml", "Cargo.lock", "apps/web/package.json",
-                   "workers/api/Cargo.toml", "crates/shared/src/lib.rs", "docs/synthetic.sql",
+                   "workers/api/Cargo.toml", "crates/shared/src/lib.rs", "docs/synthetic.json",
+                   "fixtures/synthetic.sql",
                    "docs/nested/pnpm-lock.yaml", "new-area/code.ts", *input_docs)],
             ):
                 with self.subTest(files=files):
