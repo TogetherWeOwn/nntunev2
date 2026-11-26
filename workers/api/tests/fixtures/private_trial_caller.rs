@@ -520,6 +520,86 @@ pub(crate) async fn verify_publication(
         .status,
         403
     );
+    let outcome = committed.outcome();
+    let receipt_rows = async || {
+        observer
+            .query_one(
+                "SELECT ARRAY[s.xmin::text, p.xmin::text]
+             FROM public.ingest_session_reservations s
+             JOIN public.storage_digest_inventory_intents p ON p.map_id = s.completed_map_id
+             WHERE s.id = $1::text::uuid AND s.terminal_reason = 'completed'
+               AND s.write_lease_id IS NULL AND s.multipart_object_id = $2::text::uuid
+               AND p.map_id = $3::text::uuid AND p.media_version = $4 AND p.page_versions = $5",
+                &[
+                    &prepared.scope.session,
+                    &outcome.object,
+                    &outcome.map,
+                    &outcome.media_version,
+                    &outcome.page_versions,
+                ],
+            )
+            .await
+            .unwrap()
+            .get::<_, Vec<String>>(0)
+    };
+    let receipt_before = receipt_rows().await;
+    {
+        let mut gate = connection().await;
+        let gate = gate.transaction().await.unwrap();
+        let gate_pid = gate
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        gate.batch_execute(
+            "SET LOCAL lock_timeout = '2s';
+             LOCK TABLE public.catalogue_s3_sources IN ACCESS EXCLUSIVE MODE;",
+        )
+        .await
+        .unwrap();
+        let mut reader = connection().await;
+        let reader_pid = reader
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let mut pending =
+            std::pin::pin!(publish(&mut reader, upload_writer, Some("fixture-bucket")));
+        blocker_observer::observe_blocked(observer, gate_pid, reader_pid, pending.as_mut())
+            .await
+            .unwrap();
+        // Replay has read the upload receipt and is waiting on the publication lookup.
+        assert!(observer
+            .query_one(
+                "SELECT strpos(query, 'SELECT s.track_id::text') > 0
+                    AND strpos(query, 'FROM public.catalogue_s3_sources s') > 0
+                 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'",
+                &[&reader_pid],
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0));
+        assert_eq!(receipt_rows().await, receipt_before);
+        assert!(observer
+            .query_one("SELECT pg_cancel_backend($1)", &[&reader_pid])
+            .await
+            .unwrap()
+            .get::<_, bool>(0));
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+            .await
+            .expect("cancelled publication lookup must return");
+        let sealed = crate::handlers::unavailable();
+        assert_eq!(failed.status, 503);
+        assert_eq!(failed.body, sealed.body);
+        assert_eq!(failed.extra_headers, sealed.extra_headers);
+        assert!(failed.set_cookie.is_none() && failed.retry_after.is_none());
+        gate.rollback().await.unwrap();
+    }
+    let mut recovered_reader = connection().await;
+    let replay = publish(&mut recovered_reader, upload_writer, Some("fixture-bucket")).await;
+    assert_eq!((replay.status, &replay.body), (200, &first.body));
+    assert_eq!(replay.extra_headers, first.extra_headers);
+    assert_eq!(receipt_rows().await, receipt_before);
     // A different completed job can reference the same deduplicated object,
     // so both catalogue receipts have identical upload bytes, digest and pins.
     let unrelated_job = "synthetic-unrelated-replay-job";
