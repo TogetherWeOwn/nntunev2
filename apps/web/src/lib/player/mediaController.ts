@@ -513,15 +513,18 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const audio = attachment?.audio;
 		const version = attachmentVersion;
 		const queueRevision = queue.revision;
-		const intent = ++positionIntent;
+		// These controls can report a refusal while the failed decoder waits
+		// for its receipt. The refusal must leave that recovery current.
+		const recoveringFailedSource = pendingGrant !== undefined && get(playbackStatus) === 'error';
+		const intent = recoveringFailedSource ? positionIntent : ++positionIntent;
 		// Cancel on acceptance, even if the native seek is deferred or refused.
-		if (track) pendingShare.supersede(track.id, source);
+		if (track && !recoveringFailedSource) pendingShare.supersede(track.id, source);
 		const revision = pendingShare.revision;
 		const isCurrent = (guard = system?.active) => !destroyed && attachmentVersion === version && queue.isCurrent(queueRevision) &&
 			positionIntent === intent && pendingShare.revision === revision && guard?.() !== false;
 		runPosition(() => {
 			const matches = (guard = system?.active) => !!audio && !!source && matchesSource(audio, source, () => isCurrent(guard));
-			const outcome = attachment && audio && matches() ? jumpMedia(audio, direction, matches, () => {
+			const outcome = !recoveringFailedSource && attachment && audio && matches() ? jumpMedia(audio, direction, matches, () => {
 				if (current === attachment) clearJumpFeedback();
 			}, seconds, system?.unavailable, onSeekLanded(attachment, system)) : undefined;
 			if (outcome ? !matches(system?.canReport) : !isCurrent()) return;
