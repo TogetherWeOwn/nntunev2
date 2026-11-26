@@ -805,17 +805,21 @@ class VerifyTests(Base):
         other_id = RUN_ID - 1
         other_jobs = f"runs/{other_id}/jobs?filter=all&per_page=100&page=1"
         selected_jobs = f"runs/{RUN_ID}/jobs?filter=all&per_page=100&page=1"
-        for api_conclusion in (None, "skipped", "success"):
-            with self.subTest(api_conclusion=api_conclusion):
+        for api_conclusion, started, completed in (
+            (None, None, None), ("skipped", -2.75, -2.25),
+            ("success", -2.75, -2.25), ("success", 6, 7),
+        ):
+            with self.subTest(api_conclusion=api_conclusion, started=started):
                 w = World()
                 if api_conclusion is not None:
-                    # An older run can start deploying after the selected
-                    # run has begun its journey. Both push SHAs stay fixed.
-                    w.runs.append(dict(w.run, id=other_id, created_at=iso(-30), updated_at=iso(1)))
+                    # Cover both overlapping evidence and a deploy after the
+                    # selected journey releases the workflow lock at minute 5.
+                    # Both push SHAs stay fixed.
+                    w.runs.append(dict(w.run, id=other_id, created_at=iso(-30), updated_at=iso(completed + 1)))
                     w.others[other_id] = [
-                        dict(w.job("staging-web", -2.25, started=-2.75), id=201,
+                        dict(w.job("staging-web", completed, started=started), id=201,
                              run_id=other_id, conclusion="skipped"),
-                        dict(w.job("staging-api", -2.25, started=-2.75, steps=[
+                        dict(w.job("staging-api", completed, started=started, steps=[
                             w.step(sa.DEPLOY_STEPS["staging-api"], 1, api_conclusion)
                         ]), id=202, run_id=other_id, conclusion=api_conclusion),
                     ]
