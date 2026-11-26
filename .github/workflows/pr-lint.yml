@@ -46,7 +46,15 @@ concurrency:
 jobs:
   pr-lint:
     name: pr-lint
-    runs-on: ubuntu-24.04
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.run_attempt == 1
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.actor)
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.triggering_actor)
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.event.pull_request.user.login)
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - name: Check PR title convention

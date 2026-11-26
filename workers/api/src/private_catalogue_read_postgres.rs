@@ -273,7 +273,7 @@ async fn resolves_only_the_committed_scoped_publication() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let cookie = issue_session(keys.primary, MEMBER, issued_at, 120).unwrap();
+    let cookie = issue_session(keys.primary, MEMBER, issued_at, 600).unwrap();
     let claims = verify_session_dual(&keys, &cookie, issued_at).unwrap();
     let invite: i64 = writer
         .query_one(
