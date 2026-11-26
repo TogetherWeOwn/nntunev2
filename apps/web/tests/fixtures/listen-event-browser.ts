@@ -27,7 +27,7 @@ export async function mountListenEventFixture(signal: AbortSignal): Promise<List
 	// Exercise the same receipt validation and publication as the browser
 	// caller. The fixture supplies canonical synthetic IDs and private IDs.
 	const grant = createBrowserPlaybackGrant(owner, sessionBinding, async (request) => ({
-		...request, durationMs: 60_000
+		data: { ...request, durationMs: 60_000 }
 	}));
 	let source: BrowserPlaybackSource | undefined;
 	let writes = 0;

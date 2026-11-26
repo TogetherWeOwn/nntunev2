@@ -182,8 +182,7 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
     def test_snapshot_spike_is_build_and_recall_only(self):
         text = (WORKFLOWS / "mb-snapshot-spike.yml").read_text()
         self.assertRegex(text, r"(?m)^  workflow_dispatch:$")
-        self.assertIn("  pull_request:\n    types: [labeled]", text)
-        self.assertIn("github.event.label.name == 'mb-snapshot-spike'", text)
+        self.assertNotRegex(text, r"(?m)^  (pull_request|pull_request_target|push):")
         self.assertIn("permissions:\n  contents: read", text)
         self.assertNotRegex(text, r"(?m)^\s*(stage|environment|workflow_call):")
         self.assertNotRegex(text, r"\b(secrets|inputs\.stage|CLOUDFLARE_\w+|wrangler)\b")

@@ -12,6 +12,7 @@ export async function mockInvitedLibraryPlayback(page: Page, origin: string, fix
 	libraryItems: () => LibraryTrack[];
 	playableTrackId: (requestedId: string) => string | undefined;
 	audio: Buffer | ((route: Route) => Promise<void>);
+	grantUnavailable?: (trackId: string) => boolean;
 	isRevoked?: () => boolean;
 }) {
 	const context = page.context();
@@ -43,6 +44,7 @@ export async function mockInvitedLibraryPlayback(page: Page, origin: string, fix
 			(!playback || input.play_id !== playId || trackId !== playback.trackId || input.session_id !== playback.sessionId)) {
 			return route.fulfill({ status: 409 });
 		}
+		if (fixture.grantUnavailable?.(trackId)) return route.fulfill({ status: 503 });
 		playback = { trackId, sessionId: input.session_id };
 		return route.fulfill({ json: { trackId, playbackSessionId: playback.sessionId, sessionBinding: binding, playId, durationMs: 14_000 } });
 	});

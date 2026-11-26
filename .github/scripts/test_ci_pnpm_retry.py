@@ -389,7 +389,8 @@ class TestPnpmRetryShape(unittest.TestCase):
             jobs = split_jobs(handle.read())
         self.assertFalse({"svelte-check", "vitest"} & jobs.keys())
         job = jobs["web-checks"]
-        self.assertIsNone(job_level_field(job, "if"))
+        self.assertEqual(job_level_field(job, "if"),
+                         "${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'web-checks') }}")
         self.assertIsNone(job_level_field(job, "continue-on-error"))
         run_steps = [
             (run, step_level_field(step, "id"), step_level_field(step, "if"),

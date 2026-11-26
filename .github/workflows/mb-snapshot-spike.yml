@@ -1,7 +1,6 @@
 # Phase 0 spike: R2 snapshot backend for workers/mb (measurement only).
 #
-# Never runs on push and is not a required check. Manual dispatch and a PR
-# labeled `mb-snapshot-spike` run only the credential-free build and recall.
+# Manual dispatch runs the credential-free build and recall.
 # The live latency benchmark was retired.
 #
 # Gates and method: workers/mb/SNAPSHOT.md. Only the CC0 core archive
@@ -27,8 +26,6 @@ on:
         required: false
         type: string
         default: "20261109"
-  pull_request:
-    types: [labeled]
 
 permissions:
   contents: read
@@ -44,7 +41,6 @@ env:
 jobs:
   spike:
     name: mb-snapshot-spike
-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'mb-snapshot-spike'
     runs-on: ubuntu-latest
     timeout-minutes: 345
     steps:
