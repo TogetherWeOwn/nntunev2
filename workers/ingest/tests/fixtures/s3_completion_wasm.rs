@@ -129,6 +129,16 @@ async fn run(mode: &str, endpoint: &str, read_page: Option<Function>) -> Result<
         })
         .to_string());
     }
+    // The lost-acknowledgement inventory is read only after the failed PUT.
+    let mut read_page = read_page;
+    let (mode, staged_inventory) = if mode == "multipart-resume-lost-ack" {
+        let staged_inventory = read_page
+            .take()
+            .ok_or_else(|| JsValue::from_str("missing staged part inventory fixture"))?;
+        ("multipart-resume", Some(staged_inventory))
+    } else {
+        (mode, None)
+    };
     let readback = mode.starts_with("readback");
     let multipart_resume = matches!(mode, "multipart-resume" | "multipart-resume-full");
     let resume_bytes;
@@ -283,8 +293,8 @@ async fn run(mode: &str, endpoint: &str, read_page: Option<Function>) -> Result<
             &context,
             &parts,
             until,
+            staged_inventory,
             mode == "multipart-resume",
-            read_page,
         )
         .await;
     }
@@ -408,8 +418,8 @@ async fn resume_multipart<'a>(
     context: &'a EnvelopeContext,
     parts: &[UploadPart<'a>],
     until: std::time::SystemTime,
+    staged_inventory: Option<Function>,
     interrupt_second: bool,
-    read_page: Option<Function>,
 ) -> Result<String, JsValue> {
     let [first, second] = parts else {
         panic!("expected two fixture parts");
@@ -452,7 +462,7 @@ async fn resume_multipart<'a>(
     let resumed_etag;
     let upload = DurableUpload::new(target, context, binding.session, until);
     if saved.len() == 1 {
-        let receipt = match read_page {
+        let receipt = match staged_inventory {
             Some(read_page) => recover_staged_part(&read_page, saved[0], second)?,
             None => sender
                 .put_part(binding, context, second, &upload, until)

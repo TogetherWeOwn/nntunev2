@@ -377,6 +377,7 @@ for (const [name, loseAck, changedDigest] of [
     const stored = new Map();
     const requests = [];
     let published;
+    let finalBody;
     t.mock.method(globalThis, 'fetch', async (request) => {
       const url = new URL(request.url);
       requests.push(`${request.method} ${url.search.slice(1)}`);
@@ -385,12 +386,10 @@ for (const [name, loseAck, changedDigest] of [
         assert.equal(number, stored.size + 1, 'a stored part must never be sent again');
         assert.ok(number <= 2);
         const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
-        if (number === 2 && changedDigest) {
-          body[0] ^= 1;
-        }
         const receipt = { etag: `"fixture-part-${number}"`, 'x-amz-checksum-sha256': checksum(body) };
         stored.set(number, { receipt, len: body.length });
         if (number === 2 && loseAck) {
+          finalBody = body;
           throw new Error('synthetic final part acknowledgement lost after storing ciphertext');
         }
         return new Response(null, { headers: receipt });
@@ -411,12 +410,23 @@ for (const [name, loseAck, changedDigest] of [
       assert.deepEqual([...stored.keys()], [1, 2]);
       assert.equal(published, undefined);
       requests.push('LIST parts');
+      if (changedDigest) {
+        // A separate write replaces the stored part with bytes matching its own checksum.
+        const replacement = Buffer.from(finalBody);
+        replacement[0] ^= 1;
+        const digest = checksum(replacement);
+        assert.notEqual(digest, stored.get(2).receipt['x-amz-checksum-sha256']);
+        stored.set(2, {
+          receipt: { etag: '"replacement-part-2"', 'x-amz-checksum-sha256': digest },
+          len: replacement.length,
+        });
+      }
       return { next_marker: null, parts: [...stored].map(([number, { receipt, len }]) => ({
         number, len, etag: receipt.etag, digest: [...Buffer.from(receipt['x-amz-checksum-sha256'], 'base64')],
       })) };
     };
 
-    const result = complete(loseAck ? 'multipart-resume' : 'multipart-resume-full', loseAck ? readPage : undefined);
+    const result = complete(loseAck ? 'multipart-resume-lost-ack' : 'multipart-resume-full', loseAck ? readPage : undefined);
     if (changedDigest) {
       await assert.rejects(result, rejectedWith('unconfirmed final part inventory'));
     } else {
