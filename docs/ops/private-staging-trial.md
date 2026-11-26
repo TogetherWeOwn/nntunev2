@@ -227,7 +227,7 @@ not supply those custody records.
 succeed in the selected attempt, both the retirement and private music jobs
 must skip, and the prior confirmed cleanup must finish before deployment.
 Keep the current retirement job recorded as **Skipped**. Record **Pending**
-for an aborted deployment, an armed journey, or missing or mismatched scope,
+for an aborted deployment, a journey that ran, or missing or mismatched scope,
 job or step evidence. Preserve any verified historical sign-off. The report
 checks saved evidence and grants no staging or release clearance.
 

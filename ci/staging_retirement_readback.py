@@ -22,7 +22,7 @@ def attempt(records, run_id, number, sha, event):
     route = f"runs/{run_id}/attempts/{number}"
     run = records[route]
     require(decimal(run.get("id")) == run_id and decimal(run.get("run_attempt")) == number
-            and run.get("path") in (WORKFLOW, f"{WORKFLOW}@refs/heads/main")
+            and run.get("path") in (WORKFLOW, f"{WORKFLOW}@main", f"{WORKFLOW}@refs/heads/main")
             and run.get("head_sha") == sha and run.get("head_branch") == "main"
             and run.get("event") == event and run.get("status") == "completed"
             and run.get("conclusion") in TERMINAL_CONCLUSIONS, "selected attempt does not match")

@@ -165,7 +165,7 @@ class StagingRetirementReadbackTests(unittest.TestCase):
 
         def run(run_id, attempt, sha, event):
             return {"id": run_id, "run_attempt": attempt, "workflow_id": WORKFLOW_ID,
-                    "path": f"{sa.WORKFLOW}@refs/heads/main", "head_sha": sha,
+                    "path": f"{sa.WORKFLOW}@main", "head_sha": sha,
                     "head_branch": "main", "event": event, "status": "completed",
                     "conclusion": "success", "repository": repo, "head_repository": repo}
 
@@ -178,7 +178,7 @@ class StagingRetirementReadbackTests(unittest.TestCase):
                     "run_id": run["id"], "head_sha": run["head_sha"], "steps": list(steps)}
 
         candidate_run = run(100, 2, SHA, "push")
-        cleanup_run = run(90, 1, OTHER_SHA, "workflow_dispatch")
+        cleanup_run = run(90, 1, OTHER_SHA, "workflow_dispatch") | {"path": sa.WORKFLOW}
         clean = {"actions": {
             current: candidate_run,
             f"{current}/jobs": page("jobs", [
@@ -208,6 +208,8 @@ class StagingRetirementReadbackTests(unittest.TestCase):
         armed["actions"][f"{current}/jobs"]["jobs"][3]["conclusion"] = "success"
         wrong_attempt = copy.deepcopy(clean)
         wrong_attempt["actions"][f"{current}/jobs"]["jobs"][1]["run_attempt"] = 1
+        wrong_ref = copy.deepcopy(clean)
+        wrong_ref["actions"][current]["path"] = f"{sa.WORKFLOW}@other"
         late = copy.deepcopy(clean)
         late["actions"][f"{prior}/jobs"]["jobs"][0]["completed_at"] = iso(-9)
         truncated = copy.deepcopy(clean)
@@ -224,6 +226,7 @@ class StagingRetirementReadbackTests(unittest.TestCase):
             ("green API job with a skipped deploy step", unconfigured, 1),
             ("candidate ran the private music journey", armed, 1),
             ("another attempt's deploy job", wrong_attempt, 1),
+            ("foreign workflow ref", wrong_ref, 1),
             ("cleanup completed after deployment started", late, 1),
             ("incomplete prior jobs page", truncated, 1),
             ("missing prior receipt", {"actions": clean["actions"]}, 1),
