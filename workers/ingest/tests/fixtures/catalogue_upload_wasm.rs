@@ -35,6 +35,30 @@ const LEASE: &str = "99000000-0000-4000-8000-000000000002";
 const ALBUM: &str = "Synthetic Signals";
 const RELEASE: &str = "ab340000-0000-4000-8000-000000000000";
 
+pub(super) async fn assert_unpublished(object: &str, map_id: [u8; 16]) {
+    let observer = postgres::connect().await;
+    let row = observer
+        .query_one(
+            "SELECT NOT EXISTS (
+                SELECT FROM public.ingest_session_reservations
+                WHERE id = $1::text::uuid AND completed_map_id IS NOT NULL
+            ) AND NOT EXISTS (
+                SELECT FROM public.storage_digest_inventory_intents WHERE map_id = $2::text::uuid
+            ) AND NOT EXISTS (
+                SELECT FROM public.storage_validated_digest_winners WHERE object_id = $3::text::uuid
+            ) AND NOT EXISTS (
+                SELECT FROM public.tracks WHERE release_id = $4::text::uuid
+            )",
+            &[&SESSION, &hex::encode(map_id), &object, &RELEASE],
+        )
+        .await
+        .unwrap();
+    assert!(
+        row.get::<_, bool>(0),
+        "failed completion recorded a durable outcome"
+    );
+}
+
 pub(super) async fn publish(
     verified: &VerifiedCompletedReadback<'_, '_>,
     context: &EnvelopeContext,
