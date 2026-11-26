@@ -193,7 +193,9 @@ protected `main` dispatch with a cleanup scope input. A push that aborts before
 deployment can show the same skip. Use the selected attempt's `staging-web`
 and `staging-api` job records and require success of the actual deploy steps
 `Deploy to staging` and `Deploy api to staging`. A green job whose deploy step
-skipped does not establish deployment.
+skipped does not establish deployment. Require the `post-deploy private music
+journey` job to be skipped in that attempt so an armed journey cannot use this
+report for a new publication.
 
 For a disposable fixture whose original sign-off passed, reuse the read-only
 Actions run, job and verdict readback above. Match the original publication
@@ -221,13 +223,13 @@ retirement step for `verdict`. Take `approved_scope_sha256` independently from
 the original approved scope bytes. GitHub's run and jobs responses alone do
 not supply those custody records.
 
-**Already cleared** means both deploy steps succeeded in the selected attempt
-and the prior confirmed cleanup for this scope finished by the time either
-deploy step started. Keep the current job recorded as **Skipped**. If the
-candidate aborted before deploy, either deployment step lacks evidence, or
-any original scope or retirement record is missing or mismatched, record
-**Pending** for the candidate. Preserve any verified historical sign-off.
-The report checks saved evidence and grants no staging or release clearance.
+**Already cleared** records the original scope only. Both deploy steps must
+succeed in the selected attempt, both the retirement and private music jobs
+must skip, and the prior confirmed cleanup must finish before deployment.
+Keep the current retirement job recorded as **Skipped**. Record **Pending**
+for an aborted deployment, an armed journey, or missing or mismatched scope,
+job or step evidence. Preserve any verified historical sign-off. The report
+checks saved evidence and grants no staging or release clearance.
 
 ### Isolated database catalog preflight
 

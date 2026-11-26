@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from staging_admission import (
-    DEPLOY_STEPS, HASH, MAX_RUN_PAGE, SHA, TERMINAL_CONCLUSIONS, WORKFLOW,
+    DEPLOY_STEPS, HASH, MAX_RUN_PAGE, PRIVATE_JOURNEY, SHA, TERMINAL_CONCLUSIONS, WORKFLOW,
     Refused, decimal, parse_json, require, require_steps, timestamp,
 )
 
@@ -60,6 +60,7 @@ def require_already_cleared(evidence, sha, run_id, number, scope_sha256):
     run_id = decimal(run_id)
     candidate, jobs = attempt(records, run_id, decimal(number), sha, "push")
     job(jobs, RETIREMENT, "skipped")
+    job(jobs, PRIVATE_JOURNEY, "skipped")
     deploy_starts = []
     for name, step_name in DEPLOY_STEPS.items():
         deploy = job(jobs, name, "success")

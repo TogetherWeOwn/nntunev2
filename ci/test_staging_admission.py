@@ -185,6 +185,7 @@ class StagingRetirementReadbackTests(unittest.TestCase):
                 job(candidate_run, 101, retire, "skipped"),
                 job(candidate_run, 102, "staging-web", "success", step("Deploy to staging")),
                 job(candidate_run, 103, "staging-api", "success", step("Deploy api to staging")),
+                job(candidate_run, 104, "post-deploy private music journey", "skipped"),
             ]),
             prior: cleanup_run,
             f"{prior}/jobs": page("jobs", [job(cleanup_run, 400, retire, "success",
@@ -195,7 +196,7 @@ class StagingRetirementReadbackTests(unittest.TestCase):
                           "scope_sha256": scope, "verdict": "Private staging fixture cleanup: confirmed"}}
         aborted = copy.deepcopy(clean)
         aborted["actions"][current]["conclusion"] = "failure"
-        _, web, api = aborted["actions"][f"{current}/jobs"]["jobs"]
+        _, web, api, _ = aborted["actions"][f"{current}/jobs"]["jobs"]
         web.update(conclusion="skipped", steps=[])
         api.update(conclusion="failure", steps=[
             step("Install prerequisites") | {"conclusion": "failure"},
@@ -203,6 +204,8 @@ class StagingRetirementReadbackTests(unittest.TestCase):
         ])
         unconfigured = copy.deepcopy(clean)
         unconfigured["actions"][f"{current}/jobs"]["jobs"][2]["steps"][0]["conclusion"] = "skipped"
+        armed = copy.deepcopy(clean)
+        armed["actions"][f"{current}/jobs"]["jobs"][3]["conclusion"] = "success"
         wrong_attempt = copy.deepcopy(clean)
         wrong_attempt["actions"][f"{current}/jobs"]["jobs"][1]["run_attempt"] = 1
         late = copy.deepcopy(clean)
@@ -219,6 +222,7 @@ class StagingRetirementReadbackTests(unittest.TestCase):
             ("already cleared", clean, 0),
             ("pre-deploy abort", aborted, 1),
             ("green API job with a skipped deploy step", unconfigured, 1),
+            ("candidate ran the private music journey", armed, 1),
             ("another attempt's deploy job", wrong_attempt, 1),
             ("cleanup completed after deployment started", late, 1),
             ("incomplete prior jobs page", truncated, 1),
