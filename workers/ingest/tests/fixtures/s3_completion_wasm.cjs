@@ -649,39 +649,45 @@ test('an ambiguous or mismatched abort response stays unconfirmed', async (t) =>
   }
 });
 
-test('overlapping inventory pages preserve the confirmed checkpoint and a coherent retry resumes', async (t) => {
-  const confirmed = [];
-  const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
-    const number = confirmed.length + 1;
-    assert.ok(number <= 2, 'status and resume must only read inventory');
-    const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
-    const etag = `"inventory-part-${number}"`;
-    confirmed.push({ number, len: body.length, etag, digest: sha256(body) });
-    return new Response(null, { headers: { etag, 'x-amz-checksum-sha256': checksum(body) } });
-  });
-  const markers = [];
-  const uploadId = new URLSearchParams(uploadQuery).get('uploadId');
-  const readPage = (observedBucket, key, id, marker) => {
-    assert.deepEqual([observedBucket, key, id], [bucket, mediaKey, uploadId]);
-    assert.equal(confirmed.length, 2);
-    markers.push(marker);
-    const [first, second] = confirmed;
-    if (marker === null) return { next_marker: 1, parts: [first] };
+for (const [kind, repeatedPart] of [
+  ['identical', (part) => ({ ...part })],
+  ['conflicting', (part) => ({ ...part, etag: '"overlapping-part-1"' })],
+]) {
+  test(`keeps the checkpoint across ${kind} multipart page overlap and resumes on a coherent retry`, async (t) => {
+    const confirmed = [];
+    const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+      const number = confirmed.length + 1;
+      assert.ok(number <= 2, 'status and resume must only read inventory');
+      const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
+      const etag = `"inventory-part-${number}"`;
+      const sha = checksum(body);
+      confirmed.push({ number, len: body.length, etag, digest: [...Buffer.from(sha, 'base64')] });
+      return new Response(null, { headers: { etag, 'x-amz-checksum-sha256': sha } });
+    });
+    const markers = [];
+    const uploadId = new URLSearchParams(uploadQuery).get('uploadId');
+    const readPage = (observedBucket, key, id, marker) => {
+      assert.deepEqual([observedBucket, key, id], [bucket, mediaKey, uploadId]);
+      assert.equal(confirmed.length, 2);
+      markers.push(marker);
+      const [first, second] = confirmed;
+      if (marker === null) return { next_marker: 1, parts: [first] };
 
-    assert.equal(marker, 1);
-    // Both pages arrive and together include every part. The terminal page
-    // repeats part 1 with a different receipt alongside genuine part 2.
-    const parts = markers.length === 2
-      ? [{ ...first, etag: '"overlapping-part-1"' }, second]
-      : [second];
-    return { next_marker: null, parts };
-  };
+      assert.equal(marker, 1);
+      // The first terminal page repeats part 1 alongside genuine part 2.
+      const parts = markers.length === 2 ? [repeatedPart(first), second] : [second];
+      return { next_marker: null, parts };
+    };
 
-  const result = JSON.parse(await complete('multipart-resume', readPage));
-  assert.deepEqual(markers, [null, 1, null, 1]);
-  assert.equal(fetch.mock.callCount(), 2);
-  assert.deepEqual(result, {
-    first: { status: 'pending', upload_id: uploadId, parts: confirmed },
-    retry: { status: 'resumable', upload_id: uploadId, parts: confirmed },
+    const result = JSON.parse(await complete('multipart-resume', readPage));
+    assert.deepEqual(markers, [null, 1, null, 1]);
+    assert.equal(fetch.mock.callCount(), 2);
+    assert.deepEqual(result, {
+      statuses: [
+        { status: 'pending', upload_id: uploadId, parts: confirmed },
+        { status: 'resumable', upload_id: uploadId, parts: confirmed },
+      ],
+      manifest: confirmed.map(({ number, etag, digest }) => [number, etag, Buffer.from(digest).toString('base64')]),
+    });
   });
-});
+}

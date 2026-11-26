@@ -411,16 +411,7 @@ async fn resume_multipart<'a>(
             .await;
         if let Some(read_page) = read_page {
             let receipts = [confirmed, second.map_err(dispatch_error)?];
-            let saved = receipts
-                .each_ref()
-                .map(|part| checkpoint_part(part, part.etag()));
-            let checkpoint = ResumeCheckpoint {
-                binding,
-                parts: &saved,
-            };
-            let first = inventory_status(&read_page, target, binding, &receipts, &checkpoint)?;
-            let retry = inventory_status(&read_page, target, binding, &receipts, &checkpoint)?;
-            return Ok(serde_json::json!({ "first": first, "retry": retry }).to_string());
+            return resume_from_inventory(&read_page, target, binding, context, receipts);
         }
         assert!(matches!(second, Err(DispatchError::Unconfirmed(None))));
         saved_etag = confirmed.etag().to_owned();
@@ -462,12 +453,12 @@ async fn resume_multipart<'a>(
     Ok(version.clone())
 }
 
-#[derive(PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize)]
 struct InventoryPart {
     number: u32,
     len: usize,
     etag: String,
-    digest: String,
+    digest: [u8; 32],
 }
 
 #[derive(serde::Deserialize)]
@@ -476,13 +467,54 @@ struct InventoryPage {
     parts: Vec<InventoryPart>,
 }
 
-fn inventory_status(
+fn resume_from_inventory<'a>(
+    read_page: &Function,
+    target: UploadTarget<'a>,
+    binding: ResumeBinding<'a>,
+    context: &'a EnvelopeContext,
+    receipts: [UploadedPart<'a>; 2],
+) -> Result<String, JsValue> {
+    let [first_etag, second_etag] = receipts.each_ref().map(|part| part.etag().to_owned());
+    let saved = [
+        checkpoint_part(&receipts[0], &first_etag),
+        checkpoint_part(&receipts[1], &second_etag),
+    ];
+    let checkpoint = ResumeCheckpoint {
+        binding,
+        parts: &saved,
+    };
+    let mut statuses = Vec::new();
+    for _ in 0..2 {
+        let (first, last) = inventory_pages(read_page, target)?;
+        let observed = first
+            .parts
+            .iter()
+            .chain(&last.parts)
+            .map(|part| CheckpointPart {
+                number: part.number,
+                len: part.len,
+                etag: &part.etag,
+                digest: part.digest,
+            });
+        let coherent = checkpoint.matches_parts(observed);
+        statuses.push(inventory_status(coherent, target, &checkpoint));
+        if coherent {
+            let completion =
+                SessionCompletion::prepare(binding, context, receipts.into(), &checkpoint)
+                    .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+            let manifest: Vec<_> = completion.manifest().collect();
+            return Ok(
+                serde_json::json!({ "statuses": statuses, "manifest": manifest }).to_string(),
+            );
+        }
+    }
+    Err(JsValue::from_str("fixture inventory did not recover"))
+}
+
+fn inventory_pages(
     read_page: &Function,
     target: UploadTarget<'_>,
-    binding: ResumeBinding<'_>,
-    receipts: &[UploadedPart<'_>],
-    checkpoint: &ResumeCheckpoint<'_>,
-) -> Result<serde_json::Value, JsValue> {
+) -> Result<(InventoryPage, InventoryPage), JsValue> {
     // The callback models only the fixture's two-page status read for this upload.
     let page = |marker: JsValue| -> Result<InventoryPage, JsValue> {
         let reply = read_page.call4(
@@ -500,26 +532,28 @@ fn inventory_status(
         .ok_or_else(|| JsValue::from_str("missing fixture continuation marker"))?;
     let last = page(JsValue::from(marker))?;
     assert!(last.next_marker.is_none());
+    Ok((first, last))
+}
 
+fn inventory_status(
+    coherent: bool,
+    target: UploadTarget<'_>,
+    checkpoint: &ResumeCheckpoint<'_>,
+) -> serde_json::Value {
     let saved: Vec<_> = checkpoint
         .parts
         .iter()
-        .map(|part| InventoryPart {
-            number: part.number,
-            len: part.len,
-            etag: part.etag.into(),
-            digest: hex::encode(part.digest),
+        .map(|part| {
+            serde_json::json!({
+                "number": part.number,
+                "len": part.len,
+                "etag": part.etag,
+                "digest": part.digest,
+            })
         })
         .collect();
-    // Compare the full ordered observation before any map or deduplication can
-    // hide a repeated receipt. Only the independently verified PUTs back resume.
-    let coherent = first.parts.iter().chain(&last.parts).eq(&saved);
-    let status = if coherent && matches_checkpoint(binding, receipts, checkpoint) {
-        "resumable"
-    } else {
-        "pending"
-    };
-    Ok(serde_json::json!({ "status": status, "upload_id": target.upload_id, "parts": saved }))
+    let status = if coherent { "resumable" } else { "pending" };
+    serde_json::json!({ "status": status, "upload_id": target.upload_id, "parts": saved })
 }
 
 fn checkpoint_part<'a>(receipt: &UploadedPart<'_>, etag: &'a str) -> CheckpointPart<'a> {
