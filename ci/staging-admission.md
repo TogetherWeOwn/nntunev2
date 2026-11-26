@@ -231,6 +231,13 @@ The object has `schema: 1`, the candidate `sha`, decimal string `run_id` and
 no private pins. The line is staging evidence only. Match it against the
 [pinned candidate template](../docs/first-private-music-launch.md#pinned-candidate-template).
 
+If the final Web or API read returns a different build after the selected
+private receipt and its Web/API/Stream pins pass verification, admission is
+Pending. The refusal identifies the selected SHA, run and attempt. Retain
+those references and compare the current Web, API and Stream build, version
+and deployment IDs with that attempt through the authorized read-only
+deployment records. Return to candidate qualification if staging moved.
+
 ### Synthetic handoff when Actions evidence is unavailable
 
 For candidate `<sha>`, the private journey and receipt upload in run

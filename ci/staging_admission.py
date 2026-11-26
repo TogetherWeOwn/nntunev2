@@ -422,6 +422,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Refused("staging identity redirect refused")
 
 
+class CurrentStagingBuildDrift(Refused):
+    def __init__(self, surface):
+        super().__init__("current staging identity drift")
+        self.surface = surface
+
+
 def current_identity(env, sha):
     # Same two public read-only identity endpoints as the journey helper. No
     # redirects: the Access pair must never cross to a login/foreign origin.
@@ -433,7 +439,7 @@ def current_identity(env, sha):
     require(env.get("CF_ACCESS_CLIENT_ID") and env.get("CF_ACCESS_CLIENT_SECRET"),
             "missing staging identity Access pair")
     opener = urllib.request.build_opener(NoRedirect())
-    for path, field in (("/api/build", "sha"), ("/healthz", "build_sha")):
+    for surface, path, field in (("Web", "/api/build", "sha"), ("API", "/healthz", "build_sha")):
         request = urllib.request.Request(raw.rstrip("/") + path, headers={
             "CF-Access-Client-Id": env["CF_ACCESS_CLIENT_ID"],
             "CF-Access-Client-Secret": env["CF_ACCESS_CLIENT_SECRET"],
@@ -442,9 +448,12 @@ def current_identity(env, sha):
             with opener.open(request, timeout=15) as response:
                 require(response.status == 200, "staging identity HTTP failure")
                 data = parse_json(response.read(MAX_JSON + 1))
-            require(isinstance(data, dict) and data.get(field) == sha, "current staging identity drift")
+            observed = data.get(field) if isinstance(data, dict) else None
+            require(isinstance(observed, str) and SHA.fullmatch(observed), "invalid staging build identity")
             if field == "sha":
                 require(set(data) == {"sha"}, "invalid web identity shape")
+            if observed != sha:
+                raise CurrentStagingBuildDrift(surface)
         except (urllib.error.URLError, TimeoutError):
             raise Refused("staging identity evidence unavailable") from None
 
@@ -768,7 +777,20 @@ def main():
                      repository_id=decimal(env["GITHUB_REPOSITORY_ID"]), sha=sha, policy=policy,
                      contract_bytes=contract_bytes, manifest_hash=digest(manifest), producer_source_ok=producer_source_ok,
                      private_track_sha256=digest(git_file(sha, PRIVATE_TRACK_FILE)) if private else None)
-    current_identity(env, sha)
+    try:
+        current_identity(env, sha)
+    except CurrentStagingBuildDrift as error:
+        if not private:
+            raise
+        # Retain the validated receipt's provenance. The live read can only
+        # report Web/API build SHAs, so compare all three deployments separately.
+        print(f"::error::Candidate admission pending for {receipt['sha']}, "
+              f"staging run {receipt['run_id']}, attempt {receipt['run_attempt']}. "
+              f"The live {error.surface} build differs from the selected build. "
+              "Use the authorized read-only deployment records to compare the current Web, API and Stream "
+              "build, version and deployment IDs with the selected attempt. "
+              "Return to candidate qualification for fresh evidence if staging moved.", file=sys.stderr)
+        sys.exit(1)
     if receipt.get("journey") == PRIVATE:
         # Project only validated pins. The artifact can carry fields that the
         # verifier does not read and that must never reach the Actions log.
