@@ -340,6 +340,20 @@ async fn run(
         binding,
         parts: &parts,
     };
+    let pending_publication = if mode == "readback-publish" {
+        Some(
+            catalogue::prepare(
+                &context,
+                &manifest,
+                record.as_ref().unwrap(),
+                map_id,
+                target,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     let prepare = |receipt| {
         SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint).unwrap()
     };
@@ -356,8 +370,11 @@ async fn run(
             Err(error @ DispatchError::Unconfirmed(Some(MultipartError::EmbeddedError))),
             Some(reconcile),
         ) => {
-            assert_eq!(mode, "readback-publish");
-            catalogue::assert_unpublished(&object, map_id).await;
+            pending_publication
+                .as_ref()
+                .unwrap()
+                .assert_unpublished(target)
+                .await;
             // The synthetic origin confirms the upload and its part are still pending.
             // Only then does the fixture dispatch again from the same checkpoint.
             assert_eq!(
@@ -412,20 +429,12 @@ async fn run(
             .verify_readback(&inventory, envelope, readback_until)
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
-        if mode == "readback-publish" {
+        if let Some(pending) = pending_publication {
             let object = crate::admin_review::ObjectRef {
                 media: completed.metadata().clone(),
                 plaintext_sha256: *verified.origin().plaintext_sha256(),
             };
-            return Ok(catalogue::publish(
-                &verified,
-                &context,
-                &record,
-                map_id,
-                object,
-                target.upload_id,
-            )
-            .await);
+            return Ok(catalogue::publish(pending, &verified, context.identities[0], object).await);
         }
     }
     let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {

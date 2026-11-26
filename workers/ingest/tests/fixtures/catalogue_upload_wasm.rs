@@ -1,5 +1,8 @@
-use nntune_core::media_envelope::EnvelopeContext;
-use tokio_postgres::Transaction;
+use nntune_core::{
+    digest_enrollment::OriginManifest, digest_geometry::DigestGeometry,
+    media_envelope::EnvelopeContext,
+};
+use tokio_postgres::{Client, Transaction};
 
 use super::now;
 use crate::{
@@ -22,6 +25,7 @@ use crate::{
     multipart::{
         readback_inventory::{ReadbackScope, VerifiedCompletedReadback},
         session_outcome::CompletionScope,
+        UploadTarget,
     },
     track_writers::TrackRow,
 };
@@ -35,41 +39,22 @@ const LEASE: &str = "99000000-0000-4000-8000-000000000002";
 const ALBUM: &str = "Synthetic Signals";
 const RELEASE: &str = "ab340000-0000-4000-8000-000000000000";
 
-pub(super) async fn assert_unpublished(object: &str, map_id: [u8; 16]) {
-    let observer = postgres::connect().await;
-    let row = observer
-        .query_one(
-            "SELECT NOT EXISTS (
-                SELECT FROM public.ingest_session_reservations
-                WHERE id = $1::text::uuid AND completed_map_id IS NOT NULL
-            ) AND NOT EXISTS (
-                SELECT FROM public.storage_digest_inventory_intents WHERE map_id = $2::text::uuid
-            ) AND NOT EXISTS (
-                SELECT FROM public.storage_validated_digest_winners WHERE object_id = $3::text::uuid
-            ) AND NOT EXISTS (
-                SELECT FROM public.tracks WHERE release_id = $4::text::uuid
-            )",
-            &[&SESSION, &hex::encode(map_id), &object, &RELEASE],
-        )
-        .await
-        .unwrap();
-    assert!(
-        row.get::<_, bool>(0),
-        "failed completion recorded a durable outcome"
-    );
+pub(super) struct PendingPublication {
+    writer: Client,
+    scope: CompletionScope<'static>,
+    intent: CandidateIntent,
+    retain_until: i64,
 }
 
-pub(super) async fn publish(
-    verified: &VerifiedCompletedReadback<'_, '_>,
+pub(super) async fn prepare(
     context: &EnvelopeContext,
+    origin: &OriginManifest,
     record: &[u8],
     map_id: [u8; 16],
-    object: ObjectRef,
-    upload_id: &str,
-) -> String {
-    let [root, environment, library, object_id, generation, configuration] = context.identities;
+    target: UploadTarget<'_>,
+) -> PendingPublication {
+    let [_, environment, library, object_id, generation, configuration] = context.identities;
     let ids = context.identities.map(hex::encode);
-    let inventory = verified.inventory();
     let intent = CandidateIntent {
         identities: [environment, library, object_id, generation, configuration],
         plaintext_len: context.plaintext_len,
@@ -77,8 +62,7 @@ pub(super) async fn publish(
         header: context.header,
         reservation_generation: 1,
     };
-    let hashes = verified
-        .origin()
+    let hashes = origin
         .candidate_page_hashes(
             &intent.identities,
             intent.plaintext_len,
@@ -86,9 +70,9 @@ pub(super) async fn publish(
             &intent.header,
         )
         .unwrap();
-    let bucket = inventory.bucket();
     let offset = i64::try_from(intent.plaintext_len).unwrap();
-    let sealed = i64::try_from(inventory.geometry().sealed_len()).unwrap();
+    let geometry = DigestGeometry::new(intent.plaintext_len).unwrap();
+    let sealed = i64::try_from(geometry.sealed_len()).unwrap();
     let scope = CompletionScope {
         environment,
         library,
@@ -99,7 +83,7 @@ pub(super) async fn publish(
         revision: 1,
         offset,
     };
-    let mut writer = postgres::connect().await;
+    let writer = postgres::connect().await;
     writer
         .batch_execute(concat!(
             include_str!("../../../api/tests/fixtures/storage_s3_locator_schema.sql"),
@@ -129,7 +113,7 @@ pub(super) async fn publish(
                 &offset,
                 &sealed,
                 &intent.header.as_slice(),
-                &object.plaintext_sha256.as_slice(),
+                &origin.plaintext_sha256().as_slice(),
                 &hashes[0].as_slice(),
                 &record,
             ],
@@ -145,7 +129,7 @@ pub(super) async fn publish(
                  statement_timestamp() + interval '5 minutes', statement_timestamp() + interval '5 minutes',
                  $5::text::uuid, 1, $6, $7::text::uuid, $5::text::uuid, $8::text::uuid, $9, $10)",
         &[&SESSION, &ids[2], &OWNER, &scope.fingerprint.as_slice(), &ids[4],
-          &offset, &LEASE, &ids[3], &bucket, &upload_id],
+          &offset, &LEASE, &ids[3], &target.bucket, &target.upload_id],
     ).await.unwrap();
 
     let retain_until = i64::try_from(
@@ -156,6 +140,62 @@ pub(super) async fn publish(
     )
     .unwrap()
         + 600;
+    PendingPublication {
+        writer,
+        scope,
+        intent,
+        retain_until,
+    }
+}
+
+impl PendingPublication {
+    pub(super) async fn assert_unpublished(&self, target: UploadTarget<'_>) {
+        let mut observer = postgres::connect().await;
+        assert!(
+            read_completion(&mut observer, &self.scope, async |_, _| Ok(
+                self.retain_until
+            ))
+            .await
+            .unwrap()
+            .is_none(),
+            "failed completion recorded a durable outcome"
+        );
+        let row = observer
+            .query_one(
+                "SELECT s.terminal_reason IS NULL AND s.completed_map_id IS NULL
+                     AND s.write_lease_id = $2::text::uuid AND s.multipart_upload_id = $3
+                     AND s.multipart_bucket = $4 AND s.multipart_object_id = $5::text::uuid
+                     AND NOT EXISTS (SELECT FROM public.storage_digest_inventory_intents WHERE map_id = $6::text::uuid)
+                     AND NOT EXISTS (SELECT FROM public.storage_validated_digest_winners WHERE object_id = s.multipart_object_id)
+                     AND NOT EXISTS (SELECT FROM public.catalogue_s3_sources WHERE object_id = s.multipart_object_id)
+                     AND NOT EXISTS (SELECT FROM public.tracks WHERE release_id = $7::text::uuid)
+                 FROM public.ingest_session_reservations s WHERE s.id = $1::text::uuid",
+                &[&SESSION, &LEASE, &target.upload_id, &target.bucket, &hex::encode(self.intent.identities[2]),
+                  &hex::encode(self.intent.map_id), &RELEASE],
+            )
+            .await
+            .unwrap();
+        assert!(
+            row.get::<_, bool>(0),
+            "the exact upload must remain pending"
+        );
+    }
+}
+
+pub(super) async fn publish(
+    pending: PendingPublication,
+    verified: &VerifiedCompletedReadback<'_, '_>,
+    root: [u8; 16],
+    object: ObjectRef,
+) -> String {
+    let PendingPublication {
+        mut writer,
+        scope,
+        intent,
+        retain_until,
+    } = pending;
+    let [environment, library, object_id, _, configuration] = intent.identities;
+    let bucket = verified.inventory().bucket();
     let mut tx = writer.transaction().await.unwrap();
     stage_completion(
         &mut tx,
