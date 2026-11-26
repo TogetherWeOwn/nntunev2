@@ -13458,6 +13458,135 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn paid_invite_renewal_requiring_action_keeps_confirmed_coverage() {
+        use serde_json::{json, Value};
+
+        let mut h = stripe_harness();
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        deliver_first_period(&h, "evt_test_first_period");
+        let active = live_for(&h, "u1").expect("established subscription");
+        assert_eq!(active.status, "active");
+        let paid_end = BILLING_NOW + BILLING_PERIOD;
+        let renewal_end = paid_end + BILLING_PERIOD;
+        let action_at = paid_end + 3_600;
+        assert_eq!(active.paid_through_unix, Some(paid_end));
+        assert_eq!(active.paid_invoice_id.as_deref(), Some("in_test_1"));
+        let history = h.store.invoice_history.borrow().clone();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history["in_test_1"].period_end_unix, paid_end);
+
+        let (customer, subscription) = ("cus_test_1", "sub_test_1");
+        let mut past_due = test_subscription(subscription, customer, "past_due", PRICE_PLUS);
+        past_due.current_period_end = Some(renewal_end);
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .insert(subscription.into(), past_due);
+        let mut open = test_invoice(
+            "in_test_action",
+            customer,
+            subscription,
+            PRICE_PLUS,
+            paid_end,
+            renewal_end,
+            action_at,
+        );
+        open.status = "open".into();
+        open.amount_paid = 0;
+        open.status_transitions = None;
+        h.stripe.invoices.borrow_mut().insert(open.id.clone(), open);
+
+        let mut ctx = h.ctx();
+        ctx.now = action_at as u64;
+        let deliver = |id, kind, object| {
+            let body = paid_invite_event_body(id, kind, action_at, object);
+            let request = Request {
+                method: "POST".into(),
+                path: "/v1/billing/webhook".into(),
+                cookie: None,
+                origin: None,
+                authorization: None,
+                stripe_signature: Some(sign(&body, action_at)),
+                body,
+            };
+            webhook_ok(&block_on(handle(&ctx, &request)));
+        };
+        // The invoice action event is acknowledged. The bound subscription
+        // update is the supported signal for reconciling the renewal.
+        let attempts = h.store.paid_reconcile_attempts.get();
+        deliver(
+            "evt_test_renewal_action",
+            "invoice.payment_action_required",
+            json!({
+                "id": "in_test_action", "object": "invoice", "livemode": false, "status": "open",
+                "customer": customer, "subscription": subscription, "billing_reason": "subscription_cycle",
+            }),
+        );
+        assert_eq!(h.store.paid_reconcile_attempts.get(), attempts);
+        assert_eq!(live_for(&h, "u1").as_ref(), Some(&active));
+        assert_eq!(*h.store.invoice_history.borrow(), history);
+        deliver(
+            "evt_test_renewal_past_due",
+            "customer.subscription.updated",
+            json!({
+                "id": subscription, "object": "subscription", "livemode": false,
+                "customer": customer, "status": "past_due",
+            }),
+        );
+
+        let grace = paid_end + 7 * 24 * 3_600;
+        let pending = live_for(&h, "u1").expect("subscription still reserves the live slot");
+        assert_eq!(
+            pending.stripe_subscription_id,
+            active.stripe_subscription_id
+        );
+        assert_eq!(pending.stripe_customer_id, active.stripe_customer_id);
+        assert_eq!(pending.status, "past_due");
+        assert_eq!(pending.plan_id, PLAN_PLUS);
+        assert_eq!(pending.paid_through_unix, Some(paid_end));
+        assert_eq!(pending.paid_invoice_id, active.paid_invoice_id);
+        assert_eq!(pending.grace_until_unix, Some(grace));
+        assert_eq!(*h.store.invoice_history.borrow(), history);
+
+        // The renewal invoice is still open, so the hourly pass gets only
+        // the prior paid invoice. Grace keeps the paid plan past settlement.
+        ctx.now = (paid_end + 4 * 3_600) as u64;
+        block_on(reconcile_paid_targets(
+            &ctx,
+            vec![("u1", Some(subscription))],
+        ))
+        .unwrap();
+        assert_eq!(h.store.paid_reconcile_attempts.get(), attempts + 2);
+        assert_eq!(live_for(&h, "u1"), Some(pending));
+        assert_eq!(*h.store.invoice_history.borrow(), history);
+        let cookie = cookie_of(&block_on(ctx.start_session("u1")).unwrap());
+        let response = block_on(handle(
+            &ctx,
+            &Request {
+                method: "GET".into(),
+                path: "/v1/me/subscription".into(),
+                cookie: Some(cookie),
+                origin: Some(ORIGIN.into()),
+                authorization: None,
+                stripe_signature: None,
+                body: Vec::new(),
+            },
+        ));
+        assert_eq!(response.status, 200, "{}", response.body);
+        let account: Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(account["state"], "active");
+        assert_eq!(account["status"], "past_due");
+        assert_eq!(account["planId"], PLAN_PLUS);
+        assert_eq!(
+            account["currentPeriodEnd"],
+            crate::ledger::iso8601_utc(renewal_end)
+        );
+        assert_eq!(account["graceUntil"], crate::ledger::iso8601_utc(grace));
+    }
+
+    #[test]
     fn hourly_paid_checkout_requires_a_persisted_success_mark() {
         let mut h = stripe_harness();
         h.config.invites_required = true;
