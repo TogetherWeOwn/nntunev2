@@ -23,6 +23,12 @@ export function createPlayerController(
 	let browserSession: ReturnType<typeof createBrowserPlaybackSession> | undefined;
 	let privateListening = $state.raw<PrivateListeningState>();
 	let activeGrant = $state.raw<BrowserPlaybackSource>();
+	// Retry keeps the media locator and attachment, and refreshes only this hint.
+	let grantExpiry: BrowserPlaybackSource['expired'];
+	function setActiveGrant(grant?: BrowserPlaybackSource) {
+		grantExpiry = grant?.expired;
+		activeGrant = grant;
+	}
 	function streamFor(track: Track | null): string {
 		if (!browserPlayback) return resolveStreamUrl(track);
 		return activeGrant && activeGrant.trackId === track?.id && activeGrant.isCurrent() ? activeGrant.streamUrl : '';
@@ -32,7 +38,8 @@ export function createPlayerController(
 		browserSession = undefined;
 		previous?.owner.signal.removeEventListener('abort', purgeAtAuthBoundary);
 		previous?.dispose();
-		activeGrant = privateListening = undefined;
+		setActiveGrant();
+		privateListening = undefined;
 	}
 	function bindBrowserPlayback(owner: AccountSession, binding: string) {
 		if (!browserPlayback || destroyed || queue.purging || !owner.isCurrent() || !validSessionBinding(binding) ||
@@ -64,15 +71,19 @@ export function createPlayerController(
 	const media = createMediaController(queue, {
 		...effects, browseCopy, streamFor, announce: announceQueue,
 		commit: (next, source) => commitQueue(next, 'replace', undefined, source),
+		grantExpired: (id) => activeGrant?.trackId === id && grantExpiry?.() === true,
 		prepare: browserPlayback ? (id, current, publish, { retry, retireSuperseded } = {}) => {
 			const before = activeGrant;
 			const playId = retry && before?.trackId === id ? before.playId : undefined;
 			if (retry && !playId) return Promise.resolve(false);
-			return browserSession?.open(id, current, publish, playId,
+			return browserSession?.open(id, current, (source) => {
+				if (retry) grantExpiry = source.expired;
+				publish(source);
+			}, playId,
 				retireSuperseded && before && (() => {
 					const track = currentTrack(queue.snapshot);
 					if (!retireSuperseded() || activeGrant !== before || track?.id !== before.trackId) return;
-					activeGrant = undefined;
+					setActiveGrant();
 					retireNativeHost();
 					media.clearSeekFeedback();
 					if (before.isCurrent() && currentTrack(queue.snapshot)?.id === track.id && !activeGrant) {
@@ -166,7 +177,7 @@ export function createPlayerController(
 		}
 		if (kind === 'replace') announceQueue('');
 		if (!isCurrent()) return false;
-		if (grant || trackChanged) activeGrant = grant;
+		if (grant || trackChanged) setActiveGrant(grant);
 		queue.publish(next, receipt, library?.sources);
 		if (isCurrent() && trackChanged && after && canPrepare && !nextSource) media.bindPausedTransport(after);
 		if (!isCurrent()) return false;
