@@ -177,8 +177,12 @@ class TrialRolePreflightTests(unittest.TestCase):
                 for pending in (None, auth):
                     with self.subTest(pending=pending):
                         def query(build_sha, version_id, binding, sql):
-                            pin = ("unexpected_fixture_role", 40999) if binding == pending else pins[binding]
-                            row = (preflight.DATABASE, database_oid, *pin, *pin)
+                            observed_db, observed_oid = preflight.DATABASE, database_oid
+                            pin = pins[binding]
+                            if binding == pending:
+                                observed_db, observed_oid = "unexpected_fixture_db", 40998
+                                pin = ("unexpected_fixture_role", 40999)
+                            row = (observed_db, observed_oid, *pin, *pin)
                             return preflight.BindingReadback(build, version, binding, (row,))
 
                         summary.write_text("")
@@ -188,7 +192,7 @@ class TrialRolePreflightTests(unittest.TestCase):
                         for binding, role in BINDING_ROLES.items():
                             verdict = "pending" if binding == pending else "pass"
                             expected += (f"- `{binding}` — {verdict} (expected role `{role}`, "
-                                         f"selected database `{preflight.DATABASE}`)\n")
+                                         f"expected database `{preflight.DATABASE}`)\n")
                         self.assertEqual(summary.read_text(), expected)
 
     def test_isolation(self):

@@ -239,7 +239,7 @@ def main(*, query=None, build_sha=None, version_id=None, role_pins=None):
                 for binding, evidence in binding_identities.items():
                     role = "unconfirmed" if evidence["role"] is None else f"`{evidence['role']}`"
                     print(f"- `{binding}` — {evidence['verdict']} "
-                          f"(expected role {role}, selected database `{evidence['database']}`)", file=summary)
+                          f"(expected role {role}, expected database `{evidence['database']}`)", file=summary)
     except (KeyError, ValueError, OSError, subprocess.TimeoutExpired, StagingApplyError):
         print("Trial role preflight refused; scope or staging catalog could not be verified.", file=sys.stderr)
         return 1
