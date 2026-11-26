@@ -960,8 +960,9 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     expect(job).not.toContain('continue-on-error');
 
     expect(job).toMatch(/Run synthetic smoke[\s\S]*Run full journey[\s\S]*Enforce journey evidence gate[\s\S]*Record candidate admission receipt[\s\S]*Upload candidate admission receipt/);
-    expect(stagingStep('Record candidate admission receipt')).toContain("steps.journey-gate.outcome == 'success' || steps.journey-gate.outcome == 'failure'");
-    expect(stagingStep('Upload candidate admission receipt')).toContain("success() && steps.journey-gate.outcome == 'success' && steps.receipt.outcome == 'success'");
+    expect(stagingStep('Run synthetic smoke')).toContain("\n        if: success() && steps.staging.outputs.configured == 'true'\n");
+    expect(stagingStep('Record candidate admission receipt')).toContain("\n        if: ${{ !cancelled() && (steps.journey-gate.outcome == 'success' || steps.journey-gate.outcome == 'failure') }}\n");
+    expect(stagingStep('Upload candidate admission receipt')).toContain("        if: ${{ success() && steps.journey-gate.outcome == 'success' && steps.receipt.outcome == 'success' }}\n");
   });
 
   test('post-deploy smoke only discards JUnit after a successful smoke', () => {
@@ -3036,8 +3037,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(gateAt, 'gate must run after the full journey').toBeGreaterThan(runAt);
     const nextStep = section.indexOf('\n      - name:', gateAt + 1);
     const stepBlock = section.slice(gateAt, nextStep === -1 ? undefined : nextStep);
-    expect(stepBlock).toContain('!cancelled()');
-    expect(stepBlock).toContain("steps.journey.outcome == 'success' || steps.journey.outcome == 'failure'");
+    expect(stepBlock).toContain("\n        if: ${{ !cancelled() && (steps.journey.outcome == 'success' || steps.journey.outcome == 'failure') }}\n");
     expect(stepBlock).toContain('node scripts/enforce-journey-evidence.mjs');
     expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '12'`);
     expect(stepBlock).toContain(`REQUIRE_QA_AUTH_TOKEN: 'true'`);
