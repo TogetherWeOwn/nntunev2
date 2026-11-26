@@ -437,7 +437,7 @@ def prove_setup_caller(cluster, *, interrupt, reader):
         route = {"PATH": routed_client(cluster, "route")}
         env |= route
         for overrides in (
-            {"GITHUB_RUN_ATTEMPT": "2"}, {"GITHUB_RUN_ID": "0"}, {"BOOTSTRAP_STEP_DEBUG": "true"},
+            {"GITHUB_RUN_ID": "0"}, {"BOOTSTRAP_STEP_DEBUG": "true"},
             {"BOOTSTRAP_PLAN_DIGEST": secrets.token_hex(32)},
             {"GITHUB_SHA": secrets.token_hex(20)}, {"GITHUB_REPOSITORY": "fixture/fork"},
         ):
@@ -535,10 +535,15 @@ def prove_setup_caller(cluster, *, interrupt, reader):
         run(env, "complete", 3)
         identity_sql = f"""SELECT oid FROM pg_database WHERE datname = '{LAUNCH}' AND datallowconn
             AND NOT datistemplate AND datdba = '{OWNER}'::regrole
+            AND has_database_privilege('{MIGRATOR}', oid, 'CONNECT')
+            AND has_database_privilege('{MIGRATOR}', oid, 'CREATE')
+            AND NOT EXISTS (SELECT FROM aclexplode(datacl) WHERE grantee = 0)
             AND NOT has_database_privilege('{reader}', oid, 'CONNECT');"""
         identity = cluster.sql(identity_sql)
         checked(identity, "read back the new database identity with the reader still fenced")
         require(identity.stdout.strip().isdigit(), "observe a single launch database OID")
+        run(env | {"GITHUB_RUN_ATTEMPT": "2"}, "refused", 0)
+        cluster.ok("preserve the verified launch identity after rerun refusal", identity_sql, identity.stdout)
         run(env, "refused", 1)  # The name collision stops any second write.
         cluster.ok("preserve the new database OID after collision refusal", identity_sql, identity.stdout)
         cluster.ok("preserve both sibling database identities and ACLs", sibling_sql, siblings.stdout)

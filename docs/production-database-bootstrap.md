@@ -275,6 +275,36 @@ timeouts. Server processing, wire bytes, provider metering and hard-kill
 session closure require separate evidence. A failure from the point of
 attempted creation is uncertain. The caller stops without retry or deletion.
 
+### Setup handoff after a rerun
+
+GitHub keeps the run ID and increments the attempt on a rerun. The
+[setup workflow](../.github/workflows/deploy-database-bootstrap.yml) gates
+both jobs on attempt `1`, and the
+[setup caller](../.github/scripts/database_bootstrap_setup.py) checks the
+same attempt and authorized run before opening a SQL connection. The
+caller's fixed `complete` verdict carries no run identity. Attribute it to
+the protected job in its attempt-specific GitHub record. The setup plan
+digest and the database OID identify the approved bytes and the SQL target.
+Both can match a saved readback for an earlier attempt.
+
+Rehearse with synthetic run `8102`, branch `fixture001`, database
+`launch_fixture` (OID `41003`) and issued setup role OID `41001`. Use the
+same candidate SHA and setup plan digest throughout. Assume the saved
+Environment protection and scoped SQL issuer authority are verified for the
+original approval. Evaluate these records in order:
+
+| Evidence presented | Handoff decision |
+| --- | --- |
+| Run `8102` was rerun. The presented setup readback cites `8102/1`, and the branch, database OID and plan digest match. The latest attempt has no verified job readback. | Keep the handoff pending. Preserve the original approval and issuer records under `8102/1`. Read back the current attempt and its jobs from the attempt-specific GitHub endpoints. |
+| The `8102/2` readback confirms the protected setup job was skipped. The original setup job ended without a verified `complete` verdict or its SQL cleanup is unresolved. | Record the rerun as skipped. Reconcile the original attempt under SQL custody on the approved TLS route, using the recorded issuance OID for role cleanup where applicable. Keep baseline pending while the outcome or cleanup is unresolved. |
+| Complete control — the `8102/2` readback confirms the skip. The separate `8102/1` record shows the approved protected job succeeded and emitted `complete`, with the approved candidate and exact plan digest. Cleanup readback confirms removal of the candidate variable, authorization and credential material, retirement of the issued setup role and absence of its sessions. A current read-only catalog check on the approved TLS route confirms OID `41003`, expected owner and grants, the pending reader's connection fence and unchanged sibling databases. | Retain the completed setup under `8102/1` and carry its verified database OID into preparation for a separately approved baseline. Record `8102/2` only as skipped. |
+
+The original approval and issuance records remain evidence for their own
+attempt and role. A later authorized setup needs a new dispatch and its own
+approval. The baseline retains its separate Environment, run and reader
+issuer checks. [Workflow attempt readback](https://docs.github.com/en/rest/actions/workflow-runs#get-a-workflow-run-attempt)
+· [Jobs for a workflow attempt](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt)
+
 ### Protected baseline
 
 The [baseline workflow](../.github/workflows/deploy-database-baseline.yml)
