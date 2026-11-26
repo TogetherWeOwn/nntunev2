@@ -95,36 +95,6 @@ If dedicated PostgreSQL provisioning stops partway through, use the
    publication and versioned storage pins for cleanup. Keep tone B's pins
    separately for its recorded disposition.
 
-### Offline C1 handoff after a lost connection create response
-
-Keep the trial disarmed. If a create was sent and its response was lost, mark
-that binding unresolved in the original attempt. Confirm the original executor
-has stopped and the protected admission still applies. Use a protected result
-or equivalent evidence that ties the request to the exact config ID in the
-admitted account. Inventory can help locate candidates. Require that
-independent link to the request before using any candidate.
-
-In the synthetic example, `UPLOAD`, `AUTH` and `PUBLISH` are already verified.
-The create for `PRIVATE_TRIAL_ENROLL_DB` reached the provider, but its response
-never reached the executor. The protected result links the original request to
-the config ID. Of two synthetic readback records with the requested settings,
-exactly one has the linked ID in the admitted account. Match the database and
-assigned SQL role against the independently admitted pins. Check the origin
-host, Access client, pinned CA, `verify-full` and disabled caching against the
-protected readback evidence.
-
-Record the binding, config ID, original scope and evidence references as
-verified present. Carry the same ID into `PRIVATE_TRIAL_ENROLL_DB_STAGING_ID`
-in the prepared handoff. Omit `ENROLL` from any remaining create steps. If the
-request-to-ID link is missing, or the scoped readback has zero or multiple
-matches, keep the binding unresolved and hold dependent steps. An unavailable
-readback also leaves it unresolved. Reconcile the original request under the
-existing protected provisioning procedure. Stage C2 still requires its own
-serving readbacks.
-
-The [offline fixture](../../.github/scripts/test_worker_build_workflow.py)
-rehearses that handoff and renders the staging bindings using synthetic IDs.
-
 ## Retire and recover
 
 1. **Contain and retire the selected fixture (77c).** Stop new trial activity.
