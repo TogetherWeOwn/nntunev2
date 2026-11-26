@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { open, readFile, writeFile } from 'node:fs/promises';
 import { finalSmokeFixture, mainSha, recoveryFixture } from './fixtures/production-worker-transport.mjs';
-import { intentFile, workflow } from './production-maintenance/recovery-evidence.mjs';
+import { admitRecovery, intentFile, workflow } from './production-maintenance/recovery-evidence.mjs';
+import maintenanceWorker from './production-maintenance/worker.mjs';
 
 const checkedAt = '2026-10-01T12:00:00Z';
 const now = () => Date.parse(checkedAt) + 60_000;
@@ -116,6 +117,23 @@ test('switch-off reports unavailable rollback intent for the pinned successful r
   await transport.run('prepare-recovery', retained);
   assert.deepEqual(transport.calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
   assert.deepEqual(transport.rows, allocation);
+});
+
+test('operator keeps the recorded rollback write when its maintenance probe is cancelled', () => {
+  const report = readFileSync(new URL('../docs/ops/first-release-recovery-example.md', import.meta.url), 'utf8');
+  const example = report.split('## Record a cancelled health proof after the rollback write\n')[1]?.split('\n## ')[0];
+  assert.ok(example, 'include a cancelled health proof in the operator handoff');
+  assert.match(example, /same selected recovery run `102`, attempt `1`, and\s+the successful `recover-worker` job `103` for rollout `101\/1`/);
+  assert.match(example, /wrote deployment\s+`33333333-3333-4333-8333-333333333333`, serving the pinned maintenance version\s+`22222222-2222-4222-8222-222222222222` at 100%/);
+  assert.match(example, /Match its evidence to the selected recovery and the serving\s+deployment above\./);
+
+  const rows = example.split('\n');
+  const cancelled = rows.find((line) => line.startsWith('| `cancelled`'));
+  const verified = rows.find((line) => line.startsWith('| `success`'));
+  assert.match(cancelled, /\| \*\*Pending\.\*\* Maintenance health proof is missing\. \|/);
+  assert.match(cancelled, /Keep the writer freeze and reconcile the recorded recovery evidence\. Repeat the authorized maintenance readback for serving deployment `33333333-3333-4333-8333-333333333333`/);
+  assert.match(verified, /`503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex` \| \*\*Complete\.\*\*/);
+  assert.match(example, /Keep run `102\/1` and the observed write when the probe is cancelled\. Do not\s+dispatch another recovery or rerun the workflow/);
 });
 
 test('maintenance remains active when the candidate receipt cannot identify a distinct version', async (t) => {
@@ -298,6 +316,104 @@ test('operator switch-off resumes read-only after incomplete deployment history'
   assert.match(readFileSync(resume.GITHUB_OUTPUT, 'utf8'), /^allow-submit=false$/m);
   assert.deepEqual(calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
   assert.deepEqual(rows, restoredHistory);
+});
+
+test('operator switch-off keeps a successful probe for an earlier maintenance deployment pending', async (t) => {
+  let readEarlierDeployment = false;
+  const transport = finalSmokeFixture(t, {
+    ...fixture,
+    deploymentReadback(receipt) {
+      if (!readEarlierDeployment) return receipt;
+      // Return the complete history as it appeared before the candidate rollout.
+      return { ...receipt, result: { deployments: [precedingMaintenance] },
+        result_info: { page: 1, total_count: 1, count: 1 } };
+    },
+  });
+  await transport.run('record');
+  const [precedingMaintenance] = transport.rows;
+  const { enter, fresh } = recoveryFixture(t, transport, 'success');
+  const selected = fresh('13');
+
+  const url = `https://api.cloudflare.com/client/v4/accounts/${selected.CLOUDFLARE_ACCOUNT_ID}/workers/scripts/nntune-web/deployments?page=1&per_page=100`;
+  async function readDeploymentHistory() {
+    const response = await transport.request(url, { method: 'GET', redirect: 'error',
+      headers: { Authorization: `Bearer ${selected.CLOUDFLARE_API_TOKEN}` } });
+    assert.equal(response.ok, true);
+    const { success, result } = await response.json();
+    assert.equal(success, true);
+    return result.deployments;
+  }
+
+  transport.shift();
+  const rollout = await readDeploymentHistory();
+  assert.equal(await enter(selected), 'Recorded maintenance allocation verified');
+  const [restoredDeployment, ...precedingRollout] = await readDeploymentHistory();
+  assert.match(restoredDeployment.annotations['workers/message'], /^First-release maintenance recovery [a-f0-9]{32}$/);
+  assert.deepEqual(precedingRollout, rollout);
+  assert.notEqual(precedingMaintenance.id, restoredDeployment.id);
+  assert.deepEqual(precedingMaintenance.versions, restoredDeployment.versions);
+
+  // The probe reports status and headers. Its deployment ID comes from the
+  // accompanying provider readback, using the same field as the recovery job.
+  async function verifyProbe() {
+    const health = await maintenanceWorker.fetch(new Request(`https://${selected.DOMAIN}`));
+    assert.equal(health.status, 503);
+    assert.equal(health.headers.get('cache-control'), 'no-store');
+    assert.equal(health.headers.get('x-robots-tag'), 'noindex');
+    const [serving] = await readDeploymentHistory();
+    assert.deepEqual(serving.versions, restoredDeployment.versions);
+    return serving.id === restoredDeployment.id ? 'complete' : 'pending';
+  }
+
+  const writes = transport.calls.filter((method) => method === 'POST').length;
+  const before = transport.calls.length;
+  readEarlierDeployment = true;
+  assert.equal(await verifyProbe(), 'pending');
+  readEarlierDeployment = false;
+  assert.equal(await verifyProbe(), 'complete');
+  assert.equal(writes, 1);
+  assert.deepEqual(transport.calls.slice(before), ['GET', 'GET']);
+
+  const guide = readFileSync(new URL('../docs/first-private-music-launch.md', import.meta.url), 'utf8');
+  const verification = guide.split('\n## Switch off and verify\n')[1]?.split('\n## ')[0];
+  assert.match(verification, /From the pinned Worker's deployment history, record the ID of the deployment\s+whose recovery marker and preceding rollout history match the selected\s+recovery attempt\./);
+  assert.match(verification, /Match the serving deployment ID from the provider readback accompanying\s+the probe to that recorded ID\./);
+  assert.match(verification, /If the IDs differ, keep switch-off \*\*Pending\*\* and the writer freeze\s+in place\. Repeat the authorized maintenance readback for the recorded\s+recovery deployment\./);
+});
+
+test('a truncated rollback intent download leaves recovery pending', async (t) => {
+  const transport = finalSmokeFixture(t, fixture);
+  await transport.prepare();
+  const { calls, rows, run, temp } = transport;
+  const { fresh, evidence } = recoveryFixture(t, transport, 'success');
+  const rollout = structuredClone(rows);
+  const original = readFileSync(join(temp, intentFile));
+  const before = calls.length;
+
+  const pending = fresh('13');
+  assert.throws(() => admitRecovery(pending, (repo) => {
+    const source = evidence(repo);
+    return {
+      ...source,
+      artifactFor(producer, name) {
+        const { artifact, archive } = source.artifactFor(producer, name);
+        return { artifact, archive: archive.subarray(0, archive.length - 1) };
+      },
+    };
+  }), /Sealed intent archive digest mismatch/);
+  assert.deepEqual(readdirSync(pending.RUNNER_TEMP), []);
+  assert.deepEqual(calls.slice(before), []);
+  assert.deepEqual(rows, rollout);
+  assert.deepEqual(readFileSync(join(temp, intentFile)), original);
+
+  const complete = fresh('14');
+  admitRecovery(complete, evidence);
+  assert.deepEqual(readFileSync(join(complete.RUNNER_TEMP, intentFile)), original);
+  assert.match(readFileSync(complete.GITHUB_OUTPUT, 'utf8'), /^allow-submit=true$/m);
+  await run('prepare-recovery', complete);
+  assert.ok(existsSync(join(complete.RUNNER_TEMP, 'production-final-allocation.sealed')));
+  assert.deepEqual(calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
+  assert.deepEqual(rows, rollout);
 });
 
 test('operator recovers the existing rollback run after the dispatch response is lost', async (t) => {

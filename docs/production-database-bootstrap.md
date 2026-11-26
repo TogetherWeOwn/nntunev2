@@ -436,19 +436,52 @@ python3 -IB .github/scripts/database_bootstrap_reader_evidence.py < evidence.jso
   role name and OID that the result actually checked (`reader_role` and
   `reader_oid`). Record `result: passed` only for a completed, successful
   privilege check. Use JSON integers for OIDs and lowercase hex for digests.
+  If the readback shows a reader grant beyond the reviewed least-privilege
+  inventory, record `result: failed` and list each one in `extra_grants`
+  in one of these bounded forms: `<PRIVILEGE> ON <schema>.<object>` for a
+  relation grant, `<PRIVILEGE> (<column>[, <column>...]) ON
+  <schema>.<object>` for a column grant, or `<PRIVILEGE> ON LARGE OBJECT
+  <oid>` for a large-object grant. Column grants use PostgreSQL's `SELECT`,
+  `INSERT`, `UPDATE`, or `REFERENCES` privileges. Large-object grants use
+  `SELECT` or `UPDATE`. Append `WITH GRANT OPTION` when the readback includes
+  that option. For example, `UPDATE ON grant_tracks.tracks`, `UPDATE (id) ON
+  grant_tracks.tracks`, and `UPDATE ON LARGE OBJECT 900001` are valid entries.
 
-The protected baseline emits a fixed verdict. It does not emit an inventory
-digest. For `reader_privileges`, use a retained private readback that records
-the observed role identity, effective privilege result and covered inventory in
-the same read-only catalog snapshot. Hash that inventory using the same
-representation as the reviewed and saved inventories. If this readback is
-unavailable, omit `reader_privileges` so the evidence stays pending.
+The protected baseline emits only a fixed verdict. Arrange a separate authorized
+read-only catalog capture in advance. Take the snapshot while the scoped reader
+is active, before fencing or retirement. Retain the observed role identity,
+effective privilege result and covered inventory together from that snapshot.
+Follow the normal cleanup even if capture is incomplete. Use the same
+deterministic representation for all three inventories. Include object identities
+and their schema definitions or versions so a change to a definition changes the
+digest even when the object has the same name. Hash the definitions actually
+observed for each readback.
+If the privilege readback is unavailable, omit `reader_privileges` so the
+evidence stays pending.
 
-Keep the baseline evidence pending if the check exits nonzero with `pending`,
-including when the catalog matches but the privilege result belongs to a
-different reader. `consistent` confirms the supplied evidence agrees. The
-protected run's `empty` verdict, provenance and retirement evidence are still
-required. Keep credentials and raw SQL results out of the normalized record.
+Every pending message leaves baseline evidence pending. A plain `pending`
+covers absent or unusable readback and other evidence failures, including
+a privilege result for a different reader. Recover any missing private
+readback for the same attempt. `pending (inventory-mismatch)` means a complete,
+scoped inventory differs from the review, or a passing privilege result for the
+reviewed reader and database covers a different inventory. Use the separately
+authorized read-only catalog check on the reviewed database to compare expected
+and observed object identities and definitions. Once the catalog agrees with the
+review, obtain a matched inventory and scoped privilege result from one
+authorized read-only catalog snapshot while the scoped reader is active, then
+rerun the offline check. After reader retirement, use only a retained matched
+readback from the same attempt. If it is unavailable, keep the baseline pending
+and migration closed. The reader preparation helper requires an absent launch
+database.
+`pending (extra-grant: ...)` names each extra grant the reader holds. Keep the
+migration closed until the authority that issued that grant, or another
+custodian with separately verified authority for that exact grant type and
+object, revokes it. Do not infer revocation authority from the reader issuer's
+CONNECT, schema USAGE, or SELECT evidence. Record the revocation readback and
+repeat the privilege check.
+`consistent` confirms the supplied evidence agrees. The protected run's
+`empty` verdict, provenance and retirement evidence are still required.
+Keep credentials and raw SQL results out of the normalized record.
 
 ### Carry verified staging evidence into database approval
 
@@ -546,6 +579,22 @@ The release operator calls a stop while the job is still waiting.
 | Maintenance readback for reader `42001` shows no login and a cleared credential. | Keep the fence committed even if the launch route is unavailable. Keep migration closed while retirement is unresolved. |
 | On the pinned launch database `41001`, retirement commits with `retired`, the grants are revoked, and the role and its sessions are absent. | Record cleanup complete. The canceled attempt still has no baseline. |
 | Run `102`, attempt `1`, is proposed for the same setup target. | Require fresh approval, run-bound authorization and a new reader role. Verify a new baseline for the same database and branch before using it in the existing release handoff. |
+
+Rehearse the cleanup decision with the
+[offline receipt check](../.github/scripts/database_bootstrap_reader_cleanup.py).
+Run `python3 -B .github/scripts/database_bootstrap_reader_cleanup.py` from the
+repository root. Pass one JSON object on stdin with `reviewed` pins from the exact activation plan
+and a `receipt` from the separate retirement readback. Both objects carry
+`branch_id`, `launch`, `database_oid`, `reader_role` and `reader_oid` for their
+own target. Use integer OIDs. Set the receipt's `status` to `absent` only after
+recording committed retirement, cleared credentials, and absence of grants,
+the role and its sessions. A bare SQL verdict cannot supply those target pins.
+
+For the tabletop exercise, use `fixture_launch` and `fixture_reader` with the
+branch and OIDs above. A receipt from database OID `41002` or from reader OID
+`42002` leaves cleanup pending. Retry the comparison with the exact matching
+receipt to get the `consistent` verdict. The check compares saved records
+locally. The SQL custodian still performs the retirement and readback above.
 
 #### Interpret incomplete readback after setup
 

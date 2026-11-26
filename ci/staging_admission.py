@@ -4,6 +4,7 @@
 The production CLI reads only reviewed policy from its main workflow checkout,
 Git objects and authenticated Actions metadata. Offline fixtures call the pure
 functions; there is deliberately no production policy/API/local-receipt override.
+The offline terminal-push diagnostic cannot produce a receipt or verified pins.
 """
 
 import argparse
@@ -33,15 +34,27 @@ PRIVATE_JOURNEY = "post-deploy private music journey"
 PRIVATE_CRITERIA = frozenset({"upload-to-library", "play", "seek", "queue", "anonymous-refused",
                               "unlisted-refused", "revoked-or-expired-refused", "video-off"})
 PRIVATE_TRACK_FILE = "fixtures/synthetic-flac/private-staging/tone-a.flac"
+PRIVATE_CUTOFF_PROOF = "private-cutoff-refusal"
 PRIVATE_TRACK_PROOFS = {
     "private-publication": "upload-to-library",
     "private-library": "upload-to-library",
     "private-play": "play",
     "private-anonymous-refusal": "anonymous-refused",
     "private-unlisted-refusal": "unlisted-refused",
-    "private-cutoff-refusal": "revoked-or-expired-refused",
+    PRIVATE_CUTOFF_PROOF: "revoked-or-expired-refused",
 }
 IDENTITY_PHASES = ("build-identity", "build-identity-final")
+# The ordinary Playwright JUnit reporter uses the spec filename and test title.
+ORDINARY_IDENTITY_CASES = {
+    "build-identity": (
+        "build-identity.spec.ts",
+        "deployed build matches the promotion SHA (exact-head staging evidence)",
+    ),
+    "build-identity-final": (
+        "zz-build-identity-final.spec.ts",
+        "deployed build still matches the promotion SHA at journey end (superseded-deploy guard)",
+    ),
+}
 RECORD = "Record candidate admission receipt"
 UPLOAD = "Upload candidate admission receipt"
 # Bind conservative dependency roots, not a hand-picked set of test helpers.
@@ -233,6 +246,8 @@ def junit_evidence(xml, contract):
                 if private:
                     require(selector == (PRIVATE, phase), "unexpected private identity case")
                     identities[phase]["deployments"] = private_deployments(value.get("deployments"), value["expected"])
+                else:
+                    require(selector == ORDINARY_IDENTITY_CASES[phase], "unexpected ordinary identity case")
     if private:
         require(all(rows.get((PRIVATE, phase)) == ["passed"] for phase in IDENTITY_PHASES),
                 "private identity cases did not pass exactly once")
@@ -246,12 +261,20 @@ def junit_evidence(xml, contract):
     return coverage, identities, track_proofs
 
 
+def private_cutoff_track(value):
+    cutoff = value.get("cutoff_listener")
+    require(isinstance(cutoff, str) and UUID.fullmatch(cutoff) and cutoff == value.get("refused_listener"),
+            "private cutoff refusal does not identify the invited listener")
+    return {key: item for key, item in value.items() if key not in ("cutoff_listener", "refused_listener")}
+
+
 def private_track_evidence(track_proofs):
     observations = {}
     for selector, name, value in track_proofs:
         require(selector == (PRIVATE, PRIVATE_TRACK_PROOFS[name]) and name not in observations,
                 "misplaced or duplicate private track evidence")
-        observations[name] = parse_json(value.encode())
+        proof = parse_json(value.encode())
+        observations[name] = private_cutoff_track(proof) if name == PRIVATE_CUTOFF_PROOF else proof
     require(observations.keys() == PRIVATE_TRACK_PROOFS.keys(), "missing private track evidence")
     publication = observations["private-publication"]
     require(all(proof == publication for proof in observations.values()),
@@ -422,6 +445,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Refused("staging identity redirect refused")
 
 
+class CurrentStagingBuildDrift(Refused):
+    def __init__(self, surface):
+        super().__init__("current staging identity drift")
+        self.surface = surface
+
+
 def current_identity(env, sha):
     # Same two public read-only identity endpoints as the journey helper. No
     # redirects: the Access pair must never cross to a login/foreign origin.
@@ -433,7 +462,7 @@ def current_identity(env, sha):
     require(env.get("CF_ACCESS_CLIENT_ID") and env.get("CF_ACCESS_CLIENT_SECRET"),
             "missing staging identity Access pair")
     opener = urllib.request.build_opener(NoRedirect())
-    for path, field in (("/api/build", "sha"), ("/healthz", "build_sha")):
+    for surface, path, field in (("Web", "/api/build", "sha"), ("API", "/healthz", "build_sha")):
         request = urllib.request.Request(raw.rstrip("/") + path, headers={
             "CF-Access-Client-Id": env["CF_ACCESS_CLIENT_ID"],
             "CF-Access-Client-Secret": env["CF_ACCESS_CLIENT_SECRET"],
@@ -442,9 +471,14 @@ def current_identity(env, sha):
             with opener.open(request, timeout=15) as response:
                 require(response.status == 200, "staging identity HTTP failure")
                 data = parse_json(response.read(MAX_JSON + 1))
-            require(isinstance(data, dict) and data.get(field) == sha, "current staging identity drift")
+            observed = data.get(field) if isinstance(data, dict) else None
+            require(isinstance(observed, str) and SHA.fullmatch(observed), "invalid staging build identity")
             if field == "sha":
                 require(set(data) == {"sha"}, "invalid web identity shape")
+            else:
+                require(set(data) == {"ok", "build_sha"} and data["ok"] is True, "invalid API identity shape")
+            if observed != sha:
+                raise CurrentStagingBuildDrift(surface)
         except (urllib.error.URLError, TimeoutError):
             raise Refused("staging identity evidence unavailable") from None
 
@@ -547,6 +581,44 @@ class Actions:
         return list(found.values())
 
 
+def diagnose_terminal_push(sha, evidence):
+    run = evidence.get("run")
+    require(isinstance(run, dict) and SHA.fullmatch(sha) and run.get("head_sha") == sha
+            and run.get("path") == WORKFLOW and run.get("head_branch") == "main"
+            and run.get("event") == "push" and run.get("status") == "completed"
+            and run.get("conclusion") == "failure" and decimal(run.get("run_attempt")) == "1",
+            "expected a failed automatic staging push for the selected build")
+    run_id = decimal(run.get("id"))
+    job_page, annotations = evidence.get("jobs"), evidence.get("annotations")
+    require(isinstance(job_page, dict) and isinstance(annotations, list), "incomplete evidence")
+    jobs, count = job_page.get("jobs"), job_page.get("total_count")
+    require(isinstance(jobs, list) and type(count) is int and count == len(jobs) <= 100
+            and all(isinstance(row, dict) for row in (*jobs, *annotations)), "incomplete evidence")
+
+    target = f"Staging run {run_id}, attempt 1"
+    if not jobs:
+        require(any(note.get("annotation_level") == "failure"
+                    and note.get("message") == "Queue is full for concurrency group 'deploy-staging-main'"
+                    for note in annotations), "missing workflow queue rejection annotation")
+        return (f"{target} was rejected before jobs by the deploy-staging-main queue. "
+                "Exact-build qualification is pending. The next eligible automatic staging admission can "
+                "provide evidence for the build it runs.")
+
+    journeys = [job for job in jobs if job.get("name") == JOURNEY]
+    require(len(journeys) == 1, "missing or ambiguous full journey job")
+    job = journeys[0]
+    require(decimal(job.get("run_id")) == run_id and decimal(job.get("run_attempt")) == "1"
+            and job.get("head_sha") == sha and job.get("status") == "completed"
+            and job.get("conclusion") == "failure", "missing matching failed full journey job")
+    steps = job.get("steps")
+    require(isinstance(steps, list) and all(isinstance(step, dict) for step in steps), "invalid journey steps")
+    journey_steps = [step for step in steps if step.get("name") == "Run full journey"]
+    require(len(journey_steps) == 1 and journey_steps[0].get("status") == "completed"
+            and journey_steps[0].get("conclusion") == "failure", "missing failed full journey step")
+    return (f"{target} was admitted, and the full E2E journey failed. "
+            "Inspect the journey job and return to candidate qualification.")
+
+
 def unchanged_by_job(job, opening, source, producer_source_ok, deploy_step):
     reason = "known intervening staging deployment; fresh journey required"
     require(job.get("status") == "completed" and job.get("conclusion") in TERMINAL_CONCLUSIONS, reason)
@@ -575,6 +647,49 @@ def require_steps(job, names, reason):
                 and steps[0].get("conclusion") == "success" and type(steps[0].get("number")) is int
                 and steps[0]["number"] > previous, reason)
         previous = steps[0]["number"]
+
+
+def diagnose_pending_push(sha, evidence):
+    repo = "TogetherWeOwn/nntunev2"
+    run, job_page = evidence.get("run"), evidence.get("jobs")
+    require(isinstance(run, dict) and SHA.fullmatch(sha) and run.get("head_sha") == sha
+            and run.get("path") == WORKFLOW and run.get("head_branch") == "main"
+            and run.get("event") == "push" and decimal(run.get("run_attempt")) == "1"
+            and run["conclusion"] is None, "expected an unresolved automatic staging push")
+    run_id = decimal(run.get("id"))
+    for repository in (run.get("repository"), run.get("head_repository")):
+        require(isinstance(repository, dict) and repository.get("full_name") == repo,
+                "foreign staging push")
+    require(isinstance(job_page, dict), "missing attempt jobs")
+    jobs, count = job_page.get("jobs"), job_page.get("total_count")
+    require(isinstance(jobs, list) and type(count) is int and count == len(jobs) <= 100,
+            "incomplete attempt jobs")
+
+    target = f"Staging run {run_id}, attempt 1"
+    api = f"/repos/{repo}/actions"
+    if not jobs:
+        require(run.get("status") in ("pending", "queued", "requested"), "expected a pending workflow run")
+        return (f"{target} was accepted and has no jobs yet. "
+                f"Next read: GET {api}/runs/{run_id}/attempts/1/jobs?per_page=100&page=1")
+
+    require(run.get("status") in ("queued", "in_progress"), "expected a run with queued work")
+    by_id = {}
+    for job in jobs:
+        require(isinstance(job, dict) and decimal(job.get("run_id")) == run_id
+                and decimal(job.get("run_attempt")) == "1" and job.get("head_sha") == sha,
+                "job belongs to a different staging attempt")
+        job_id = decimal(job.get("id"))
+        require(job_id not in by_id, "duplicate job")
+        by_id[job_id] = job
+    journeys = [(job_id, job) for job_id, job in by_id.items() if job.get("name") == JOURNEY]
+    require(len(journeys) == 1, "missing or ambiguous full journey job")
+    job_id, job = journeys[0]
+    # Captured queued jobs can populate started_at before runner assignment.
+    require(job.get("status") == "queued" and job["conclusion"] is None and job["completed_at"] is None
+            and type(job.get("runner_id")) is int and job["runner_id"] == 0
+            and job.get("runner_name") == "" and job.get("steps") == [], "journey is not clearly unassigned")
+    return (f"{target} has a queued full-journey job {job_id} with no runner assigned. "
+            f"Next read: GET {api}/jobs/{job_id}")
 
 
 def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifest_hash,
@@ -667,6 +782,7 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
             "invalid artifact provenance")
     require(timestamp(artifact.get("expires_at")) > datetime.now(timezone.utc), "expired receipt")
     archive = actions.read(f"artifacts/{decimal(artifact.get('id'))}/zip", MAX_ARCHIVE)
+    require(len(archive) == artifact["size_in_bytes"], "artifact archive size mismatch")
     require("sha256:" + digest(archive) == artifact["digest"], "artifact content digest mismatch")
     receipt = validate_receipt(read_archive(archive), repo=repo, sha=sha, run_id=run_id, attempt=attempt,
                                workflow_sha=sha, manifest_hash=manifest_hash,
@@ -682,7 +798,10 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     # Per-lane locks are not a reservation. Discover recent/rerunnable runs
     # and every unresolved run, not the workflow's entire lifetime history.
     for other in actions.conflicts(workflow_id, opening):
-        if (decimal(other.get("id")) == run_id if private else other.get("head_sha") == sha):
+        other_id = decimal(other.get("id"))
+        # Independent runs can redeploy the same commit. The selected run's
+        # attempt is checked again below after reading the other writers.
+        if other_id == run_id:
             continue
         require(other.get("status") in (*PENDING_RUN_STATES, "completed"),
                 "unclassified conflicting staging run")
@@ -693,7 +812,6 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
             # pre-opening run cannot conceal a later job in that snapshot.
             if timestamp(other.get("updated_at")) <= opening:
                 continue
-        other_id = decimal(other.get("id"))
         # Include ALL attempts: a failed latest rerun must not hide a mutation
         # from an earlier attempt after the candidate journey started.
         other_jobs = actions.listing(f"runs/{other_id}/jobs?filter=all", "jobs")
@@ -716,8 +834,23 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("produce", "produce-private", "verify"))
+    diagnoses = {"diagnose-terminal-push": ("terminal", diagnose_terminal_push),
+                 "diagnose-pending-push": ("pending push", diagnose_pending_push)}
+    parser.add_argument("mode", choices=("produce", "produce-private", "verify", *diagnoses))
+    parser.add_argument("candidate_sha", nargs="?", help="pinned source SHA for a diagnose mode")
     args = parser.parse_args()
+    if args.mode in diagnoses:
+        label, diagnose = diagnoses[args.mode]
+        if args.candidate_sha is None:
+            parser.error(f"{args.mode} requires the pinned candidate SHA")
+        try:
+            evidence = parse_json(sys.stdin.buffer.read(MAX_JSON + 1))
+        except RecursionError:
+            raise Refused(f"{label} evidence is nested too deeply") from None
+        print(diagnose(args.candidate_sha, evidence), file=sys.stderr)
+        sys.exit(1)
+    if args.candidate_sha is not None:
+        parser.error("candidate_sha is only for a diagnose mode")
     env = os.environ
     policy = parse_json((ROOT / POLICY).read_bytes())
     contract_bytes = (ROOT / CONTRACT).read_bytes() if (ROOT / CONTRACT).is_file() else b""
@@ -769,7 +902,20 @@ def main():
                      repository_id=decimal(env["GITHUB_REPOSITORY_ID"]), sha=sha, policy=policy,
                      contract_bytes=contract_bytes, manifest_hash=digest(manifest), producer_source_ok=producer_source_ok,
                      private_track_sha256=digest(git_file(sha, PRIVATE_TRACK_FILE)) if private else None)
-    current_identity(env, sha)
+    try:
+        current_identity(env, sha)
+    except CurrentStagingBuildDrift as error:
+        if not private:
+            raise
+        # Retain the validated receipt's provenance. The live read can only
+        # report Web/API build SHAs, so compare all three deployments separately.
+        print(f"::error::Candidate admission pending for {receipt['sha']}, "
+              f"staging run {receipt['run_id']}, attempt {receipt['run_attempt']}. "
+              f"The live {error.surface} build differs from the selected build. "
+              "Use the authorized read-only deployment records to compare the current Web, API and Stream "
+              "build, version and deployment IDs with the selected attempt. "
+              "Return to candidate qualification for fresh evidence if staging moved.", file=sys.stderr)
+        sys.exit(1)
     if receipt.get("journey") == PRIVATE:
         # Project only validated pins. The artifact can carry fields that the
         # verifier does not read and that must never reach the Actions log.

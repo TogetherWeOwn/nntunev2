@@ -205,7 +205,9 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   let seekContentRange = span;
   let fullRange = false;
   let fullRangeEnd = 65_616;
+  let mediaUnavailableOnce = false;
   let stallTail;
+  let truncateTail;
   const fetches = [];
   const reports = [];
   const server = createServer({
@@ -215,6 +217,11 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     const page = req.url.startsWith(pagePath);
     verifyGet(req, host, page, fullRange ? `bytes=0-${fullRangeEnd}` : undefined);
     fetches.push(page ? 'page' : 'media');
+    if (!page && mediaUnavailableOnce) {
+      mediaUnavailableOnce = false;
+      res.writeHead(503, { 'content-length': 0 }).end();
+      return;
+    }
     const bytes = Buffer.from(page ? fixture.digest_page()
       : fullRange ? fixture.full_ciphertext().subarray(0, fullRangeEnd + 1) : fixture.ciphertext());
     const headers = {
@@ -222,6 +229,14 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
       'x-amz-version-id': page ? observedPageVersion : (mediaVersionOverride ?? 'version+/%?=&'),
     };
     if (!page) headers['content-range'] = fullRange ? `bytes 0-${fullRangeEnd}/${reportedSealedLength}` : seekContentRange;
+    if (!page && truncateTail) {
+      const truncated = truncateTail;
+      truncateTail = undefined;
+      res.writeHead(206, { ...headers, connection: 'close' });
+      res.write(bytes.subarray(0, -1));
+      truncated(() => res.end());
+      return;
+    }
     res.writeHead(page ? 200 : 206, headers);
     if (!page && stallTail) {
       res.once('close', () => stallTail(res.writableFinished));
@@ -431,7 +446,7 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   assert.equal(reports.length, pageReportStart);
   observedPageVersion = 'page+/%?=&';
 
-  await t.test('a shifted Content-Range delivers and counts no media', async (t) => {
+  await t.test('a shifted Content-Range is refused and the same request can be retried', async (t) => {
     const fetchStart = fetches.length;
     const reportStart = reports.length;
     // Keep the status, version, length and authentic ciphertext from the successful seek.
@@ -440,9 +455,21 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     const refused = await request();
     assert.equal(refused.response.status, 502);
     assert.equal(refused.response.headers.get('content-range'), null);
-    assert.equal(JSON.parse(refused.bytes).code, 'upstream_unavailable');
+    const error = JSON.parse(refused.bytes);
+    assert.equal(error.code, 'upstream_unavailable');
+    assert.equal(error.retryable, true);
     assert.deepEqual(fetches.slice(fetchStart), ['media']);
     assert.equal(reports.length, reportStart);
+
+    seekContentRange = span;
+    const retry = await request();
+    assert.equal(retry.response.status, 206);
+    assert.equal(retry.response.headers.get('content-range'), 'bytes 65536-65536/65537');
+    assert.deepEqual(retry.bytes, plaintext.subarray(65_536));
+    assert.deepEqual(fetches.slice(fetchStart), ['media', 'media', 'page']);
+    assert.deepEqual(reports.slice(reportStart), [{
+      user_id: 'member', play_id: play, track_id: 'track', start: 65_536, end: 65_537, file_bytes: 65_537,
+    }]);
   });
 
   fullRange = true;
@@ -557,6 +584,33 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     assert.equal(alarm, null, 'the accepted batch needs no further retry');
   });
 
+  await t.test('a temporarily unavailable range delivers and counts bytes only on retry', async (t) => {
+    const firstFetch = fetches.length;
+    const firstReport = reports.length;
+    const headers = { range: 'bytes=65535-65536' };
+    mediaUnavailableOnce = true;
+    t.after(() => { mediaUnavailableOnce = false; });
+
+    const refused = await request({}, '/play/track', bearer, headers);
+    assert.equal(refused.response.status, 502);
+    assert.equal(refused.response.headers.get('content-range'), null);
+    const error = JSON.parse(refused.bytes);
+    assert.equal(error.code, 'upstream_unavailable');
+    assert.equal(error.retryable, true);
+    assert.deepEqual(fetches.slice(firstFetch), ['media']);
+    assert.deepEqual(reports.slice(firstReport), []);
+
+    // verifyGet checks the same signed version and ciphertext range on both GETs.
+    const retry = await request({}, '/play/track', bearer, headers);
+    assert.equal(retry.response.status, 206);
+    assert.equal(retry.response.headers.get('content-range'), 'bytes 65535-65536/65537');
+    assert.deepEqual(retry.bytes, Buffer.from('YZ'));
+    assert.deepEqual(fetches.slice(firstFetch), ['media', 'media', 'page']);
+    assert.deepEqual(reports.slice(firstReport), [{
+      user_id: 'member', play_id: play, track_id: 'track', start: 65_535, end: 65_537, file_bytes: 65_537,
+    }]);
+  });
+
   await t.test('a wrong encrypted object length delivers and counts no media', { timeout: 5_000 }, async (t) => {
     const firstFetch = fetches.length;
     const firstReport = reports.length;
@@ -570,6 +624,60 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     assert.deepEqual(fetches.slice(firstFetch), ['media']);
     assert.equal(reports.length, firstReport);
   });
+
+  for (const [name, short] of [
+    ['an empty media chunk after delivery preserves the tail and receipt', false],
+    ['true EOF after the prefix aborts and reports only the prefix', true],
+  ]) {
+    await t.test(name, { timeout: 5_000 }, async (t) => {
+      const firstFetch = fetches.length;
+      const firstReport = reports.length;
+      const prefixRead = Promise.withResolvers();
+      const fetch = globalThis.fetch;
+      t.mock.method(globalThis, 'fetch', async (req) => {
+        const response = await fetch(req);
+        if (req.url !== `https://${host}${path}?${query}`) return response;
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        // The last frame is one plaintext byte plus its 16-byte tag.
+        const body = new ReadableStream({
+          start(controller) { controller.enqueue(bytes.subarray(0, -17)); },
+          async pull(controller) {
+            // Expose the next read result only after the client receives the prefix.
+            await prefixRead.promise;
+            if (!short) {
+              controller.enqueue(new Uint8Array(0));
+              controller.enqueue(bytes.subarray(-17));
+            }
+            controller.close();
+          },
+        });
+        return new Response(body, { status: response.status, headers: response.headers });
+      });
+
+      const { response, settled } = await open({}, '/play/track', bearer, { range: 'bytes=65534-65536' });
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-range'), 'bytes 65534-65536/65537');
+      const client = response.body.getReader();
+      const first = await client.read();
+      prefixRead.resolve();
+      assert.equal(first.done, false);
+      assert.deepEqual(Buffer.from(first.value), Buffer.from('XY'));
+      if (short) {
+        await assert.rejects(client.read());
+      } else {
+        const tail = await client.read();
+        assert.equal(tail.done, false);
+        assert.deepEqual(Buffer.from(tail.value), Buffer.from('Z'));
+        assert.equal((await client.read()).done, true);
+      }
+      await settled;
+      assert.deepEqual(fetches.slice(firstFetch), ['media', 'page']);
+      assert.deepEqual(reports.slice(firstReport), [{
+        user_id: 'member', play_id: play, track_id: 'track',
+        start: 65_534, end: short ? 65_536 : 65_537, file_bytes: 65_537,
+      }]);
+    });
+  }
 
   await t.test('re-reading an earlier pinned range delivers bytes without new credit', { timeout: 5_000 }, async (t) => {
     const { NntpPool } = require('./s3_stream_wasm.cjs');
@@ -676,10 +784,44 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     // origin must close before sending the final frame and before expiry.
     assert.equal(req.signal.aborted, false);
     assert.equal(await closed, false);
+    stallTail = undefined;
     await settled;
     assert.deepEqual(events(), [started, completed, started, aborted]);
     assert.deepEqual(reports.at(-1), {
       user_id: 'member', play_id: play, track_id: 'track', start: 0, end: 65_536, file_bytes: 65_537,
     });
+  });
+
+  await t.test('a short pinned range aborts and a retry delivers only the missing bytes', { timeout: 5_000 }, async () => {
+    const firstFetch = fetches.length;
+    const firstReport = reports.length;
+    const identity = { user_id: 'member', play_id: play, track_id: 'track', file_bytes: plaintext.length };
+    const prefix = { ...identity, start: 65_534, end: 65_536 };
+    const tail = { ...identity, start: 65_536, end: 65_537 };
+    const providerClose = new Promise(resolve => { truncateTail = resolve; });
+    const { req, response, settled } = await open({}, '/play/track', bearer, { range: 'bytes=65534-65536' });
+    assert.equal(response.status, 206);
+    assert.equal(response.headers.get('content-range'), 'bytes 65534-65536/65537');
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    assert.equal(first.done, false);
+    assert.deepEqual(Buffer.from(first.value), Buffer.from('XY'));
+    // Close the provider connection after playback has consumed the verified prefix.
+    const closeProvider = await providerClose;
+    closeProvider();
+    // Worker aborts the writer without a reason. A close would hit the fixture's length assertion.
+    await assert.rejects(reader.read(), reason => reason === undefined, 'the Worker must abort the response');
+    assert.equal(req.signal.aborted, false);
+    await settled;
+    assert.deepEqual(fetches.slice(firstFetch), ['media', 'page']);
+    assert.deepEqual(reports.slice(firstReport), [prefix]);
+
+    fullRange = false;
+    const retry = await request();
+    assert.equal(retry.response.status, 206);
+    assert.equal(retry.response.headers.get('content-range'), 'bytes 65536-65536/65537');
+    assert.deepEqual(Buffer.concat([Buffer.from(first.value), retry.bytes]), Buffer.from('XYZ'));
+    assert.deepEqual(fetches.slice(firstFetch), ['media', 'page', 'media', 'page']);
+    assert.deepEqual(reports.slice(firstReport), [prefix, tail]);
   });
 });

@@ -440,7 +440,7 @@ impl Body {
         if dst.is_empty() {
             return Ok(0);
         }
-        if self.chunk.is_none() {
+        while self.chunk.is_none() {
             let read = self.reader.read();
             if let Some(observation) = &self.observation {
                 if !self.started {
@@ -466,7 +466,12 @@ impl Body {
                 };
             }
             let chunk: Uint8Array = field("value")?.dyn_into().map_err(|_| refused())?;
-            if chunk.length() == 0 || u64::from(chunk.length()) > self.remaining {
+            // A default stream reader can yield an empty value with done=false.
+            // Only done signals EOF, and empty values leave the byte count intact.
+            if chunk.length() == 0 {
+                continue;
+            }
+            if u64::from(chunk.length()) > self.remaining {
                 return Err(refused());
             }
             self.chunk = Some(chunk);

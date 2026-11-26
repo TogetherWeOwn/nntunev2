@@ -70,6 +70,60 @@ def check_aborted_baseline_run_binding():
             raise RuntimeError(f"baseline admission fixture: {case}")
 
 
+def check_reader_cleanup_binding():
+    script = Path(__file__).with_name("database_bootstrap_reader_cleanup.py")
+    reviewed = {
+        "branch_id": "fixture001", "launch": "fixture_launch", "database_oid": 41001,
+        "reader_role": "fixture_reader", "reader_oid": 42001,
+    }
+    receipt = reviewed | {"status": "absent"}
+    record = {"reviewed": reviewed, "receipt": receipt}
+
+    def check(case, evidence, *, accept=False):
+        raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
+        result = subprocess.run(
+            [sys.executable, "-EsB", str(script)], input=raw,
+            capture_output=True, timeout=3, check=False,
+        )
+        expected = ((0, b"database-bootstrap-reader-cleanup: consistent\n", b"") if accept else
+                    (1, b"", b"database-bootstrap-reader-cleanup: pending\n"))
+        if (result.returncode, result.stdout, result.stderr) != expected:
+            raise RuntimeError(f"reader cleanup fixture: {case}")
+
+    for key, other in {
+        "branch_id": "fixture002", "launch": "fixture_other", "database_oid": 41002,
+        "reader_role": "fixture_other_reader", "reader_oid": 42002,
+    }.items():
+        other_receipt = receipt | {key: other}
+        check(f"receipt mismatches {key}", record | {"receipt": other_receipt})
+        check(f"receipt valid for its own {key}",
+              {"reviewed": reviewed | {key: other}, "receipt": other_receipt}, accept=True)
+
+    for case, changes in {
+        "zero database OID": {"database_oid": 0},
+        "reader OID exceeds PostgreSQL range": {"reader_oid": 4294967296},
+        "reserved database": {"launch": "template1"},
+        "invalid database name": {"launch": "fixture-launch"},
+        "reserved reader prefix": {"reader_role": "pg_reader"},
+        "reserved reader name": {"reader_role": "PUBLIC"},
+        "invalid reader name": {"reader_role": "fixture.reader"},
+        "invalid branch ID": {"branch_id": "fixture01"},
+        "unexpected reviewed field": {"extra": "fixture"},
+    }.items():
+        invalid_pins = reviewed | changes
+        check(case, {"reviewed": invalid_pins, "receipt": invalid_pins | {"status": "absent"}})
+
+    check("missing receipt", {"reviewed": reviewed})
+    check("absence unconfirmed", record | {"receipt": receipt | {"status": "present"}})
+    check("duplicate receipt key", b'{"receipt": null, ' + json.dumps(record).encode()[1:])
+    check("oversized record", json.dumps(record).encode().ljust(4097))
+    check("boolean OID", {
+        "reviewed": reviewed | {"reader_oid": 1}, "receipt": receipt | {"reader_oid": True},
+    })
+    check("floating-point OID", record | {"receipt": receipt | {"database_oid": 41001.0}})
+    check("exact cleanup receipt", record, accept=True)
+
+
 def exercise(event_path):
     plan = secrets.token_bytes(64)
     sha, run = secrets.token_hex(20), str(secrets.randbelow(10**10) + 1)
@@ -127,21 +181,36 @@ def exercise(event_path):
 
 def check_reader_privilege_binding():
     script = Path(__file__).with_name("database_bootstrap_reader_evidence.py")
-    inventory = {"branch_id": "fixture001", "database_oid": 17001, "inventory_sha256": "a" * 64}
+    retained = b"fixture_catalog.retained: SELECT 1 AS id\n"
+    reviewed = b"fixture_catalog.required: SELECT 2 AS id\n" + retained
+    previous = b"fixture_catalog.required: SELECT 1 AS id\n" + retained
+    inventory = {
+        "branch_id": "fixture001", "database_oid": 17001,
+        "inventory_sha256": hashlib.sha256(reviewed).hexdigest(),
+    }
     review = inventory | {"reader_role": "Fixture-Reader", "reader_oid": 17002}
     privileges = review | {"result": "passed"}
     record = {"review": review, "inventory": inventory, "reader_privileges": privileges}
 
-    def check(case, evidence, accept=False):
+    def check(case, evidence, verdict="pending"):
         raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
         result = subprocess.run(
             [sys.executable, "-IB", str(script)], input=raw, env={},
             capture_output=True, timeout=3, check=False,
         )
-        expected = ((0, b"database-bootstrap-reader-evidence: consistent\n", b"") if accept else
-                    (1, b"", b"database-bootstrap-reader-evidence: pending\n"))
+        output = f"database-bootstrap-reader-evidence: {verdict}\n".encode()
+        expected = (0, output, b"") if verdict == "consistent" else (1, b"", output)
         if (result.returncode, result.stdout, result.stderr) != expected:
             raise RuntimeError(f"reader privilege fixture: {case}")
+
+    # Both observations can follow the same migration run and cover the same reader.
+    previous_privileges = privileges | {"inventory_sha256": hashlib.sha256(previous).hexdigest()}
+    check("reader privileges cover the earlier definition of the same object",
+          record | {"reader_privileges": previous_privileges}, "pending (inventory-mismatch)")
+    check("earlier definition reported by a different reader",
+          record | {"reader_privileges": previous_privileges | {"reader_oid": 17003}})
+    check("earlier definition without a successful privilege check",
+          record | {"reader_privileges": previous_privileges | {"result": "failed"}})
 
     for case, override in {
         "another scoped reader": {"reader_role": "Fixture-Other-Reader", "reader_oid": 17003},
@@ -149,16 +218,83 @@ def check_reader_privilege_binding():
         "same OID different role name": {"reader_role": "Fixture-Other-Reader"},
         "OID encoded as a float": {"reader_oid": 17002.0},
         "unsuccessful privilege result": {"result": "failed"},
-        "privileges checked against another inventory": {"inventory_sha256": "b" * 64},
+        "malformed privilege inventory digest": {"inventory_sha256": "b" * 63},
     }.items():
         check(case, record | {"reader_privileges": privileges | override})
-    check("saved inventory differs from review and privileges", record | {
-        "inventory": inventory | {"inventory_sha256": "b" * 64},
-    })
+    observed = inventory | {"inventory_sha256": hashlib.sha256(retained).hexdigest()}
+    missing_object = record | {"inventory": observed, "reader_privileges": privileges | observed}
+    check("complete readback omits a reviewed object", missing_object, "pending (inventory-mismatch)")
+    repeated_identity = inventory | {"inventory_sha256": hashlib.sha256(retained * 2).hexdigest()}
+    check("readback repeats one identity at the expected row count",
+          record | {"inventory": repeated_identity, "reader_privileges": privileges | repeated_identity},
+          "pending (inventory-mismatch)")
+    check("complete mismatched readback without privilege evidence",
+          {"review": review, "inventory": observed}, "pending (inventory-mismatch)")
+    check("absent inventory readback", {"review": review, "reader_privileges": privileges})
+    check("inventory readback lacks its digest",
+          record | {"inventory": {"branch_id": "fixture001", "database_oid": 17001}})
+    check("malformed inventory digest", record | {"inventory": inventory | {"inventory_sha256": "b" * 63}})
+    check("inventory for another branch", missing_object | {"inventory": observed | {"branch_id": "fixture002"}})
+    check("inventory for another database", missing_object | {"inventory": observed | {"database_oid": 17003}})
+
+    # A complete inventory cannot supply scope that the passing access readback lacks.
+    for field in ("database_oid", "inventory_sha256"):
+        unscoped_privileges = privileges.copy()
+        del unscoped_privileges[field]
+        check(f"passing privileges without {field}", record | {"reader_privileges": unscoped_privileges})
+    check("passing privileges for another database with the same inventory digest",
+          record | {"reader_privileges": privileges | {"database_oid": 17004}})
+
     check("missing privilege evidence", {"review": review, "inventory": inventory})
     check("duplicate privilege object", b'{"reader_privileges": null, ' + json.dumps(record).encode()[1:])
+    over = privileges | {"result": "failed", "extra_grants": ["UPDATE ON fixture_catalog.required"]}
+    check("readback shows an extra table grant", record | {"reader_privileges": over},
+          "pending (extra-grant: UPDATE ON fixture_catalog.required)")
+    for grant in (
+        "UPDATE (id) ON fixture_catalog.required",
+        "UPDATE ON LARGE OBJECT 900001",
+        "UPDATE ON fixture_catalog.required WITH GRANT OPTION",
+        "SELECT ON fixture_catalog.required WITH GRANT OPTION",
+    ):
+        check(f"readback names {grant}", record | {"reader_privileges": over | {"extra_grants": [grant]}},
+              f"pending (extra-grant: {grant})")
+    mixed = ["UPDATE (id) ON fixture_catalog.required", "UPDATE ON LARGE OBJECT 900001"]
+    check("readback names mixed table grant forms", record | {"reader_privileges": over | {"extra_grants": mixed}},
+          f"pending (extra-grant: {', '.join(mixed)})")
+    check("extra grant from another inventory", record | {"reader_privileges": over | {"inventory_sha256": "b" * 64}})
+    for case, override in {
+        "extra grant beside a passed result": {"result": "passed"},
+        "extra grant for another reader": {"reader_oid": 17003},
+        "empty extra grant list": {"extra_grants": []},
+        "repeated extra grant": {"extra_grants": ["UPDATE ON fixture_catalog.required"] * 2},
+        "unnamed extra grant": {"extra_grants": ["UPDATE"]},
+        "large object OID exceeds PostgreSQL range": {"extra_grants": ["UPDATE ON LARGE OBJECT 4294967296"]},
+        "column list has an empty name": {"extra_grants": ["UPDATE () ON fixture_catalog.required"]},
+        "column grant targets a large object": {"extra_grants": ["UPDATE (id) ON LARGE OBJECT 900001"]},
+        "column grant uses a table-only privilege": {"extra_grants": ["DELETE (id) ON fixture_catalog.required"]},
+        "large object grant uses a table-only privilege": {"extra_grants": ["DELETE ON LARGE OBJECT 900001"]},
+    }.items():
+        check(case, record | {"reader_privileges": over | override})
     check("oversized record", json.dumps(record).encode().ljust(4097))
-    check("privileges match the approved reader and inventory", record, accept=True)
+
+    unscoped_inventory = inventory.copy()
+    del unscoped_inventory["database_oid"]
+    check("matching inventory digest without database OID", record | {"inventory": unscoped_inventory})
+    check("privileges match the approved reader and inventory", record, "consistent")
+
+    # Both targets returned migration version 1, the same catalog, and
+    # effective read access for the same reader. Only the database OID differs.
+    catalog = b"1\ngrant_ledger.schema_migrations\ngrant_tracks.tracks\n"
+    catalog_pin = {"inventory_sha256": hashlib.sha256(catalog).hexdigest()}
+    other_target = catalog_pin | {"database_oid": 17004}
+    matching = {
+        "review": review | catalog_pin,
+        "inventory": inventory | catalog_pin,
+        "reader_privileges": privileges | catalog_pin,
+    }
+    check("matching database target", matching, "consistent")
+    check("identical catalog from another database", matching | {"inventory": inventory | other_target})
+    check("effective access on another database", matching | {"reader_privileges": privileges | other_target})
 
 
 def snapshot_record(branch="fixture001"):
@@ -336,6 +472,7 @@ if __name__ == "__main__":
         check_inventory_run_binding()
         check_snapshot_readback()
         check_snapshot_label_retry()
+        check_reader_cleanup_binding()
     except Exception:
         sys.exit("database-bootstrap-admission-fixture: failed")
     print("database-bootstrap-admission-fixture: run binding, snapshot readback, refusals and teardown passed")

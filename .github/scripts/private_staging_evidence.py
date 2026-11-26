@@ -82,6 +82,8 @@ def review_cases(xml, sha, attempt):
                                                     timestamp))
                     admission.timestamp(timestamp)
                 else:
+                    if prop.attrib["name"] == admission.PRIVATE_CUTOFF_PROOF:
+                        value = admission.private_cutoff_track(value)
                     fields = {"build_sha": sha, **attempt}
                     track, digest = value.get("track_id"), value.get("sha256")
                     require_review(value.keys() == fields.keys() | {"track_id", "sha256"}

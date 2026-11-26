@@ -213,6 +213,59 @@ test('Selected only survives a failed invited Library refresh and successful Ret
 	expect(fixture.listingAccounts).toEqual([listener.account, listener.account, listener.account]);
 });
 
+test('keyboard Refresh and Retry keep focus and update one live status', async ({ page, origin }) => {
+	const failed = Promise.withResolvers<503>();
+	const recovered = Promise.withResolvers<Track[]>();
+	const replies = [[first], failed.promise, recovered.promise];
+	const fixture = await mockCatalogue(page, origin, () => replies.shift() ?? 503);
+	await fixture.signIn();
+	const main = page.getByRole('main');
+	const refresh = main.getByRole('button', { name: 'Refresh', exact: true });
+	const retry = main.getByRole('button', { name: 'Retry', exact: true });
+	const loading = main.getByRole('status').filter({ hasText: /^Loading your library…$/ });
+	const stale = main.getByRole('status').and(main.getByTestId('library-stale-badge'));
+	const refreshed = main.getByRole('status').filter({ hasText: /^Library refreshed\.$/ });
+
+	try {
+		await page.goto(origin + library.path);
+		await expectCatalogue(page, [first]);
+		await refresh.focus();
+		await expect(refresh).toBeFocused();
+		const statusesBeforeRefresh = await main.getByRole('status').elementHandles();
+		await page.keyboard.press('Enter');
+		await expect(loading).toBeVisible();
+		await expect(refresh).toBeFocused();
+		const liveStatus = await loading.elementHandle();
+		expect(
+			await liveStatus.evaluate((node, previous) => previous.includes(node), statusesBeforeRefresh),
+			'the loading status was already mounted before Refresh'
+		).toBe(true);
+		failed.resolve(503);
+		await expect(retry).toBeFocused();
+		await expect(stale).toHaveText(/^stale — updated /);
+		expect(await stale.evaluate((node, previous) => node === previous, liveStatus)).toBe(true);
+
+		await page.keyboard.press('Space');
+		await expect(loading).toBeVisible();
+		await expect(retry).toBeFocused();
+		recovered.resolve([added]);
+		await expectCatalogue(page, [added]);
+		await expect(refresh).toBeFocused();
+		await expect(stale).toHaveCount(0);
+		await expect(refreshed).toHaveCount(1);
+		expect(await refreshed.evaluate((node, previous) => node === previous, liveStatus)).toBe(true);
+
+		await page.keyboard.press('Tab');
+		await expect(main.getByRole('combobox', { name: 'Repeat', exact: true })).toBeFocused();
+		await page.keyboard.press('Shift+Tab');
+		await expect(refresh).toBeFocused();
+		expect(fixture.listingAccounts).toEqual([listener.account, listener.account, listener.account]);
+	} finally {
+		failed.resolve(503);
+		recovered.resolve([added]);
+	}
+});
+
 test('returning to Library shows the new track and keeps the current selection', async ({ page, origin }) => {
 	let catalogue = [first, selected];
 	const fixture = await mockCatalogue(page, origin, () => catalogue);
@@ -292,4 +345,50 @@ test('Refresh adds the first available track to an empty invited Library', async
 		firstRefresh.resolve([first]);
 		repeatRefresh.resolve([updated]);
 	}
+});
+
+test('Title Z–A survives a failed invited Library refresh and successful Retry', async ({ page, origin }) => {
+	const initial = [first, selected, added];
+	const renamed = { ...first, title: 'Zulu catalogue track' };
+	const newcomer = { id: '00000000-0000-4000-8000-000000000004', title: 'Amber catalogue track' };
+	const refreshed = [renamed, newcomer, selected];
+	let listing: Listing = initial;
+	const fixture = await mockCatalogue(page, origin, () => listing);
+	await fixture.signIn();
+
+	const main = page.getByRole('main');
+	const order = main.getByRole('combobox', { name: 'Order tracks', exact: true });
+	const selectedOrder = order.locator('option:checked');
+	const titles = main.getByTestId('library-list').getByTestId(library.item).locator(library.select);
+	const stale = main.getByTestId('library-stale-badge');
+	const refresh = main.getByRole('button', { name: library.refresh, exact: true });
+	const retry = main.getByRole('button', { name: 'Retry', exact: true });
+	const listingUrl = origin + library.api;
+	const mode = 'Title Z–A';
+	const initialSorted = [selected.title, added.title, first.title];
+
+	await page.goto(origin + library.path);
+	await expect(selectedOrder).toHaveText('Original order');
+	await expect(titles).toHaveText(initial.map(({ title }) => title));
+	await order.selectOption({ label: mode });
+	await expect(selectedOrder).toHaveText(mode);
+	await expect(titles).toHaveText(initialSorted);
+	expect(fixture.listingAccounts).toEqual([listener.account]);
+
+	listing = 503;
+	const [failed] = await Promise.all([page.waitForResponse(listingUrl), refresh.click()]);
+	expect(failed.status()).toBe(503);
+	await expect(stale).toBeVisible();
+	await expect(selectedOrder).toHaveText(mode);
+	await expect(titles).toHaveText(initialSorted);
+	expect(fixture.listingAccounts).toEqual([listener.account, listener.account]);
+
+	listing = refreshed;
+	const [retried] = await Promise.all([page.waitForResponse(listingUrl), retry.click()]);
+	expect(retried.status()).toBe(200);
+	await expect(stale).toBeHidden();
+	await expect(refresh).toBeVisible();
+	await expect(selectedOrder).toHaveText(mode);
+	await expect(titles).toHaveText([renamed.title, selected.title, newcomer.title]);
+	expect(fixture.listingAccounts).toEqual([listener.account, listener.account, listener.account]);
 });

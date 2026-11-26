@@ -2,6 +2,7 @@
 
 import base64
 import errno
+import hashlib
 import io
 import ipaddress
 import json
@@ -17,8 +18,9 @@ import time
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 
-import database_bootstrap_setup as setup
+import apply_migration
 import database_bootstrap_baseline as baseline
+import database_bootstrap_setup as setup
 from database_bootstrap_reader_role import MAX_READER_SECONDS, ReaderRoleLifecycle
 from database_bootstrap_role import SetupRoleLifecycle
 from fixtures.database_bootstrap.authorization import caller_env, plan_binding
@@ -640,6 +642,7 @@ def prove_baseline(cluster):
                f'GRANT CONNECT ON DATABASE {LAUNCH} TO {READER};', role=CREATOR, switch=OWNER)
     fixture_plan = baseline.baseline_plan(json.dumps(plan | {"reader_role": READER}).encode())
     prove_missing_baseline_relation(cluster, fixture_plan)
+    prove_ineffective_baseline_grant(cluster, fixture_plan)
     cluster.ok("use the exact mixed-case SQL reader name", f'ALTER ROLE {READER} RENAME TO "{reader}";')
     calls = cluster.directory / "invocations"
     before = calls.stat().st_size
@@ -794,6 +797,121 @@ def prove_missing_baseline_relation(cluster, plan):
                        "ERROR:  P0001: reviewed baseline inventory differs", **reader)
     finally:
         cluster.ok("remove the reviewed inventory fixture", "DROP SCHEMA baseline_readiness_fixture CASCADE;", **launch)
+
+
+def prove_ineffective_baseline_grant(cluster, plan):
+    launch = {"database": LAUNCH, "role": MIGRATOR}
+    reader = {"database": LAUNCH, "role": READER}
+    script = Path(__file__).with_name("database_bootstrap_reader_evidence.py")
+    begin = "\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n"
+    sql = baseline.baseline_sql(plan).decode("ascii")
+    require(sql.startswith(begin), "read the migration inventory in the baseline snapshot")
+    observed_identity = f"{READER}|{plan.reader_oid}|{plan.database_oid}\n"
+    catalog = "1\ngrant_ledger.schema_migrations\ngrant_tracks.tracks\n"
+    readback_sql = begin + """
+        SELECT current_user, current_user::regrole::oid, oid
+        FROM pg_database WHERE datname = current_database();
+        SELECT version FROM grant_ledger.schema_migrations ORDER BY version;
+        SELECT n.nspname || '.' || c.relname
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname IN ('grant_ledger', 'grant_tracks') AND c.relkind = 'r'
+        ORDER BY 1;
+        SELECT EXISTS (
+            SELECT FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL aclexplode(c.relacl) acl
+            WHERE n.nspname = 'grant_tracks' AND c.relname = 'tracks'
+              AND acl.grantee = current_user::regrole AND acl.privilege_type = 'SELECT'
+        );
+        SELECT coalesce(string_agg(grant_name, ', ' ORDER BY grant_name), '') FROM (
+            SELECT acl.privilege_type || ' ON ' || n.nspname || '.' || c.relname
+                   || CASE WHEN acl.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END AS grant_name
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL aclexplode(c.relacl) acl
+            WHERE n.nspname IN ('grant_ledger', 'grant_tracks')
+              AND acl.grantee = current_user::regrole
+              AND (acl.privilege_type <> 'SELECT' OR acl.is_grantable)
+            UNION ALL
+            SELECT acl.privilege_type || ' (' || a.attname || ') ON ' || n.nspname || '.' || c.relname
+                   || CASE WHEN acl.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL aclexplode(a.attacl) acl
+            WHERE n.nspname IN ('grant_ledger', 'grant_tracks') AND a.attnum > 0
+              AND acl.grantee = current_user::regrole
+              AND (acl.privilege_type <> 'SELECT' OR acl.is_grantable)
+            UNION ALL
+            SELECT acl.privilege_type || ' ON LARGE OBJECT ' || l.oid
+                   || CASE WHEN acl.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
+            FROM pg_largeobject_metadata l
+            CROSS JOIN LATERAL aclexplode(l.lomacl) acl
+            WHERE acl.grantee = current_user::regrole
+              AND (acl.privilege_type <> 'SELECT' OR acl.is_grantable)
+        ) grants;
+    """ + sql.removeprefix(begin)
+    inventory = {
+        "branch_id": plan.branch_id, "database_oid": plan.database_oid,
+        "inventory_sha256": hashlib.sha256(catalog.encode()).hexdigest(),
+    }
+    review = inventory | {"reader_role": plan.reader_role, "reader_oid": plan.reader_oid}
+    cluster.ok("complete the synthetic migration and grant read access", f"""
+        BEGIN;
+        CREATE SCHEMA grant_ledger;
+        CREATE SCHEMA grant_tracks;
+        CREATE TABLE grant_ledger.schema_migrations (version int);
+        CREATE TABLE grant_tracks.tracks (id int);
+        INSERT INTO grant_ledger.schema_migrations VALUES (1);
+        SELECT lo_create(900001);
+        GRANT USAGE ON SCHEMA grant_ledger, grant_tracks TO {READER};
+        GRANT SELECT ON grant_ledger.schema_migrations, grant_tracks.tracks TO {READER};
+        COMMIT;
+    """, "900001\n", **launch)
+    try:
+        for case, change, refusal, extra in (
+            ("least-privilege", None, None, None),
+            ("over-privileged delegated SELECT", f"GRANT SELECT ON grant_tracks.tracks TO {READER} WITH GRANT OPTION;",
+             "baseline table privilege refused", "SELECT ON grant_tracks.tracks WITH GRANT OPTION"),
+            ("over-privileged table grant", f"REVOKE SELECT ON grant_tracks.tracks FROM {READER};"
+             f" GRANT SELECT, UPDATE ON grant_tracks.tracks TO {READER};",
+             "baseline table privilege refused", "UPDATE ON grant_tracks.tracks"),
+            ("over-privileged column grant", f"REVOKE UPDATE ON grant_tracks.tracks FROM {READER};"
+             f" GRANT UPDATE (id) ON grant_tracks.tracks TO {READER};",
+             "baseline table privilege refused", "UPDATE (id) ON grant_tracks.tracks"),
+            ("over-privileged large-object grant", f"REVOKE UPDATE (id) ON grant_tracks.tracks FROM {READER};"
+             f" GRANT UPDATE ON LARGE OBJECT 900001 TO {READER};",
+             "baseline scope refused", "UPDATE ON LARGE OBJECT 900001"),
+            ("ineffective grants", f"REVOKE UPDATE ON LARGE OBJECT 900001 FROM {READER};"
+             f" REVOKE USAGE ON SCHEMA grant_tracks FROM {READER};", "baseline coverage refused", None),
+        ):
+            if change:
+                cluster.ok(f"prepare the {case}", change, **launch)
+            result = cluster.sql(readback_sql, **reader)
+            observed_extra = extra or ""
+            prefix = observed_identity + catalog + f"t\n{observed_extra}\n"
+            if refusal is None:
+                checked(result, "read the complete bundle with effective access", prefix + "rows-present\n")
+                privileges = {"result": "passed"}
+            else:
+                require(result.returncode == 3 and result.stdout == prefix
+                        and f"ERROR:  P0001: {refusal}" in result.stderr,
+                        f"verify the listed grant survives the {case} privilege refusal")
+                privileges = {"result": "failed"} | ({"extra_grants": [observed_extra]} if extra else {})
+            observed_catalog = result.stdout[len(observed_identity):len(observed_identity) + len(catalog)]
+            observed_inventory = inventory | {"inventory_sha256": hashlib.sha256(observed_catalog.encode()).hexdigest()}
+            evidence = {
+                "review": review, "inventory": observed_inventory,
+                "reader_privileges": review | observed_inventory | privileges,
+            }
+            verdict = command(sys.executable, "-IB", str(script), input_text=json.dumps(evidence), timeout=3)
+            verdict_name = (f"pending (extra-grant: {extra})" if extra else
+                            "consistent" if refusal is None else "pending")
+            line = f"database-bootstrap-reader-evidence: {verdict_name}\n"
+            expected = (0, line, "") if verdict_name == "consistent" else (1, "", line)
+            require((verdict.returncode, verdict.stdout, verdict.stderr) == expected,
+                    f"check the offline verdict for the {case} reader")
+    finally:
+        cluster.ok("remove both synthetic migration schemas and large object",
+                   "SELECT lo_unlink(900001); DROP SCHEMA grant_ledger, grant_tracks CASCADE;", "1\n", **launch)
 
 
 def prepare_baseline_readers(cluster, names, *, host):
@@ -1076,6 +1194,75 @@ def prove_reader_lifecycle(cluster, pending, *, scenario, database_oid, publish=
         """, database=LAUNCH)
 
 
+def verify_migrated_library_read(cluster):
+    migrations = Path(__file__).resolve().parents[2] / "migrations"
+    manifest = migrations / "manifest.toml"
+    forward = "0035_library_table.sql"
+    launch = {"role": MIGRATOR, "database": LAUNCH}
+    transaction = "BEGIN; SET LOCAL search_path = public, pg_catalog;\n"
+    # Use the runner's ledger and migration SQL on the fixture's TLS connection.
+    for entry in apply_migration.load_manifest(manifest):
+        if entry["target"] != "app":
+            continue
+        file = entry["file"]
+        if file == forward:
+            cluster.ok("verify the library is absent before its migration",
+                       "SELECT to_regclass('public.library') IS NULL;", "t\n", **launch)
+        sql, _, _, _ = apply_migration.compose(
+            migrations / file, manifest, "bootstrap-fixture", expect_database=LAUNCH)
+        cluster.ok("prepare the migration ledger", transaction + apply_migration.ddl_sql(LAUNCH) + "COMMIT;",
+                   "\n", **launch)
+        checked(cluster.sql(transaction + sql + "COMMIT;", **launch), f"apply app migration {file}")
+        if file == forward:
+            break
+    else:
+        raise FixtureFailure("find the library migration in the app manifest")
+
+    cluster.ok("seed one synthetic library row as the migrator", """
+        INSERT INTO public.users (id, email, created_at) VALUES ('fixture-user', 'user@example.invalid', 0);
+        INSERT INTO public.library (idempotency_key, job_id, user_id)
+        VALUES ('fixture-library', 'fixture-job', 'fixture-user');
+        """, **launch)
+    cluster.ok("read the migrated library as the scoped reader", f"""
+        BEGIN READ ONLY;
+        SELECT job_id FROM public.library WHERE idempotency_key = 'fixture-library';
+        SELECT session_user = '{READER}' AND current_user = '{READER}'
+           AND (SELECT relowner = '{MIGRATOR}'::regrole FROM pg_class WHERE oid = 'public.library'::regclass)
+           AND NOT has_table_privilege(current_user, 'public.library', 'SELECT WITH GRANT OPTION')
+           AND NOT has_table_privilege(current_user, 'public.library', 'DELETE, TRUNCATE, TRIGGER, MAINTAIN')
+           AND NOT has_any_column_privilege(current_user, 'public.library',
+               'INSERT, UPDATE, REFERENCES, SELECT WITH GRANT OPTION');
+        COMMIT;
+        """, "fixture-job\nt\n", role=READER, database=LAUNCH)
+
+
+def verify_migrated_library_write_refusal(cluster):
+    insert = """
+        INSERT INTO public.library (idempotency_key, job_id, user_id)
+        VALUES ('fixture-library-insert', 'fixture-inserted', 'fixture-user')
+        RETURNING job_id;
+        """
+    update = """
+        UPDATE public.library SET job_id = 'fixture-updated'
+        WHERE idempotency_key = 'fixture-library' RETURNING job_id;
+        """
+    delete = """
+        DELETE FROM public.library
+        WHERE idempotency_key = 'fixture-library' RETURNING job_id;
+        """
+    cluster.ok("verify runtime CRUD on the migrated library", f"""
+        BEGIN READ WRITE;
+        SELECT session_user = '{RUNTIME}' AND current_user = '{RUNTIME}';
+        {insert}
+        {update}
+        {delete}
+        ROLLBACK;
+        """, "t\nfixture-inserted\nfixture-updated\nfixture-updated\n", role=RUNTIME, database=LAUNCH)
+    for operation, sql in (("INSERT", insert), ("UPDATE", update), ("DELETE", delete)):
+        cluster.denied(f"refuse reader {operation} on the migrated library",
+                       f"BEGIN READ WRITE;\n{sql}\nROLLBACK;", "ERROR:  42501:", role=READER, database=LAUNCH)
+
+
 def verify_launch_grants(cluster):
     cluster.ok("verify revoked PUBLIC access and transferred ownership on admission", f"""
         SELECT datallowconn AND datdba = '{OWNER}'::regrole
@@ -1085,23 +1272,26 @@ def verify_launch_grants(cluster):
     for role in (RUNTIME, READER, STAGING):
         cluster.denied("refuse connection during migrator-only setup", "SELECT 1;",
                        "permission denied for database", role=role, database=LAUNCH)
+    cluster.ok("assign the template schema to the fixture migrator", f"""
+        ALTER SCHEMA public OWNER TO {MIGRATOR};
+        REVOKE ALL ON SCHEMA public FROM PUBLIC;
+        """, database=LAUNCH)
     cluster.ok("establish migrator-owned schema and default privileges", f"""
-        CREATE SCHEMA app;
-        GRANT USAGE ON SCHEMA app TO {RUNTIME}, {READER};
-        ALTER DEFAULT PRIVILEGES IN SCHEMA app
+        GRANT USAGE ON SCHEMA public TO {RUNTIME}, {READER};
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public
             GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {RUNTIME};
-        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO {READER};
-        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT USAGE ON SEQUENCES TO {RUNTIME};
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {READER};
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO {RUNTIME};
         ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
-        CREATE TABLE app.tracks (id serial PRIMARY KEY, title text);
-        CREATE TABLE app.ledger (version int);
-        REVOKE ALL ON app.ledger FROM {RUNTIME};
-        CREATE TABLE app.hidden (id int);
-        ALTER TABLE app.hidden ENABLE ROW LEVEL SECURITY;
-        CREATE FUNCTION app.private_fn() RETURNS int LANGUAGE sql AS 'SELECT 1';
-        INSERT INTO app.tracks (title) VALUES ('fixture');
-        INSERT INTO app.ledger VALUES (1);
-        INSERT INTO app.hidden VALUES (1);
+        CREATE TABLE public.fixture_tracks (id serial PRIMARY KEY, title text);
+        CREATE TABLE public.fixture_ledger (version int);
+        REVOKE ALL ON public.fixture_ledger FROM {RUNTIME};
+        CREATE TABLE public.fixture_hidden (id int);
+        ALTER TABLE public.fixture_hidden ENABLE ROW LEVEL SECURITY;
+        CREATE FUNCTION public.fixture_private_fn() RETURNS int LANGUAGE sql AS 'SELECT 1';
+        INSERT INTO public.fixture_tracks (title) VALUES ('fixture');
+        INSERT INTO public.fixture_ledger VALUES (1);
+        INSERT INTO public.fixture_hidden VALUES (1);
         """, role=MIGRATOR, database=LAUNCH)
     cluster.ok("withdraw setup authority and admit serving roles", f"""
         REVOKE CREATE ON DATABASE {LAUNCH} FROM {MIGRATOR};
@@ -1115,41 +1305,44 @@ def verify_launch_grants(cluster):
     cluster.ok("verify runtime CRUD and sequence defaults", f"""
         BEGIN;
         SELECT session_user = '{RUNTIME}' AND current_user = '{RUNTIME}'
-           AND NOT has_table_privilege(current_user, 'app.tracks', 'SELECT WITH GRANT OPTION');
-        INSERT INTO app.tracks (title) VALUES ('runtime');
-        UPDATE app.tracks SET title = 'updated' WHERE title = 'runtime' RETURNING title;
-        DELETE FROM app.tracks WHERE title = 'updated' RETURNING title;
+           AND NOT has_table_privilege(current_user, 'public.fixture_tracks', 'SELECT WITH GRANT OPTION');
+        INSERT INTO public.fixture_tracks (title) VALUES ('runtime');
+        UPDATE public.fixture_tracks SET title = 'updated' WHERE title = 'runtime' RETURNING title;
+        DELETE FROM public.fixture_tracks WHERE title = 'updated' RETURNING title;
         ROLLBACK;
         """, "t\nupdated\nupdated\n", role=RUNTIME, database=LAUNCH)
     for role, sql in (
-        (READER, "INSERT INTO app.tracks (title) VALUES ('denied')"),
-        (READER, "UPDATE app.tracks SET title = 'denied'"),
-        (READER, "DELETE FROM app.tracks"),
-        (READER, "SELECT nextval('app.tracks_id_seq')"),
-        (READER, "CREATE TABLE app.denied(id int)"),
+        (READER, "INSERT INTO public.fixture_tracks (title) VALUES ('denied')"),
+        (READER, "UPDATE public.fixture_tracks SET title = 'denied'"),
+        (READER, "DELETE FROM public.fixture_tracks"),
+        (READER, "SELECT nextval('public.fixture_tracks_id_seq')"),
+        (READER, "CREATE TABLE public.denied(id int)"),
         (READER, "SET ROLE " + MIGRATOR),
-        (RUNTIME, "UPDATE app.ledger SET version = 2"),
-        (RUNTIME, "TRUNCATE app.tracks"),
+        (RUNTIME, "UPDATE public.fixture_ledger SET version = 2"),
+        (RUNTIME, "TRUNCATE public.fixture_tracks"),
         (RUNTIME, "CREATE TEMP TABLE denied(id int)"),
         (RUNTIME, "CREATE SCHEMA denied"),
-        (RUNTIME, "SELECT app.private_fn()"),
+        (RUNTIME, "SELECT public.fixture_private_fn()"),
         (MIGRATOR, "CREATE SCHEMA denied"),
     ):
         cluster.denied("verify scoped SQL refusal", f"BEGIN; {sql}; ROLLBACK;", "ERROR:  42501:",
                        role=role, database=LAUNCH)
 
     cluster.ok("verify migrator sees the hidden sentinel and owns the ledger", f"""
-        SELECT NOT row_security_active('app.hidden') AND EXISTS (SELECT FROM app.hidden)
-           AND (SELECT relowner = current_user::regrole FROM pg_class WHERE oid = 'app.ledger'::regclass);
+        SELECT NOT row_security_active('public.fixture_hidden') AND EXISTS (SELECT FROM public.fixture_hidden)
+           AND (SELECT relowner = current_user::regrole FROM pg_class WHERE oid = 'public.fixture_ledger'::regclass);
         """, "t\n", role=MIGRATOR, database=LAUNCH)
     cluster.ok("verify reader census distinguishes population from RLS-obscured absence", f"""
         BEGIN READ ONLY;
         SELECT session_user = '{READER}' AND current_user = '{READER}'
-           AND NOT row_security_active('app.tracks') AND EXISTS (SELECT FROM app.tracks)
-           AND EXISTS (SELECT FROM app.ledger)
-           AND row_security_active('app.hidden') AND NOT EXISTS (SELECT FROM app.hidden);
+           AND NOT row_security_active('public.fixture_tracks') AND EXISTS (SELECT FROM public.fixture_tracks)
+           AND EXISTS (SELECT FROM public.fixture_ledger)
+           AND row_security_active('public.fixture_hidden') AND NOT EXISTS (SELECT FROM public.fixture_hidden);
         COMMIT;
         """, "t\n", role=READER, database=LAUNCH)
+
+    verify_migrated_library_read(cluster)
+    verify_migrated_library_write_refusal(cluster)
 
     cluster.ok("verify staging login on its own database", "SELECT 1;", "1\n", role=STAGING, database=SIBLING)
     cluster.denied("refuse staging login on launch", "SELECT 1;", "permission denied for database",

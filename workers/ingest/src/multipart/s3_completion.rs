@@ -404,16 +404,7 @@ impl S3CompletionSender {
             .headers
             .get("etag")
             .map_err(|_| refuse())?
-            .filter(|tag| {
-                tag.strip_prefix('"')
-                    .and_then(|value| value.strip_suffix('"'))
-                    .is_some_and(|value| {
-                        !value.is_empty()
-                            && value
-                                .bytes()
-                                .all(|byte| byte.is_ascii_graphic() && byte != b'"')
-                    })
-            })
+            .filter(|tag| valid_part_etag(tag))
             .ok_or_else(refuse)?;
         let returned = reply
             .headers
@@ -550,6 +541,17 @@ impl S3CompletionSender {
             },
         ))
     }
+}
+
+fn valid_part_etag(tag: &str) -> bool {
+    tag.strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .is_some_and(|value| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && byte != b'"')
+        })
 }
 
 struct SignedRequest<'a> {

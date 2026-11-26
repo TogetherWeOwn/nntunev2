@@ -99,6 +99,34 @@ If dedicated PostgreSQL provisioning stops partway through, use the
    publication and versioned storage pins for cleanup. Keep tone B's pins
    separately for its recorded disposition.
 
+### Read ordinary staging progress for a pinned candidate
+
+For a disarmed candidate, match the full recorded SHA, run ID and attempt to the
+automatic `main` push of `deploy.yml` at the qualification callback. For an
+armed run, use the [private journey proof](../first-private-music-launch.md#qualify-the-candidate).
+Read `GET /repos/TogetherWeOwn/nntunev2/actions/runs/<run-id>/attempts/<attempt>`
+and the same attempt's `/jobs?per_page=100&page=1` listing. Include every page
+and confirm `total_count` before treating an empty listing as evidence. Take job
+IDs from that listing and match the SHA and run ID on each job read. This handoff
+uses GET requests only and retains the selected candidate.
+
+Use these synthetic snapshots of one attempt to rehearse the callback.
+
+| Saved evidence | What to inspect on the next callback |
+| --- | --- |
+| The run is `pending` with a null conclusion and a complete zero-job listing. | Read the same attempt's jobs listing for `gate`. For a terminal zero-job failure, REST may return no check runs or annotations to explain it. Before recording a queue rejection, open that attempt's run summary at `https://github.com/TogetherWeOwn/nntunev2/actions/runs/<run-id>/attempts/<attempt>` and confirm the `Queue is full` message for `deploy-staging-main`. Without it, report the failure as unclassified. Use the pinned `<attempt>` in every run and jobs route. |
+| The job named `gate` is `queued` with no runner assigned (`runner_id` null or `0`, `runner_name` null or empty) and no steps. | Read `GET /repos/TogetherWeOwn/nntunev2/actions/jobs/<job-id>` for `gate` and check for runner assignment or execution. Actions can populate `started_at` while the job is still queued. |
+| `Deploy to staging` and `Deploy api to staging` succeeded, and the full journey is queued, running or lacks a successful result. | Read the attempt's `post-deploy-e2e / synthetic smoke (health)` job for `Run synthetic smoke`, then its `post-deploy-e2e / full journey (…)` job for `Run full journey`, the evidence gate and the receipt record and upload steps. A failed smoke with a skipped journey is a smoke failure. |
+
+In all three snapshots, record qualification as pending. Report the pinned
+attempt, last confirmed step and next read-only endpoint in the handoff.
+A job row, successful deploy or passing smoke only establishes progress.
+Qualification still requires the same attempt's complete ordinary journey,
+its [attempt-bound receipt](../../ci/staging-admission.md), and the existing
+[staging build identity and health checks](../ops.md#staging-promotion-checklist).
+Confirm writer clearance through the existing trial handoff before downstream
+use. An older writer's progress belongs to its own attempt.
+
 ### Rehearse the verifier handoff offline
 
 The hosted [`e2e-lint` job](../../.github/workflows/ci.yml) runs the offline

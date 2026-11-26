@@ -205,6 +205,12 @@ the `tone-a.flac` bytes in that build. The receipt carries the shared identity
 as `private_track`. The verifier checks it against the selected attempt and
 candidate Git object.
 
+`private-cutoff-refusal` also carries `cutoff_listener` and `refused_listener`.
+These run-local UUID aliases must match. The journey assigns them from the
+session established by the synthetic invite and the authenticated session
+used for the cutoff probes. The aliases stay in JUnit. Session bindings,
+email addresses, and credentials stay out of JUnit and the receipt.
+
 The `build-identity` and `build-identity-final` cases use the same class and
 carry the existing `candidate-identity` properties, plus a `deployments` map
 with the four provider identity fields per lane. Read these independently
@@ -230,6 +236,13 @@ The object has `schema: 1`, the candidate `sha`, decimal string `run_id` and
 `build-identity-final` observation times. Refusals and ordinary admissions emit
 no private pins. The line is staging evidence only. Match it against the
 [pinned candidate template](../docs/first-private-music-launch.md#pinned-candidate-template).
+
+If the final Web or API read returns a different build after the selected
+private receipt and its Web/API/Stream pins pass verification, admission is
+Pending. The refusal identifies the selected SHA, run and attempt. Retain
+those references and compare the current Web, API and Stream build, version
+and deployment IDs with that attempt through the authorized read-only
+deployment records. Return to candidate qualification if staging moved.
 
 ### Synthetic handoff when Actions evidence is unavailable
 
@@ -332,11 +345,47 @@ a report containing an unexpected paid-signup case emits no summary. This CI
 comparison prepares QA for the live review, which still requires evidence
 from the exact protected run.
 
+### Accepted automatic push awaiting work
+
+Run `python3 -I ci/staging_admission.py diagnose-pending-push <pinned-sha> <
+evidence.json` with saved Actions responses for a first-attempt main push.
+Provide the run object as `run` and its complete attempt-specific jobs page
+(`total_count` and `jobs`, up to 100 rows) as `jobs`. Capture the two
+responses for the same attempt.
+
+An unresolved run with zero job rows points to the attempt's jobs endpoint.
+A queued full-journey job with runner ID `0`, an empty runner name and no steps
+points to that job's endpoint. Actions can populate `started_at` on a queued job
+before runner assignment. The diagnostic prints the observed IDs and the next
+read on stderr, exits 1 and emits no receipt or admission pins. Use the normal
+receipt verifier for a completed success. A rejected push or a failed journey
+does not receive a pending-work diagnosis.
+
+### Receipt verification fixtures
+
 `python3 -I ci/test_staging_admission.py` uses synthetic policy and authenticated
 API-shaped fixtures without a network, deploy or operational acceptance claim.
 It is included in the existing required `release-proof` CI job. The production
 workflow's old inline job checks are only preliminary guards, separately covered
 by `e2e/tests/deploy-production.spec.ts`; they cannot bypass the receipt verifier.
+
+### Automatic push rejected before jobs
+
+For an offline rehearsal, run `python3 -I ci/staging_admission.py
+diagnose-terminal-push <pinned-sha> < evidence.json`. The JSON object has `run`,
+`jobs` (the attempt's `total_count` and `jobs`), and `annotations` (an array of
+workflow annotations). Use the synthetic fixture to pair all three inputs for
+the same attempt. The diagnostic relies on that pairing because the annotation
+rows carry no run or attempt ID.
+
+A failed first-attempt main push with zero jobs and the `deploy-staging-main`
+queue-full annotation leaves exact-build qualification pending. The next eligible
+automatic staging admission can provide evidence for the build it runs. A later
+push with a different SHA needs its own qualification. When the same pinned
+attempt instead has a failed full E2E journey step, inspect that job and return
+to candidate qualification. Both diagnostics exit unsuccessfully and emit no
+admission pins. The synthetic successful control for the same source still
+verifies through the receipt reader.
 
 AGENTS.md “Clean-room, YouTube and MetaBrainz guardrails”: this change handles
 admission metadata only; no UI, playback, catalogue ingestion or cover-art rights

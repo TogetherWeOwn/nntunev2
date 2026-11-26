@@ -7,6 +7,16 @@ import sys
 MAX_RECORD_BYTES = 4096
 CATALOG_PINS = {"branch_id", "database_oid", "inventory_sha256"}
 READER_PINS = {"reader_role", "reader_oid"}
+IDENTIFIER = r"[a-z_][a-z0-9_]{0,62}"
+PRIVILEGE = r"(?:SELECT|INSERT|UPDATE|DELETE|TRUNCATE|REFERENCES|TRIGGER|MAINTAIN|USAGE|CREATE|CONNECT|TEMPORARY|EXECUTE)"
+COLUMN_PRIVILEGE = r"(?:SELECT|INSERT|UPDATE|REFERENCES)"
+LARGE_OBJECT_PRIVILEGE = r"(?:SELECT|UPDATE)"
+EXTRA_GRANT = re.compile(
+    rf"(?:{PRIVILEGE} ON {IDENTIFIER}(?:\.{IDENTIFIER})?"
+    rf"|{COLUMN_PRIVILEGE} \((?:{IDENTIFIER})(?:, {IDENTIFIER})*\) ON {IDENTIFIER}(?:\.{IDENTIFIER})?"
+    rf"|{LARGE_OBJECT_PRIVILEGE} ON LARGE OBJECT [1-9][0-9]{{0,9}})"
+    r"(?: WITH GRANT OPTION)?"
+)
 
 
 def unique_fields(pairs):
@@ -20,6 +30,17 @@ def valid_oid(value):
     return type(value) is int and 0 < value <= 0xFFFFFFFF
 
 
+def valid_inventory_digest(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def valid_extra_grant(value):
+    if not isinstance(value, str) or EXTRA_GRANT.fullmatch(value) is None:
+        return False
+    large_object = re.search(r" ON LARGE OBJECT ([0-9]+)(?: WITH GRANT OPTION)?$", value)
+    return large_object is None or valid_oid(int(large_object.group(1)))
+
+
 def matches_pins(observed, expected):
     return (
         isinstance(observed, dict) and observed.keys() == expected.keys()
@@ -27,37 +48,64 @@ def matches_pins(observed, expected):
     )
 
 
-def consistent_reader_evidence(raw):
+def reader_evidence_verdict(raw):
     if len(raw) > MAX_RECORD_BYTES:
-        return False
+        return "pending"
     record = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
-    if not isinstance(record, dict) or record.keys() != {"review", "inventory", "reader_privileges"}:
-        return False
-    review = record["review"]
+    if not isinstance(record, dict) or record.keys() - {"review", "inventory", "reader_privileges"}:
+        return "pending"
+    review = record.get("review")
     if not isinstance(review, dict) or review.keys() != CATALOG_PINS | READER_PINS:
-        return False
+        return "pending"
     branch, digest, role = review["branch_id"], review["inventory_sha256"], review["reader_role"]
     if not (
         isinstance(branch, str) and re.fullmatch(r"(?:[a-z0-9]{10}|[a-z0-9]{12})", branch)
-        and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+        and valid_inventory_digest(digest)
         and isinstance(role, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,63}", role)
         and not role.lower().startswith("pg_") and role.lower() != "public"
         and valid_oid(review["database_oid"]) and valid_oid(review["reader_oid"])
     ):
-        return False
+        return "pending"
 
     catalog = {key: review[key] for key in CATALOG_PINS}
-    return (
-        matches_pins(record["inventory"], catalog)
-        and matches_pins(record["reader_privileges"], review | {"result": "passed"})
-    )
+    inventory = record.get("inventory")
+    observed_digest = inventory.get("inventory_sha256") if isinstance(inventory, dict) else None
+    if not (
+        valid_inventory_digest(observed_digest)
+        and matches_pins(inventory, catalog | {"inventory_sha256": observed_digest})
+    ):
+        return "pending"
+    if observed_digest != digest:
+        return "pending (inventory-mismatch)"
+    privileges = record.get("reader_privileges")
+    covered_digest = privileges.get("inventory_sha256") if isinstance(privileges, dict) else None
+    if not (
+        valid_inventory_digest(covered_digest)
+        and isinstance(privileges, dict)
+    ):
+        return "pending"
+    if isinstance(privileges, dict) and "extra_grants" in privileges:
+        privileges = dict(privileges)
+        extra = privileges.pop("extra_grants")
+        if (isinstance(extra, list) and extra
+                and all(valid_extra_grant(grant) for grant in extra)
+                and len(set(extra)) == len(extra)
+                and matches_pins(privileges, review | {"result": "failed"})):
+            return f"pending (extra-grant: {', '.join(extra)})"
+        return "pending"
+    if not matches_pins(privileges, review | {"inventory_sha256": covered_digest, "result": "passed"}):
+        return "pending"
+    return "consistent" if covered_digest == digest else "pending (inventory-mismatch)"
 
 
 if __name__ == "__main__":
+    verdict = "pending"
     try:
-        consistent = len(sys.argv) == 1 and consistent_reader_evidence(sys.stdin.buffer.read(MAX_RECORD_BYTES + 1))
+        if len(sys.argv) == 1:
+            verdict = reader_evidence_verdict(sys.stdin.buffer.read(MAX_RECORD_BYTES + 1))
     except (OSError, ValueError, RecursionError):
-        consistent = False
-    if not consistent:
-        sys.exit("database-bootstrap-reader-evidence: pending")
-    print("database-bootstrap-reader-evidence: consistent")
+        pass
+    message = f"database-bootstrap-reader-evidence: {verdict}"
+    if verdict != "consistent":
+        sys.exit(message)
+    print(message)

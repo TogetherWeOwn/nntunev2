@@ -57,11 +57,15 @@ impl Fixture {
     }
 
     fn from_plaintext(plaintext: &[u8]) -> Self {
+        Self::from_object(plaintext, id(3))
+    }
+
+    fn from_object(plaintext: &[u8], object_id: [u8; 16]) -> Self {
         let len = plaintext.len() as u64;
         let mut seal =
-            DigestEnrollment::new(len, [id(1), id(2), id(3), id(4), id(5)], id(6)).unwrap();
+            DigestEnrollment::new(len, [id(1), id(2), object_id, id(4), id(5)], id(6)).unwrap();
         let context = EnvelopeContext {
-            identities: [id(7), id(1), id(2), id(3), id(4), id(5)],
+            identities: [id(7), id(1), id(2), object_id, id(4), id(5)],
             plaintext_len: len,
             header: seal.header().to_bytes(),
         };
@@ -77,7 +81,11 @@ impl Fixture {
         };
         let locator = S3Locator::new(
             "fixture-media".into(),
-            "media/00000000000040008000000000000003/00000000000040008000000000000004".into(),
+            format!(
+                "media/{:032x}/{:032x}",
+                u128::from_be_bytes(object_id),
+                u128::from_be_bytes(id(4))
+            ),
             S3Binding::VersionId("media-v1".into()),
         )
         .unwrap();
@@ -98,7 +106,7 @@ impl Fixture {
             environment_id: id(1),
             library_id: id(2),
             reference_id: id(9),
-            object_id: id(3),
+            object_id: self.context.identities[3],
             generation_id: id(4),
             provider_configuration: id(5),
             root_version_id: id(7),

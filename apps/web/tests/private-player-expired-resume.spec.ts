@@ -1,13 +1,16 @@
-import { expect } from '@playwright/test';
+import { expect, type BrowserContext, type Page } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { privateStagingAudio } from '../../../e2e/helpers/private-staging-fixture.js';
 import { fixtureCookie, hasFixtureSession, serveFlac, test } from './helpers/private-music-fixture.js';
 
-test('private Play resumes the same listen after its grant expires during Pause', async ({ page, context, origin }) => {
+type InvitedPage = { page: Page; context: BrowserContext; origin: string };
+
+async function startPrivatePlayback({ page, context, origin }: InvitedPage) {
 	const { library, player } = PRIVATE_MUSIC;
 	const tracks = ['Paused tone', 'First upcoming tone', 'Second upcoming tone'].map((title, index) => ({
 		id: `00000000-0000-4000-8000-00000000011${index}`, title, duration_ms: 14_000
 	}));
+	let libraryTracks = tracks;
 	const [selected] = tracks;
 	const tone = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
 	const member = 'synthetic-listener', binding = 'A'.repeat(43), playId = `private_browser_${'a'.repeat(22)}`;
@@ -26,7 +29,7 @@ test('private Play resumes the same listen after its grant expires during Pause'
 	await page.route(`${origin}/v1/me/likes/session`, async (route) => hasFixtureSession(await route.request().headerValue('cookie'), member)
 		? route.fulfill({ json: { session_binding: binding } }) : route.fulfill({ status: 401 }));
 	await page.route(origin + library.api, async (route) => hasFixtureSession(await route.request().headerValue('cookie'), member)
-		? route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: tracks }) : route.fulfill({ status: 401 }));
+		? route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: libraryTracks }) : route.fulfill({ status: 401 }));
 	await page.route(`${playsUrl}/events**`, (route) => {
 		listenEvents.push(route.request().url());
 		return route.fulfill({ status: 404 });
@@ -82,6 +85,23 @@ test('private Play resumes the same listen after its grant expires during Pause'
 		const response = await fetch(src, { cache: 'no-store', headers: { range: 'bytes=0-3' } });
 		return { status: response.status, bytes: await response.text() };
 	}, mediaPath());
+	const expireGrant = async () => {
+		now += grantLifetime;
+		await page.clock.setFixedTime(now - clockSkew);
+	};
+	const holdRenewal = () => {
+		const renewal = Promise.withResolvers<void>();
+		allowRenewal = renewal.promise;
+		return renewal.resolve;
+	};
+	const addLibraryTrack = (track: typeof selected) => { libraryTracks = [...libraryTracks, track]; };
+	return { audio, play, pause, selected, addLibraryTrack, expectQueue, initial, continuation, plays, listenEvents, readRange,
+		expireGrant, holdRenewal, playsUrl, mediaUrl: origin + mediaPath() };
+}
+
+test('private Play resumes the same listen after its grant expires during Pause', async ({ page, context, origin }) => {
+	const { audio, play, pause, expectQueue, initial, continuation, plays, listenEvents, readRange,
+		expireGrant, holdRenewal, mediaUrl } = await startPrivatePlayback({ page, context, origin });
 	const expectedPlays = [initial];
 	for (let attempt = 0; attempt < 2; attempt++) {
 		await pause.click();
@@ -94,13 +114,11 @@ test('private Play resumes the same listen after its grant expires during Pause'
 			}
 			return observation;
 		});
-		now += grantLifetime;
-		await page.clock.setFixedTime(now - clockSkew);
+		await expireGrant();
 		expect(await readRange()).toEqual({ status: 404, bytes: '' });
 		await expectQueue();
 		expect(plays).toEqual(expectedPlays);
-		const renewal = Promise.withResolvers<void>();
-		allowRenewal = renewal.promise;
+		const releaseRenewal = holdRenewal();
 		expectedPlays.push(continuation);
 		try {
 			await play.click();
@@ -108,7 +126,7 @@ test('private Play resumes the same listen after its grant expires during Pause'
 			await expect(audio).toHaveJSProperty('paused', true);
 			expect(await resume.evaluate(({ starts }) => starts)).toEqual([]);
 		} finally {
-			renewal.resolve();
+			releaseRenewal();
 		}
 		await expect.poll(() => resume.evaluate(({ node, pausedAt }) => !node.paused && !node.error && node.currentTime > pausedAt + 0.2)).toBe(true);
 		const { pausedAt, starts, discontinuities } = await resume.evaluate(({ pausedAt, starts, discontinuities }) =>
@@ -117,11 +135,165 @@ test('private Play resumes the same listen after its grant expires during Pause'
 		// The queued play event can run after the native decoder has advanced.
 		expect(starts[0]).toBeGreaterThanOrEqual(pausedAt - 0.05);
 		expect(discontinuities).toEqual([]);
-		await expect(audio).toHaveJSProperty('currentSrc', origin + mediaPath());
+		await expect(audio).toHaveJSProperty('currentSrc', mediaUrl);
 		expect(await readRange()).toEqual({ status: 206, bytes: 'fLaC' });
 		await expectQueue();
 		await resume.dispose();
 	}
 	expect(plays).toEqual(expectedPlays);
 	expect(listenEvents).toEqual([]);
+});
+
+declare global {
+	interface Window {
+		__privateRenewalActions?: Partial<Record<'play' | 'pause', MediaSessionActionHandler>>;
+	}
+}
+
+async function checkPauseDuringRenewal({ page, context, origin }: InvitedPage, navigateWhileHeld: boolean) {
+	await page.addInitScript(() => {
+		const session = navigator.mediaSession;
+		const register = session.setActionHandler.bind(session);
+		const actions: NonNullable<Window['__privateRenewalActions']> = {};
+		window.__privateRenewalActions = actions;
+		session.setActionHandler = (action, handler) => {
+			register(action, handler);
+			if (action === 'play' || action === 'pause') actions[action] = handler ?? undefined;
+		};
+	});
+	const mediaAction = (action: 'play' | 'pause') => page.evaluate((action) => {
+		const handler = window.__privateRenewalActions?.[action];
+		if (!handler) throw new Error(`Missing Media Session ${action} handler`);
+		handler({ action });
+	}, action);
+	const { audio, play, pause, selected, addLibraryTrack, expectQueue, initial, continuation, plays, listenEvents, readRange,
+		expireGrant, holdRenewal, playsUrl, mediaUrl } = await startPrivatePlayback({ page, context, origin });
+	const probe = await audio.evaluateHandle((node: HTMLAudioElement) => {
+		const starts: number[] = [], discontinuities: string[] = [];
+		const nativePlay = node.play.bind(node);
+		node.play = () => {
+			starts.push(node.currentTime);
+			return nativePlay();
+		};
+		for (const event of ['seeking', 'emptied', 'loadstart']) {
+			node.addEventListener(event, () => discontinuities.push(event));
+		}
+		return { node, starts, discontinuities, pausedAtGesture: [] as boolean[] };
+	});
+
+	await expireGrant();
+	if (!navigateWhileHeld) {
+		// A matching Play action on an already-playing decoder does not renew or restart it.
+		const activeAt = await probe.evaluate(({ node }) => node.currentTime);
+		await mediaAction('play');
+		await expect(pause).toBeVisible();
+		await expect.poll(() => probe.evaluate(({ node }) => node.currentTime)).toBeGreaterThan(activeAt + 0.2);
+	}
+	expect(await readRange()).toEqual({ status: 404, bytes: '' });
+	expect(plays).toEqual([initial]);
+	expect(await probe.evaluate(({ starts }) => starts)).toEqual([]);
+
+	await pause.click();
+	await expect(audio).toHaveJSProperty('paused', true);
+	const saved = await probe.evaluate(({ node }) => node.currentTime);
+	expect(saved).toBeGreaterThan(1);
+
+	const expectPausedDecoder = async () => {
+		await expect(play).toBeVisible();
+		expect(await audio.evaluate((node: HTMLAudioElement, original) => ({
+			sameNode: node === original.node, paused: node.paused, time: node.currentTime,
+			source: node.currentSrc, failed: node.error !== null,
+			starts: original.starts, discontinuities: original.discontinuities
+		}), probe)).toEqual({
+			sameNode: true, paused: true, time: saved, source: mediaUrl, failed: false, starts: [], discontinuities: []
+		});
+	};
+	const main = page.getByRole('main');
+	const openNowPlaying = async () => {
+		await page.getByTestId('shell-rail').getByRole('link', { name: 'Now Playing', exact: true }).press('Enter');
+		await expect(page).toHaveURL(origin + '/now-playing');
+		await expect(main.getByRole('heading', { name: selected.title, exact: true })).toBeVisible();
+		await expectPausedDecoder();
+	};
+
+	const releaseRenewal = holdRenewal();
+	const renewed = page.waitForResponse(playsUrl);
+	try {
+		await play.click();
+		await expect.poll(() => plays).toEqual([initial, continuation]);
+		// The compact transport shows Play while the native decoder is paused.
+		await mediaAction('pause');
+		await expectPausedDecoder();
+		if (navigateWhileHeld) {
+			await openNowPlaying();
+			const { library } = PRIVATE_MUSIC;
+			const newTrack = { id: '00000000-0000-4000-8000-000000000113', title: 'New Library tone', duration_ms: 14_000 };
+			addLibraryTrack(newTrack);
+			await main.getByRole('button', { name: 'Back', exact: true }).press('Enter');
+			await expect(page).toHaveURL(origin + library.path);
+			await expect(main.getByRole('heading', { name: 'Library', exact: true })).toBeVisible();
+			await expect(main.getByTestId(library.item).filter({ hasText: newTrack.title })).toBeVisible();
+			await expectQueue();
+			await expectPausedDecoder();
+			await openNowPlaying();
+			expect(await readRange()).toEqual({ status: 404, bytes: '' });
+			expect(plays).toEqual([initial, continuation]);
+		}
+	} finally {
+		releaseRenewal();
+	}
+	const response = await renewed;
+	expect(response.status()).toBe(200);
+	expect(await response.finished()).toBeNull();
+	expect(await readRange()).toEqual({ status: 206, bytes: 'fLaC' });
+	if (!navigateWhileHeld) await expectQueue();
+	await expectPausedDecoder();
+	expect(plays).toEqual([initial, continuation]);
+
+	// Capture the state at each trusted Play gesture while waiting for the previous attempt to clear.
+	await play.evaluate((button, observation) => {
+		button.addEventListener('click', (event) => {
+			observation.pausedAtGesture.push(event.isTrusted && observation.node.paused && observation.starts.length === 0);
+		}, { capture: true });
+	}, probe);
+	const expectedPlays = [initial, continuation, continuation];
+	const releaseResume = holdRenewal();
+	try {
+		// A response can finish before the Player clears its pending renewal. Only an
+		// accepted Play can send the next continuation. Hold that reply during the poll.
+		await expect.poll(async () => {
+			if (plays.length === 2) await play.click();
+			return plays;
+		}).toEqual(expectedPlays);
+		await expect(audio).toHaveJSProperty('paused', true);
+		expect(await probe.evaluate(({ starts }) => starts)).toEqual([]);
+	} finally {
+		releaseResume();
+	}
+	await expect.poll(() => audio.evaluate((node: HTMLAudioElement, { original, saved }) =>
+		node === original.node && !node.paused && !node.error && node.currentTime > saved + 0.2,
+	{ original: probe, saved })).toBe(true);
+	const { starts, discontinuities, pausedAtGesture } = await probe.evaluate(({ starts, discontinuities, pausedAtGesture }) =>
+		({ starts, discontinuities, pausedAtGesture }));
+	expect(pausedAtGesture.length).toBeGreaterThan(0);
+	expect(pausedAtGesture).not.toContain(false);
+	expect(starts).toEqual([saved]);
+	expect(discontinuities).toEqual([]);
+	await expect(audio).toHaveJSProperty('currentSrc', mediaUrl);
+	if (navigateWhileHeld) {
+		await expect(main.getByRole('heading', { name: selected.title, exact: true })).toBeVisible();
+	} else {
+		await expectQueue();
+	}
+	expect(plays).toEqual(expectedPlays);
+	expect(listenEvents).toEqual([]);
+	await probe.dispose();
+}
+
+test('Media Session Pause holds after private grant renewal until explicit Play', async ({ page, context, origin }) => {
+	await checkPauseDuringRenewal({ page, context, origin }, false);
+});
+
+test('private grant renewal preserves Pause across Library and Now Playing until explicit Play', async ({ page, context, origin }) => {
+	await checkPauseDuringRenewal({ page, context, origin }, true);
 });

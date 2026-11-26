@@ -21,7 +21,7 @@ const buildSha =
 		?.GITHUB_SHA ||
 	'unknown';
 
-export default defineConfig(({ command, mode }) => {
+export default defineConfig(({ command, mode, isPreview }) => {
 	// Only browser fixtures bundle the video view and allow its stubbed origins.
 	const videoFixtures = mode === 'browser-fixtures';
 	// SvelteKit's `csp` option is baked in at build time, so the API origin
@@ -89,7 +89,8 @@ export default defineConfig(({ command, mode }) => {
 
 				// Cloudflare Workers (serverless), via the tracked wrangler.toml
 				// in this directory; local dev/checks run without deploying.
-				adapter: adapter(),
+				// Keep Wrangler's SQLite state isolated across parallel browser fixture previews.
+				adapter: adapter(isPreview && videoFixtures ? { platformProxy: { persist: false } } : undefined),
 
 				// Nonce mode: every inline script/style SvelteKit emits carries
 				// a per-request nonce, so scripts need neither 'unsafe-inline'

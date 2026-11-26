@@ -47,6 +47,18 @@ pub struct ResumeCheckpoint<'a> {
     pub parts: &'a [CheckpointPart<'a>],
 }
 
+impl ResumeCheckpoint<'_> {
+    /// Compare the entire observed sequence with the saved prefix. Pass parts
+    /// in their original order, including repeated entries across pages.
+    /// An observation never supplies verified receipts or authorizes resume.
+    pub(crate) fn matches_parts<'a>(
+        &'a self,
+        observed: impl IntoIterator<Item = CheckpointPart<'a>>,
+    ) -> bool {
+        self.parts.iter().copied().eq(observed)
+    }
+}
+
 /// Match the caller's local binding and verified receipt prefix against a checkpoint.
 /// Neither input may be reconstructed from provider state. A match only makes
 /// resume worth considering; it does not validate sealer state or authorize any action.
@@ -60,16 +72,14 @@ pub fn matches_checkpoint(
         && receipts.len() == checkpoint.parts.len()
         && receipts
             .iter()
-            .zip(checkpoint.parts)
             .enumerate()
-            .all(|(i, (receipt, saved))| {
-                receipt.plan == expected.plan
-                    && receipt.number as usize == i + 1
-                    && receipt.number == saved.number
-                    && receipt.len == saved.len
-                    && receipt.etag == saved.etag
-                    && receipt.digest == saved.digest
-            })
+            .all(|(i, receipt)| receipt.plan == expected.plan && receipt.number as usize == i + 1)
+        && checkpoint.matches_parts(receipts.iter().map(|receipt| CheckpointPart {
+            number: receipt.number,
+            len: receipt.len,
+            etag: &receipt.etag,
+            digest: receipt.digest,
+        }))
 }
 
 #[cfg(test)]

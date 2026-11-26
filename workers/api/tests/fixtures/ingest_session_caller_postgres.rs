@@ -38,6 +38,9 @@ use blocker_observer::observe_blocked;
 #[path = "ingest_session_reuse_postgres.rs"]
 mod reuse_cases;
 
+#[path = "ingest_session_pending_part.rs"]
+mod pending_part;
+
 #[path = "ingest_session_inventory_pages.rs"]
 mod inventory_pages;
 
@@ -205,7 +208,16 @@ async fn prove_scoped_writer() {
     // Reuse tests tombstone their winner. Publication needs its own live winner
     // and creates a reference that must block deletion in the reuse scenario.
     prove_attempt(&observer, &authority, &mut writer, 0xd0, None, true).await;
-    for (seed, fail_later_page) in [(0xe0, false), (0xf0, true)] {
+    prove_attempt(
+        &observer,
+        &authority,
+        &mut writer,
+        0xe0,
+        Some(Fault::PendingPartConfirmation),
+        false,
+    )
+    .await;
+    for (seed, fail_later_page) in [(0xc8, false), (0xd8, true)] {
         Box::pin(prove_attempt(
             &observer,
             &authority,
@@ -232,6 +244,7 @@ enum Fault {
     Quarantined,
     LostCallerCompletionResponse,
     LostProviderCompletionResponse,
+    PendingPartConfirmation,
     InventoryRead { fail_later_page: bool },
 }
 
@@ -255,6 +268,7 @@ async fn prove_attempt(
     let map_text = uuid_text(map);
     let root_text = uuid_text(root_id);
     let key = format!("media/{obj}/{generation}");
+    let pending_confirmation = matches!(fault, Some(Fault::PendingPartConfirmation));
     let inventory_case = match fault {
         Some(Fault::InventoryRead { fail_later_page }) => Some(fail_later_page),
         _ => None,
@@ -262,6 +276,9 @@ async fn prove_attempt(
     let padded;
     let input = if publish_fixture {
         include_bytes!("../../../../fixtures/synthetic-flac/private-staging/tone-a.flac").as_slice()
+    } else if pending_confirmation {
+        padded = pending_part::padded_flac();
+        &padded
     } else if inventory_case.is_some() {
         // Retain the audio frames and add FLAC padding to cross a part boundary.
         let padding = PART_BYTES - FLAC.len() - 4;
@@ -595,6 +612,162 @@ async fn prove_attempt(
             fail_later_page,
         ))
         .await
+    } else if pending_confirmation {
+        let plan = Plan::new(
+            UploadTarget {
+                bucket: inventory_bucket,
+                ..target
+            },
+            header,
+            length,
+        )
+        .unwrap();
+        let upload_parts = pending_part::partition(plan, &sealed);
+        assert_eq!(upload_parts.len(), if pending_confirmation { 3 } else { 1 });
+        let binding = ResumeBinding {
+            plan,
+            configuration,
+            environment: &env,
+            library: &lib,
+            session: &sid,
+            object: &obj,
+            generation: &generation,
+            envelope_scheme: 2,
+        };
+        let (receipts, parts, ciphertext) = if pending_confirmation {
+            Box::pin(pending_part::resume(
+                &upload_parts,
+                &sealed,
+                binding,
+                (header, length),
+                async || {
+                    let before = pending_part::reservation(observer, &sid).await;
+                    let mut reconnect = connect(WRITER).await;
+                    assert!(matches!(
+                        read(&mut reconnect, auth, prepared, reload).await,
+                        Err(UploadError::Refused)
+                    ));
+                    assert!(matches!(
+                        open_or_reuse(
+                            &mut reconnect,
+                            auth,
+                            prepared,
+                            until,
+                            reload,
+                            async |_, _, _, _| panic!(
+                                "pending confirmation opened another provider upload"
+                            ),
+                        )
+                        .await,
+                        Err(UploadError::Refused)
+                    ));
+                    let recovered = handoff(
+                        &mut reconnect,
+                        &prepared.scope,
+                        &opened.lease,
+                        &context,
+                        (BUCKET, &key),
+                        until,
+                        async |_, _: &str| panic!("recovery initiated another provider upload"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(recovered.target() == target);
+                    assert_eq!(
+                        recovered.usable_until(),
+                        opened.durable_target().usable_until()
+                    );
+                    assert_eq!(pending_part::reservation(observer, &sid).await, before);
+                    recovered
+                },
+            ))
+            .await
+        } else {
+            let (receipt, checkpoint_part) =
+                pending_part::acknowledge(&upload_parts[0], "\"synthetic\"");
+            (
+                vec![receipt],
+                vec![checkpoint_part],
+                upload_parts[0].request().2.to_vec(),
+            )
+        };
+        assert_ne!(ciphertext, input);
+        let checkpoint = ResumeCheckpoint {
+            binding,
+            parts: &parts,
+        };
+        let completion =
+            SessionCompletion::prepare(binding, &context, receipts, &checkpoint).unwrap();
+        let provider_version = Cell::new(None);
+        let lost_provider_response = matches!(fault, Some(Fault::LostProviderCompletionResponse));
+        let mut composite = Sha256::new();
+        for part in &parts {
+            composite.update(part.digest);
+        }
+        let composite = format!("{}-{}", STANDARD.encode(composite.finalize()), parts.len());
+        let send = async |sent: CompletionRequest<'_>| {
+            assert_eq!(sent.target.upload_id, UPLOAD);
+            assert!(
+                provider_version.replace(Some(MEDIA)).is_none(),
+                "duplicate provider commit"
+            );
+            if pending_confirmation {
+                pending_part::assert_manifest(&sent.body, &upload_parts);
+            }
+            if lost_provider_response {
+                return Err(());
+            }
+            Ok(CompletionResponse {
+                configuration,
+                status: 200,
+                version: Some(MEDIA.into()),
+                body: format!(
+                "<CompleteMultipartUploadResult><Bucket>{inventory_bucket}</Bucket><Key>{key}</Key>
+                <ChecksumSHA256>{composite}</ChecksumSHA256></CompleteMultipartUploadResult>"
+            )
+                .into_bytes(),
+            })
+        };
+        let completed = if lost_provider_response {
+            completion
+                .dispatch_durable(
+                    opened.durable_target(),
+                    async |sent, deadline| {
+                        assert_eq!(deadline, opened.durable_target().usable_until());
+                        send(sent).await
+                    },
+                    async |sent, deadline| {
+                        assert_eq!(deadline, opened.durable_target().usable_until());
+                        assert_eq!(
+                            (sent.configuration, sent.bucket, sent.key),
+                            (configuration, BUCKET, key.as_str())
+                        );
+                        let pending: bool = observer
+                            .query_one(
+                                "SELECT terminal_reason IS NULL AND completed_map_id IS NULL
+                        AND write_lease_id IS NOT NULL AND multipart_upload_id = $2
+                     FROM public.ingest_session_reservations WHERE id = $1::text::uuid",
+                                &[&sid, &UPLOAD],
+                            )
+                            .await
+                            .unwrap()
+                            .get(0);
+                        assert!(pending);
+                        Ok(CompletionReadResponse {
+                            configuration,
+                            content_length: Some(ciphertext.len() as u64),
+                            composite_sha256: Some(composite.clone()),
+                            marker: provider_marker.get().cloned(),
+                            version: Some(provider_version.get().unwrap().into()),
+                        })
+                    },
+                )
+                .await
+        } else {
+            completion.dispatch(send).await
+        }
+        .unwrap();
+        (opened, None, completed, ciphertext)
     } else {
         let plan = Plan::new(
             UploadTarget {
@@ -1039,6 +1212,7 @@ async fn prove_attempt(
             | Fault::CommittedSidecarVersion
             | Fault::LostCallerCompletionResponse
             | Fault::LostProviderCompletionResponse
+            | Fault::PendingPartConfirmation
             | Fault::InventoryRead { .. } => unreachable!(),
         };
         assert!(
