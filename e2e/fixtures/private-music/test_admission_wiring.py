@@ -400,10 +400,15 @@ def run_fixture(root):
     assert result.returncode != 0, "receipt step accepted a closing observation from an earlier attempt"
     assert not receipt.exists(), "receipt step wrote a receipt using evidence from different attempts"
 
+    expected_drift = json.loads(matching_closing)
+    expected_drift["staging-api"]["deployment_id"] = REDEPLOYMENT
+    assert drifted_closing == expected_drift, "drifted observation changed pins beyond the API deployment ID"
     closing.write_text(json.dumps(drifted_closing))
     result = run(command)
     assert result.returncode != 0, "receipt step accepted a changed serving deployment"
+    assert result.stderr == b"Private staging deployment evidence unavailable or mismatched.\n"
     assert not receipt.exists(), "receipt step wrote a receipt after serving deployment drift"
+    assert report.read_bytes() == original_report, "deployment drift changed the report"
     closing.write_bytes(matching_closing)
 
     mismatched = json.loads(env["API_PIN"]) | {"run_attempt": "1"}
