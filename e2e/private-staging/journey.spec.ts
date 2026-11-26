@@ -15,9 +15,10 @@ import {
   assertCuratedLibrary, assertPrivateInvite, assertPrivateRefusals, PRIVATE_MUSIC,
 } from '../helpers/private-music-journey.js';
 import {
-  freshTrialPublication, parsePrivateStagingFixture, privateStagingAudio, PRIVATE_TRIAL_UPLOAD, SESSION_COOKIE,
+  parsePrivateStagingFixture, privateStagingAudio, PRIVATE_TRIAL_UPLOAD, SESSION_COOKIE,
 } from '../helpers/private-staging-fixture.js';
-import { privateLibraryObservation, privateRunIdentity, privateTrackObservation } from './track-evidence.js';
+import { privateRunIdentity, privateTrackObservation } from './track-evidence.js';
+import { uploadToLibrary } from './upload-to-library.js';
 
 const ORIGIN = 'https://staging.nntune.com';
 const REGISTER = '/v1/auth/passkey/register';
@@ -156,20 +157,22 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     }, { timeout: 60_000, intervals: [1_000] }).toBe(true);
     await refresh.click();
     await expect(rowFor(fixture.companion.trackId)).toBeVisible();
-    const owner = await playwrightRequest.newContext();
-    const receipt = await post(owner, PRIVATE_TRIAL_UPLOAD, upload.body, {
-      ...access, 'Content-Type': 'audio/flac', Cookie: `${SESSION_COOKIE}=${fixture.ownerSession}`,
-    }).finally(() => owner.dispose());
-    expect(receipt.status).toBe(200);
-    const publication = freshTrialPublication(receipt.text, upload.sha256, priorIds);
-    await refresh.click();
-    const row = rowFor(publication.trackId);
-    await expect(row).toBeVisible();
-    const libraryEvidence = privateLibraryObservation(
-      run, publication, await getLibrary(), await row.getAttribute(PRIVATE_MUSIC.library.id),
+    const { publication, annotations } = await uploadToLibrary(
+      run, upload.sha256, priorIds,
+      async () => {
+        const owner = await playwrightRequest.newContext();
+        return post(owner, PRIVATE_TRIAL_UPLOAD, upload.body, {
+          ...access, 'Content-Type': 'audio/flac', Cookie: `${SESSION_COOKIE}=${fixture.ownerSession}`,
+        }).finally(() => owner.dispose());
+      },
+      async (trackId) => {
+        await refresh.click();
+        const row = rowFor(trackId);
+        await expect(row).toBeVisible();
+        return { ...await getLibrary(), renderedTrackId: await row.getAttribute(PRIVATE_MUSIC.library.id) };
+      },
     );
-    observe('private-publication', publication, publication.trackId);
-    test.info().annotations.push({ type: 'private-library', description: JSON.stringify(libraryEvidence) });
+    test.info().annotations.push(...annotations);
     return publication;
   });
   const requestFreshPlay = async (context: typeof request, binding?: string) => {
