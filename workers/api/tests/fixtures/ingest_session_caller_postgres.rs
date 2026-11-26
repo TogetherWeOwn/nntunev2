@@ -572,11 +572,6 @@ async fn prove_attempt(
     .unwrap();
     let upload_parts = pending_part::partition(plan, &sealed);
     assert_eq!(upload_parts.len(), if pending_confirmation { 3 } else { 1 });
-    let ciphertext: Vec<_> = upload_parts
-        .iter()
-        .flat_map(|part| part.request().2.iter().copied())
-        .collect();
-    assert_ne!(ciphertext, input);
     let binding = ResumeBinding {
         plan,
         configuration,
@@ -587,7 +582,7 @@ async fn prove_attempt(
         generation: &generation,
         envelope_scheme: 2,
     };
-    let (receipts, parts) = if pending_confirmation {
+    let (receipts, parts, ciphertext) = if pending_confirmation {
         Box::pin(pending_part::resume(
             &upload_parts,
             &sealed,
@@ -636,8 +631,13 @@ async fn prove_attempt(
     } else {
         let (receipt, checkpoint_part) =
             pending_part::acknowledge(&upload_parts[0], "\"synthetic\"");
-        (vec![receipt], vec![checkpoint_part])
+        (
+            vec![receipt],
+            vec![checkpoint_part],
+            upload_parts[0].request().2.to_vec(),
+        )
     };
+    assert_ne!(ciphertext, input);
     let checkpoint = ResumeCheckpoint {
         binding,
         parts: &parts,

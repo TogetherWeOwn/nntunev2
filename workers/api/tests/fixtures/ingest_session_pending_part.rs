@@ -3,6 +3,13 @@ use nntune_core::digest_enrollment::EnrollmentOutput;
 use nntune_ingest::multipart::{
     resume_checkpoint::matches_checkpoint, UploadPart, UploadedPart, PART_BYTES,
 };
+use std::collections::BTreeMap;
+
+const ETAGS: [&str; 3] = [
+    "\"fixture-first\"",
+    "\"fixture-middle\"",
+    "\"fixture-last\"",
+];
 
 pub(super) fn padded_flac() -> Vec<u8> {
     // Add one synthetic FLAC PADDING block so the ciphertext spans three parts.
@@ -59,19 +66,37 @@ pub(super) async fn resume<'a>(
     sealed: &[EnrollmentOutput],
     binding: ResumeBinding<'a>,
     reconnect: impl AsyncFnOnce(),
-) -> (Vec<UploadedPart<'a>>, Vec<CheckpointPart<'static>>) {
+) -> (Vec<UploadedPart<'a>>, Vec<CheckpointPart<'static>>, Vec<u8>) {
     let [first, middle, last] = upload_parts else {
         panic!("expected three provider parts");
     };
+    let mut stored = BTreeMap::<u32, (Vec<u8>, CheckpointPart<'static>)>::new();
+    let mut requests = Vec::new();
+    let (original_target, _, _, _) = last.request();
+    let mut put = |part: &UploadPart<'a>| {
+        let (target, number, bytes, _) = part.request();
+        assert!(target == original_target);
+        requests.push(number);
+        if let Some((previous, confirmation)) = stored.get_mut(&number) {
+            assert_eq!(number, 3, "resume sent a committed neighbor");
+            assert_eq!(bytes, previous.as_slice(), "retry changed ciphertext");
+            let checksum = STANDARD.encode(confirmation.digest);
+            let ack = part
+                .verify_reply(confirmation.etag.into(), &checksum)
+                .unwrap();
+            previous.copy_from_slice(bytes);
+            (ack, *confirmation)
+        } else {
+            let (ack, confirmation) = acknowledge(part, ETAGS[number as usize - 1]);
+            stored.insert(number, (bytes.to_vec(), confirmation));
+            (ack, confirmation)
+        }
+    };
+
     // The fixture stands in for the trusted receipt checkpoint. PostgreSQL
     // holds the upload identity and lease and records progress at completion.
-    let (mut receipts, mut saved): (Vec<_>, Vec<_>) = [
-        acknowledge(first, "\"fixture-first\""),
-        acknowledge(middle, "\"fixture-middle\""),
-    ]
-    .into_iter()
-    .unzip();
-    let (late_ack, provider_confirmation) = acknowledge(last, "\"fixture-last\"");
+    let (mut receipts, mut saved): (Vec<_>, Vec<_>) = [put(first), put(middle)].into_iter().unzip();
+    let (late_ack, _) = put(last);
     receipts.push(late_ack);
 
     reconnect().await;
@@ -106,24 +131,8 @@ pub(super) async fn resume<'a>(
     let [missing] = &rebuilt[checkpoint.parts.len()..] else {
         panic!("resume must only send the uncommitted part");
     };
-    let (target, number, bytes, checksum) = missing.request();
-    let (original_target, _, original_bytes, original_checksum) = last.request();
-    assert!(target == original_target);
-    assert_eq!(
-        (number, bytes, checksum),
-        (3, original_bytes, original_checksum)
-    );
-    // The mock provider returns its recorded confirmation for the exact replay.
-    let provider_checksum = STANDARD.encode(provider_confirmation.digest);
-    let retry_ack = missing
-        .verify_reply(provider_confirmation.etag.into(), &provider_checksum)
-        .unwrap();
-    saved.push(CheckpointPart {
-        number,
-        len: bytes.len(),
-        etag: provider_confirmation.etag,
-        digest: Sha256::digest(bytes).into(),
-    });
+    let (retry_ack, confirmed) = put(missing);
+    saved.push(confirmed);
 
     // The late original acknowledgement can stand in for the retry response
     // only when it matches the now-confirmed checkpoint.
@@ -146,16 +155,19 @@ pub(super) async fn resume<'a>(
             parts: &conflicting
         },
     ));
-    (receipts, saved)
+    assert_eq!(requests, [1, 2, 3, 3]);
+    let ciphertext = stored.into_values().flat_map(|(bytes, _)| bytes).collect();
+    (receipts, saved, ciphertext)
 }
 
 pub(super) fn assert_manifest(body: &[u8], upload_parts: &[UploadPart<'_>]) {
     let mut expected =
         String::from("<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
-    for (part, etag) in upload_parts.iter().zip(["first", "middle", "last"]) {
+    for (part, etag) in upload_parts.iter().zip(ETAGS) {
         use std::fmt::Write;
         let (_, number, _, checksum) = part.request();
-        write!(expected, "<Part><PartNumber>{number}</PartNumber><ETag>&quot;fixture-{etag}&quot;</ETag><ChecksumSHA256>{checksum}</ChecksumSHA256></Part>").unwrap();
+        let etag = etag.trim_matches('"');
+        write!(expected, "<Part><PartNumber>{number}</PartNumber><ETag>&quot;{etag}&quot;</ETag><ChecksumSHA256>{checksum}</ChecksumSHA256></Part>").unwrap();
     }
     expected.push_str("</CompleteMultipartUpload>");
     assert_eq!(body, expected.as_bytes());
