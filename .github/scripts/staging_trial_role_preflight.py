@@ -214,7 +214,8 @@ def binding_connection_verdict(identity_verdicts, origin_tls_attestations):
     return "pending"
 
 
-def main():
+def main(*, query=None, build_sha=None, version_id=None, role_pins=None):
+    """Write the operator summary and return the two-login preflight status."""
     try:
         scope = parse_scope(os.environ.get(SCOPE_ENV, ""))
         child = evidence_child_env(os.environ[SECRET_ENV], DATABASE)
@@ -229,6 +230,16 @@ def main():
             print("### Staging trial roles before application grants\n", file=summary)
             for check, passed in verdicts.items():
                 print(f"- {check} — {'pass' if passed else 'refused'}", file=summary)
+            if query is not None:
+                binding_identities = read_binding_identities(
+                    build_sha=build_sha, version_id=version_id, database_oid=scope["database_oid"],
+                    role_pins=role_pins, query=query,
+                )
+                print("\n### Staging trial binding SQL identities\n", file=summary)
+                for binding, evidence in binding_identities.items():
+                    role = "unconfirmed" if evidence["role"] is None else f"`{evidence['role']}`"
+                    print(f"- `{binding}` — {evidence['verdict']} "
+                          f"(expected role {role}, expected database `{evidence['database']}`)", file=summary)
     except (KeyError, ValueError, OSError, subprocess.TimeoutExpired, StagingApplyError):
         print("Trial role preflight refused; scope or staging catalog could not be verified.", file=sys.stderr)
         return 1

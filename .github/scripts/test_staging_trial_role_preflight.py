@@ -150,6 +150,51 @@ class TrialRolePreflightTests(unittest.TestCase):
         self.assertEqual((code, stages, error), (1, [], "Trial role lifecycle refused"))
         psql.assert_not_called()
 
+    def test_operator_summary_includes_binding_identities_only_with_reader(self):
+        database_oid = 40200
+        build, version = "a" * 40, "12345678-0000-4000-8000-000000000001"
+        pins = {binding: (role, index) for index, (binding, role) in enumerate(BINDING_ROLES.items(), 40201)}
+        scope = {"database_oid": database_oid, "issuer_oid": 0,
+                 "reader": [READER, 40301], "writer": [WRITER, 40302]}
+        auth = "PRIVATE_TRIAL_AUTH_DB"
+        baseline_report = "### Staging trial roles before application grants\n\n- database isolation — pass\n"
+
+        with TemporaryDirectory() as tmp:
+            summary = Path(tmp) / "summary.md"
+            with (
+                patch.dict(os.environ, {
+                    preflight.SCOPE_ENV: json.dumps(scope), preflight.SECRET_ENV: "synthetic-url",
+                    "GITHUB_STEP_SUMMARY": str(summary),
+                }, clear=True),
+                patch.object(preflight, "evidence_child_env", return_value={"PGPASSWORD": "fixture"}),
+                patch.object(preflight, "load_entries", return_value=[
+                    {"file": preflight.BASELINE, "sha256": DIGEST, "target": "app"},
+                ]),
+                patch.object(preflight, "observe", return_value={"database isolation": True}),
+            ):
+                self.assertEqual(preflight.main(), 0)
+                self.assertEqual(summary.read_text(), baseline_report)
+                for pending in (None, auth):
+                    with self.subTest(pending=pending):
+                        def query(build_sha, version_id, binding, sql):
+                            observed_db, observed_oid = preflight.DATABASE, database_oid
+                            pin = pins[binding]
+                            if binding == pending:
+                                observed_db, observed_oid = "unexpected_fixture_db", 40998
+                                pin = ("unexpected_fixture_role", 40999)
+                            row = (observed_db, observed_oid, *pin, *pin)
+                            return preflight.BindingReadback(build, version, binding, (row,))
+
+                        summary.write_text("")
+                        self.assertEqual(preflight.main(query=query, build_sha=build, version_id=version,
+                                                        role_pins=pins), 0)
+                        expected = baseline_report + "\n### Staging trial binding SQL identities\n\n"
+                        for binding, role in BINDING_ROLES.items():
+                            verdict = "pending" if binding == pending else "pass"
+                            expected += (f"- `{binding}` — {verdict} (expected role `{role}`, "
+                                         f"expected database `{preflight.DATABASE}`)\n")
+                        self.assertEqual(summary.read_text(), expected)
+
     def test_isolation(self):
         with scratch_database(ADMIN, preflight.DATABASE) as db:
             run_psql(db, f"""
