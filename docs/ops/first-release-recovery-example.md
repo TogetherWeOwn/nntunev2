@@ -47,6 +47,24 @@ The next read reports `completed` with conclusion `success` for `102/1`.
 Record the status and continue with that attempt's recovery job, serving
 allocation and denial evidence before marking switch-off complete.
 
+## Follow an acknowledged recovery through environment protection
+
+In this separate pending example, run `102/1` is already recorded. Actions
+reports `waiting` and the `recover-worker` job for that exact attempt is
+waiting on the `production` Environment. Record **Waiting on production
+Environment protection** and keep the writer freeze. The current recovery
+operator continues observing `102/1`. Check that job's protection status in
+Actions. When it requires approval, the existing authorized Environment
+reviewer follows the usual approval rules on that run.
+
+The next read is the same attempt's job list
+(`GET /repos/example/fixture/actions/runs/102/attempts/1/jobs`). Verify the
+job's run ID and attempt. When that `recover-worker` job is `in_progress`,
+record that it has started and continue reading its job status and steps.
+Keep switch-off **Pending** until the recovery job, pinned serving allocation
+and denial readbacks agree. Keep the original run and attempt throughout,
+and continue with reads of that run without redispatching or rerunning it.
+
 ## Record the completed switch-off
 
 | Handoff field | Example entry |

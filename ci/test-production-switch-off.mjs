@@ -293,6 +293,39 @@ test('operator recovers the existing rollback run after the dispatch response is
     start: 'confirmed', runId: 102, attempt: 1, switchOff: 'pending',
   });
 
+  const resume = (record, read) => {
+    const path = `/repos/${repository.full_name}/actions/runs/${record.runId}/attempts/${record.attempt}`;
+    const request = { method: 'GET', path };
+    const { nextRead, nextAction, ...confirmed } = record;
+    const pending = { ...confirmed, status: 'pending', nextRead: request };
+    let reply;
+    try {
+      reply = read(request);
+    } catch {
+      return pending;
+    }
+    if (reply?.id !== record.runId || reply.run_attempt !== record.attempt) return pending;
+    const observed = { ...confirmed, status: reply.status, conclusion: reply.conclusion };
+    if (reply.status !== 'waiting' && reply.status !== 'in_progress') return observed;
+
+    const jobsRequest = { method: 'GET', path: `${path}/jobs` };
+    const checkJob = { ...observed, nextRead: jobsRequest };
+    let listing;
+    try {
+      listing = read(jobsRequest);
+    } catch {
+      return checkJob;
+    }
+    if (!Array.isArray(listing?.jobs) || listing.total_count !== listing.jobs.length) return checkJob;
+    const jobs = listing.jobs.filter((job) => job.name === 'recover-worker');
+    const [job] = jobs;
+    if (jobs.length !== 1 || job.run_id !== record.runId || job.run_attempt !== record.attempt) return checkJob;
+    if (job.status === 'waiting') return { ...checkJob, nextAction: 'check-production-environment-protection' };
+    if (job.status === 'in_progress') return { ...checkJob, nextAction: 'read-recovery-job' };
+    return checkJob;
+  };
+
+  const nextRead = { method: 'GET', path: '/repos/example/fixture/actions/runs/102/attempts/1' };
   await t.test('a temporary status failure retries the recorded attempt read-only', () => {
     const reads = [];
     const readRun = (request) => {
@@ -300,29 +333,45 @@ test('operator recovers the existing rollback run after the dispatch response is
       if (reads.length === 1) throw new Error('synthetic status read unavailable');
       return { ...run, status: 'completed', conclusion: 'success' };
     };
-    const resume = (record) => {
-      const request = {
-        method: 'GET',
-        path: `/repos/${repository.full_name}/actions/runs/${record.runId}/attempts/${record.attempt}`,
-      };
-      let reply;
-      try {
-        reply = readRun(request);
-      } catch {
-        return { ...record, status: 'pending', nextRead: request };
-      }
-      const { nextRead, ...confirmed } = record;
-      return { ...confirmed, status: reply.status, conclusion: reply.conclusion };
-    };
-
-    const nextRead = { method: 'GET', path: '/repos/example/fixture/actions/runs/102/attempts/1' };
-    const unavailable = resume(recorded);
+    const unavailable = resume(recorded, readRun);
     assert.deepEqual(unavailable, { ...recorded, status: 'pending', nextRead });
     assert.deepEqual(reads, [nextRead]);
     assert.equal(dispatches, 1);
 
-    assert.deepEqual(resume(unavailable), { ...recorded, status: 'completed', conclusion: 'success' });
+    assert.deepEqual(resume(unavailable, readRun), { ...recorded, status: 'completed', conclusion: 'success' });
     assert.deepEqual(reads, [nextRead, nextRead]);
+  });
+
+  await t.test('the recorded rollback waits for production and resumes verification on the same attempt', () => {
+    const recoveryJob = source.split('\n  recover-worker:\n')[1]?.split(/\n {2}\S/)[0];
+    assert.match(recoveryJob, /^    name: recover-worker$/m);
+    assert.match(recoveryJob, /^    environment: production$/m);
+
+    const reads = [];
+    const nextJobRead = { method: 'GET', path: '/repos/example/fixture/actions/runs/102/attempts/1/jobs' };
+    let status = 'waiting';
+    let jobAttempt = 1;
+    const read = (request) => {
+      reads.push(request);
+      if (request.path === nextRead.path) return { ...run, status, conclusion: null };
+      assert.deepEqual(request, nextJobRead);
+      return { total_count: 1, jobs: [{ id: 103, name: 'recover-worker', run_id: 102,
+        run_attempt: jobAttempt, status, conclusion: null }] };
+    };
+
+    const waiting = resume(recorded, read);
+    assert.deepEqual(waiting, { ...recorded, status: 'waiting', conclusion: null,
+      nextRead: nextJobRead, nextAction: 'check-production-environment-protection' });
+
+    status = 'in_progress';
+    jobAttempt = 2;
+    const unconfirmed = resume(waiting, read);
+    assert.deepEqual(unconfirmed, { ...recorded, status: 'in_progress', conclusion: null, nextRead: nextJobRead });
+
+    jobAttempt = 1;
+    assert.deepEqual(resume(unconfirmed, read), { ...recorded, status: 'in_progress', conclusion: null,
+      nextRead: nextJobRead, nextAction: 'read-recovery-job' });
+    assert.deepEqual(reads, [nextRead, nextJobRead, nextRead, nextJobRead, nextRead, nextJobRead]);
   });
 
   assert.deepEqual(runs, [run]);
