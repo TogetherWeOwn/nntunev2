@@ -118,7 +118,9 @@ for (const pauseDuringBuffering of [true, false]) {
 				await pause.press('Enter');
 				await expect.poll(() => native.evaluate(({ events }) => events.pausedAt)).not.toBeNull();
 				resumeAt = (await native.evaluate(({ events }) => events.pausedAt))!;
-				expect(resumeAt).toBeCloseTo(waitingAt, 1);
+				// The clock may drain already-decoded output after `waiting`, but must not run on.
+				expect(resumeAt).toBeGreaterThanOrEqual(waitingAt);
+				expect(resumeAt - waitingAt).toBeLessThan(0.25);
 			}
 
 			delayedMedia.release();
