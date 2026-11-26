@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { open, readFile, writeFile } from 'node:fs/promises';
-import { finalSmokeFixture, recoveryFixture } from './fixtures/production-worker-transport.mjs';
+import { finalSmokeFixture, mainSha, recoveryFixture } from './fixtures/production-worker-transport.mjs';
 import { intentFile, workflow } from './production-maintenance/recovery-evidence.mjs';
 
 const checkedAt = '2026-10-01T12:00:00Z';
@@ -69,6 +69,53 @@ test('rollback retries read-only after the verified summary cannot be written', 
   assert.equal(retry.stderr, '');
   assert.equal(await readFile(summary, 'utf8'), 'Recorded maintenance allocation already verified\n');
   assert.deepEqual(await readCheckpoint(), before);
+});
+
+test('switch-off reports unavailable rollback intent for the pinned successful rollout', async (t) => {
+  // The source SHA must be a main ancestor even when the Actions reads are synthetic.
+  const transport = finalSmokeFixture(t, { ...fixture, sha: mainSha() });
+  await transport.prepare();
+  const { fresh, admitWithFakeGitHub } = recoveryFixture(t, transport, 'success');
+  const allocation = structuredClone(transport.rows);
+  const before = transport.calls.length;
+  const unavailable = /Switch-off pending: pinned rollback intent unavailable/;
+  const cases = [
+    ['expired flag', (listing) => { listing.artifacts[0].expired = true; }, unavailable],
+    ['expired timestamp', (listing) => { listing.artifacts[0].expires_at = '2000-01-01T00:00:00Z'; }, unavailable],
+    ['absent', (listing) => { listing.total_count = 0; listing.artifacts = []; }, unavailable],
+    ['wrong producer', (listing) => {
+      listing.artifacts[0].expired = true;
+      listing.artifacts[0].workflow_run.head_sha = 'e'.repeat(40);
+    }, /Protected rollback check failed/],
+    ['incomplete listing', (listing) => { listing.artifacts = []; }, /Protected rollback check failed/],
+  ];
+  for (const [i, [label, changeListing, expected]] of cases.entries()) {
+    const env = fresh(String(13 + i));
+    const result = admitWithFakeGitHub(env, changeListing);
+    assert.equal(result.status, 1, label);
+    assert.match(result.stderr, expected, label);
+    if (expected === unavailable) {
+      assert.match(result.stderr, /Read the Actions artifact metadata for the original rollout/);
+    } else {
+      assert.doesNotMatch(result.stderr, unavailable, label);
+    }
+    assert.deepEqual(readFileSync(join(env.RUNNER_TEMP, 'actions-reads'), 'utf8').trim().split('\n'), [
+      'workflows/deploy-production.yml', 'runs/12/attempts/1', 'runs/12/attempts/1/jobs?per_page=100&page=1',
+      'runs/12/artifacts?per_page=100&page=1',
+    ], label);
+    assert.equal(existsSync(join(env.RUNNER_TEMP, intentFile)), false, label);
+    assert.equal(existsSync(env.GITHUB_OUTPUT), false, label);
+  }
+  assert.equal(transport.calls.length, before);
+
+  const retained = fresh('18');
+  const result = admitWithFakeGitHub(retained);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(readFileSync(join(retained.RUNNER_TEMP, intentFile)), readFileSync(join(transport.temp, intentFile)));
+  assert.match(readFileSync(retained.GITHUB_OUTPUT, 'utf8'), /^allow-submit=true$/m);
+  await transport.run('prepare-recovery', retained);
+  assert.deepEqual(transport.calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
+  assert.deepEqual(transport.rows, allocation);
 });
 
 test('maintenance remains active when the candidate receipt cannot identify a distinct version', async (t) => {

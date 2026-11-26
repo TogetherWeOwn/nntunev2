@@ -1480,6 +1480,20 @@ Recovery verifies the intent and rollout before reservation. The plan expires
 after two minutes. Reconcile an expired or ambiguous reservation against audit.
 Verify restored build health and identity or the private maintenance behavior.
 
+If the recovery job reports **Switch-off pending: pinned rollback intent
+unavailable**, read the Actions artifact metadata on the original rollout run
+and record whether `production-rollback-intent-<original-rollout-run-id>-1`
+is absent from the complete listing or expired. Keep the original recovery
+run, accepted SHA, hostname and rollout run and attempt in the private release
+record. Keep the custody and key in the protected Environment and leave the
+writer freeze in place. Use the pinned Worker's complete deployment history
+and provider audit to read back the recorded fallback at 100%, using the
+pinned maintenance version for a first release.
+Keep switch-off pending and continue the existing denial readbacks. Resolve
+the missing evidence through the existing protected recovery procedure before
+any write. An incomplete listing or mismatched producer uses the general
+protected rollback refusal and requires reconciliation of that evidence.
+
 ### First private release handoff
 
 Use the [first private music launch instructions and pinned candidate template](first-private-music-launch.md).
