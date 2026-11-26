@@ -10,7 +10,9 @@ use nntune_stream::{
 };
 use std::{
     cell::{Cell, RefCell},
+    future::poll_fn,
     io,
+    rc::Rc,
     task::{Context, Poll},
 };
 
@@ -93,7 +95,10 @@ pub(super) fn cases() -> impl Iterator<Item = Case> {
 pub(super) struct Source {
     fixture: Fixture,
     sealed: Vec<u8>,
+    track_id: &'static str,
     play_id: &'static str,
+    lease_epoch: u64,
+    current_epoch: Rc<Cell<u64>>,
     fault: Fault,
     checked_lease: Cell<bool>,
     pub(super) empty_media_once: Cell<bool>,
@@ -101,6 +106,7 @@ pub(super) struct Source {
     pub(super) revoked: Cell<bool>,
     pub(super) short_media_once: Cell<bool>,
     pub(super) expected_media_start: Cell<u64>,
+    pub(super) pause_final_frame: Cell<Option<Rc<FrameGate>>>,
     clock: Cell<SystemTime>,
     pub(super) expected_media_end: Cell<u64>,
     pub(super) corrupt_final_frame_once: Cell<bool>,
@@ -110,6 +116,7 @@ impl Source {
     pub(super) fn new(fault: Fault) -> Self {
         Self::with_media(
             Fixture::from_plaintext(FLAC),
+            "track",
             "private_1234567890abcdefghijkl",
             fault,
         )
@@ -118,12 +125,29 @@ impl Source {
     pub(super) fn browser() -> Self {
         Self::with_media(
             Fixture::new(),
+            "track",
             "private_browser_AAAAAAAAAAAAAAAAAAAAAA",
             Fault::None,
         )
     }
 
-    fn with_media(fixture: Fixture, play_id: &'static str, fault: Fault) -> Self {
+    pub(super) fn other_track() -> Self {
+        let mut plaintext = vec![b'B'; LEN as usize];
+        plaintext[65_535..].copy_from_slice(b"QR");
+        Self::with_media(
+            Fixture::from_object(&plaintext, id(10)),
+            "other-track",
+            "private_browser_BBBBBBBBBBBBBBBBBBBBBB",
+            Fault::None,
+        )
+    }
+
+    fn with_media(
+        fixture: Fixture,
+        track_id: &'static str,
+        play_id: &'static str,
+        fault: Fault,
+    ) -> Self {
         let mut sealed = [&fixture.context.header[..], &fixture.first, &fixture.last].concat();
         if fault == Fault::Ciphertext {
             sealed[48] ^= 1;
@@ -137,7 +161,10 @@ impl Source {
         Self {
             fixture,
             sealed,
+            track_id,
             play_id,
+            lease_epoch: 42,
+            current_epoch: Rc::new(Cell::new(42)),
             fault,
             checked_lease: Cell::new(false),
             empty_media_once: Cell::new(false),
@@ -145,6 +172,7 @@ impl Source {
             revoked: Cell::new(false),
             short_media_once: Cell::new(false),
             expected_media_start: Cell::new(0),
+            pause_final_frame: Cell::new(None),
             clock: Cell::new(start),
             expected_media_end: Cell::new(sealed_len),
             corrupt_final_frame_once: Cell::new(false),
@@ -154,12 +182,57 @@ impl Source {
     pub(super) fn time(&self) -> SystemTime {
         self.clock.get()
     }
+
+    pub(super) fn with_current_epoch(mut self, epoch: u64, current_epoch: Rc<Cell<u64>>) -> Self {
+        self.lease_epoch = epoch;
+        self.current_epoch = current_epoch;
+        self
+    }
+
+    fn is_current(&self) -> bool {
+        self.current_epoch.get() == self.lease_epoch
+    }
 }
 
-pub(super) struct BodyBytes(std::io::Cursor<Vec<u8>>);
+#[derive(Default)]
+pub(super) struct FrameGate {
+    pub(super) waiting: Cell<bool>,
+    pub(super) released: Cell<bool>,
+    pub(super) dropped: Cell<bool>,
+}
+
+pub(super) struct BodyBytes {
+    cursor: io::Cursor<Vec<u8>>,
+    gate: Option<(u64, Rc<FrameGate>)>,
+}
+
 impl ReadbackBody for BodyBytes {
     async fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-        std::io::Read::read(&mut self.0, dst)
+        if let Some((_, gate)) = self
+            .gate
+            .as_ref()
+            .filter(|(offset, _)| self.cursor.position() == *offset)
+        {
+            gate.waiting.set(true);
+            // The test invokes each poll and controls when the frame is readable.
+            poll_fn(|_| {
+                if gate.released.get() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+        io::Read::read(&mut self.cursor, dst)
+    }
+}
+
+impl Drop for BodyBytes {
+    fn drop(&mut self) {
+        if let Some((_, gate)) = &self.gate {
+            gate.dropped.set(true);
+        }
     }
 }
 
@@ -169,9 +242,9 @@ impl PrivateSource for Source {
     async fn resolve(&self, grant: &Grant) -> Option<CatalogueMedia<'_>> {
         assert_eq!(grant.user_id, "member");
         assert_eq!(grant.play_id.as_deref(), Some(self.play_id));
-        assert_eq!(grant.lease_epoch, Some(42));
-        assert_eq!(grant.track_id, "track");
-        (self.fault != Fault::Denied).then(|| {
+        assert_eq!(grant.lease_epoch, Some(self.lease_epoch));
+        assert_eq!(grant.track_id, self.track_id);
+        (self.is_current() && self.fault != Fault::Denied).then(|| {
             let reference = if self.fault == Fault::WrongReference {
                 id(8)
             } else {
@@ -194,7 +267,8 @@ impl PrivateSource for Source {
         if checked && self.fault == Fault::ExpiredAtWrite {
             self.clock.set(self.fixture.pins().usable_until);
         }
-        !self.revoked.get()
+        self.is_current()
+            && !self.revoked.get()
             && self.fault != Fault::LeaseLost
             && !(checked && self.fault == Fault::Displaced)
     }
@@ -232,7 +306,14 @@ impl PrivateSource for Source {
             content_range: Some(format!("bytes {start}-{}/{sealed_len}", end - 1)),
             content_length: Some(end - start),
             has_content_encoding: false,
-            body: BodyBytes(io::Cursor::new(bytes)),
+            body: BodyBytes {
+                cursor: io::Cursor::new(bytes),
+                gate: self.pause_final_frame.take().map(|gate| {
+                    assert!(!self.fixture.last.is_empty());
+                    let offset = end - start - self.fixture.last.len() as u64;
+                    (offset, gate)
+                }),
+            },
         })
     }
 

@@ -127,19 +127,24 @@ def exercise(event_path):
 
 def check_reader_privilege_binding():
     script = Path(__file__).with_name("database_bootstrap_reader_evidence.py")
-    inventory = {"branch_id": "fixture001", "database_oid": 17001, "inventory_sha256": "a" * 64}
+    retained = b"fixture_catalog.retained\n"
+    reviewed = b"fixture_catalog.required\n" + retained
+    inventory = {
+        "branch_id": "fixture001", "database_oid": 17001,
+        "inventory_sha256": hashlib.sha256(reviewed).hexdigest(),
+    }
     review = inventory | {"reader_role": "Fixture-Reader", "reader_oid": 17002}
     privileges = review | {"result": "passed"}
     record = {"review": review, "inventory": inventory, "reader_privileges": privileges}
 
-    def check(case, evidence, accept=False):
+    def check(case, evidence, verdict="pending"):
         raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
         result = subprocess.run(
             [sys.executable, "-IB", str(script)], input=raw, env={},
             capture_output=True, timeout=3, check=False,
         )
-        expected = ((0, b"database-bootstrap-reader-evidence: consistent\n", b"") if accept else
-                    (1, b"", b"database-bootstrap-reader-evidence: pending\n"))
+        output = f"database-bootstrap-reader-evidence: {verdict}\n".encode()
+        expected = (0, output, b"") if verdict == "consistent" else (1, b"", output)
         if (result.returncode, result.stdout, result.stderr) != expected:
             raise RuntimeError(f"reader privilege fixture: {case}")
 
@@ -152,13 +157,21 @@ def check_reader_privilege_binding():
         "privileges checked against another inventory": {"inventory_sha256": "b" * 64},
     }.items():
         check(case, record | {"reader_privileges": privileges | override})
-    check("saved inventory differs from review and privileges", record | {
-        "inventory": inventory | {"inventory_sha256": "b" * 64},
-    })
+    observed = inventory | {"inventory_sha256": hashlib.sha256(retained).hexdigest()}
+    missing_object = record | {"inventory": observed, "reader_privileges": privileges | observed}
+    check("complete readback omits a reviewed object", missing_object, "pending (inventory-mismatch)")
+    check("complete mismatched readback without privilege evidence",
+          {"review": review, "inventory": observed}, "pending (inventory-mismatch)")
+    check("absent inventory readback", {"review": review, "reader_privileges": privileges})
+    check("inventory readback lacks its digest",
+          record | {"inventory": {"branch_id": "fixture001", "database_oid": 17001}})
+    check("malformed inventory digest", record | {"inventory": inventory | {"inventory_sha256": "b" * 63}})
+    check("inventory for another branch", missing_object | {"inventory": observed | {"branch_id": "fixture002"}})
+    check("inventory for another database", missing_object | {"inventory": observed | {"database_oid": 17003}})
     check("missing privilege evidence", {"review": review, "inventory": inventory})
     check("duplicate privilege object", b'{"reader_privileges": null, ' + json.dumps(record).encode()[1:])
     check("oversized record", json.dumps(record).encode().ljust(4097))
-    check("privileges match the approved reader and inventory", record, accept=True)
+    check("privileges match the approved reader and inventory", record, "consistent")
 
 
 def snapshot_record(branch="fixture001"):

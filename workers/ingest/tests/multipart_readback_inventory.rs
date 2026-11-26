@@ -80,6 +80,7 @@ struct ReadbackFixture {
     context: EnvelopeContext,
     record: [u8; 230],
     media: CompletedVersionedMedia,
+    media_version: &'static str,
     media_bytes: Vec<u8>,
     page_bytes: Vec<Vec<u8>>,
 }
@@ -102,7 +103,7 @@ impl ReadbackFixture {
     }
 
     fn in_scope(plaintext: &[u8], identities: [[u8; 16]; 6], map_id: [u8; 16], key: &str) -> Self {
-        Self::complete(plaintext, identities, map_id, key, None).unwrap()
+        Self::complete(plaintext, identities, map_id, key, SHARED_VERSION, None).unwrap()
     }
 
     fn complete(
@@ -110,6 +111,7 @@ impl ReadbackFixture {
         identities: [[u8; 16]; 6],
         map_id: [u8; 16],
         key: &str,
+        media_version: &'static str,
         fault: Option<CompletionFault>,
     ) -> Result<Self, FixtureCompletionError> {
         let plaintext_len = plaintext.len() as u64;
@@ -193,7 +195,7 @@ impl ReadbackFixture {
             configuration: CONFIGURATION,
             status: 200,
             body: body.as_bytes(),
-            version_headers: &[SHARED_VERSION],
+            version_headers: &[media_version],
         };
         let [_, environment, library, object, generation, _] = identities.map(hex::encode);
         let binding = ResumeBinding {
@@ -213,7 +215,7 @@ impl ReadbackFixture {
         let observed = S3Locator::new(
             BUCKET.into(),
             key.into(),
-            S3Binding::VersionId(SHARED_VERSION.into()),
+            S3Binding::VersionId(media_version.into()),
         )
         .unwrap();
         // The synthetic provider can report all bytes even when the trusted
@@ -235,6 +237,7 @@ impl ReadbackFixture {
             context,
             record,
             media,
+            media_version,
             media_bytes,
             page_bytes,
         })
@@ -302,7 +305,7 @@ impl ReadbackFixture {
         first_page_key: &str,
     ) -> BucketReadbackResponse<MemoryBody<'_>> {
         let (version, bytes) = match pin.object_key {
-            key if key == media_key => (SHARED_VERSION, &self.media_bytes),
+            key if key == media_key => (self.media_version, &self.media_bytes),
             key if key == first_page_key => (FINAL_VERSION, &self.page_bytes[0]),
             PAGE_ONE_KEY => (PAGE_ONE_VERSION, &self.page_bytes[1]),
             _ => panic!("unexpected readback key"),

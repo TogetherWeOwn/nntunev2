@@ -22,7 +22,10 @@ use nntune_ingest::{
     multipart::session_outcome::{CommittedOutcome, CompletionScope},
 };
 use serde_json::json;
-use tokio_postgres::Transaction;
+use tokio_postgres::{error::SqlState, Transaction};
+
+#[path = "independent_publications.rs"]
+mod independent_publications;
 
 const ALBUM: &str = "Synthetic Signals";
 const RAW_ERROR: &str = "§~synthetic-mirror-error~!";
@@ -47,6 +50,24 @@ fn scope_key(scope: &CompletionScope<'_>) -> [String; 8] {
         scope.revision.to_string(),
         scope.offset.to_string(),
     ]
+}
+
+async fn read_completion(
+    db: &Client,
+    scope: &CompletionScope<'_>,
+) -> Result<Option<CommittedOutcome>, PublicationError> {
+    Ok(db
+        .query_opt(READ, &[&&scope_key(scope)[..]])
+        .await?
+        .map(|row| CommittedOutcome {
+            map: row.get(0),
+            object: row.get(1),
+            generation: row.get(2),
+            configuration: row.get(3),
+            root_version: row.get(4),
+            media_version: row.get(5),
+            page_versions: row.get(6),
+        }))
 }
 
 #[derive(Clone, Copy)]
@@ -150,20 +171,11 @@ pub(super) async fn exercise(
                 Some(candidates),
                 (200, &body),
                 async |scope| {
-                    let row = db.query_opt(READ, &[&&scope_key(scope)[..]]).await?;
+                    let outcome = read_completion(db, scope).await?;
                     if matches!(media, Indeterminate(_)) {
                         return Err(PublicationError::Indeterminate);
                     }
-                    Ok(row.map(|row| {
-                        let mut outcome = CommittedOutcome {
-                            map: row.get(0),
-                            object: row.get(1),
-                            generation: row.get(2),
-                            configuration: row.get(3),
-                            root_version: row.get(4),
-                            media_version: row.get(5),
-                            page_versions: row.get(6),
-                        };
+                    Ok(outcome.map(|mut outcome| {
                         if let Conflicting(_, pin) = media {
                             [
                                 &mut outcome.map,
@@ -252,13 +264,14 @@ pub(super) async fn exercise(
     let sessions = both
         .each_ref()
         .map(|flac| hex::encode(flac.receipt.intent.identities[2]));
+    let fingerprints = [[0x83; 32], [0x84; 32]];
     let uploads = std::array::from_fn::<_, 2, _>(|i| VerifiedUpload {
         scope: CompletionScope {
             environment,
             library,
             principal: job.owner_id,
             session: &sessions[i],
-            fingerprint: &[0x83; 32],
+            fingerprint: &fingerprints[i],
             seal: both[i].receipt.intent.identities[3],
             revision: 1,
             offset: both[i].receipt.intent.plaintext_len as i64,
@@ -335,6 +348,9 @@ pub(super) async fn exercise(
         Ok(StageOutcome::Staged(_))
     ));
     tx.rollback().await.unwrap();
+
+    independent_publications::exercise(db, writer, objects, &uploads).await;
+
     let mut tx = writer.transaction().await.unwrap();
     let result = apply(&mut tx, Scoped(&uploads), false, 2).await;
     assert_counter(&result, json!({"outcome": "staged"}));
@@ -406,13 +422,29 @@ pub(super) async fn exercise(
         );
     }
     let release = "ab340000-0000-4000-8000-000000000000";
+    let rows = async || db.query(ROWS, &[&release]).await.unwrap().len();
+    let stored_review = async || {
+        let row = db
+            .query_one(
+                "SELECT view::text, retried_revision FROM public.test_flac_review",
+                &[],
+            )
+            .await
+            .unwrap();
+        let view: JobView = serde_json::from_str(row.get(0)).unwrap();
+        (view, row.get::<_, Option<i64>>(1))
+    };
+    enum RecordFailure {
+        Callback,
+        Database,
+    }
     let run = async |client: &mut Client,
                      scope,
                      revision,
                      resolved: Option<u32>,
                      bad_receipt,
                      match_found: bool,
-                     fail_record| {
+                     record_failure| {
         use nntune_ingest::caller_auth::issue;
         const KEY: &str = "synthetic-review-receiver-fixture-key";
         let bearer = format!("Bearer {}", issue(job.owner_id, scope, 10, KEY.as_bytes()));
@@ -449,7 +481,29 @@ pub(super) async fn exercise(
                 let changed = tx.execute("UPDATE public.test_flac_review SET view = $1::text::jsonb,
                     retried_revision = $2 WHERE (view->>'revision')::bigint = $2", &[&view, &prior]).await.unwrap();
                 assert_eq!(changed, 1);
-                if fail_record { Err(BoundaryError::Unavailable) } else { Ok(()) }
+                if result.status == ReviewStatus::Published {
+                    assert_eq!(tx.query(ROWS, &[&release]).await.unwrap().len(), 1);
+                    assert_eq!(rows().await, 0, "staged track must be invisible to readers");
+                    let (stored_view, retried_revision) = stored_review().await;
+                    assert_eq!(
+                        (&stored_view, retried_revision),
+                        (&expected.view, expected.retried_revision.map(i64::from)),
+                        "staged receipt must be invisible to readers"
+                    );
+                }
+                match record_failure {
+                    Some(RecordFailure::Database) => {
+                        // Force a database error after staging the track and receipt.
+                        let error = tx
+                            .execute("UPDATE public.test_flac_review SET view = NULL", &[])
+                            .await
+                            .expect_err("the receipt must reject a null view");
+                        assert_eq!(error.code(), Some(&SqlState::NOT_NULL_VIOLATION));
+                        Err(BoundaryError::Unavailable)
+                    }
+                    Some(RecordFailure::Callback) => Err(BoundaryError::Unavailable),
+                    None => Ok(()),
+                }
             },
             async |_| {
                 Ok(ResolvedCompletion {
@@ -483,13 +537,12 @@ pub(super) async fn exercise(
         )
         .await
     };
-    let rows = async || db.query(ROWS, &[&release]).await.unwrap().len();
-    for (scope, revision, resolved, bad_receipt, fail_record, status) in [
-        (READ_SCOPE, 1, 1, false, false, 404),
-        (RETRY_SCOPE, 0, 1, false, false, 409),
-        (RETRY_SCOPE, 1, 2, false, false, 409),
-        (RETRY_SCOPE, 1, 1, true, false, 409),
-        (RETRY_SCOPE, 1, 1, false, true, 503),
+    for (scope, revision, resolved, bad_receipt, record_failure, status) in [
+        (READ_SCOPE, 1, 1, false, None, 404),
+        (RETRY_SCOPE, 0, 1, false, None, 409),
+        (RETRY_SCOPE, 1, 2, false, None, 409),
+        (RETRY_SCOPE, 1, 1, true, None, 409),
+        (RETRY_SCOPE, 1, 1, false, Some(RecordFailure::Callback), 503),
     ] {
         let error = run(
             writer,
@@ -498,20 +551,20 @@ pub(super) async fn exercise(
             Some(resolved),
             bad_receipt,
             true,
-            fail_record,
+            record_failure,
         )
         .await
         .unwrap_err();
         assert_eq!(error.status, status);
         assert_eq!(rows().await, 0);
     }
-    let review = run(writer, RETRY_SCOPE, 1, Some(1), false, false, false)
+    let review = run(writer, RETRY_SCOPE, 1, Some(1), false, false, None)
         .await
         .unwrap();
     assert_eq!(review.status, ReviewStatus::NeedsReview);
     assert_eq!(review.revision, 2);
     assert_eq!(review.reason, Some(NeedsReview::SearchEvidence));
-    let replay = run(writer, RETRY_SCOPE, 1, None, true, true, true)
+    let replay = run(writer, RETRY_SCOPE, 1, None, true, true, None)
         .await
         .unwrap();
     assert_eq!(replay, review);
@@ -569,7 +622,23 @@ pub(super) async fn exercise(
         )
     };
 
-    let first = run(writer, RETRY_SCOPE, 2, Some(2), false, true, false)
+    // The same committed upload and review revision must recover after rollback.
+    let failure = run(
+        outcome_writer,
+        RETRY_SCOPE,
+        2,
+        Some(2),
+        false,
+        true,
+        Some(RecordFailure::Database),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(failure.status, 503);
+    assert_eq!(rows().await, 0);
+    assert_eq!(stored_review().await, (review, Some(1)));
+
+    let first = run(writer, RETRY_SCOPE, 2, Some(2), false, true, None)
         .await
         .unwrap();
     let (track_id, accepted_seq, view) = publication().await;
@@ -581,7 +650,7 @@ pub(super) async fn exercise(
     // Discard the response after checking it at the receiver. The retry
     // still has only the original revision and a separate connection.
     drop(first);
-    let replay = run(outcome_writer, RETRY_SCOPE, 2, None, true, false, true)
+    let replay = run(outcome_writer, RETRY_SCOPE, 2, None, true, false, None)
         .await
         .unwrap();
     assert_eq!(replay, view);
