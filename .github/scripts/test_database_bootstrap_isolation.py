@@ -823,11 +823,27 @@ def prove_ineffective_baseline_grant(cluster, plan):
               AND acl.grantee = current_user::regrole AND acl.privilege_type = 'SELECT'
         );
         SELECT coalesce(string_agg(grant_name, ', ' ORDER BY grant_name), '') FROM (
-            SELECT acl.privilege_type || ' ON ' || n.nspname || '.' || c.relname AS grant_name
+            SELECT acl.privilege_type || ' ON ' || n.nspname || '.' || c.relname
+                   || CASE WHEN acl.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END AS grant_name
             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
             CROSS JOIN LATERAL aclexplode(c.relacl) acl
             WHERE n.nspname IN ('grant_ledger', 'grant_tracks')
               AND acl.grantee = current_user::regrole AND acl.privilege_type <> 'SELECT'
+            UNION ALL
+            SELECT acl.privilege_type || ' (' || a.attname || ') ON ' || n.nspname || '.' || c.relname
+                   || CASE WHEN acl.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL aclexplode(a.attacl) acl
+            WHERE n.nspname IN ('grant_ledger', 'grant_tracks') AND a.attnum > 0
+              AND acl.grantee = current_user::regrole AND acl.privilege_type <> 'SELECT'
+            UNION ALL
+            SELECT acl.privilege_type || ' ON LARGE OBJECT ' || l.oid
+                   || CASE WHEN acl.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
+            FROM pg_largeobject_metadata l
+            CROSS JOIN LATERAL aclexplode(l.lomacl) acl
+            WHERE acl.grantee = current_user::regrole AND acl.privilege_type <> 'SELECT'
         ) grants;
     """ + sql.removeprefix(begin)
     inventory = {
@@ -842,23 +858,29 @@ def prove_ineffective_baseline_grant(cluster, plan):
         CREATE TABLE grant_ledger.schema_migrations (version int);
         CREATE TABLE grant_tracks.tracks (id int);
         INSERT INTO grant_ledger.schema_migrations VALUES (1);
+        SELECT lo_create(900001);
         GRANT USAGE ON SCHEMA grant_ledger, grant_tracks TO {READER};
         GRANT SELECT ON grant_ledger.schema_migrations, grant_tracks.tracks TO {READER};
         COMMIT;
-    """, **launch)
+    """, "900001\n", **launch)
     try:
-        extra = "UPDATE ON grant_tracks.tracks"
-        for case, change, refusal, verdict_name in (
-            ("least-privilege", None, None, "consistent"),
-            ("over-privileged", f"GRANT UPDATE ON grant_tracks.tracks TO {READER};",
-             "baseline table privilege refused", f"pending (extra-grant: {extra})"),
-            ("ineffective", f"REVOKE UPDATE ON grant_tracks.tracks FROM {READER};"
-             f" REVOKE USAGE ON SCHEMA grant_tracks FROM {READER};", "baseline coverage refused", "pending"),
+        for case, change, refusal, extra in (
+            ("least-privilege", None, None, None),
+            ("over-privileged table grant", f"GRANT UPDATE ON grant_tracks.tracks TO {READER};",
+             "baseline table privilege refused", "UPDATE ON grant_tracks.tracks"),
+            ("over-privileged column grant", f"REVOKE UPDATE ON grant_tracks.tracks FROM {READER};"
+             f" GRANT UPDATE (id) ON grant_tracks.tracks TO {READER};",
+             "baseline table privilege refused", "UPDATE (id) ON grant_tracks.tracks"),
+            ("over-privileged large-object grant", f"REVOKE UPDATE (id) ON grant_tracks.tracks FROM {READER};"
+             f" GRANT UPDATE ON LARGE OBJECT 900001 TO {READER};",
+             "baseline scope refused", "UPDATE ON LARGE OBJECT 900001"),
+            ("ineffective grants", f"REVOKE UPDATE ON LARGE OBJECT 900001 FROM {READER};"
+             f" REVOKE USAGE ON SCHEMA grant_tracks FROM {READER};", "baseline coverage refused", None),
         ):
             if change:
-                cluster.ok(f"prepare the {case} reader grants", change, **launch)
+                cluster.ok(f"prepare the {case}", change, **launch)
             result = cluster.sql(readback_sql, **reader)
-            observed_extra = extra if case == "over-privileged" else ""
+            observed_extra = extra or ""
             prefix = observed_identity + catalog + f"t\n{observed_extra}\n"
             if refusal is None:
                 checked(result, "read the complete bundle with effective access", prefix + "rows-present\n")
@@ -867,7 +889,7 @@ def prove_ineffective_baseline_grant(cluster, plan):
                 require(result.returncode == 3 and result.stdout == prefix
                         and f"ERROR:  P0001: {refusal}" in result.stderr,
                         f"verify the listed grant survives the {case} privilege refusal")
-                privileges = {"result": "failed"} | ({"extra_grants": [observed_extra]} if observed_extra else {})
+                privileges = {"result": "failed"} | ({"extra_grants": [observed_extra]} if extra else {})
             observed_catalog = result.stdout[len(observed_identity):len(observed_identity) + len(catalog)]
             observed_inventory = inventory | {"inventory_sha256": hashlib.sha256(observed_catalog.encode()).hexdigest()}
             evidence = {
@@ -875,13 +897,15 @@ def prove_ineffective_baseline_grant(cluster, plan):
                 "reader_privileges": review | observed_inventory | privileges,
             }
             verdict = command(sys.executable, "-IB", str(script), input_text=json.dumps(evidence), timeout=3)
+            verdict_name = (f"pending (extra-grant: {extra})" if extra else
+                            "consistent" if refusal is None else "pending")
             line = f"database-bootstrap-reader-evidence: {verdict_name}\n"
             expected = (0, line, "") if verdict_name == "consistent" else (1, "", line)
             require((verdict.returncode, verdict.stdout, verdict.stderr) == expected,
                     f"check the offline verdict for the {case} reader")
     finally:
-        cluster.ok("remove both synthetic migration schemas", "DROP SCHEMA grant_ledger, grant_tracks CASCADE;",
-                   **launch)
+        cluster.ok("remove both synthetic migration schemas and large object",
+                   "SELECT lo_unlink(900001); DROP SCHEMA grant_ledger, grant_tracks CASCADE;", "1\n", **launch)
 
 
 def prepare_baseline_readers(cluster, names, *, host):
