@@ -25,6 +25,8 @@ const MAX_RECEIPT = 4096;
 const MAX_ITEMS = 100;
 const MAX_CANDIDATES = 20;
 
+class ArtifactUnavailableError extends Error {}
+
 function requireProof(condition, reason) {
   if (!condition) throw new Error(`production promotion proof refused: ${reason}`);
 }
@@ -183,16 +185,21 @@ function productionEvidence(repo) {
     const artifacts = list(`runs/${runId}/artifacts`, "artifacts").filter(
       (artifact) => artifact.name === name,
     );
+    if (artifacts.length === 0) {
+      throw new ArtifactUnavailableError("production promotion proof refused: missing or ambiguous attempt-bound artifact");
+    }
     requireProof(artifacts.length === 1, "missing or ambiguous attempt-bound artifact");
     const artifact = artifacts[0];
     const producer = artifact.workflow_run;
+    const expiresAt = artifact.expires_at ? Date.parse(artifact.expires_at) : Infinity;
+    const metadataRefusal = "expired, oversized or mismatched artifact producer metadata";
     requireProof(
       id(artifact.id) &&
-        artifact.expired === false &&
+        typeof artifact.expired === "boolean" &&
         Number.isSafeInteger(artifact.size_in_bytes) &&
         artifact.size_in_bytes > 0 &&
         artifact.size_in_bytes <= MAX_ARCHIVE &&
-        (!artifact.expires_at || Date.parse(artifact.expires_at) > Date.now()) &&
+        !Number.isNaN(expiresAt) &&
         typeof artifact.digest === "string" &&
         /^sha256:[0-9a-f]{64}$/.test(artifact.digest) &&
         id(producer?.id) === runId &&
@@ -200,8 +207,11 @@ function productionEvidence(repo) {
         id(producer?.head_repository_id) === repositoryId &&
         producer?.head_branch === "main" &&
         producer?.head_sha === run.head_sha,
-      "expired, oversized or mismatched artifact producer metadata",
+      metadataRefusal,
     );
+    if (artifact.expired || expiresAt <= Date.now()) {
+      throw new ArtifactUnavailableError(`production promotion proof refused: ${metadataRefusal}`);
+    }
     const archive = command(
       "gh",
       ["api", "--method", "GET", `repos/${repo}/actions/artifacts/${id(artifact.id)}/zip`],
@@ -278,4 +288,4 @@ function verifyPromotion({ repo, sha }) {
   );
 }
 
-module.exports = { verifyPromotion, validateReceipt, artifactName, productionEvidence };
+module.exports = { verifyPromotion, validateReceipt, artifactName, productionEvidence, ArtifactUnavailableError };

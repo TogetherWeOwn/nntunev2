@@ -13,11 +13,7 @@ class ClockReadbackTest(unittest.TestCase):
         fixture.setUp()
 
         finish = fixture.evidence
-        fixture.evidence = {
-            **finish,
-            "checks": dict.fromkeys(acceptance.runner.PREREQUISITES, acceptance.SHA),
-        }
-        del fixture.evidence["checkout_session"]
+        fixture.evidence = fixture.admission
         with patch.dict(fixture.routes["/v1/balance"], livemode=True):
             fixture.run_case("stripe_mode", "admit")
         with patch.dict(fixture.routes["/v1/account"], id="acct_unrelated"):

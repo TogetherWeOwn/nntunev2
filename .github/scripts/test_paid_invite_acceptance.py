@@ -17,6 +17,8 @@ SESSION = "cs_test_privateSession"
 ACCOUNT = "acct_privateAccount"
 SUBSCRIPTION = "sub_privateSubscription"
 SUBSCRIPTION_PATH = f"/v1/subscriptions/{SUBSCRIPTION}"
+ENROLLMENT = "ad202f8f-e541-4319-8f67-5eb290101418"
+OTHER_ENROLLMENT = "62a75673-c4c7-402a-8f91-49def1d0fb45"
 ENV = {
     "NNTUNE_PAID_INVITE_ACCEPTANCE": "1", "EXPECTED_BUILD_SHA": SHA,
     "CF_ACCESS_CLIENT_ID": "privateAccessId", "CF_ACCESS_CLIENT_SECRET": "privateAccessSecret",
@@ -26,10 +28,18 @@ ENV = {
 
 class AcceptanceTest(unittest.TestCase):
     def setUp(self):
-        self.evidence = {
+        self.admission = {
             "app": "nntune-v2", "environment": "staging", "origin": "https://staging.nntune.com",
-            "build": SHA, "stripe_account": ACCOUNT, "checkout_session": SESSION,
+            "build": SHA, "stripe_account": ACCOUNT,
+            "checks": dict.fromkeys(runner.PREREQUISITES, SHA),
+        }
+        self.evidence = {
+            **self.admission, "checkout_session": SESSION, "enrollment_id": ENROLLMENT,
             "checks": dict.fromkeys(runner.PREREQUISITES + runner.JOURNEY, SHA),
+            "playback_receipt": {
+                "build": SHA, "checkout_session": SESSION, "enrollment_id": ENROLLMENT,
+                "played_at": 1795626000, "metered_at": 1795626030,
+            },
         }
         self.routes = {
             "/api/build": {"sha": SHA},
@@ -93,8 +103,7 @@ class AcceptanceTest(unittest.TestCase):
         self.assertEqual(err.getvalue(), "")
 
     def test_admit_checks_build_and_mode_without_checkout(self):
-        del self.evidence["checkout_session"]
-        self.evidence["checks"] = dict.fromkeys(runner.PREREQUISITES, SHA)
+        self.evidence = self.admission
         self.run_case("admitted", "admit")
         self.assertEqual([path for path, _ in self.requests], list(self.routes)[:4])
 
@@ -222,6 +231,40 @@ class AcceptanceTest(unittest.TestCase):
         ):
             with self.subTest(code=code), patch.dict(self.routes[path], override):
                 self.run_case(code)
+
+    def test_finish_requires_playback_receipt_for_the_selected_enrollment(self):
+        receipt = self.evidence["playback_receipt"]
+        # An otherwise complete observation can be filed with the wrong invite.
+        # Preserve the paid Checkout, playback and meter times in both cases.
+        with patch.dict(receipt, enrollment_id=OTHER_ENROLLMENT):
+            self.run_case("playback_enrollment_mismatch")
+            self.assertEqual(self.connected, [])
+            self.assertEqual(self.requests, [])
+
+        self.run_case("accepted")
+        self.assertEqual([path for path, _ in self.requests],
+                         list(self.routes) + ["/api/build", "/healthz"])
+
+    def test_finish_refuses_uncorrelated_or_invalid_playback_receipts(self):
+        receipt = self.evidence["playback_receipt"]
+        with patch.dict(self.evidence, enrollment_id=""):
+            self.run_case("invalid_enrollment")
+        for changes, verdict in (
+            ({"build": "7" * 40}, "wrong_build"),
+            ({"checkout_session": "cs_test_other"}, "playback_checkout_mismatch"),
+            ({"played_at": receipt["metered_at"] + 1}, "invalid_playback_receipt"),
+            ({"metered_at": True}, "invalid_playback_receipt"),
+        ):
+            with self.subTest(changes=changes), patch.dict(receipt, changes):
+                self.run_case(verdict)
+        for invalid_receipt in (None, SHA, {**receipt, "enrollment_id": None}):
+            with self.subTest(receipt=invalid_receipt), patch.dict(
+                self.evidence, playback_receipt=invalid_receipt,
+            ):
+                self.run_case("invalid_playback_receipt")
+        del self.evidence["playback_receipt"]
+        self.run_case("missing_evidence")
+        self.assertEqual(self.connected, [])
 
 
 if __name__ == "__main__":
