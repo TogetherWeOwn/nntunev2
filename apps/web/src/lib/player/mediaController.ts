@@ -336,7 +336,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	async function preparePlay(trackId: string, isEligible: () => boolean, publish: (source: BrowserPlaybackSource) => Promise<void>,
-		{ retry, retireSuperseded }: { retry?: boolean; retireSuperseded?: boolean } = {}) {
+		{ retry, retireSuperseded, failureMessage = 'Could not start playback.' }:
+		{ retry?: boolean; retireSuperseded?: boolean; failureMessage?: string } = {}) {
 		if (!selection?.prepare || destroyed || queue.purging || !isEligible()) return;
 		const request = pendingGrant = ++grantIntent;
 		const revision = queue.revision, intent = playIntent, position = positionIntent, version = attachmentVersion;
@@ -347,7 +348,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			const accepted = await selection.prepare(trackId, current, (grant) => { playback = publish(grant); }, {
 				retry, retireSuperseded: retireSuperseded ? () => pendingGrant === request : undefined
 			});
-			if (!accepted && current()) selection.announce('Could not start playback.', true);
+			if (!accepted && current()) selection.announce(failureMessage, true);
 			await playback;
 		} finally { if (pendingGrant === request) pendingGrant = undefined; }
 	}
@@ -654,9 +655,13 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (selection.prepare && track) {
 			if (pendingGrant) return;
 			const evidence = queue.sourceForQueuedPlay(track.id);
-			if (evidence) await playSelected(result.queue, result.queue.currentIndex, {
-				...evidence, isCurrent: () => evidence.isCurrent() && ownsOrigin()
-			});
+			if (!evidence) return;
+			const index = result.queue.currentIndex;
+			const failureMessage = index !== base.currentIndex
+				? 'Could not start the next track. Choose a track to continue.' : undefined;
+			// Keep the ended track selected until the successor has a grant.
+			await preparePlay(track.id, () => evidence.isCurrent() && ownsOrigin(),
+				(grant) => playSelected(result.queue, index, grant, '', grant), { failureMessage });
 			return;
 		}
 		const streamUrl = streamFor(track);
