@@ -1,13 +1,15 @@
 //! Checkpoint-bound S3 multipart completion and its receipt validation.
 
-use std::{fmt::Write as _, time::SystemTime};
+use std::fmt::Write as _;
+
+#[cfg(any(target_arch = "wasm32", feature = "upload-caller", test))]
+use {super::session_upload::DurableUpload, std::time::SystemTime};
 
 use nntune_core::media_envelope::EnvelopeContext;
 use quick_xml::escape::escape;
 
 use super::{
     resume_checkpoint::{matches_checkpoint, ResumeBinding, ResumeCheckpoint},
-    session_upload::DurableUpload,
     CompletedVersionedMedia, Completion, MultipartError, UploadTarget, UploadedPart,
     VersionedCompletionReply, S3_XML_NAMESPACE,
 };
@@ -20,6 +22,7 @@ pub(crate) fn valid_upload_id(upload_id: &str) -> bool {
 }
 
 pub struct SessionCompletion<'a> {
+    #[cfg(any(target_arch = "wasm32", feature = "upload-caller", test))]
     binding: ResumeBinding<'a>,
     completion: Completion<'a>,
     context: &'a EnvelopeContext,
@@ -49,12 +52,14 @@ pub struct CompletionResponse {
 }
 
 /// A checksum-enabled HEAD for the object of the recorded upload.
+#[cfg(any(target_arch = "wasm32", feature = "upload-caller", test))]
 pub struct CompletionReadRequest<'a> {
     pub configuration: [u8; 16],
     pub bucket: &'a str,
     pub key: &'a str,
 }
 
+#[cfg(any(target_arch = "wasm32", feature = "upload-caller", test))]
 pub struct CompletionReadResponse {
     pub configuration: [u8; 16],
     pub content_length: Option<u64>,
@@ -93,6 +98,7 @@ impl<'a> SessionCompletion<'a> {
             .complete(receipts)
             .map_err(PrepareError::Parts)?;
         Ok(Self {
+            #[cfg(any(target_arch = "wasm32", feature = "upload-caller", test))]
             binding: expected,
             completion,
             context,
@@ -152,6 +158,7 @@ impl<'a> SessionCompletion<'a> {
     /// Under the original durable upload lease, retry an ambiguous transport
     /// result with a read only. A different lease or an older upload without
     /// the initiation marker cannot establish which version was committed.
+    #[cfg(any(target_arch = "wasm32", feature = "upload-caller", test))]
     pub async fn dispatch_durable(
         self,
         upload: &DurableUpload<'_>,
