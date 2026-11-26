@@ -27,6 +27,8 @@ class WorkflowLoader(yaml.BaseLoader):
         mapping = super().construct_mapping(node, deep)
         if len(mapping) != len(node.value):
             raise yaml.YAMLError("duplicate workflow mapping key")
+        if "<<" in mapping:
+            raise yaml.YAMLError("YAML merge keys are unsupported by Actions")
         return mapping
 
 
@@ -77,6 +79,8 @@ def findings(text):
     for event in sorted(watched):
         settings = events[event]
         types = settings.get("types", [])
+        if isinstance(types, str):
+            types = [types]
         if event in PR_EVENTS and "edited" in types:
             yield f"{event} types include 'edited'"
         if event == "workflow_run" and types != ["completed"]:

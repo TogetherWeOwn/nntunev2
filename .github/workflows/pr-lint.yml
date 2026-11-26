@@ -11,6 +11,7 @@ name: pr-lint
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    branches: [main]
   # Merge queue validation: `pr-lint` is a required check, so it
   # must report on merge_group. The queue run has no PR title and no
   # commits array, so it takes the explicit merge_group branch in the run

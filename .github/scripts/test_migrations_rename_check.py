@@ -816,8 +816,9 @@ class GitFixture(unittest.TestCase):
     def test_workflow_retarget_checks_the_new_base_ref_even_at_the_same_commit(self):
         pages, metadata = self.workflow_inputs()
         original = self.full_metadata(metadata)
+        original["base"]["ref"] = "stack-parent"
         retargeted = copy.deepcopy(original)
-        retargeted["base"]["ref"] = "release"
+        retargeted["base"]["ref"] = "main"
         self.git("commit", "--allow-empty", "-qm", "refresh checks after retarget")
         retargeted["head"]["sha"] = self.git("rev-parse", "HEAD")
         event = self.event(retargeted)
@@ -827,10 +828,10 @@ class GitFixture(unittest.TestCase):
         result = self.run_workflow(pages, retargeted, event=event)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         snapshot = json.loads((self.workflow_api / "pr-metadata.json").read_text())
-        self.assertEqual(snapshot["before"]["base"]["ref"], "release")
+        self.assertEqual(snapshot["before"]["base"]["ref"], "main")
 
         stale_base = copy.deepcopy(retargeted)
-        stale_base["base"]["ref"] = "main"
+        stale_base["base"]["ref"] = "stack-parent"
         result = self.run_workflow(pages, retargeted, event=event, samples=[retargeted, stale_base])
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("API base repository/ref retargeted", result.stderr)

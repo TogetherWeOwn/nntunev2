@@ -108,8 +108,12 @@ numeric `?pr=` suffix copied from the PR Checks tab.
 Before merging, open the linked runs, verify the current head and base, and
 confirm the required checks and the reviewers' decisions at their sources.
 GitHub reports body edits and base retargets as the same `edited` activity.
-After retargeting, push an updated PR head to run the gates against the new
-base. Verify the new head and the migration snapshot's base ref before merge.
+The required `migrations-staging` and `pr-lint` PR triggers target `main`.
+Stacked PRs still run `ci-ok`, including its migration gate. Push an updated
+PR head after retargeting a stacked PR to `main` so it gets both required
+checks. For stacks that already received either check against another base,
+verify both runs were created after the retarget and the migration snapshot
+records `main` at the new head before merging.
 For substantive title, description or Attestation corrections at the same
 head, close and reopen the PR to re-run the title, PR standards and migration
 checks with the current metadata. For same-head graph evidence, reopening also

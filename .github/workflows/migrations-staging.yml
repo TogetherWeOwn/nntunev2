@@ -13,6 +13,8 @@ name: migrations-staging
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    # A PR against a stack branch must not get a verdict reusable on main.
+    branches: [main]
   # Required checks must report on merge_group; the queue run has no PR
   # file list, so it passes vacuously (renames were checked on the PR).
   merge_group:

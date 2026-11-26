@@ -26,6 +26,7 @@ class GuardFixtures(unittest.TestCase):
             "# guards: required:ci-ok\non: {pull_request: {}, push: {branches: [release]}}",
             "# guards: required:ci-ok\non: {pull_request: {}, push: {branches: ['**', '!main']}}",
             "# guards: required:proof\non: {workflow_run: {workflows: [CI], types: [completed]}}",
+            "# guards: required:proof\non: {workflow_run: {workflows: [CI], types: completed}}",
         )
         for fixture in fixtures:
             with self.subTest(fixture=fixture):
@@ -57,6 +58,8 @@ class GuardFixtures(unittest.TestCase):
     def test_ambiguous_triggers_fail_closed(self):
         with self.assertRaisesRegex(yaml.YAMLError, "duplicate"):
             list(findings("on: pull_request\n'on': workflow_dispatch"))
+        with self.assertRaisesRegex(yaml.YAMLError, "merge keys"):
+            list(findings("on: {pull_request: {<<: {types: [edited]}}}"))
 
 
 class RequiredLintTests(unittest.TestCase):
@@ -81,13 +84,14 @@ class RequiredLintTests(unittest.TestCase):
     def test_supported_events_preserve_reopen_sync_main_and_merge_group(self):
         for name in ("migrations-staging", "pr-lint"):
             events = workflows((ACTIONS / f"{name}.yml").read_text())
-            self.assertEqual({"types": ["opened", "synchronize", "reopened"]}, events["pull_request"])
+            self.assertEqual({"types": ["opened", "synchronize", "reopened"], "branches": ["main"]},
+                             events["pull_request"])
             self.assertIn("merge_group", events)
         events = workflows(self.text)
         self.assertEqual(["main"], events["push"]["branches"])
         self.assertEqual("true", events["workflow_dispatch"]["inputs"]["pr_number"]["required"])
         codeql = workflows((ACTIONS / "codeql.yml").read_text())
-        self.assertEqual({"pull_request", "merge_group", "schedule"}, set(codeql))
+        self.assertEqual({"pull_request", "merge_group", "schedule", "workflow_dispatch"}, set(codeql))
         self.assertNotIn("paths", codeql["pull_request"])
 
     def test_title_event_dispatch_input_push_and_merge_group(self):

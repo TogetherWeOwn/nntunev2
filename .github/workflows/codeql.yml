@@ -7,8 +7,8 @@ name: codeql
 
 # No path filters: the `baseline-codeql` ruleset requires CodeQL results on
 # every PR once main has analyses, so a filtered-out PR (Rust or docs only)
-# waits forever for results that never arrive. The scheduled scan refreshes
-# default-branch results.
+# waits forever for results that never arrive. Schedule or dispatch a scan
+# to refresh default-branch results.
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -17,6 +17,7 @@ on:
   merge_group:
   schedule:
     - cron: '23 3 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
