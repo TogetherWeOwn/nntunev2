@@ -87,8 +87,8 @@ marker and provider readback confirm that the attempt wrote deployment
 `22222222-2222-4222-8222-222222222222` at 100%. Keep those observations in the
 record. The private Access, API and media denials agree in both cases.
 
-The operator's authorized maintenance probe is recorded as a separate
-verification job. Match its evidence to the selected recovery and the serving
+The synthetic probe job below represents the operator's authorized maintenance
+readback. Match its evidence to the selected recovery and the serving
 deployment above.
 
 | Maintenance probe job | Switch-off verdict | Next action |
