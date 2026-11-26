@@ -1,4 +1,4 @@
-use super::{now, Duration, FixtureVersionRemover, S3CompletionSender};
+use super::{now, valid_part_etag, Duration, FixtureVersionRemover, S3CompletionSender};
 use crate::multipart::{
     readback_inventory::CompletedReadbackInventory,
     resume_checkpoint::{matches_checkpoint, CheckpointPart, ResumeBinding, ResumeCheckpoint},
@@ -7,6 +7,7 @@ use crate::multipart::{
     sidecar::SidecarPut,
     Plan, UploadPart, UploadTarget, UploadedPart, PART_BYTES,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use nntune_core::{
     digest_enrollment::DigestEnrollment,
     digest_readback::EnrolledEnvelope,
@@ -128,6 +129,16 @@ async fn run(mode: &str, endpoint: &str, read_page: Option<Function>) -> Result<
         })
         .to_string());
     }
+    // The lost-acknowledgement inventory is read only after the failed PUT.
+    let mut read_page = read_page;
+    let (mode, staged_inventory) = if mode == "multipart-resume-lost-ack" {
+        let staged_inventory = read_page
+            .take()
+            .ok_or_else(|| JsValue::from_str("missing staged part inventory fixture"))?;
+        ("multipart-resume", Some(staged_inventory))
+    } else {
+        (mode, None)
+    };
     let readback = mode.starts_with("readback");
     let multipart_resume = matches!(mode, "multipart-resume" | "multipart-resume-full");
     let resume_bytes;
@@ -282,6 +293,7 @@ async fn run(mode: &str, endpoint: &str, read_page: Option<Function>) -> Result<
             &context,
             &parts,
             until,
+            staged_inventory,
             mode == "multipart-resume",
             read_page,
         )
@@ -407,6 +419,7 @@ async fn resume_multipart<'a>(
     context: &'a EnvelopeContext,
     parts: &[UploadPart<'a>],
     until: std::time::SystemTime,
+    staged_inventory: Option<Function>,
     interrupt_second: bool,
     read_page: Option<Function>,
 ) -> Result<String, JsValue> {
@@ -455,10 +468,13 @@ async fn resume_multipart<'a>(
     let resumed_etag;
     let upload = DurableUpload::new(target, context, binding.session, until);
     if saved.len() == 1 {
-        let receipt = sender
-            .put_part(binding, context, second, &upload, until)
-            .await
-            .map_err(dispatch_error)?;
+        let receipt = match staged_inventory {
+            Some(read_page) => recover_staged_part(&read_page, saved[0], second)?,
+            None => sender
+                .put_part(binding, context, second, &upload, until)
+                .await
+                .map_err(dispatch_error)?,
+        };
         resumed_etag = receipt.etag().to_owned();
         saved.push(checkpoint_part(&receipt, &resumed_etag));
         receipts.push(receipt);
@@ -589,4 +605,55 @@ fn checkpoint_part<'a>(receipt: &UploadedPart<'_>, etag: &'a str) -> CheckpointP
         etag,
         digest: receipt.digest,
     }
+}
+
+fn recover_staged_part<'a>(
+    read_page: &Function,
+    confirmed: CheckpointPart<'_>,
+    part: &UploadPart<'a>,
+) -> Result<UploadedPart<'a>, JsValue> {
+    // This fixture accepts a terminal two-part snapshot. Keep the acknowledged
+    // prefix pinned and derive the recovered receipt from the sealed request.
+    #[derive(serde::Deserialize)]
+    struct ListedPart {
+        number: u32,
+        len: usize,
+        etag: String,
+        digest: [u8; 32],
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Inventory {
+        next_marker: Option<u32>,
+        parts: [ListedPart; 2],
+    }
+
+    let pending = || JsValue::from_str("unconfirmed final part inventory");
+    let (target, number, body, _) = part.request();
+    let reply = read_page.call4(
+        &JsValue::UNDEFINED,
+        &JsValue::from_str(target.bucket),
+        &JsValue::from_str(target.key),
+        &JsValue::from_str(target.upload_id),
+        &JsValue::NULL,
+    )?;
+    let Inventory {
+        next_marker,
+        parts: [prefix, staged],
+    } = serde_wasm_bindgen::from_value(reply).map_err(|_| pending())?;
+    if next_marker.is_some()
+        || confirmed
+            != (CheckpointPart {
+                number: prefix.number,
+                len: prefix.len,
+                etag: &prefix.etag,
+                digest: prefix.digest,
+            })
+        || (staged.number, staged.len) != (number, body.len())
+        || !valid_part_etag(&staged.etag)
+    {
+        return Err(pending());
+    }
+    part.verify_reply(staged.etag, &STANDARD.encode(staged.digest))
+        .map_err(|_| pending())
 }
