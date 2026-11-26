@@ -38,8 +38,8 @@ pub(crate) trait TrialStorage {
     ) -> Result<UploadedPart<'a>, DispatchError>;
     async fn complete(
         &self,
+        upload: &DurableUpload<'_>,
         completion: SessionCompletion<'_>,
-        until: SystemTime,
     ) -> Result<CompletedVersionedMedia, DispatchError>;
     async fn confirm_head(
         &self,
@@ -92,10 +92,10 @@ impl TrialStorage for S3CompletionSender {
     }
     async fn complete(
         &self,
+        upload: &DurableUpload<'_>,
         completion: SessionCompletion<'_>,
-        until: SystemTime,
     ) -> Result<CompletedVersionedMedia, DispatchError> {
-        self.complete(completion, until).await
+        self.complete(upload, completion).await
     }
     async fn confirm_head(
         &self,

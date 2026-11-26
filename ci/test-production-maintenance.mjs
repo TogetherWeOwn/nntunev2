@@ -446,6 +446,46 @@ test('first-release switch-off recovers maintenance from a fresh runner and repe
   assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
 });
 
+test('recovery refuses a readable rollback intent for another build', async (t) => {
+  const pinned = finalSmokeFixture(t, rollbackFixture);
+  const other = finalSmokeFixture(t, { ...rollbackFixture, sha: 'e'.repeat(40) });
+  await pinned.prepare();
+  await other.run('record');
+  const { fresh, evidence } = recoveryFixture(t, pinned, 'success');
+  const { evidence: otherEvidence } = recoveryFixture(t, other, 'success');
+  const rollout = structuredClone(pinned.rows);
+  const before = pinned.calls.length;
+  const intent = 'production-rollback-intent.sealed';
+  const plan = 'production-final-allocation.sealed';
+
+  const pending = fresh('13');
+  admitRecovery(pending, (repo) => {
+    const selected = evidence(repo);
+    const otherSource = otherEvidence(repo);
+    const { run: otherRun } = otherSource.source('12', '1');
+    return {
+      ...selected,
+      artifactFor(run, name) {
+        assert.equal(run.head_sha, pinned.env.DEPLOY_SHA);
+        return otherSource.artifactFor(otherRun, name);
+      },
+    };
+  });
+  assert.deepEqual(readFileSync(join(pending.RUNNER_TEMP, intent)), readFileSync(join(other.temp, intent)));
+  await assert.rejects(pinned.run('prepare-recovery', pending), /Rollback intent or final allocation is missing, invalid or stale/);
+  assert.equal(existsSync(join(pending.RUNNER_TEMP, plan)), false);
+  assert.deepEqual(pinned.calls.slice(before), []);
+  assert.deepEqual(pinned.rows, rollout);
+
+  const exact = fresh('14');
+  admitRecovery(exact, evidence);
+  assert.deepEqual(readFileSync(join(exact.RUNNER_TEMP, intent)), readFileSync(join(pinned.temp, intent)));
+  await pinned.run('prepare-recovery', exact);
+  assert.ok(existsSync(join(exact.RUNNER_TEMP, plan)));
+  assert.deepEqual(pinned.calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
+  assert.deepEqual(pinned.rows, rollout);
+});
+
 test('recovery refuses superseding deployments and any second unresolved submission', async (t) => {
   const transport = finalSmokeFixture(t, rollbackFixture, 'unresolved');
   await transport.run('record');

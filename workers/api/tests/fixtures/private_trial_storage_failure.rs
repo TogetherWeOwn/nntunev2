@@ -51,7 +51,7 @@ impl TrialStorage for RefusedCompletion {
         until: SystemTime,
     ) -> Result<DurableUpload<'a>, HandoffError> {
         assert_eq!(key, self.key);
-        handoff(db, scope, lease, context, (BUCKET, key), until, async |_| {
+        handoff(db, scope, lease, context, (BUCKET, key), until, async |_, _| {
             let response = format!(
                 "<InitiateMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{key}</Key><UploadId>{UPLOAD}</UploadId></InitiateMultipartUploadResult>"
             );
@@ -78,30 +78,34 @@ impl TrialStorage for RefusedCompletion {
 
     async fn complete(
         &self,
+        upload: &DurableUpload<'_>,
         completion: SessionCompletion<'_>,
-        _: SystemTime,
     ) -> Result<CompletedVersionedMedia, DispatchError> {
         let result = completion
-            .dispatch(async |sent| {
-                self.completions.set(self.completions.get() + 1);
-                assert_eq!(
-                    (sent.target.bucket, sent.target.key, sent.target.upload_id),
-                    (BUCKET, self.key.as_str(), UPLOAD)
-                );
-                let checksum = self
-                    .part_checksum
-                    .get()
-                    .expect("the replacement part was uploaded");
-                assert!(std::str::from_utf8(&sent.body)
-                    .unwrap()
-                    .contains(&format!("<ChecksumSHA256>{checksum}</ChecksumSHA256>")));
-                Ok(CompletionResponse {
-                    configuration: self.configuration,
-                    status: 503,
-                    body: Vec::new(),
-                    version: None,
-                })
-            })
+            .dispatch_durable(
+                upload,
+                async |sent, _| {
+                    self.completions.set(self.completions.get() + 1);
+                    assert_eq!(
+                        (sent.target.bucket, sent.target.key, sent.target.upload_id),
+                        (BUCKET, self.key.as_str(), UPLOAD)
+                    );
+                    let checksum = self
+                        .part_checksum
+                        .get()
+                        .expect("the replacement part was uploaded");
+                    assert!(std::str::from_utf8(&sent.body)
+                        .unwrap()
+                        .contains(&format!("<ChecksumSHA256>{checksum}</ChecksumSHA256>")));
+                    Ok(CompletionResponse {
+                        configuration: self.configuration,
+                        status: 503,
+                        body: Vec::new(),
+                        version: None,
+                    })
+                },
+                async |_, _| panic!("explicit completion refusal reached recovery"),
+            )
             .await;
         assert!(matches!(
             &result,
