@@ -217,11 +217,20 @@ test('a delayed private range settles the latest seek on the same track', async 
 		return observed;
 	});
 
+	const requests = await seek.evaluateHandle((slider: HTMLInputElement) => {
+		const positions: number[] = [];
+		// Read the browser's request before PlayerSeek restores the published value.
+		slider.addEventListener('input', (event) => {
+			if (event.isTrusted) positions.push(slider.valueAsNumber);
+		}, { capture: true });
+		return positions;
+	});
 	const sliderPosition = () => seek.evaluate((slider: HTMLInputElement) => slider.valueAsNumber);
 	try {
 		await seek.scrollIntoViewIfNeeded();
 		const point = fractionClickPoint((await seek.boundingBox())!, 0.82);
 		await page.mouse.move(point.x, point.y);
+		expect(firstSeekRead, 'The distant range should start with the first seek').toBeUndefined();
 		await page.mouse.down();
 		let firstPosition: number;
 		try {
@@ -233,11 +242,15 @@ test('a delayed private range settles the latest seek on the same track', async 
 		} finally {
 			await page.mouse.up();
 		}
-		const latestPosition = await sliderPosition();
-		expect(latestPosition, 'The second slider input should supersede the pending position').toBeGreaterThan(firstPosition + 0.02);
+		const requested = await requests.jsonValue();
+		expect(requested).toHaveLength(2);
+		const [firstTarget, latestTarget] = requested;
+		expect(firstPosition).toBeCloseTo(firstTarget, 2);
+		expect(latestTarget, 'The second input should request a distinct position').toBeGreaterThan(firstTarget + 0.02);
 		await expect(audio).toHaveJSProperty('seeking', true);
 		await expect(seek).toHaveAttribute('aria-valuetext', 'Seeking to 0:11 of 0:14');
-		expect(await native.evaluate((node: HTMLAudioElement) => node.currentTime)).toBeCloseTo(latestPosition, 2);
+		expect(await sliderPosition(), 'The pending slider should publish the second request').toBeCloseTo(latestTarget, 2);
+		expect(await native.evaluate((node: HTMLAudioElement) => node.currentTime)).toBeCloseTo(latestTarget, 2);
 		expect(await completions.jsonValue()).toEqual([]);
 
 		// Only the read started by the first gesture may supply bytes for this settlement.
@@ -246,9 +259,9 @@ test('a delayed private range settles the latest seek on the same track', async 
 		await expect(audio).toHaveJSProperty('seeking', false);
 		await expect(seek).toHaveAttribute('aria-valuetext', '0:11 of 0:14');
 		await expect.poll(() => completions.jsonValue()).toEqual([
-			{ position: expect.closeTo(latestPosition, 2), trusted: true }
+			{ position: expect.closeTo(latestTarget, 2), trusted: true }
 		]);
-		expect(await sliderPosition()).toBeCloseTo(latestPosition, 2);
+		expect(await sliderPosition()).toBeCloseTo(latestTarget, 2);
 	} finally {
 		releaseFirstRead.resolve();
 		releaseLaterReads.resolve();
