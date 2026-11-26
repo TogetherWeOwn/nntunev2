@@ -4,8 +4,8 @@ name: e2e-staging
 # Runs the Playwright suite in e2e/ against STAGING_BASE_URL (behind
 # Cloudflare Access via the QA service-token pair).
 #
-# Sequencing: the full journey runs after smoke passes in the same job,
-# and only when deploy.yml calls this workflow with
+# Sequencing: this workflow no longer triggers on push. The full journey
+# runs after smoke passes, and only when deploy.yml calls this workflow with
 # `post_deploy: true` from a job that `needs` successful `staging-web` and
 # `staging-api` jobs of the same run/revision — a skipped or failed deploy therefore
 # cannot produce a full-journey PASS. Scheduled and manually dispatched
@@ -95,8 +95,7 @@ concurrency:
 
 jobs:
   e2e:
-    # The release readers consume this exact called-job name. A separate
-    # skipped monitoring job in the call would fail the release prerequisites.
+    # The release readers require this exact name for the only called job.
     name: ${{ inputs.post_deploy && 'full journey (signup → library → meter → limits)' || 'synthetic smoke (health)' }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.post_deploy && 40 || 10 }}
@@ -121,10 +120,11 @@ jobs:
             fi
             echo "configured=false" >> "$GITHUB_OUTPUT"
             echo "::notice::STAGING_BASE_URL not configured (pre-deploy) — synthetic smoke skips."
-          elif [ -z "${CF_ACCESS_CLIENT_ID:-}" ] || [ -z "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
-            echo "::error::Configured staging requires CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET."
-            exit 1
           else
+            if [ -z "${CF_ACCESS_CLIENT_ID:-}" ] || [ -z "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+              echo "::error::Configured staging requires CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET."
+              exit 1
+            fi
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -160,8 +160,7 @@ jobs:
         run: |
           set -euo pipefail
           npm run e2e:smoke
-          # Retain failed smoke and standalone monitoring diagnostics. In a
-          # post-deploy call, only the full journey may supply JUnit evidence.
+          # A successful post-deploy smoke must leave no candidate JUnit.
           if [ "$POST_DEPLOY" = true ] && [ -e test-results/junit.xml ]; then
             rm -- test-results/junit.xml
           fi
@@ -304,7 +303,6 @@ jobs:
           SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
         run: |
           set -euo pipefail
-          # Same credential-bearing paths as the synthetic job above:
           # error-context.md renders filled secrets and junit failure messages
           # (e.g. toHaveValue Received strings) can carry the same filled
           # values. Strip error-context.md plus the whole playwright-report/

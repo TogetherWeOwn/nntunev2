@@ -487,8 +487,6 @@ How the suite uses them:
   Manual dispatch and the 6-hour schedule run the synthetic smoke only
   (monitoring, not post-deploy promotion evidence); dispatch defines no
   `post_deploy` input, so it cannot mint that evidence by hand.
-  On a post-deploy call, the same job runs smoke and then the full journey
-  with one runner setup. Smoke failure stops the journey and receipt.
   Missing `STAGING_BASE_URL` → the synthetic smoke skips with notice
   (pre-deploy); the post-deploy full journey fails in preflight, because a
   skipped journey after a real `staging-web` deploy would otherwise pass
@@ -571,10 +569,10 @@ specs) — never a scheduled/manual synthetic run, which
 is monitoring only; NEEDS WORK cites the failing spec + step. Every spec that branches on the test-account seam records a
 bounded `signup-path` test annotation — exactly `public-ui-signup` or
 `api-minted-account`, with no email, account id, token or provider data.
-Both staging jobs publish those labels to the run's step summary on every
+The staging job publishes those labels to the run's step summary on every
 configured run (pass or fail), because green runs upload no artifacts and
 the list reporter does not print annotations; the sanitized junit upload
 stays failure-only (7 days). The full journey's evidence gate publishes the
-ran / skipped / failed counts beside those labels on every configured run,
+ran / skipped / failed counts after smoke passes and the journey runs,
 so a PASS always names how many journeys actually ran. A seam-backed (`api-minted-account`) run
 never counts as proof of the public UI signup.

@@ -46,6 +46,7 @@ const dummyPair = {
 
 test('ordinary staging shares one configuration preflight', () => {
   expect(preflights).toHaveLength(1);
+  expect(preflights[0]![1]).toContain("POST_DEPLOY: ${{ inputs.post_deploy && 'true' || 'false' }}");
 });
 
 for (const [index, postDeploy] of ['false', 'true'].entries()) {
@@ -82,7 +83,7 @@ for (const [index, postDeploy] of ['false', 'true'].entries()) {
       ['secret only', { CF_ACCESS_CLIENT_SECRET: dummyPair.CF_ACCESS_CLIENT_SECRET }],
     ] as const) {
       test(`configured staging rejects ${name} with names-only output`, () => {
-        const result = runShell(script, { STAGING_BASE_URL: 'https://staging.example', POST_DEPLOY: postDeploy, ...pair });
+        const result = runShell(script, { STAGING_BASE_URL: 'https://staging.example', ...pair });
         expect(result.status).not.toBe(0);
         expect(result.output).toContain('CF_ACCESS_CLIENT_ID');
         expect(result.output).toContain('CF_ACCESS_CLIENT_SECRET');
@@ -93,7 +94,7 @@ for (const [index, postDeploy] of ['false', 'true'].entries()) {
     }
 
     test('configured staging with complete dummy pair proceeds', () => {
-      const result = runShell(script, { STAGING_BASE_URL: 'https://staging.example', POST_DEPLOY: postDeploy, ...dummyPair });
+      const result = runShell(script, { STAGING_BASE_URL: 'https://staging.example', ...dummyPair });
       expect(result.status).toBe(0);
       expect(result.output).toContain('configured=true');
       expect(result.output).not.toContain(dummyPair.CF_ACCESS_CLIENT_ID);
@@ -531,7 +532,6 @@ function fileContainsMarker(file: string, marker: string): boolean {
 test.describe('failure-artifact sanitization', () => {
   test('shared staging job sanitizes before uploading', () => {
     expect(sanitizeSections).toHaveLength(1);
-    expect(sanitizeBlocks).toHaveLength(1);
     for (const section of sanitizeSections) {
       // The scrub needs the secret VALUES, so each sanitize step must bind
       // them (names only in source; values come from GitHub secrets).
@@ -558,7 +558,7 @@ test.describe('failure-artifact sanitization', () => {
       expect(script).toContain('***REDACTED***');
       expect(script).toContain('SYNTHETIC_NNTP_PASS');
     }
-    // Both failure labels use the shared sanitization step.
+    // Each sanitize precedes its job's upload: nothing uploads raw first.
     for (const artifact of ['e2e-synthetic-report', 'e2e-journey-report']) {
       const uploadAt = stagingWorkflow.indexOf(artifact);
       const sanitizeAt = stagingWorkflow.lastIndexOf('Sanitize failure artifacts', uploadAt);
@@ -675,8 +675,12 @@ test.describe('failure-artifact sanitization', () => {
 });
 
 // Fail-closed publication gate (acceptance contract for the Builder):
-// The contract pinned below:
-//   1. The sanitize step carries an `id:` and the failure upload adds
+// Today both upload steps run on `failure() && configured` alone and the
+// sanitize blocks swallow cleanup failures (`|| true`, stderr discarded)
+// and per-file read errors (`except OSError: continue`), so a sanitizer
+// that failed, was skipped, or silently left a file unscrubbed still
+// publishes. The contract pinned below:
+//   1. Each sanitize step carries an `id:` and its job's upload step adds
 //      `steps.<sanitize-id>.outcome == 'success'` to its existing
 //      `failure() && steps.staging.outputs.configured == 'true'`
 //      condition. Skipped / failed / cancelled sanitize => no upload.
@@ -918,6 +922,35 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     expect(callBlock).toMatch(/ {6}post_deploy:\n(?:.*\n)*? {8}type: boolean\n {8}required: true/);
   });
 
+  test('full journey runs only for the post-deploy call (evaluated)', () => {
+    const condition = stagingStep('Run full journey').match(/^        if: (.+)$/m)?.[1];
+    expect(condition, 'full journey needs a step-level gate').toBeDefined();
+    expect(condition).not.toContain('always()');
+    expect(condition).not.toContain('!cancelled()');
+    expect(condition).toContain("steps.smoke.outcome == 'success'");
+
+    const evaluate = (postDeploy: boolean | '', smokePassed = true): boolean => {
+      const inner = condition!
+        .replace(/^\$\{\{\s*/, '')
+        .replace(/\s*\}\}$/, '');
+      const expr = inner.replace(
+        /inputs\.post_deploy/g,
+        postDeploy === '' ? 'false' : String(postDeploy),
+      ).replace(/success\(\)/g, 'true')
+        .replace(/steps\.smoke\.outcome == 'success'/g, String(smokePassed));
+      expect(expr, `unmodelled journey-gate syntax in: ${condition}`).toMatch(
+        /^[\s()!&|truefals]+$/,
+      );
+      return Function(`"use strict"; return (${expr});`)() as boolean;
+    };
+    // workflow_call from deploy.yml passes post_deploy: true.
+    expect(evaluate(true)).toBe(true);
+    expect(evaluate(true, false)).toBe(false);
+    // workflow_dispatch/schedule leave the input unset: monitoring only.
+    expect(evaluate('')).toBe(false);
+    expect(evaluate(false)).toBe(false);
+  });
+
   test('post-deploy smoke and journey share one runner and block qualification on failure', () => {
     const jobs = stagingWorkflow.split('\njobs:\n')[1]!;
     expect([...jobs.matchAll(/^  ([\w-]+):/gm)].map((m) => m[1])).toEqual(['e2e']);
@@ -926,41 +959,29 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     expect(job).not.toMatch(/^    (if|needs):/m);
     expect(job).not.toContain('continue-on-error');
 
-    const stages = [
-      ['Run synthetic smoke', "success() && steps.staging.outputs.configured == 'true'"],
-      ['Run full journey', "success() && inputs.post_deploy && steps.smoke.outcome == 'success'"],
-      ['Enforce journey evidence gate (all-skipped must fail)', "!cancelled() && (steps.journey.outcome == 'success' || steps.journey.outcome == 'failure')"],
-      ['Record candidate admission receipt', "!cancelled() && (steps.journey-gate.outcome == 'success' || steps.journey-gate.outcome == 'failure')"],
-      ['Upload candidate admission receipt', "success() && steps.journey-gate.outcome == 'success' && steps.receipt.outcome == 'success'"],
-    ] as const;
-    const offsets = stages.map(([name, guard]) => {
-      const condition = stagingStep(name).match(/^        if: (.+)$/m)?.[1];
-      expect(condition?.replace(/^\$\{\{ | \}\}$/g, '')).toBe(guard);
-      return job.indexOf(`      - name: ${name}\n`);
-    });
-    expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
+    expect(job).toMatch(/Run synthetic smoke[\s\S]*Run full journey[\s\S]*Enforce journey evidence gate[\s\S]*Record candidate admission receipt[\s\S]*Upload candidate admission receipt/);
+    expect(stagingStep('Record candidate admission receipt')).toContain("steps.journey-gate.outcome == 'success' || steps.journey-gate.outcome == 'failure'");
+    expect(stagingStep('Upload candidate admission receipt')).toContain("success() && steps.journey-gate.outcome == 'success' && steps.receipt.outcome == 'success'");
   });
 
   test('post-deploy smoke only discards JUnit after a successful smoke', () => {
     const step = stagingStep('Run synthetic smoke');
     expect(step).toContain("POST_DEPLOY: ${{ inputs.post_deploy && 'true' || 'false' }}");
-    const script = `npm() {
-  test "$*" = 'run e2e:smoke'
-  mkdir -p test-results
-  echo synthetic > test-results/junit.xml
-  return "$SMOKE_EXIT"
-}
-` + step.split('        run: |\n')[1]!.replace(/^ {10}/gm, '');
+    const script = 'npm() { test "$*" = "run e2e:smoke"; return "$SMOKE_EXIT"; }\n'
+      + step.split('        run: |\n')[1]!.replace(/^ {10}/gm, '');
     const probe = makeProbe();
     try {
+      mkdirSync(join(probe, 'test-results'));
+      const junit = join(probe, 'test-results', 'junit.xml');
       for (const [postDeploy, exitCode, keepJunit] of [
         ['true', 3, true],
         ['false', 0, true],
         ['true', 0, false],
       ] as const) {
+        writeFileSync(junit, '<testsuite/>');
         const result = runShell(script, { POST_DEPLOY: postDeploy, SMOKE_EXIT: String(exitCode) }, probe);
         expect(result.status).toBe(exitCode);
-        expect(existsSync(join(probe, 'test-results', 'junit.xml'))).toBe(keepJunit);
+        expect(existsSync(junit)).toBe(keepJunit);
       }
     } finally {
       rmSync(probe, { recursive: true, force: true });

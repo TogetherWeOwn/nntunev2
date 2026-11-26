@@ -19,6 +19,9 @@ WORKFLOWS = {"deploy.yml": {"push", "workflow_dispatch"},
              "e2e-staging.yml": {"push", "schedule", "workflow_dispatch"},
              "deploy-production.yml": {"workflow_dispatch"}}
 BAD = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
+POST_DEPLOY_SMOKE = "post-deploy-e2e / synthetic smoke (health)"
+POST_DEPLOY_JOURNEY = "post-deploy-e2e / full journey (signup → library → meter → limits)"
+SMOKE_STEP = "Run synthetic smoke"
 # The successful evidence step prevents skipped/unconfigured jobs from closing
 # an incident. Keys are job names from the reviewed default-branch workflows.
 GATES = {
@@ -28,9 +31,8 @@ GATES = {
         "staging-api": "Deploy api to staging",
         "staging-mb": "Deploy mb to staging",
         "staging-ingest": "Deploy ingest to staging",
-        "post-deploy-e2e / synthetic smoke (health)": "Run synthetic smoke",
-        "post-deploy-e2e / full journey (signup → library → meter → limits)":
-            "Enforce journey evidence gate (all-skipped must fail)",
+        POST_DEPLOY_SMOKE: SMOKE_STEP,
+        POST_DEPLOY_JOURNEY: "Enforce journey evidence gate (all-skipped must fail)",
     },
     "e2e-staging.yml": {"synthetic smoke (health)": "Run synthetic smoke"},
     "deploy-production.yml": {
@@ -138,9 +140,24 @@ def trusted(run):
 
 def gate_result(jobs, name, evidence):
     selected = [j for j in jobs if j.get("name") == name]
+    # Preserve the smoke key for both historical jobs and the combined job.
+    shared_smoke = name == POST_DEPLOY_SMOKE and not selected
+    if shared_smoke:
+        selected = [j for j in jobs if j.get("name") == POST_DEPLOY_JOURNEY]
     if len(selected) != 1:
         return None
     job = selected[0]
+    if shared_smoke or name == POST_DEPLOY_JOURNEY:
+        steps = [s for s in job.get("steps", []) if s.get("name") == SMOKE_STEP]
+        if len(steps) > 1 or (shared_smoke and not steps):
+            return None
+        if steps:
+            smoke = steps[0].get("conclusion")
+            if shared_smoke and smoke in BAD | {"success"}:
+                return {**job, "conclusion": smoke, "steps": steps}
+            if not shared_smoke and smoke != "success":
+                return None
+            # A failure before smoke belongs to the first gate.
     recovered = any(s.get("name") == evidence and s.get("conclusion") == "success"
                     for s in job.get("steps", [])) if evidence is not None else any(
                         j.get("name") == "staging-web" and j.get("conclusion") == "success"
@@ -368,7 +385,7 @@ def report(api, run_id, dry_run=False, newer_evidence=None):
         url = f"https://github.com/{REPO}/actions/runs/{run_id}/attempts/{attempt}"
         body = (f"Run: {url}\n\nWorkflow source SHA: `{run['head_sha']}`\n\n"
                 f"Gate: {name}\n\nThreshold: job and required evidence step success; "
-                f"measured job conclusion: {conclusion}; failing step numbers: "
+                f"measured conclusion: {conclusion}; failing step numbers: "
                 f"{', '.join(failed) or 'none reported'}.\n\n"
                 "Numerical test measurements are not available in the jobs API; "
                 "inspect the linked gate summary for its skip/count budget. "
