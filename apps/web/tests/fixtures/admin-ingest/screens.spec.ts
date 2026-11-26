@@ -108,6 +108,58 @@ test('ten separate FLAC inputs keep independent outcomes through a denial', asyn
 	await expect(page.locator('video, audio, iframe')).toHaveCount(0);
 });
 
+test('the FLAC picker stays locked during a file read and accepts the next selection', async ({ page, ingestOrigin }) => {
+	const firstFile = new URL('fixture-1.flac', clips);
+	const nextFile = new URL('fixture-2.flac', clips);
+	const expectedFiles = await Promise.all([readFile(firstFile), readFile(nextFile)]);
+	const readStarted = Promise.withResolvers<void>();
+	const releaseRead = Promise.withResolvers<void>();
+	const received: Buffer[] = [];
+	await page.exposeFunction('queueFixture', () => queuePage([]));
+	await page.exposeFunction('uploadFixture', (bytes: number[]) => {
+		received.push(Buffer.from(bytes));
+		return 'accepted';
+	});
+	await page.exposeFunction('holdFirstFileRead', () => {
+		readStarted.resolve();
+		return releaseRead.promise;
+	});
+	await page.addInitScript(() => {
+		const arrayBuffer = File.prototype.arrayBuffer;
+		File.prototype.arrayBuffer = async function (this: File) {
+			if (this.name === 'fixture-1.flac') {
+				await (window as Window & { holdFirstFileRead(): Promise<void> }).holdFirstFileRead();
+			}
+			return arrayBuffer.call(this);
+		};
+	});
+	await openScreens(page, ingestOrigin, 'owner', true);
+	const picker = page.getByLabel('FLAC files');
+	const upload = page.getByRole('button', { name: 'Upload files' });
+	const results = page.getByRole('list', { name: 'Upload results' }).getByRole('listitem');
+	await picker.setInputFiles(fileURLToPath(firstFile));
+	await upload.click();
+	await readStarted.promise;
+	try {
+		await expect(picker).toHaveJSProperty('disabled', true);
+		await expect(upload).toHaveJSProperty('disabled', true);
+		await expect(results).toHaveText(['fixture-1.flac · Uploading']);
+		expect(received).toHaveLength(0);
+	} finally {
+		releaseRead.resolve();
+	}
+
+	await expect(results).toHaveText(['fixture-1.flac · Accepted for processing.']);
+	await expect(picker).toBeEnabled();
+	await expect(picker).toHaveValue('');
+	expect(received).toEqual([expectedFiles[0]]);
+
+	await picker.setInputFiles(fileURLToPath(nextFile));
+	await upload.click();
+	await expect(results).toHaveText(['fixture-2.flac · Accepted for processing.']);
+	expect(received).toEqual(expectedFiles);
+});
+
 test('queue status filters, paging, and detail expose supported states and fixed reasons', async ({ page, ingestOrigin }) => {
 	const rows = [
 		{ job_id: 'accepted-job', status: 'accepted', revision: 0 },
