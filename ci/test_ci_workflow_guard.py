@@ -63,6 +63,49 @@ class GuardFixtures(unittest.TestCase):
             list(findings("on: {pull_request: {<<: {types: [edited]}}}"))
 
 
+class TrustedPRRunnerTests(unittest.TestCase):
+    def test_runner_selection_stays_scoped_to_trusted_prs(self):
+        accounts = "fromJSON('[\"Rick7C2\", \"togetherweown[bot]\"]')"
+        guard = (
+            "github.event_name == 'pull_request' && github.run_attempt == 1"
+            " && github.event.pull_request.head.repo.full_name == github.repository"
+            f" && contains({accounts}, github.actor)"
+            f" && contains({accounts}, github.triggering_actor)"
+            f" && contains({accounts}, github.event.pull_request.user.login)"
+            " && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'"
+            " && vars.CI_BLACKSMITH_2VCPU"
+        )
+        latest = guard + " || 'ubuntu-latest'"
+        pinned = guard + " || 'ubuntu-24.04'"
+        expected = {
+            "ci": dict.fromkeys((
+                "early", "fixture-check", "nzb-guard", "rust-wasm", "cargo-deny",
+                "public-text", "cargo-pool", "binding-parity", "migrations-gate",
+                "test-nntp", "mb-import-etl", "rust-mb", "config-parity",
+                "dependabot-coverage", "rust-repair", "rust-transcode", "cache-policy",
+                "production-secrets-shape", "release-proof", "docs-links", "web-checks",
+                "web-build", "history-fixture", "web-a11y", "tail-projection",
+                "changed-lines-mutation", "ci-ok",
+            ), latest) | {"ci-commits": pinned},
+            "gitleaks": {"gitleaks": latest},
+            "migrations-staging": {"migrations-staging": latest},
+            "pr-lint": {"pr-lint": pinned},
+            "pr-size": {"pr-size-gate": f"toJSON({latest})"},
+        }
+        for workflow, jobs in expected.items():
+            doc = yaml.load((ACTIONS / f"{workflow}.yml").read_text(), Loader=WorkflowLoader)
+            selectors = {}
+            for job_id, job in doc["jobs"].items():
+                runner = job.get("runs-on", job.get("with", {}).get("runs-on", ""))
+                # The existing WASM budget route has its own policy.
+                if job_id != "worker-wasm-budget" and "CI_BLACKSMITH_2VCPU" in runner:
+                    selectors[job_id] = runner
+            with self.subTest(workflow=workflow):
+                self.assertEqual(selectors, {
+                    job_id: "${{ " + expression + " }}" for job_id, expression in jobs.items()
+                })
+
+
 class RequiredLintTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

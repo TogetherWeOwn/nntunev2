@@ -3,7 +3,7 @@ use crate::{
     ingest_session_caller::{
         Authorization, CommittedFlacUpload, CurrentAuthorization, PreparedUpload,
     },
-    private_catalogue_read::{lookup_scoped, PublicationScope},
+    private_catalogue_read::{lookup, lookup_scoped, PublicationPins, PublicationScope},
     private_listening::PrivateListening,
     storage_digest_read::uuid_text,
     worker_entry::playback_store_for_postgres_test,
@@ -654,7 +654,7 @@ pub(crate) async fn verify_publication(
     assert_eq!((refused.status, refused.body), (503, unavailable.body));
     point_admission_at(&unrelated_track, track).await;
     let replay = publish(&mut publication, upload_writer, Some("fixture-bucket")).await;
-    assert_eq!((replay.status, replay.body), (200, first.body));
+    assert_eq!((replay.status, &replay.body), (200, &first.body));
 
     for statement in [
         "DELETE FROM public.storage_validated_digest_references WHERE reference_id = $1::text::uuid",
@@ -674,6 +674,14 @@ pub(crate) async fn verify_publication(
         1
     );
 
+    Box::pin(verify_playback_version(
+        &mut publication,
+        track,
+        body["sha256"].as_str().unwrap(),
+        prepared,
+        committed,
+    ))
+    .await;
     assert_eq!(
         publish(
             &mut publication,
@@ -711,6 +719,102 @@ pub(crate) async fn verify_publication(
         assert_eq!(duration, stored);
     }
     assert_eq!(set_duration(Some(14_000)).await, 1);
+
+    // Lose only the follow-up digest-page evidence for the committed upload.
+    // The existing catalogue receipt and exact media locator remain available.
+    let outcome = committed.outcome();
+    let publication_rows = async || {
+        let row = observer
+            .query_one(
+                "SELECT ARRAY[t.xmin::text, s.xmin::text, a.xmin::text, l.xmin::text,
+                              r.xmin::text, u.xmin::text, w.xmin::text], p.page_versions
+                 FROM public.tracks t
+                 JOIN public.catalogue_s3_sources s ON s.track_id = t.id
+                 JOIN public.private_library_admissions a USING (track_id, accepted_seq, object_id)
+                 JOIN public.storage_s3_locator_intents l USING (object_id)
+                 JOIN public.storage_validated_digest_references r
+                   ON (r.reference_id, r.object_id) = (t.id, s.object_id)
+                 JOIN public.storage_validated_digest_winners w ON w.object_id = s.object_id
+                 JOIN public.ingest_session_reservations u ON u.multipart_object_id = s.object_id
+                 JOIN public.storage_digest_inventory_intents p ON p.map_id = u.completed_map_id
+                 WHERE t.release_id = $1::text::uuid AND s.source_job_id = $2
+                   AND u.id = $3::text::uuid AND u.terminal_reason = 'completed'
+                   AND u.write_lease_id IS NULL AND u.idempotency_key = s.source_job_id
+                   AND w.object_id = $4::text::uuid AND p.map_id = $5::text::uuid
+                   AND l.s3_bucket = $6 AND l.s3_key = $7 AND l.s3_version_id = $8
+                   AND p.media_version = l.s3_version_id",
+                &[
+                    &RELEASE,
+                    &JOB,
+                    &prepared.scope.session,
+                    &outcome.object,
+                    &outcome.map,
+                    &published.locator.bucket(),
+                    &published.locator.key(),
+                    &outcome.media_version,
+                ],
+            )
+            .await
+            .unwrap();
+        (row.get::<_, Vec<String>>(0), row.get::<_, Vec<String>>(1))
+    };
+    let set_page_versions = async |expected: &[String], replacement: &[String]| {
+        let mut fault = connection().await;
+        let tx = fault.transaction().await.unwrap();
+        tx.batch_execute(
+            "SET LOCAL lock_timeout = '2s';
+             ALTER TABLE public.storage_digest_inventory_intents
+               DISABLE TRIGGER storage_digest_inventory_intent_append_only;",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tx.execute(
+                "UPDATE public.storage_digest_inventory_intents SET page_versions = $1
+             WHERE map_id = $2::text::uuid AND media_version = $3 AND page_versions = $4",
+                &[
+                    &replacement,
+                    &outcome.map,
+                    &outcome.media_version,
+                    &expected
+                ],
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        tx.batch_execute(
+            "ALTER TABLE public.storage_digest_inventory_intents
+               ENABLE TRIGGER storage_digest_inventory_intent_append_only;",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    };
+    let (rows_before, pins_before) = publication_rows().await;
+    assert!(!pins_before.is_empty());
+    assert_eq!(pins_before, outcome.page_versions);
+    set_page_versions(&pins_before, &[]).await;
+    let mut retry = connection().await;
+    let pending = publish(&mut retry, upload_writer, Some(scope.bucket)).await;
+    let sealed = crate::handlers::unavailable();
+    assert_eq!(pending.status, sealed.status);
+    assert_eq!(pending.body, sealed.body);
+    assert_eq!(pending.extra_headers, sealed.extra_headers);
+    assert!(pending.set_cookie.is_none() && pending.retry_after.is_none());
+    assert_eq!(publication_rows().await, (rows_before.clone(), Vec::new()));
+
+    set_page_versions(&[], &pins_before).await;
+    let mut recovery = connection().await;
+    let recovered = publish(&mut recovery, upload_writer, Some(scope.bucket)).await;
+    assert_eq!(recovered.status, 200);
+    assert_eq!(recovered.body, first.body);
+    assert_eq!(recovered.extra_headers, first.extra_headers);
+    assert_eq!(publication_rows().await, (rows_before, pins_before));
+    assert!(exact_reference().await);
+    let recovered_listing = handle(&ctx, &library).await;
+    assert_eq!(recovered_listing.status, 200);
+    assert_eq!(recovered_listing.body, listing.body);
 
     assert!(
         published_media(track).await == published,
@@ -753,6 +857,83 @@ pub(crate) async fn verify_publication(
     assert_eq!(handle(&ctx, &library).await.status, 403);
 
     track.to_owned()
+}
+
+async fn verify_playback_version(
+    db: &mut Client,
+    track: &str,
+    digest: &str,
+    prepared: PreparedUpload<'_>,
+    committed: &CommittedFlacUpload<'_, '_>,
+) {
+    let outcome = committed.outcome();
+    let pins = PublicationPins {
+        environment: prepared.scope.environment,
+        library: prepared.scope.library,
+        provider_configuration: prepared.intent.identities[4],
+        accepted_seq: db
+            .query_one(
+                "SELECT accepted_seq FROM public.ingest_jobs WHERE id = $1",
+                &[&JOB],
+            )
+            .await
+            .unwrap()
+            .get(0),
+        bucket: committed.verified().inventory().bucket(),
+        version: &outcome.media_version,
+    };
+    let (matching, _) = lookup(db, track, &pins, Some(digest))
+        .await
+        .unwrap()
+        .expect("matching version should supply playback evidence");
+    assert!(
+        matches!(matching.locator.binding(), S3Binding::VersionId(version) if version == pins.version)
+    );
+
+    // Inject a different observed version on the same object and map. Keep
+    // the committed receipt's pins fixed and roll back both fixture changes.
+    let fault = db.transaction().await.unwrap();
+    fault.batch_execute(
+        "ALTER TABLE public.storage_s3_locator_intents DISABLE TRIGGER storage_s3_locator_intent_append_only;
+         ALTER TABLE public.storage_digest_inventory_intents DISABLE TRIGGER storage_digest_inventory_intent_append_only",
+    ).await.unwrap();
+    let other_version = "different-trial-media-version";
+    assert_eq!(
+        fault
+            .execute(
+                "UPDATE public.storage_s3_locator_intents SET s3_version_id = $1
+         WHERE object_id = $2::text::uuid AND s3_version_id = $3",
+                &[&other_version, &outcome.object, &pins.version],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fault
+            .execute(
+                "UPDATE public.storage_digest_inventory_intents SET media_version = $1
+         WHERE map_id = $2::text::uuid AND media_version = $3",
+                &[&other_version, &outcome.map, &pins.version],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let (observed, row) = lookup_scoped(&fault, track, (&pins).into(), None, Some(digest))
+        .await
+        .unwrap()
+        .expect("the same track should resolve with the substituted version alone");
+    assert!(observed.target == matching.target);
+    assert_eq!(row.get::<_, i64>("accepted_seq"), pins.accepted_seq);
+    assert!(
+        matches!(observed.locator.binding(), S3Binding::VersionId(version) if version == other_version)
+    );
+    assert!(lookup(&fault, track, &pins, Some(digest))
+        .await
+        .unwrap()
+        .is_none());
+    fault.rollback().await.unwrap();
 }
 
 pub(crate) async fn verify_cleanup(

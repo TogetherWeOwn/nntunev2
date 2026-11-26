@@ -441,10 +441,12 @@ gh workflow run staging-trial-provider-preflight.yml --ref main \
 ```
 
 GitHub must resolve the dispatch to that reviewed commit. Open the run and
-record its URL and the fixed verdict from the successful probe step. A skipped
-job or a rerun supplies no qualification evidence. Reconcile any interrupted or
-failed attempt before preparing a fresh pair and dispatch. Withdraw the
-disposable credential and clear the run's Environment secrets after use.
+record its URL and the fixed verdict from the successful probe step. The job
+summary reports an incomplete attempt when the probe did not succeed and the
+runner can still publish the summary. A skipped job or a rerun supplies no
+qualification evidence. Reconcile any interrupted or failed attempt before
+preparing a fresh pair and dispatch. Withdraw the disposable credential and
+clear the run's Environment secrets after use.
 
 For the controlled manual path, build the standalone probe in the protected
 qualification environment from the reviewed commit before loading provider

@@ -164,6 +164,10 @@ def page(key, rows, total=None):
     return {"total_count": len(rows) if total is None else total, key: rows}
 
 
+def artifact_listing(name):
+    return f"runs/{RUN_ID}/artifacts?name={name}&per_page=100&page=1"
+
+
 class World:
     """Coherent synthetic run: one main-push attempt, three green jobs, one receipt."""
 
@@ -175,6 +179,7 @@ class World:
         self.receipt = sa.produce(make_env(**(env or {})), xml or make_junit(), self.policy,
                                   contract_bytes, manifest, private_pins=private_deployments,
                                   private_track_sha256=PRIVATE_AUDIO_SHA)
+        self.artifact_name = sa.artifact_name(SHA, RUN_ID, 1, self.receipt.get("journey"))
         self.workflow = {"id": WORKFLOW_ID, "path": sa.WORKFLOW, "state": "active"}
         repo = {"full_name": REPO, "id": REPO_ID}
         self.run = {"id": RUN_ID, "run_attempt": 1, "workflow_id": WORKFLOW_ID, "path": sa.WORKFLOW,
@@ -206,7 +211,7 @@ class World:
         self.archive = archive if archive is not None else make_zip(
             [("staging-admission.json", json.dumps(self.receipt))])
         self.artifact = {
-            "id": ARTIFACT_ID, "name": sa.artifact_name(SHA, RUN_ID, 1, self.receipt.get("journey")),
+            "id": ARTIFACT_ID, "name": self.artifact_name,
             "expired": False,
             "size_in_bytes": len(self.archive), "digest": "sha256:" + sa.digest(self.archive),
             "expires_at": iso(60 * 24),
@@ -232,7 +237,7 @@ class World:
                 page("workflow_runs", self.runs),
             f"runs/{RUN_ID}": self.run,
             f"runs/{RUN_ID}/attempts/1/jobs{base}": jobs or page("jobs", self.jobs),
-            f"runs/{RUN_ID}/artifacts{base}": artifacts or page(
+            artifact_listing(self.artifact_name): artifacts or page(
                 "artifacts", [self.artifact] if self.artifact is not None else []),
         }
         if self.artifact is not None:
@@ -539,7 +544,6 @@ class PrivateAdmissionTests(Base):
         first_job_listing = page("jobs", first_jobs)
         routes = world.routes(jobs=first_job_listing)
         self.assertEqual(world.verify(routes=routes)["result"], "satisfied")
-        artifact_listing = f"runs/{RUN_ID}/artifacts?per_page=100&page=1"
 
         # A successful single-job rerun supersedes attempt 1 but lacks its deployment jobs.
         world.run.update(run_attempt=2, updated_at=iso(-25))
@@ -547,7 +551,7 @@ class PrivateAdmissionTests(Base):
             "jobs", [dict(world.job("staging-ingest", -25, started=-30), run_attempt=2)])
         actions = FakeActions(routes)
         self.refused("^missing or ambiguous required staging job$", world.verify_with_actions, actions)
-        self.assertNotIn(artifact_listing, actions.calls)
+        self.assertFalse(any(call.startswith(f"runs/{RUN_ID}/artifacts?") for call in actions.calls))
 
         # Re-run all jobs with a fresh report and deployment pins for attempt 3.
         world.run.update(run_attempt=3, updated_at=iso(5))
@@ -566,8 +570,9 @@ class PrivateAdmissionTests(Base):
         routes[f"runs/{RUN_ID}/attempts/3/jobs?per_page=100&page=1"] = page("jobs", rerun_jobs)
         routes[f"artifacts/{ARTIFACT_ID}/zip"] = prior_archive
         routes[f"artifacts/{ARTIFACT_ID + 1}/zip"] = world.archive
+        listing = artifact_listing(current_artifact["name"])
 
-        routes[artifact_listing] = page("artifacts", [prior_artifact, current_artifact])
+        routes[listing] = page("artifacts", [current_artifact])
         actions = FakeActions(routes)
         verified = world.verify_with_actions(actions)
         self.assertEqual(verified["result"], "satisfied")
@@ -577,7 +582,7 @@ class PrivateAdmissionTests(Base):
         self.assertEqual(verified["coverage"], [{"id": name, "outcome": "passed"} for name in PRIVATE_CASES])
         self.assertNotIn(f"artifacts/{ARTIFACT_ID}/zip", actions.calls)
 
-        routes[artifact_listing] = page("artifacts", [prior_artifact])
+        routes[listing] = page("artifacts", [prior_artifact])
         actions = FakeActions(routes)
         self.refused("missing or ambiguous attempt-bound receipt", world.verify_with_actions, actions)
         self.assertFalse(any(call.endswith("/zip") for call in actions.calls))
@@ -814,10 +819,97 @@ class VerifyTests(Base):
         w = World()
         self.assertEqual(w.verify()["result"], "satisfied")
 
+    def test_offline_terminal_main_push_distinguishes_queue_rejection_and_e2e_failure(self):
+        world = World()
+        receipt = world.verify()
+        self.assertEqual((receipt["sha"], receipt["run_id"], receipt["run_attempt"], receipt["result"]),
+                         (SHA, str(RUN_ID), "1", "satisfied"))
+
+        run = dict(world.run, conclusion="failure")
+        queue_notice = {"annotation_level": "failure",
+                        "message": "Queue is full for concurrency group 'deploy-staging-main'"}
+        rejected = {"run": run, "jobs": page("jobs", []), "annotations": [queue_notice]}
+        jobs = copy.deepcopy(world.jobs)
+        jobs[-1]["conclusion"] = "failure"
+        jobs[-1]["steps"][0]["conclusion"] = "failure"
+        for step in jobs[-1]["steps"][1:]:
+            step["conclusion"] = "skipped"
+        failed = {"run": run, "jobs": page("jobs", jobs), "annotations": []}
+
+        generic = "::error::Candidate admission refused: missing, unapproved, stale or incoherent evidence\n"
+
+        def assert_diagnosis(raw, expected):
+            result = subprocess.run(
+                [sys.executable, "-I", str(HERE / "staging_admission.py"), "diagnose-terminal-push", SHA],
+                input=raw, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, expected)
+
+        for case, evidence, expected in (
+            ("queue rejected", rejected,
+             f"Staging run {RUN_ID}, attempt 1 was rejected before jobs by the deploy-staging-main queue. "
+             "Exact-build qualification is pending. The next eligible automatic staging admission can "
+             "provide evidence for the build it runs.\n"),
+            ("E2E failed", failed, f"Staging run {RUN_ID}, attempt 1 was admitted, and the full E2E journey failed. "
+             "Inspect the journey job and return to candidate qualification.\n"),
+            ("no annotation", dict(rejected, annotations=[]), generic),
+            ("different annotation", dict(rejected, annotations=[dict(queue_notice, message="synthetic diagnostic")]),
+             generic),
+            ("different queue", dict(rejected, annotations=[dict(
+                queue_notice, message="Queue is full for concurrency group 'deploy-staging-other'",
+            )]), generic),
+            ("incomplete job list", dict(rejected, jobs=page("jobs", [], total=1)), generic),
+            ("different build", dict(rejected, run=dict(run, head_sha=OTHER_SHA)), generic),
+            ("manual run", dict(rejected, run=dict(run, event="workflow_dispatch")), generic),
+            ("rerun", dict(rejected, run=dict(run, run_attempt=2)), generic),
+            ("jobs present", dict(rejected, jobs=page("jobs", world.jobs)), generic),
+            ("different job attempt", dict(failed, jobs=page("jobs", [*jobs[:-1], dict(jobs[-1], run_attempt=2)])),
+             generic),
+            ("missing E2E step", dict(failed, jobs=page("jobs", [*jobs[:-1], dict(jobs[-1], steps=[])])), generic),
+            ("successful run", dict(rejected, run=world.run, jobs=page("jobs", world.jobs)), generic),
+        ):
+            with self.subTest(case=case):
+                assert_diagnosis(json.dumps(evidence), expected)
+        with self.subTest(case="excessive nesting"):
+            assert_diagnosis('{"nested":' + '[' * 10_000 + '0' + ']' * 10_000 + '}', generic)
+
     def test_positive_ignores_skipped_gate_only_later_run(self):
         w = World()
         w.add_other("skipped")
         self.assertEqual(w.verify()["result"], "satisfied")
+
+    def test_independent_same_sha_runs_use_deployment_history(self):
+        other_id = RUN_ID - 1
+        other_jobs = f"runs/{other_id}/jobs?filter=all&per_page=100&page=1"
+        selected_jobs = f"runs/{RUN_ID}/jobs?filter=all&per_page=100&page=1"
+        for api_conclusion, started, completed in (
+            (None, None, None), ("skipped", -2.75, -2.25),
+            ("success", -2.75, -2.25), ("success", 6, 7),
+        ):
+            with self.subTest(api_conclusion=api_conclusion, started=started):
+                w = World()
+                if api_conclusion is not None:
+                    # Cover both overlapping evidence and a deploy after the
+                    # selected journey releases the workflow lock at minute 5.
+                    # Both push SHAs stay fixed.
+                    w.runs.append(dict(w.run, id=other_id, created_at=iso(-30), updated_at=iso(completed + 1)))
+                    w.others[other_id] = [
+                        dict(w.job("staging-web", completed, started=started), id=201,
+                             run_id=other_id, conclusion="skipped"),
+                        dict(w.job("staging-api", completed, started=started, steps=[
+                            w.step(sa.DEPLOY_STEPS["staging-api"], 1, api_conclusion)
+                        ]), id=202, run_id=other_id, conclusion=api_conclusion),
+                    ]
+                actions = FakeActions(w.routes())
+                if api_conclusion == "success":
+                    self.refused("^known intervening staging deployment; fresh journey required$",
+                                 w.verify_with_actions, actions)
+                else:
+                    self.assertEqual(w.verify_with_actions(actions), w.receipt)
+                self.assertNotIn(selected_jobs, actions.calls)
+                self.assertEqual(other_jobs in actions.calls, api_conclusion is not None)
 
     def test_hash_source_and_manifest_mismatch(self):
         w = World()
@@ -1148,6 +1240,19 @@ class VerifyTests(Base):
         w.jobs[0]["head_sha"] = OTHER_SHA
         self.assertWorldRefused(w, "required job did not pass")
 
+    def test_completed_required_journey_requires_success_conclusion(self):
+        world = World()
+        journey = world.jobs[-1]
+        reason = "^required job did not pass in selected attempt$"
+
+        del journey["conclusion"]
+        self.assertWorldRefused(world, reason)
+        journey["conclusion"] = None
+        self.assertWorldRefused(world, reason)
+
+        journey["conclusion"] = "success"
+        self.assertEqual(world.verify(), world.receipt)
+
     def test_step_ordering_and_outcomes(self):
         w = World()
         steps = w.jobs[2]["steps"]
@@ -1163,13 +1268,31 @@ class VerifyTests(Base):
         w.jobs[2]["steps"].append(dict(w.jobs[2]["steps"][0], number=9))
         self.assertWorldRefused(w, "steps must succeed in order")
 
-    def test_artifact_missing_duplicate_or_wrong_name(self):
+    def test_artifact_lookup_ignores_over_one_page_of_unrelated_artifacts(self):
         w = World()
-        w.artifact["name"] = "other"
-        self.assertWorldRefused(w, "missing or ambiguous")
+        unrelated = [dict(w.artifact, id=ARTIFACT_ID + offset, name=f"unrelated-{offset}")
+                     for offset in range(1, 102)]
+        unfiltered = f"runs/{RUN_ID}/artifacts?per_page=100&page=1"
+        routes = w.routes()
+        routes[unfiltered] = page("artifacts", unrelated[:100], total=len(unrelated) + 1)
+        actions = FakeActions(routes)
+
+        self.assertEqual(w.verify_with_actions(actions)["result"], "satisfied")
+        self.assertIn(artifact_listing(w.artifact["name"]), actions.calls)
+        self.assertNotIn(unfiltered, actions.calls)
+
+    def test_artifact_missing_duplicate_incomplete_or_wrong_name(self):
         w = World()
-        self.assertWorldRefused(w, "missing or ambiguous",
-                                routes=w.routes(artifacts=page("artifacts", [w.artifact, dict(w.artifact, id=901)])))
+        refusal = "missing or ambiguous attempt-bound receipt"
+        for rows, total, reason in (
+                ([], 0, refusal),
+                ([dict(w.artifact, name=w.artifact["name"] + "-other")], 1, refusal),
+                ([w.artifact, dict(w.artifact, id=ARTIFACT_ID + 1)], 2, refusal),
+                ([w.artifact], 2, "incomplete or exhausted artifacts listing")):
+            with self.subTest(total=total, rows=len(rows), reason=reason):
+                actions = FakeActions(w.routes(artifacts=page("artifacts", rows, total)))
+                self.refused(reason, w.verify_with_actions, actions)
+                self.assertFalse(any(call.endswith("/zip") for call in actions.calls))
 
     def test_artifact_provenance_and_expiry(self):
         for edit in (lambda a: a.update(expired=True),
@@ -1195,8 +1318,6 @@ class VerifyTests(Base):
                                 routes=w.routes(jobs=page("jobs", w.jobs, total=101)))
         self.assertWorldRefused(w, "incomplete or exhausted jobs",
                                 routes=w.routes(jobs=page("jobs", w.jobs, total=len(w.jobs) + 1)))
-        self.assertWorldRefused(w, "incomplete or exhausted artifacts",
-                                routes=w.routes(artifacts=page("artifacts", [w.artifact], total=2)))
         w.runs = w.runs * 1
         routes = w.routes()
         routes[f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push&head_sha={SHA}&per_page=100&page=1"] = page(
@@ -1335,7 +1456,7 @@ class SourceBindingTests(Base):
                 self.assertEqual(stopped.exception.code, 1)
                 self.assertEqual(error.getvalue(), f"::error::Candidate admission refused: {cli_refusal}\n")
                 self.assertEqual(output.getvalue(), "")
-                self.assertNotIn(f"runs/{RUN_ID}/artifacts?per_page=100&page=1", actions.calls)
+                self.assertFalse(any(call.startswith(f"runs/{RUN_ID}/artifacts?") for call in actions.calls))
                 live.assert_not_called()
                 return
             with patch.object(sa, "git", wraps=sa.git) as source_git:
@@ -1618,10 +1739,8 @@ class SourceBindingTests(Base):
             with self.subTest(field=field):
                 def wrong_receipt():
                     world = PrivateWorld()
-                    name = world.artifact["name"]
                     world.receipt[field] = value
                     world.set_archive()
-                    world.artifact["name"] = name
                     return world
 
                 self.refused(reason, self.run_main, private=True, mode="promote", world_factory=wrong_receipt)
@@ -1876,6 +1995,179 @@ class ArchiveTests(Base):
         w = World()
         w.set_archive(make_zip([("staging-admission.json", "{}"), ("x", "y")]))
         self.assertWorldRefused(w, "invalid receipt archive member")
+
+
+class StagingPushReadbackTests(unittest.TestCase):
+    SQUASH = "c" * 40
+    MANUAL = "e" * 40
+    OTHER_WORKFLOW = "f" * 40
+
+    def setUp(self):
+        self.world = World()
+
+    def comparison(self, head, status="ahead", *, merge_base=None, ahead=1, behind=0):
+        return {"base_commit": {"sha": self.SQUASH},
+                "merge_base_commit": {"sha": merge_base or self.SQUASH},
+                "status": status, "ahead_by": ahead, "behind_by": behind, "total_commits": ahead,
+                "commits": [{"sha": head}] if ahead else []}
+
+    def compare_route(self, head):
+        return f"compare/{self.SQUASH}...{head}"
+
+    def snapshot(self):
+        run = self.world.run
+        queued = dict(run, id=96, run_number=10, head_sha=OTHER_SHA, status="queued", conclusion=None)
+        manual = dict(run, id=97, run_number=20, head_sha=self.MANUAL, event="workflow_dispatch")
+        other = dict(run, id=98, run_number=21, head_sha=self.OTHER_WORKFLOW,
+                     workflow_id=6, path=".github/workflows/check.yml")
+        admitted = dict(run, run_number=30)
+        # Queue rejection appears as a failed run with no attempt job rows.
+        rejected = dict(run, id=99, run_number=25, head_sha=self.SQUASH, conclusion="failure")
+        jobs = {}
+        for entry in (admitted, manual, other):
+            jobs[f"runs/{entry['id']}/attempts/1/jobs"] = page("jobs", [
+                dict(job, run_id=entry["id"], head_sha=entry["head_sha"]) for job in self.world.jobs
+            ])
+        jobs["runs/99/attempts/1/jobs"] = page("jobs", [])
+        jobs["runs/96/attempts/1/jobs"] = page("jobs", [dict(
+            self.world.jobs[-1], run_id=96, head_sha=OTHER_SHA, status="queued", conclusion=None,
+            runner_id=0, completed_at=None, steps=[],
+        )])
+        return {
+            "workflow": self.world.workflow,
+            "runs": page("workflow_runs", [rejected, other, admitted, queued, manual]),
+            "jobs": jobs,
+            "comparisons": {self.compare_route(head): self.comparison(head)
+                            for head in (SHA, self.MANUAL, self.OTHER_WORKFLOW)}
+                           | {self.compare_route(self.SQUASH): self.comparison(self.SQUASH, "identical", ahead=0),
+                              self.compare_route(OTHER_SHA): self.comparison(
+                                  OTHER_SHA, "behind", merge_base=OTHER_SHA, ahead=0, behind=2)},
+        }
+
+    def readback(self, evidence):
+        raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
+        return subprocess.run(
+            [sys.executable, "-E", "-s", "-B", str(HERE / "staging_push_readback.py"),
+             self.SQUASH, REPO, str(REPO_ID)], input=raw, capture_output=True, check=False,
+        )
+
+    def assert_pending(self, evidence):
+        result = self.readback(evidence)
+        self.assertEqual((result.returncode, result.stderr, json.loads(result.stdout)),
+                         (1, b"", {"status": "pending"}))
+
+    def add_completed_push(self, snapshot, *, run_id, run_number):
+        head = "d" * 40
+        runs = snapshot["runs"]["workflow_runs"]
+        snapshot["runs"] = page("workflow_runs", [*runs, dict(
+            self.world.run, id=run_id, run_number=run_number, head_sha=head,
+        )])
+        snapshot["comparisons"][self.compare_route(head)] = self.comparison(head)
+        jobs = [dict(job, run_id=run_id, head_sha=head, started_at=iso(6), completed_at=iso(7))
+                for job in self.world.jobs]
+        jobs[-1].update(started_at=iso(8), completed_at=iso(10))
+        snapshot["jobs"][f"runs/{run_id}/attempts/1/jobs"] = page("jobs", jobs)
+        return head, jobs
+
+    def test_nominates_ordinary_descendant_for_exact_attempt_verification(self):
+        snapshot = self.snapshot()
+        result = self.readback(snapshot)
+        self.assertEqual((result.returncode, result.stderr), (0, b""))
+        nomination = json.loads(result.stdout)
+        self.assertEqual(nomination, {"status": "nominated", "sha": SHA,
+                                     "run_id": str(RUN_ID), "run_attempt": "1"})
+        receipt = self.world.verify(sha=nomination["sha"])
+        self.assertEqual(receipt["result"], "satisfied")
+        for key in ("sha", "run_id", "run_attempt"):
+            self.assertEqual(receipt[key], nomination[key])
+
+        other_runs = [run for run in snapshot["runs"]["workflow_runs"] if run["id"] != RUN_ID]
+        snapshot["runs"] = page("workflow_runs", other_runs)
+        self.assert_pending(snapshot)
+
+    def test_most_recent_completed_journey_wins_even_when_creation_order_differs(self):
+        for run_id, run_number in ((102, 31), (94, 8)):
+            with self.subTest(run_number=run_number):
+                snapshot = self.snapshot()
+                head, jobs = self.add_completed_push(snapshot, run_id=run_id, run_number=run_number)
+                result = self.readback(snapshot)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"status": "nominated", "sha": head,
+                                                             "run_id": str(run_id), "run_attempt": "1"})
+                for job, original in zip(jobs, self.world.jobs):
+                    job.update(started_at=original["started_at"], completed_at=original["completed_at"])
+                self.assert_pending(snapshot)
+
+    def test_completed_skipped_attempt_does_not_mask_qualifying_push(self):
+        snapshot = self.snapshot()
+        _, jobs = self.add_completed_push(snapshot, run_id=95, run_number=9)
+        for job in jobs:
+            job.update(conclusion="skipped", started_at=None, completed_at=None, steps=[])
+        result = self.readback(snapshot)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"status": "nominated", "sha": SHA,
+                                                     "run_id": str(RUN_ID), "run_attempt": "1"})
+
+        jobs[-1]["run_attempt"] = 2
+        self.assert_pending(snapshot)
+
+    def test_ancestry_must_be_bound_to_the_selected_push_head(self):
+        head_route = self.compare_route(SHA)
+        for outcome, comparison in (
+            ("behind", self.comparison(SHA, "behind", merge_base=SHA, ahead=0, behind=2)),
+            ("diverged", self.comparison(SHA, "diverged", merge_base=OTHER_SHA, behind=2)),
+            ("wrong head", self.comparison(OTHER_SHA)),
+            ("wrong base", self.comparison(SHA) | {"base_commit": {"sha": OTHER_SHA}}),
+            ("wrong merge base", self.comparison(SHA, merge_base=OTHER_SHA)),
+            ("partial comparison", self.comparison(SHA, ahead=2)),
+        ):
+            with self.subTest(outcome=outcome):
+                snapshot = self.snapshot()
+                snapshot["comparisons"][head_route] = comparison
+                self.assert_pending(snapshot)
+
+        snapshot = self.snapshot()
+        del snapshot["comparisons"][head_route]
+        self.assert_pending(snapshot)
+
+        snapshot = self.snapshot()
+        admitted = snapshot["runs"]["workflow_runs"][2]
+        admitted["head_sha"] = self.SQUASH
+        for job in snapshot["jobs"][f"runs/{RUN_ID}/attempts/1/jobs"]["jobs"]:
+            job["head_sha"] = self.SQUASH
+        result = self.readback(snapshot)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["sha"], self.SQUASH)
+
+    def test_incomplete_or_changed_attempt_evidence_stays_pending(self):
+        jobs_route = f"runs/{RUN_ID}/attempts/1/jobs"
+        for fault in ("partial runs", "partial jobs", "zero jobs", "other attempt", "other run",
+                      "other job SHA", "rerun", "superseded run", "other repository"):
+            with self.subTest(fault=fault):
+                snapshot = self.snapshot()
+                runs, jobs = snapshot["runs"], snapshot["jobs"][jobs_route]
+                admitted = runs["workflow_runs"][2]
+                if fault == "partial runs":
+                    runs["total_count"] += 1
+                elif fault == "partial jobs":
+                    jobs["total_count"] += 1
+                elif fault == "zero jobs":
+                    snapshot["jobs"][jobs_route] = page("jobs", [])
+                elif fault == "other attempt":
+                    jobs["jobs"][-1]["run_attempt"] = 2
+                elif fault == "other run":
+                    jobs["jobs"][-1]["run_id"] = 101
+                elif fault == "other job SHA":
+                    jobs["jobs"][-1]["head_sha"] = OTHER_SHA
+                elif fault == "rerun":
+                    admitted["run_attempt"] = 2
+                elif fault == "superseded run":
+                    runs["workflow_runs"][0].update(id=101, run_number=31, head_sha=SHA)
+                else:
+                    admitted["head_repository"] = {"full_name": REPO, "id": REPO_ID + 1}
+                self.assert_pending(snapshot)
+
+        self.assert_pending(b'{"runs":{},"runs":{}}')
 
 
 if __name__ == "__main__":

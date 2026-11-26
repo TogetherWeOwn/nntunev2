@@ -299,6 +299,7 @@ pub async fn billing_owned_test_entry(
                 let delivery = match path {
                     "/billing-webhook-ack-proof" => Delivery::LoseCommitAck,
                     "/billing-webhook-retry-proof" => Delivery::Retry,
+                    _ if req.url()?.query() == Some("conflict=refold") => Delivery::HistoryConflict,
                     _ => Delivery::HourlyOverlap,
                 };
                 return deliver(req, env, delivery).await;

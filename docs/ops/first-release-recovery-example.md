@@ -47,6 +47,25 @@ The next read reports `completed` with conclusion `success` for `102/1`.
 Record the status and continue with that attempt's recovery job, serving
 allocation and denial evidence before marking switch-off complete.
 
+## Follow an acknowledged recovery through environment protection
+
+In this separate pending example, run `102/1` is already recorded. Actions
+reports `waiting` and the `recover-worker` job for that exact attempt is
+waiting on the `production` Environment. Record **Waiting on production
+Environment protection** and keep the writer freeze. The current recovery
+operator continues observing `102/1`. Check that job's protection status in
+Actions. When it requires approval, the existing authorized Environment
+reviewer follows the usual approval rules on that run.
+
+The next read is the same attempt's job list
+(`GET /repos/example/fixture/actions/runs/102/attempts/1/jobs`). Verify the
+job's run ID and attempt. If `recover-worker` is queued, keep switch-off
+pending and read that job list again. When the exact job is `in_progress`,
+record the job start and continue reading its status and steps.
+Keep switch-off **Pending** until the recovery job, pinned serving allocation
+and denial readbacks agree. Keep the original run and attempt throughout,
+and continue with reads of that run without redispatching or rerunning it.
+
 ## Record the completed switch-off
 
 | Handoff field | Example entry |
@@ -77,3 +96,25 @@ The authorized probe read `503`, `Cache-Control: no-store` and
 `X-Robots-Tag: noindex` from the maintenance response. Private Access and
 direct API and media denials passed, including the existing-session and
 previously issued media-grant checks. The database and snapshot were preserved.
+
+## Record a cancelled health proof after the rollback write
+
+Both cases below use the same selected recovery run `102`, attempt `1`, and
+the successful `recover-worker` job `103` for rollout `101/1`. The recovery
+marker and provider readback confirm that the attempt wrote deployment
+`33333333-3333-4333-8333-333333333333`, serving the pinned maintenance version
+`22222222-2222-4222-8222-222222222222` at 100%. Keep those observations in the
+record. The private Access, API and media denials agree in both cases.
+
+The synthetic probe job below represents the operator's authorized maintenance
+readback. Match its evidence to the selected recovery and the serving
+deployment above.
+
+| Maintenance probe job | Switch-off verdict | Next action |
+| --- | --- | --- |
+| `cancelled` before a result was recorded | **Pending.** Maintenance health proof is missing. | Keep the writer freeze and reconcile the recorded recovery evidence. Repeat the authorized maintenance readback for serving deployment `33333333-3333-4333-8333-333333333333` before closing switch-off. |
+| `success` with `503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex` | **Complete.** The recorded recovery job, serving allocation and denial evidence agree. | Record the completed switch-off and retire the temporary release-window controls. |
+
+Keep run `102/1` and the observed write when the probe is cancelled. Do not
+dispatch another recovery or rerun the workflow from this evidence. Follow the
+[existing switch-off verification](../first-private-music-launch.md#switch-off-and-verify).

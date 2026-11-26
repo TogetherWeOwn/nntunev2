@@ -32,9 +32,10 @@ env:
   PNPM_VERSION: 10.34.7
 
 jobs:
+  # Trust the same accounts as the native Rust route. PR retries use GitHub-hosted.
   ci-commits:
     name: ci-commits
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.actor) && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.triggering_actor) && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.event.pull_request.user.login) && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404' && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-24.04' }}
     timeout-minutes: 5
     outputs:
       merge_sha: ${{ steps.commits.outputs.merge_sha }}
@@ -80,7 +81,7 @@ jobs:
     if: ${{ !cancelled() && needs.public-text.result == 'success' && needs.nzb-guard.result == 'success' }}
     outputs:
       skip: ${{ needs.ci-commits.outputs.skip }}
-    runs-on: ubuntu-latest
+    runs-on: &trusted-pr-runner ${{ github.event_name == 'pull_request' && github.run_attempt == 1 && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.actor) && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.triggering_actor) && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.event.pull_request.user.login) && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404' && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 3
     permissions:
       actions: read # Read exact-head results from the existing early PR workflows.
@@ -181,7 +182,7 @@ jobs:
   # in the nntune-subsonic tests in rust-test.
   fixture-check:
     name: fixture-check
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -198,7 +199,7 @@ jobs:
   # ci-ok's needs.
   nzb-guard:
     name: nzb-guard
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -222,7 +223,7 @@ jobs:
     needs: early
     if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'rust-wasm') }}
     name: rust check (wasm32)
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -273,7 +274,7 @@ jobs:
   # weakening the policy. Keep this job id in ci-ok's needs.
   cargo-deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -356,7 +357,7 @@ jobs:
   # allow-listed in the script until it is retired).
   public-text:
     name: public-text
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -440,7 +441,7 @@ jobs:
   # id in ci-ok's needs.
   cargo-pool:
     name: cargo-pool
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -495,7 +496,7 @@ jobs:
   # hosted runners can hit a five-minute job limit after all steps pass.
   binding-parity:
     name: binding-parity
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -529,7 +530,7 @@ jobs:
 
   migrations-gate:
     name: migrations-gate
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 10
     needs: ci-commits
     steps:
@@ -572,7 +573,7 @@ jobs:
     needs: early
     if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'test-nntp') }}
     name: test-nntp
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -747,7 +748,7 @@ jobs:
     needs: early
     if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'mb-import-etl') }}
     name: mb-import-etl
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -813,6 +814,8 @@ jobs:
         env:
           BOOTSTRAP_VERDICT: ${{ steps.bootstrap.outputs.verdict }}
         run: test "$BOOTSTRAP_VERDICT" = passed
+      - name: Compare inherited SELECT grant paths and offline Reader receipts
+        run: exec python3 -B .github/scripts/test_database_bootstrap_inherited_select.py
 
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,
   # to an empty throwaway database (twice, to prove idempotency) and runs
@@ -1169,7 +1172,7 @@ jobs:
     needs: early
     if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'rust-mb') }}
     name: rust (workers/mb)
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1196,7 +1199,7 @@ jobs:
   # id in ci-ok's needs.
   config-parity:
     name: config-parity
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1223,7 +1226,7 @@ jobs:
   # ci-ok's needs.
   dependabot-coverage:
     name: dependabot-coverage
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1294,7 +1297,7 @@ jobs:
     needs: early
     if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'rust-repair') }}
     name: rust (workers/repair)
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1361,7 +1364,7 @@ jobs:
     needs: early
     if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'rust-transcode') }}
     name: rust (workers/transcode)
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1493,7 +1496,7 @@ jobs:
   # Keep this job id in ci-ok's needs.
   cache-policy:
     name: cache-policy
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1522,7 +1525,7 @@ jobs:
   # in ci-ok's needs.
   production-secrets-shape:
     name: production-secrets-shape
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1551,7 +1554,7 @@ jobs:
   # Keep this job id in ci-ok's needs.
   release-proof:
     name: release-proof
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1569,6 +1572,8 @@ jobs:
         run: node --test ci/test-production-maintenance.mjs ci/test-production-switch-off.mjs
       - name: Unit-test candidate staging admission (offline synthetic evidence only)
         run: python3 ci/test_staging_admission.py
+      - name: Test ordinary API build artifact verification offline
+        run: python3 -B ci/test_staging_api_candidate.py
       - name: Unit-test the private launch observation record (offline)
         run: python3 ci/test_production_observation.py
       - name: Unit-test staging Worker target and submission comparison (offline)
@@ -1603,7 +1608,7 @@ jobs:
   # Keep this job id in ci-ok's needs.
   docs-links:
     name: docs-links
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     needs: ci-commits
     env:
@@ -1796,7 +1801,7 @@ jobs:
     needs: early
     if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'web-checks') }}
     name: web-checks
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 30
     defaults:
       run:
@@ -1838,7 +1843,7 @@ jobs:
     needs: early
     if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'web-build') }}
     name: web-build
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 15
     defaults:
       run:
@@ -2061,7 +2066,7 @@ jobs:
     needs: early
     if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'history-fixture') }}
     name: history-fixture
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     container: mcr.microsoft.com/playwright:v1.65.1-noble@sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579
     timeout-minutes: 15
     defaults:
@@ -2109,7 +2114,7 @@ jobs:
     needs: early
     if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'web-a11y') }}
     name: web-a11y
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     container: mcr.microsoft.com/playwright:v1.65.1-noble@sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579
     timeout-minutes: 15
     defaults:
@@ -2150,7 +2155,7 @@ jobs:
   # no Cloudflare API, network, or deploy. Keep this job id in ci-ok's needs.
   tail-projection:
     name: tail-projection
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2430,6 +2435,26 @@ jobs:
           mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
           test "${#wranglers[@]}" -eq 1
           python3 -I .github/scripts/check_worker_upload.py --wrangler "${wranglers[0]}"
+      # The staging writer still builds from its checkout. Publish the
+      # ordinary build for offline verification on the existing CI runner.
+      - name: Prepare ordinary staging API candidate
+        id: api-candidate
+        if: >-
+          ${{ github.repository == 'TogetherWeOwn/nntunev2' && github.event_name == 'push' &&
+              github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha &&
+              github.run_attempt == 1 }}
+        continue-on-error: true
+        run: python3 -B ci/staging_api_candidate.py
+      - name: Upload ordinary staging API candidate
+        if: steps.api-candidate.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.api-candidate.outputs.name }}
+          path: ${{ steps.api-candidate.outputs.path }}
+          retention-days: 2
+          compression-level: 1
+          if-no-files-found: error
       - name: Upload Worker build logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -2442,7 +2467,7 @@ jobs:
   changed-lines-mutation:
     name: changed-lines-mutation
     needs: ci-commits
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2470,7 +2495,7 @@ jobs:
     name: ci-ok
     needs: [ci-commits, early, rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, database-bootstrap-fixture, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, web-checks, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds, changed-lines-mutation]
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - run: |

@@ -501,6 +501,21 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         self.assertIn("git diff --exit-code -- ../../Cargo.lock", build)
         self.assertIn("check_worker_upload.py --wrangler", items[prepare + 2])
 
+    def test_candidate_upload_uses_verified_preparation_outputs(self):
+        ci = job((ROOT / ".github/workflows/ci.yml").read_text(), "worker-release-builds")
+        items = steps(ci)
+        dry_run = next(i for i, s in enumerate(items) if "check_worker_upload.py --wrangler" in s)
+        prepare, upload = items[dry_run + 1:dry_run + 3]
+        self.assertIn("id: api-candidate\n", prepare)
+        self.assertIn("run: python3 -B ci/staging_api_candidate.py\n", prepare)
+        self.assertIn("github.event_name == 'push'", prepare)
+        self.assertIn("github.ref == 'refs/heads/main' && github.ref_protected", prepare)
+        self.assertIn("github.run_attempt == 1", prepare)
+        self.assertIn("if: steps.api-candidate.outcome == 'success'\n", upload)
+        self.assertIn("uses: actions/upload-artifact@", upload)
+        self.assertIn("name: ${{ steps.api-candidate.outputs.name }}\n", upload)
+        self.assertIn("path: ${{ steps.api-candidate.outputs.path }}\n", upload)
+
 
 if __name__ == "__main__":
     unittest.main()

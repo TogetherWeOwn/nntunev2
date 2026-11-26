@@ -64,6 +64,7 @@ jobs:
             "$probe_dir/target/wasm32-unknown-unknown/debug/nntune_ingest.wasm"
           git diff --exit-code -- workers/ingest/Cargo.lock
       - name: Run the bound disposable provider probe
+        id: provider_probe
         env:
           PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH: >-
             ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT != '' &&
@@ -78,3 +79,14 @@ jobs:
         run: |
           exec timeout -k 2s 30s node .github/scripts/private_trial_provider_preflight.cjs \
             --provider-dispatch "$RUNNER_TEMP/trial-provider-preflight/nntune_ingest.js" 2>/dev/null
+      - name: Report provider preflight outcome
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          PROBE_OUTCOME: ${{ steps.provider_probe.outcome }}
+        run: |
+          if [[ "$PROBE_OUTCOME" == success ]]; then
+            echo 'Private staging fixture provider preflight: qualified.'
+          else
+            echo 'Private staging fixture provider preflight: incomplete.'
+          fi >> "$GITHUB_STEP_SUMMARY"

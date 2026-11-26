@@ -344,6 +344,24 @@ It is included in the existing required `release-proof` CI job. The production
 workflow's old inline job checks are only preliminary guards, separately covered
 by `e2e/tests/deploy-production.spec.ts`; they cannot bypass the receipt verifier.
 
+### Automatic push rejected before jobs
+
+For an offline rehearsal, run `python3 -I ci/staging_admission.py
+diagnose-terminal-push <pinned-sha> < evidence.json`. The JSON object has `run`,
+`jobs` (the attempt's `total_count` and `jobs`), and `annotations` (an array of
+workflow annotations). Use the synthetic fixture to pair all three inputs for
+the same attempt. The diagnostic relies on that pairing because the annotation
+rows carry no run or attempt ID.
+
+A failed first-attempt main push with zero jobs and the `deploy-staging-main`
+queue-full annotation leaves exact-build qualification pending. The next eligible
+automatic staging admission can provide evidence for the build it runs. A later
+push with a different SHA needs its own qualification. When the same pinned
+attempt instead has a failed full E2E journey step, inspect that job and return
+to candidate qualification. Both diagnostics exit unsuccessfully and emit no
+admission pins. The synthetic successful control for the same source still
+verifies through the receipt reader.
+
 AGENTS.md “Clean-room, YouTube and MetaBrainz guardrails”: this change handles
 admission metadata only; no UI, playback, catalogue ingestion or cover-art rights
 behavior changes. No per-lane lock is represented as a shared reservation.

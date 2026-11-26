@@ -3,6 +3,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nntune_core::{media_envelope::EnvelopeContext, s3_locator::S3MediaMetadata};
+use sha2::{Digest, Sha256};
 use tokio_postgres::{error::SqlState, types::Type, Client, IsolationLevel, Transaction};
 
 use super::{
@@ -41,6 +42,7 @@ pub struct DurableUpload<'a> {
     usable_until: SystemTime,
     context: &'a EnvelopeContext,
     session: String,
+    completion_marker: String,
 }
 
 impl<'a> DurableUpload<'a> {
@@ -57,6 +59,7 @@ impl<'a> DurableUpload<'a> {
             id: target.upload_id.to_owned(),
             context,
             session: session.to_owned(),
+            completion_marker: completion_marker("fixture-lease"),
             usable_until,
         }
     }
@@ -73,6 +76,10 @@ impl<'a> DurableUpload<'a> {
         self.usable_until
     }
 
+    pub(super) fn completion_marker(&self) -> &str {
+        &self.completion_marker
+    }
+
     pub(super) fn matches(&self, binding: ResumeBinding<'_>, context: &EnvelopeContext) -> bool {
         self.target() == binding.plan.target
             && self.session == binding.session
@@ -80,6 +87,16 @@ impl<'a> DurableUpload<'a> {
             && self.context.header == context.header
             && self.context.plaintext_len == context.plaintext_len
     }
+}
+
+pub(super) fn completion_marker(lease: &str) -> String {
+    // Bind provider metadata to this write lease without sending the lease ID.
+    hex::encode(
+        Sha256::new()
+            .chain_update(b"nntune-s3-completion\0")
+            .chain_update(lease)
+            .finalize(),
+    )
 }
 
 /// Commit the scoped object claim and provider ID before returning a target.
@@ -91,7 +108,7 @@ pub async fn handoff<'a>(
     context: &'a EnvelopeContext,
     target: (&'a str, &'a str),
     usable_until: SystemTime,
-    initiate: impl AsyncFnOnce(SystemTime) -> Result<InitiatedUpload<'a>, ()>,
+    initiate: impl AsyncFnOnce(SystemTime, &str) -> Result<InitiatedUpload<'a>, ()>,
 ) -> Result<DurableUpload<'a>, HandoffError> {
     let (bucket, key) = target;
     let [_, environment, library, object, generation, configuration] = context.identities;
@@ -103,6 +120,7 @@ pub async fn handoff<'a>(
     let object = uuid(&object);
     let configuration_id = uuid(&configuration);
     let length = i64::try_from(context.plaintext_len).map_err(|_| Refused)?;
+    let marker = completion_marker(lease);
     let lock = async |tx: &Transaction<'_>| {
         let row = tx
             .query_typed_opt(
@@ -149,6 +167,7 @@ pub async fn handoff<'a>(
             usable_until,
             context,
             session: scope.session.to_owned(),
+            completion_marker: marker.clone(),
         })
     };
 
@@ -177,7 +196,7 @@ pub async fn handoff<'a>(
 
     // A committed claim is exclusive even if this future is dropped, the
     // response is lost, the lease is consumed, or the second commit fails.
-    let receipt = initiate(deadline).await.map_err(|()| Pending)?;
+    let receipt = initiate(deadline, &marker).await.map_err(|()| Pending)?;
     let target = receipt.target();
     if receipt.configuration() != configuration || target.bucket != bucket || target.key != key {
         return Err(Pending);

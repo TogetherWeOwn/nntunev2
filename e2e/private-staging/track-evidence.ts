@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-type RunIdentity = { build_sha: string; run_id: string; run_attempt: string };
+export type RunIdentity = { build_sha: string; run_id: string; run_attempt: string };
 
 export function privateRunIdentity(buildSha: string, runId = '', runAttempt = ''): RunIdentity {
   const decimal = /^[1-9][0-9]{0,15}$/;
