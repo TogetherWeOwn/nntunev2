@@ -97,11 +97,13 @@ for (const [scenario, overriddenHeaders, failure] of [
 ]) {
   test(`recovers a lost completion response with ${scenario}`, async (t) => {
     const stillCommitting = scenario === 'completion still in flight';
+    const stalled = stillCommitting || scenario === 'stalled response body';
     const operations = [];
     let marker;
     let partChecksum;
     let committed;
     let stalledSignal;
+    let recoveryResponse;
     t.mock.method(globalThis, 'fetch', async (request) => {
       const query = new URL(request.url).search.slice(1);
       operations.push(`${request.method} ${query}`);
@@ -130,18 +132,21 @@ for (const [scenario, overriddenHeaders, failure] of [
             'x-amz-checksum-sha256': /<ChecksumSHA256>([^<]+)/.exec(receipt)[1],
           };
         }
-        if (stillCommitting || scenario === 'stalled response body') {
+        if (stalled) {
           stalledSignal = request.signal;
-          return new Response(new ReadableStream(), { headers: { 'x-amz-version-id': version } });
+          return new Response(new ReadableStream(), {
+            headers: committed ? { 'x-amz-version-id': version } : {},
+          });
         }
         throw new Error('completion response lost after storing the version');
       }
       if (query === '') {
-        if (stalledSignal) assert.equal(stalledSignal.aborted, true);
+        if (stalled) assert.equal(stalledSignal?.aborted, true);
         await verifySignedRequest(request, 'HEAD', '', { 'x-amz-checksum-mode': 'ENABLED' });
-        if (stillCommitting) return new Response(null, { status: 404 });
-        assert.ok(committed);
-        return new Response(null, { headers: { ...committed, ...overriddenHeaders } });
+        recoveryResponse = stillCommitting
+          ? new Response(null, { status: 404 })
+          : new Response(null, { headers: { ...committed, ...overriddenHeaders } });
+        return recoveryResponse;
       }
       await verifySignedRequest(request, 'HEAD', versionQuery, {});
       return new Response(null, { headers: committed });
@@ -153,6 +158,7 @@ for (const [scenario, overriddenHeaders, failure] of [
       assert.equal(await result, version);
     }
     assert.equal(Boolean(committed), !stillCommitting);
+    assert.equal(recoveryResponse?.status, stillCommitting ? 404 : 200);
     assert.deepEqual(operations, [
       'POST uploads=', `PUT partNumber=1&${initiatedQuery}`, `POST ${initiatedQuery}`, 'HEAD ',
       ...(failure ? [] : [`HEAD ${versionQuery}`]),
