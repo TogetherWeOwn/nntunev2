@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { s3_completion_test: complete, s3_fixture_retirement_test: retire } = require('./ingest_wasm.cjs');
 const {
-  authorization, bucket, checksum, completionReceipt, initiatedId, initiatedQuery,
+  authorization, bucket, checksum, completionMarker, completionReceipt, initiatedId, initiatedQuery,
   initiationHeaders, initiationReceipt, mapId, mediaKey, sha256, sidecarKey, uploadQuery,
 } = require('./s3_fixture_protocol.cjs');
 
@@ -85,6 +85,68 @@ test('signs the exact multipart POST once and collects its version and body', as
   assert.equal(await complete('success'), version);
   assert.equal(fetch.mock.callCount(), 1);
 });
+
+for (const [scenario, overriddenHeaders, failure] of [
+  ['matching HEAD', {}, null],
+  ['foreign initiation', { [completionMarker]: 'different-attempt' }, transportFailure],
+  ['different checksum', { 'x-amz-checksum-sha256': 'different-checksum' }, transportFailure],
+  ['wrong length', { 'content-length': String(ciphertextLength + 1) }, transportFailure],
+  ['null version', { 'x-amz-version-id': 'null' }, 'Unconfirmed(Some(CompletionVersion))'],
+]) {
+  test(`recovers a lost completion response with ${scenario}`, async (t) => {
+    const operations = [];
+    let marker;
+    let partChecksum;
+    let committed;
+    t.mock.method(globalThis, 'fetch', async (request) => {
+      const query = new URL(request.url).search.slice(1);
+      operations.push(`${request.method} ${query}`);
+      if (request.method === 'POST' && query === 'uploads=') {
+        await verifySignedRequest(request, 'POST', 'uploads=', initiationHeaders);
+        marker = request.headers.get(completionMarker);
+        return new Response(initiationReceipt());
+      }
+      if (request.method === 'PUT') {
+        const body = await verifySignedRequest(request, 'PUT', `partNumber=1&${initiatedQuery}`);
+        partChecksum = checksum(body);
+        return new Response(null, {
+          headers: { etag: '"fixture-part"', 'x-amz-checksum-sha256': partChecksum },
+        });
+      }
+      if (request.method === 'POST') {
+        assert.equal(committed, undefined, 'completion was sent twice');
+        const manifest = (await verifySignedRequest(request, 'POST', initiatedQuery)).toString();
+        const receipt = completionReceipt(manifest, 'fixture-part');
+        assert.ok(manifest.includes(`<ChecksumSHA256>${partChecksum}</ChecksumSHA256>`));
+        committed = {
+          ...headHeaders,
+          [completionMarker]: marker,
+          'x-amz-checksum-type': 'COMPOSITE',
+          'x-amz-checksum-sha256': /<ChecksumSHA256>([^<]+)/.exec(receipt)[1],
+        };
+        throw new Error('completion response lost after storing the version');
+      }
+      assert.ok(committed);
+      if (query === '') {
+        await verifySignedRequest(request, 'HEAD', '', { 'x-amz-checksum-mode': 'ENABLED' });
+        return new Response(null, { headers: { ...committed, ...overriddenHeaders } });
+      }
+      await verifySignedRequest(request, 'HEAD', versionQuery, {});
+      return new Response(null, { headers: committed });
+    });
+    const result = complete('init-completion-response-lost');
+    if (failure) {
+      await assert.rejects(result, rejectedWith(failure));
+    } else {
+      assert.equal(await result, version);
+    }
+    assert.ok(committed, 'provider never committed the upload');
+    assert.deepEqual(operations, [
+      'POST uploads=', `PUT partNumber=1&${initiatedQuery}`, `POST ${initiatedQuery}`, 'HEAD ',
+      ...(failure ? [] : [`HEAD ${versionQuery}`]),
+    ]);
+  });
+}
 
 test('signs the ciphertext part and accepts only its matching checksum and ETag', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', async (request) => {

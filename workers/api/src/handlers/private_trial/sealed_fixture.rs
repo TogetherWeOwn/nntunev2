@@ -210,7 +210,7 @@ impl SealedFixture {
             SessionCompletion::prepare(binding, &self.context, vec![uploaded], &checkpoint)
                 .map_err(|_| Unconfirmed)?;
         let completed = sender
-            .complete(completion, until)
+            .complete_durable(upload, completion)
             .await
             .map_err(|_| Unconfirmed)?;
         sender

@@ -13,7 +13,12 @@ const mac = (key, text) => createHmac('sha256', key).update(text).digest();
 const uploadQuery = 'uploadId=fixture%2B%2F%3D%3F';
 const initiatedId = 'new+/=?';
 const initiatedQuery = 'uploadId=new%2B%2F%3D%3F';
-const initiationHeaders = { 'x-amz-checksum-algorithm': 'SHA256', 'x-amz-checksum-type': 'COMPOSITE' };
+const completionMarker = 'x-amz-meta-nntune-completion';
+const initiationHeaders = {
+  'x-amz-checksum-algorithm': 'SHA256',
+  'x-amz-checksum-type': 'COMPOSITE',
+  [completionMarker]: sha256('nntune-s3-completion\0fixture-lease'),
+};
 
 function initiationReceipt(observedBucket = bucket, observedKey = mediaKey, uploadId = initiatedId) {
   return '<?xml version="1.0" encoding="UTF-8"?>'
@@ -48,6 +53,6 @@ function authorization(method, path, query, fields, access, secret, region) {
 }
 
 module.exports = {
-  authorization, bucket, checksum, completionReceipt, initiatedId, initiatedQuery,
+  authorization, bucket, checksum, completionMarker, completionReceipt, initiatedId, initiatedQuery,
   initiationHeaders, initiationReceipt, mapId, mediaKey, sha256, sidecarKey, uploadQuery,
 };

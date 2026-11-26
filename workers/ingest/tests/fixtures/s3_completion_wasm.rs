@@ -175,6 +175,7 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         _ => 2000,
     };
     let until = now() + Duration::from_millis(budget);
+    let recover_completion = mode == "init-completion-response-lost";
     if mode.starts_with("reconcile") {
         let id = if mode == "reconcile-replay" {
             "new+/=?".into()
@@ -197,11 +198,17 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
             &key
         };
         let upload = sender
-            .initiate(&context, bucket, requested_key, until)
+            .initiate(
+                &context,
+                bucket,
+                requested_key,
+                &super::session_upload::completion_marker("fixture-lease"),
+                until,
+            )
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
         assert_eq!(upload.configuration(), configuration);
-        if mode != "init-upload-completion-head" && !readback {
+        if mode != "init-upload-completion-head" && !readback && !recover_completion {
             return Ok(upload.target().upload_id.into());
         }
         Some(upload)
@@ -324,10 +331,13 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
     };
     let completion =
         SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint).unwrap();
-    let completed = sender
-        .complete(completion, until)
-        .await
-        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let completed = if recover_completion {
+        let durable = DurableUpload::new(target, &context, binding.session, until);
+        sender.complete_durable(&durable, completion).await
+    } else {
+        sender.complete(completion, until).await
+    }
+    .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     if mode == "head-context" {
         context.identities[1] = id(8);
     }
