@@ -114,8 +114,14 @@ class QueueReadbackTests(unittest.TestCase):
         sha = "a" * 40
         candidate = {"run_id": 2, "run_attempt": 1, "head_sha": sha}
         approval = candidate | {"environment": "staging", "state": "approved"}
-        older, current, successor = run(1, head_sha=sha), run(2, head_sha=sha), run(3)
-        evidence = snapshot(older, current, successor, jobs={1: [], 2: [], 3: []})
+        older = run(1, head_sha=sha)
+        current, successor = run(2, head_sha=sha, status="queued"), run(3)
+        gate = job(2, name="gate", head_sha=sha)
+        evidence = snapshot(older, current, successor, jobs={1: [], 2: [gate], 3: []})
+        code, report = self.invoke(evidence)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["runs"][1]["disposition"], "keep_existing_jobs")
+
         evidence["approval_candidate"] = candidate
 
         code, report = self.invoke(evidence | {"approval": approval})
@@ -125,8 +131,13 @@ class QueueReadbackTests(unittest.TestCase):
         self.assertEqual([row["disposition"] for row in report["runs"]],
                          ["superseded", "keep_approved", "keep_newest_eligible"])
 
-        for stale in (approval | {"run_id": 1}, approval | {"head_sha": "b" * 40},
-                      approval | {"run_attempt": True}):
+        # The earlier approved run has finished and is absent from the active pages.
+        earlier_approval = approval | {"run_id": older["id"]}
+        after_completion = snapshot(current, successor, jobs={2: [gate], 3: []})
+        self.assert_indeterminate(after_completion | {"approval_candidate": candidate,
+                                                       "approval": earlier_approval}, "--pin-sha", sha)
+
+        for stale in (approval | {"head_sha": "b" * 40}, approval | {"run_attempt": True}):
             with self.subTest(approval=stale):
                 self.assert_indeterminate(evidence | {"approval": stale}, "--pin-sha", sha)
 

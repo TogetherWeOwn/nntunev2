@@ -72,7 +72,8 @@ decision cannot be attributed to the attempt, omit `approval` and keep the
 preview indeterminate. An operator pin only preserves the named run or SHA.
 
 When both records match the current inventory, `matched_approval` reports the
-run ID, attempt and SHA and the run gets `keep_approved`. An earlier run with
-the same SHA or an earlier attempt of the same run yields `indeterminate`
-without any dispositions, even if a pin is supplied. The CLI compares the
-supplied records offline. Environment authorization stays with GitHub.
+run ID, attempt and SHA and the run gets `keep_approved`. If the approval names
+an earlier run with the same SHA or an earlier attempt than the selected one,
+the report is `indeterminate` without any dispositions, even with a pin. The
+CLI compares the supplied records offline. Environment authorization stays
+with GitHub.
