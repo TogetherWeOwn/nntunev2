@@ -261,6 +261,7 @@ def check_reader_privilege_binding():
     mixed = ["UPDATE (id) ON fixture_catalog.required", "UPDATE ON LARGE OBJECT 900001"]
     check("readback names mixed table grant forms", record | {"reader_privileges": over | {"extra_grants": mixed}},
           f"pending (extra-grant: {', '.join(mixed)})")
+    check("extra grant from another inventory", record | {"reader_privileges": over | {"inventory_sha256": "b" * 64}})
     for case, override in {
         "extra grant beside a passed result": {"result": "passed"},
         "extra grant for another reader": {"reader_oid": 17003},

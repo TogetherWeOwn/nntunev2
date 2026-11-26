@@ -90,7 +90,7 @@ def reader_evidence_verdict(raw):
         if (isinstance(extra, list) and extra
                 and all(valid_extra_grant(grant) for grant in extra)
                 and len(set(extra)) == len(extra)
-                and matches_pins(privileges, review | {"inventory_sha256": covered_digest, "result": "failed"})):
+                and matches_pins(privileges, review | {"result": "failed"})):
             return f"pending (extra-grant: {', '.join(extra)})"
         return "pending"
     if not matches_pins(privileges, review | {"inventory_sha256": covered_digest, "result": "passed"}):
