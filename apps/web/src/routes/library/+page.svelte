@@ -384,6 +384,13 @@
 				libraryList ? document.activeElement : null;
 			const focusedTrackControl = active && libraryList?.contains(active) && active instanceof HTMLElement
 				? active : null;
+			// The old listing stays interactive while Refresh is pending. Read focus
+			// at publication, since the listener can tab into a group in the meantime.
+			const focusedGroup = authoritative && !authBoundary && !state.loadError && !state.libraryUnavailable &&
+				groupByArtist && typeof document !== 'undefined'
+				? document.activeElement?.closest('.nt-artist-group') : null;
+			const focusedId = focusedGroup ? focusedLibraryRowId() : null;
+			const priorRows = focusedId === null ? [] : renderedItems.map((track) => track.id);
 			draggedLibraryItem = null;
 			if (authoritative && !authBoundary && !state.loadError && !state.libraryUnavailable) {
 				preserveTrackFocus(isCurrent);
@@ -485,6 +492,14 @@
 						focusedTrackControl.focus();
 					}
 				});
+			}
+			if (focusedGroup && focusedId !== null) {
+				const { nextId, previousId } = selectedRowRecoveryIds(
+					priorRows, focusedId, renderedItems.map((track) => track.id)
+				);
+				focusAfterLibraryRowRemoval(nextId, previousId, () =>
+					isCurrent() && showingTracks && groupByArtist && !focusedGroup.isConnected
+				);
 			}
 			// Same-account refresh completion: the panel may have remounted
 			// (branch swap), so hand focus back to the filter input the user
@@ -1185,16 +1200,18 @@
 	}
 
 	/**
-	 * After a selected row unmounts, land focus on the checkbox of the next
+	 * After a library row unmounts, land focus on the checkbox of the next
 	 * surviving displayed row, else the previous one, else the Show
 	 * control. Runs after rendering and only when the removed control took
 	 * focus with it (active element fell back to the body), so controls
 	 * that remain mounted — including the Clear selection button itself —
 	 * and any focus the user has already moved keep it.
 	 */
-	function focusAfterSelectedRowRemoval(nextId: string | null, previousId: string | null): void {
+	function focusAfterLibraryRowRemoval(
+		nextId: string | null, previousId: string | null, canRecover?: () => boolean
+	): void {
 		void tick().then(() => {
-			if (typeof document === 'undefined') return;
+			if (typeof document === 'undefined' || canRecover?.() === false) return;
 			const active = document.activeElement;
 			if (active && active !== document.body) return;
 			for (const id of [nextId, previousId]) {
@@ -1257,7 +1274,7 @@
 		const displayedIds = renderedItems.map((track) => track.id);
 		selectedIds = toggleSelected(selectedIds, id);
 		const { nextId, previousId } = selectedRowRecoveryIds(displayedIds, id, selectedIds);
-		focusAfterSelectedRowRemoval(nextId, previousId);
+		focusAfterLibraryRowRemoval(nextId, previousId);
 	}
 
 	function selectDisplayedIds(): void {
@@ -1278,7 +1295,7 @@
 		selectedIds = clearSelection(selectedIds);
 		rangeAnchorId = null;
 		if (hadSelection) announceBrowse('Selection cleared');
-		if (focusLeavesWithRows || focusLeavesWithToolbar) focusAfterSelectedRowRemoval(returnId, null);
+		if (focusLeavesWithRows || focusLeavesWithToolbar) focusAfterLibraryRowRemoval(returnId, null);
 	}
 
 	function appendSelectedIds(): void {
@@ -1371,7 +1388,7 @@
 		});
 		const focusedId = focusedLibraryRowId();
 		if (!queued && view === 'favorites' && remove && focusedId !== null && targets.has(focusedId)) {
-			focusAfterSelectedRowRemoval(null, null);
+			focusAfterLibraryRowRemoval(null, null);
 		}
 	}
 
@@ -1474,7 +1491,7 @@
 			const surviving = new Set(renderedItems.map((item) => item.id));
 			const next = displayedIds.slice(index + 1).find((id) => surviving.has(id)) ?? null;
 			const previous = displayedIds.slice(0, index).reverse().find((id) => surviving.has(id)) ?? null;
-			focusAfterSelectedRowRemoval(next, previous);
+			focusAfterLibraryRowRemoval(next, previous);
 		}, ...point };
 	}
 
