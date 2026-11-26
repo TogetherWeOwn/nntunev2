@@ -248,6 +248,10 @@ def check_reader_privilege_binding():
     check("missing privilege evidence", {"review": review, "inventory": inventory})
     check("duplicate privilege object", b'{"reader_privileges": null, ' + json.dumps(record).encode()[1:])
     check("oversized record", json.dumps(record).encode().ljust(4097))
+
+    unscoped_inventory = inventory.copy()
+    del unscoped_inventory["database_oid"]
+    check("matching inventory digest without database OID", record | {"inventory": unscoped_inventory})
     check("privileges match the approved reader and inventory", record, "consistent")
 
 
