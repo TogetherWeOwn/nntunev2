@@ -1,7 +1,8 @@
 use super::*;
-use nntune_core::digest_enrollment::EnrollmentOutput;
+use nntune_core::{digest_enrollment::EnrollmentOutput, media::Header};
 use nntune_ingest::multipart::{
-    resume_checkpoint::matches_checkpoint, UploadPart, UploadedPart, PART_BYTES,
+    resume_checkpoint::matches_checkpoint, session_upload::DurableUpload, UploadPart, UploadedPart,
+    PART_BYTES,
 };
 use std::collections::BTreeMap;
 
@@ -61,23 +62,18 @@ pub(super) fn acknowledge<'a>(
     )
 }
 
-pub(super) async fn resume<'a>(
-    upload_parts: &[UploadPart<'a>],
-    sealed: &[EnrollmentOutput],
-    binding: ResumeBinding<'a>,
-    reconnect: impl AsyncFnOnce(),
-) -> (Vec<UploadedPart<'a>>, Vec<CheckpointPart<'static>>, Vec<u8>) {
-    let [first, middle, last] = upload_parts else {
-        panic!("expected three provider parts");
-    };
-    let mut stored = BTreeMap::<u32, (Vec<u8>, CheckpointPart<'static>)>::new();
-    let mut requests = Vec::new();
-    let (original_target, _, _, _) = last.request();
-    let mut put = |part: &UploadPart<'a>| {
+struct FixtureProvider<'a> {
+    target: UploadTarget<'a>,
+    stored: BTreeMap<u32, (Vec<u8>, CheckpointPart<'static>)>,
+    requests: Vec<u32>,
+}
+
+impl FixtureProvider<'_> {
+    fn put<'a>(&mut self, part: &UploadPart<'a>) -> (UploadedPart<'a>, CheckpointPart<'static>) {
         let (target, number, bytes, _) = part.request();
-        assert!(target == original_target);
-        requests.push(number);
-        if let Some((previous, confirmation)) = stored.get_mut(&number) {
+        assert!(target == self.target);
+        self.requests.push(number);
+        if let Some((previous, confirmation)) = self.stored.get_mut(&number) {
             assert_eq!(number, 3, "resume sent a committed neighbor");
             assert_eq!(bytes, previous.as_slice(), "retry changed ciphertext");
             let checksum = STANDARD.encode(confirmation.digest);
@@ -88,18 +84,37 @@ pub(super) async fn resume<'a>(
             (ack, *confirmation)
         } else {
             let (ack, confirmation) = acknowledge(part, ETAGS[number as usize - 1]);
-            stored.insert(number, (bytes.to_vec(), confirmation));
+            self.stored.insert(number, (bytes.to_vec(), confirmation));
             (ack, confirmation)
         }
+    }
+}
+
+pub(super) async fn resume<'a>(
+    upload_parts: &[UploadPart<'a>],
+    sealed: &[EnrollmentOutput],
+    binding: ResumeBinding<'a>,
+    (header, length): (Header, u64),
+    reconnect: impl AsyncFnOnce() -> DurableUpload<'a>,
+) -> (Vec<UploadedPart<'a>>, Vec<CheckpointPart<'static>>, Vec<u8>) {
+    let [first, middle, last] = upload_parts else {
+        panic!("expected three provider parts");
+    };
+    let mut provider = FixtureProvider {
+        target: last.request().0,
+        stored: BTreeMap::new(),
+        requests: Vec::new(),
     };
 
     // The fixture stands in for the trusted receipt checkpoint. PostgreSQL
     // holds the upload identity and lease and records progress at completion.
-    let (mut receipts, mut saved): (Vec<_>, Vec<_>) = [put(first), put(middle)].into_iter().unzip();
-    let (late_ack, _) = put(last);
+    let (mut receipts, mut saved): (Vec<_>, Vec<_>) = [provider.put(first), provider.put(middle)]
+        .into_iter()
+        .unzip();
+    let (late_ack, _) = provider.put(last);
     receipts.push(late_ack);
 
-    reconnect().await;
+    let recovered = reconnect().await;
 
     let checkpoint = ResumeCheckpoint {
         binding,
@@ -127,11 +142,14 @@ pub(super) async fn resume<'a>(
 
     // Rebuild requests from retained sealed chunks after reconnect. The fixture
     // uses the verified checkpoint prefix to select the provider retry.
-    let rebuilt = partition(binding.plan, sealed);
+    let retry_plan = Plan::new(recovered.target(), header, length).unwrap();
+    assert!(retry_plan == binding.plan);
+    let rebuilt = partition(retry_plan, sealed);
     let [missing] = &rebuilt[checkpoint.parts.len()..] else {
         panic!("resume must only send the uncommitted part");
     };
-    let (retry_ack, confirmed) = put(missing);
+    assert!(SystemTime::now() < recovered.usable_until());
+    let (_, confirmed) = provider.put(missing);
     saved.push(confirmed);
 
     // The late original acknowledgement can stand in for the retry response
@@ -140,11 +158,8 @@ pub(super) async fn resume<'a>(
         binding,
         parts: &saved,
     };
-    receipts.push(retry_ack);
-    assert!(matches_checkpoint(binding, &receipts, &checkpoint));
     let mut conflicting = saved.clone();
     conflicting[2].etag = "\"different-last\"";
-    receipts.pop().unwrap();
     receipts.push(late_ack);
     assert!(matches_checkpoint(binding, &receipts, &checkpoint,));
     assert!(!matches_checkpoint(
@@ -155,8 +170,12 @@ pub(super) async fn resume<'a>(
             parts: &conflicting
         },
     ));
-    assert_eq!(requests, [1, 2, 3, 3]);
-    let ciphertext = stored.into_values().flat_map(|(bytes, _)| bytes).collect();
+    assert_eq!(provider.requests, [1, 2, 3, 3]);
+    let ciphertext = provider
+        .stored
+        .into_values()
+        .flat_map(|(bytes, _)| bytes)
+        .collect();
     (receipts, saved, ciphertext)
 }
 

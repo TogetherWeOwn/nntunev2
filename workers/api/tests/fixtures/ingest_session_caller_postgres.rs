@@ -587,6 +587,7 @@ async fn prove_attempt(
             &upload_parts,
             &sealed,
             binding,
+            (header, length),
             async || {
                 let before = pending_part::reservation(observer, &sid).await;
                 let mut reconnect = connect(WRITER).await;
@@ -625,6 +626,7 @@ async fn prove_attempt(
                     opened.durable_target().usable_until()
                 );
                 assert_eq!(pending_part::reservation(observer, &sid).await, before);
+                recovered
             },
         ))
         .await
