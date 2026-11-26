@@ -160,7 +160,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				}
 				const rateTarget = { audio, matches: matchesAttempt };
 				const liveRate = speed.read(rateTarget);
-				const seconds = recoverPosition ? get(absoluteSeek).elapsed : 0;
+				const seconds = recoverPosition ? get(absoluteSeek).elapsed || audio.currentTime : 0;
 				const restore = trackId && Number.isFinite(seconds) && seconds > 0 ?
 					captureShareSeek(++positionIntent, { trackId, seconds }, matches) : undefined;
 				if (!matchesAttempt()) return;
