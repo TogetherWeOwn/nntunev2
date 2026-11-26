@@ -865,27 +865,31 @@ class VerifyTests(Base):
     def test_same_source_competing_deploy_requires_fresh_ordinary_receipt(self):
         # Check a synthetic write between observations and a write after the
         # journey releases the workflow lock, before the receipt is consumed.
-        for completed_at in (-2.5, 7):
-            with self.subTest(completed_at=completed_at):
+        for api_done in (-2.5, 7):
+            with self.subTest(api_done=api_done):
                 world = World()
                 other_id = RUN_ID - 1  # Keep the newer run as the candidate.
                 other = dict(world.run, id=other_id, created_at=iso(-30),
-                             updated_at=iso(completed_at + 1), conclusion="failure")
+                             updated_at=iso(api_done + 1), conclusion="failure")
                 world.runs.append(other)
                 schema = "Verify actual staging migration schema (read-only)"
-                deploy = sa.DEPLOY_STEPS["staging-api"]
-                api = dict(world.job("staging-api", completed_at, started=completed_at - 0.25),
+                api = dict(world.job("staging-api", api_done, started=api_done - 0.25),
                            id=201, run_id=other_id, conclusion="failure",
-                           steps=[world.step(schema, 1, "failure"), world.step(deploy, 2, "skipped")])
-                web = dict(world.job("staging-web", completed_at), id=202, run_id=other_id,
-                           conclusion="skipped")
+                           steps=[world.step(schema, 1, "failure"),
+                                  world.step("Deploy api to staging", 2, "skipped")])
+                web = dict(world.job("staging-web", api_done + 0.25, started=api_done),
+                           id=202, run_id=other_id, conclusion="failure",
+                           steps=[world.step("Build staging web", 1, "failure"),
+                                  world.step("Deploy to staging", 2, "skipped")])
                 world.others[other_id] = [api, web]
                 self.assertEqual(world.verify(), world.receipt)
 
-                # A new serving API version still reports the original BUILD_SHA.
-                api.update(conclusion="success", steps=[world.step(schema, 1), world.step(deploy, 2)])
-                other["conclusion"] = "success"
-                self.assertWorldRefused(world, "intervening staging deployment")
+                # Either lane can serve a new version with the same source SHA.
+                for writer, sibling in ((api, web), (web, api)):
+                    with self.subTest(writer=writer["name"]):
+                        steps = [dict(step, conclusion="success") for step in writer["steps"]]
+                        world.others[other_id] = [sibling, dict(writer, conclusion="success", steps=steps)]
+                        self.assertWorldRefused(world, "intervening staging deployment")
 
     def test_older_queued_run_can_deploy_late(self):
         w = World()
