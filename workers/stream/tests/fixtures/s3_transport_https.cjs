@@ -194,6 +194,7 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   let leaseNo = 0;
   let revokeAt = Infinity;
   let host;
+  let mediaVersionOverride;
   let observedPageVersion = 'page+/%?=&';
   let fullRange = false;
   let stallTail;
@@ -208,7 +209,10 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     fetches.push(page ? 'page' : 'media');
     const bytes = Buffer.from(page ? fixture.digest_page()
       : fullRange ? fixture.full_ciphertext() : fixture.ciphertext());
-    const headers = { 'content-length': bytes.length, 'x-amz-version-id': page ? observedPageVersion : 'version+/%?=&' };
+    const headers = {
+      'content-length': bytes.length,
+      'x-amz-version-id': page ? observedPageVersion : (mediaVersionOverride ?? 'version+/%?=&'),
+    };
     if (!page) headers['content-range'] = fullRange ? 'bytes 0-65616/65617' : span;
     res.writeHead(page ? 200 : 206, headers);
     if (!page && stallTail) {
@@ -349,9 +353,25 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   assert.equal(await status(), 404);
   assert.equal(fetches.length, 4);
   revokeAt = Infinity;
+
+  await t.test('a mismatched media version delivers and counts no media', async (t) => {
+    const fetchStart = fetches.length;
+    const reportStart = reports.length;
+    // Use the same status, range, length and ciphertext as the successful seek.
+    mediaVersionOverride = 'wrong-version';
+    t.after(() => { mediaVersionOverride = undefined; });
+    const refused = await request();
+    assert.equal(refused.response.status, 502);
+    assert.equal(refused.response.headers.get('content-range'), null);
+    assert.equal(JSON.parse(refused.bytes).code, 'upstream_unavailable');
+    assert.deepEqual(fetches.slice(fetchStart), ['media']);
+    assert.equal(reports.length, reportStart);
+  });
+
+  const pageFaultStart = fetches.length;
   observedPageVersion = 'wrong-version';
   assert.equal(await status(), 502);
-  assert.equal(fetches.length, 6);
+  assert.deepEqual(fetches.slice(pageFaultStart), ['media', 'page']);
   assert.equal(reports.length, 1);
 
   observedPageVersion = 'page+/%?=&';
