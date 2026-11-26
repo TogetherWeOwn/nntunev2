@@ -73,6 +73,8 @@ If dedicated PostgreSQL provisioning stops partway through, use the
    [staging binding instructions](../ops.md#private-stream-staging).
    For the dedicated PostgreSQL target, see the
    [Stage C2 Hyperdrive origin connection](#stage-c2-hyperdrive-origin-connection).
+   If the connection IDs match but the Worker still serves a previous
+   version, use the [deployment readback rehearsal](#rehearse-a-stale-trial-deployment).
 5. **Arm and qualify one synthetic journey (77c).** Follow the
    [private music journey](../../e2e/README.md#private-music-journey-preparation)
    for the fresh owner step-up, recipient invite and prepublished tone B
@@ -121,6 +123,55 @@ receipt step must carry those fields into `private_track` in
 `staging-admission.json`. A play receipt for the companion track must fail
 with no report. Use the result as an offline handoff check. Live qualification
 and admission still require the protected run's evidence.
+
+### Rehearse a stale trial deployment
+
+Keep the trial disarmed. Match each saved
+[scoped connection readback](#stage-c2-hyperdrive-origin-connection)
+to the protected C1 database setup record. Use the deployment readback for
+the Worker on the reviewed trial route to check which version receives
+traffic. Rehearse both comparisons offline with these synthetic references.
+
+| Binding | Setup config ID | Saved scoped readback |
+| --- | --- | --- |
+| `UPLOAD` | `hd-upload` | `hd-upload` |
+| `AUTH` | `hd-auth` | `hd-auth` |
+| `PUBLISH` | `hd-publish` | `hd-publish` |
+| `ENROLL` | `hd-enroll` | `hd-enroll` |
+
+Use the same route, reviewed commit, deploy record and four matches for both
+cases. The deploy record names candidate version `version-b`. Evaluate the
+current traffic allocation and version using the comparison in the
+[staging API deployment identity readback](../../.github/scripts/staging_api_identity.py).
+
+| Case | Current deployment at 100% | Deployment readback |
+| --- | --- | --- |
+| Stale | `deployment-a` serves the previous `version-a` | Pending. The comparison returns `deployed-version-mismatch`. |
+| Matching control | `deployment-b` serves `version-b` | Matched when the version reports the reviewed build SHA and the closing deployment read still returns `deployment-b`. |
+
+For the stale case, mark C2 serving evidence pending. In the protected C2
+handoff, cite the deploy record for the expected version and the failed
+probe's run and check for the mismatch reason. Record observed deployment
+and version IDs only from a saved protected allocation readback tied to that
+exact probe observation on the same Worker and route. The unavailable
+receipt carries only the mismatch reason. Leave the observed IDs unconfirmed
+if the tied readback is missing. Any later history read is fresh evidence for
+reconciliation.
+
+The trial operator hands the mismatch to Engineering in **Setup step 4,
+Verify isolated serving and cleanup access**. Engineering reconciles the
+active route and version with the deploy record through the separately
+reviewed isolated serving lane and returns a fresh readback for that route.
+Retain the original setup record and its four IDs. Keep the trial disarmed
+and serving evidence pending while that lane or readback is missing.
+
+The control clears the deployment identity check. The ordinary disarmed API
+deploy omits the four trial bindings. After a version change, C2 needs fresh
+binding readbacks and protected read-only results through all four bindings
+on the exact reviewed trial version. The existing origin, TLS and cache checks
+still apply.
+[Binding renderer](../../.github/scripts/staging_stream_config.py)
+· [Stage C2 Hyperdrive origin connection](#stage-c2-hyperdrive-origin-connection)
 
 ## Retire and recover
 
