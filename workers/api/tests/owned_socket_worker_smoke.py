@@ -360,13 +360,14 @@ def check_checkout_hourly_overlap(base, observe):
         CREATE SEQUENCE public.checkout_overlap_writes;
         CREATE FUNCTION public.observe_checkout_overlap_writes() RETURNS trigger
         LANGUAGE plpgsql AS $$ BEGIN
-            IF EXISTS (SELECT 1 FROM public.subscriptions
+            IF EXISTS (SELECT 1 FROM public.paid_invoice_history
                        WHERE user_id = NEW.user_id AND stripe_subscription_id = NEW.stripe_subscription_id
-                         AND status = 'active' AND paid_invoice_id = 'in_worker_second')
-               AND EXISTS (SELECT 1 FROM public.paid_invoice_history
-                           WHERE user_id = NEW.user_id AND stripe_subscription_id = NEW.stripe_subscription_id
-                             AND stripe_invoice_id = 'in_worker_first') THEN
-                PERFORM nextval('public.checkout_overlap_writes');
+                         AND stripe_invoice_id = 'in_worker_first') THEN
+                PERFORM setval('public.checkout_overlap_writes', CASE status
+                    WHEN 'past_due' THEN 1 WHEN 'active' THEN 2 END)
+                FROM public.subscriptions
+                WHERE user_id = NEW.user_id AND stripe_subscription_id = NEW.stripe_subscription_id
+                  AND paid_invoice_id = 'in_worker_second';
             END IF;
             RETURN NEW;
         END $$;
@@ -376,16 +377,21 @@ def check_checkout_hourly_overlap(base, observe):
     """)
     before_subs, before_history, before_ops, before_claims = webhook_snapshot(observe)
     body, headers = signed_webhook()
+    witness = (
+        "SELECT CASE WHEN is_called THEN last_value ELSE 0 END "
+        "FROM public.checkout_overlap_writes"
+    )
+    overlap = base + "/billing-checkout-hourly-overlap-proof"
     status, _, reply = routing.http(
-        "POST", base + "/billing-checkout-hourly-overlap-proof", body, headers
+        "POST", overlap, body, headers
     )
     routing.check(
         status == 500 and reply == '{"error":"internal error"}',
         f"conflicting checkout: {status} {reply}",
     )
     routing.check(
-        observe("SELECT is_called FROM public.checkout_overlap_writes", tuples=True) == "t",
-        "checkout failed before reaching both writes and the conflicting insert",
+        observe(witness, tuples=True) == "1",
+        "stale checkout did not preserve the hourly row while staging history before the conflict",
     )
     subs, history, ops, claims = webhook_snapshot(observe)
     hourly, unrelated = before_subs
@@ -404,6 +410,20 @@ def check_checkout_hourly_overlap(base, observe):
         "checkout retained a partial insert or changed attributed hourly evidence",
     )
     routing.check(ops == before_ops and claims == before_claims == [], "checkout lost its retry state")
+
+    status, _, reply = routing.http("POST", overlap + "?conflict=refold", body, headers)
+    routing.check(
+        status == 500 and reply == '{"error":"internal error"}',
+        f"fresh conflict: {status} {reply}",
+    )
+    routing.check(
+        observe(witness, tuples=True) == "2",
+        "fresh checkout did not stage both writes before the conflict",
+    )
+    routing.check(
+        webhook_snapshot(observe) == [subs, history, ops, claims],
+        "fresh conflict did not roll back both writes",
+    )
 
     settled = None
     for phase in ("corrected retry", "replay"):
@@ -428,7 +448,10 @@ def check_checkout_hourly_overlap(base, observe):
         if settled is not None:
             routing.check(after == settled, "replay changed settled checkout state")
         settled = after
-    print("PASS: hourly invoice conflict rolled back checkout writes, then corrected retry converged", flush=True)
+    print(
+        "PASS: overlapping and fresh checkout conflicts rolled back, then corrected retry converged",
+        flush=True,
+    )
 
 
 def main():

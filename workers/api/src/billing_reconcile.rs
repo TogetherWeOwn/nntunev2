@@ -651,15 +651,12 @@ pub fn reconcile_subscription(
     // evidence (only the stale branch emits that shape), so a fresh keep
     // must stay distinguishable from it — otherwise the guard would
     // suppress the fresh status and grace this pass folded. Re-pinning
-    // makes a keep indistinguishable from a relabel on the anchor alone,
-    // so the write's equal-end adopt additionally requires the emitted
-    // anchor alone, so the write's equal-end adopt additionally requires
-    // the stored row to still match what this pass read (`read_plan` /
-    // `read_anchor`, bound as `$14` / `$13`): a keep committing after a
-    // relabel then keeps the newer plan/anchor while still applying its own
-    // status and grace — while a relabel onto the same shared invoice (the
-    // emitted anchor equalling the read anchor) still persists when nothing
-    // moved the row meanwhile.
+    // makes a keep indistinguishable from a relabel on the anchor alone.
+    // An equal-end relabel requires the stored plan and anchor to match
+    // `read_plan` and `read_anchor`, even when both plans share an invoice.
+    // When proof changed, the legacy write can still apply status and grace.
+    // The owned writer suppresses the whole update and requires a fresh fold
+    // for a terminal release or a conflicting cancel flag on matching proof.
     let (plan_id, paid_through_unix, paid_invoice_id) = if recovered || relabels {
         (item_plan, new_end, anchor_invoice)
     } else {
