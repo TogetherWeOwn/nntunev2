@@ -207,3 +207,90 @@ async fn pinned_media_play_seek_and_refusals_preserve_written_prefix() {
         play.finish().unwrap();
     }
 }
+
+#[tokio::test]
+async fn sequential_playback_waits_for_one_eof_at_the_short_final_frame() {
+    use std::{future::poll_fn, task::Poll};
+
+    struct EofBody<'a> {
+        bytes: Body<'a>,
+        eof_ready: &'a Cell<bool>,
+        eof_reads: &'a Cell<usize>,
+    }
+
+    impl ReadbackBody for EofBody<'_> {
+        async fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.bytes.read(dst).await?;
+            if count == 0 {
+                self.eof_reads.set(self.eof_reads.get() + 1);
+                poll_fn(|_| {
+                    if self.eof_ready.get() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+            Ok(count)
+        }
+    }
+
+    let mut plaintext = vec![b'A'; LEN as usize];
+    plaintext[65_535..].copy_from_slice(b"YZ");
+    let f = Fixture::from_plaintext(&plaintext);
+    let sealed = [&f.context.header[..], &f.first, &f.last].concat();
+    let eof_ready = Cell::new(false);
+    let eof_reads = Cell::new(0);
+
+    let (outcome, play) = EnrolledPlayback::start(None, f.pins(), f.media_input(), now()).unwrap();
+    assert_eq!(outcome, RangeOutcome::Full);
+    let mut play = play
+        .unwrap()
+        .open_s3(now, async |get| {
+            assert!(get.locator == f.media.locator());
+            assert_eq!(get.range, 0..65_617);
+            Ok(S3GetReply {
+                status: 206,
+                version: Some("media-v1".into()),
+                content_range: Some("bytes 0-65616/65617".into()),
+                content_length: Some(65_617),
+                has_content_encoding: false,
+                body: EofBody {
+                    bytes: Body(&sealed),
+                    eof_ready: &eof_ready,
+                    eof_reads: &eof_reads,
+                },
+            })
+        })
+        .await
+        .unwrap();
+
+    let Poll::Ready(first) = futures_util::poll!(std::pin::pin!(play.next(f.page(), now))) else {
+        panic!("the first frame must be ready while EOF is pending");
+    };
+    let first = first.unwrap().unwrap();
+    assert_eq!(first.as_slice(), &plaintext[..65_536]);
+    assert_eq!(eof_reads.get(), 0);
+    play.written(first.as_slice().len()).unwrap();
+
+    let last = {
+        // Drive the pending EOF read explicitly, without a timer or socket.
+        let mut next = std::pin::pin!(play.next(f.page(), now));
+        assert!(futures_util::poll!(&mut next).is_pending());
+        assert_eq!(eof_reads.get(), 1);
+        eof_ready.set(true);
+        let Poll::Ready(part) = futures_util::poll!(&mut next) else {
+            panic!("the final frame must be ready once the body confirms EOF");
+        };
+        part.unwrap().unwrap()
+    };
+    assert_eq!(last.as_slice(), &plaintext[65_536..]);
+    assert_eq!(play.served_bytes(), 65_536);
+    play.written(last.as_slice().len()).unwrap();
+    assert_eq!(play.served_bytes(), LEN);
+    assert!(play.next_page(now()).unwrap().is_none());
+    assert!(play.next(f.page(), now).await.unwrap().is_none());
+    play.finish().unwrap();
+    assert_eq!(eof_reads.get(), 1);
+}
