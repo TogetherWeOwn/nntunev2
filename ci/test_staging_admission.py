@@ -801,6 +801,62 @@ class VerifyTests(Base):
         w = World()
         self.assertEqual(w.verify()["result"], "satisfied")
 
+    def test_offline_terminal_main_push_distinguishes_queue_rejection_and_e2e_failure(self):
+        world = World()
+        receipt = world.verify()
+        self.assertEqual((receipt["sha"], receipt["run_id"], receipt["run_attempt"], receipt["result"]),
+                         (SHA, str(RUN_ID), "1", "satisfied"))
+
+        run = dict(world.run, conclusion="failure")
+        queue_notice = {"annotation_level": "failure",
+                        "message": "Queue is full for concurrency group 'deploy-staging-main'"}
+        rejected = {"run": run, "jobs": page("jobs", []), "annotations": [queue_notice]}
+        jobs = copy.deepcopy(world.jobs)
+        jobs[-1]["conclusion"] = "failure"
+        jobs[-1]["steps"][0]["conclusion"] = "failure"
+        for step in jobs[-1]["steps"][1:]:
+            step["conclusion"] = "skipped"
+        failed = {"run": run, "jobs": page("jobs", jobs), "annotations": []}
+
+        generic = "::error::Candidate admission refused: missing, unapproved, stale or incoherent evidence\n"
+
+        def assert_diagnosis(raw, expected):
+            result = subprocess.run(
+                [sys.executable, "-I", str(HERE / "staging_admission.py"), "diagnose-terminal-push", SHA],
+                input=raw, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, expected)
+
+        for case, evidence, expected in (
+            ("queue rejected", rejected,
+             f"Staging run {RUN_ID}, attempt 1 was rejected before jobs by the deploy-staging-main queue. "
+             "Exact-build qualification is pending. The next eligible automatic staging admission can "
+             "provide evidence for the build it runs.\n"),
+            ("E2E failed", failed, f"Staging run {RUN_ID}, attempt 1 was admitted, and the full E2E journey failed. "
+             "Inspect the journey job and return to candidate qualification.\n"),
+            ("no annotation", dict(rejected, annotations=[]), generic),
+            ("different annotation", dict(rejected, annotations=[dict(queue_notice, message="synthetic diagnostic")]),
+             generic),
+            ("different queue", dict(rejected, annotations=[dict(
+                queue_notice, message="Queue is full for concurrency group 'deploy-staging-other'",
+            )]), generic),
+            ("incomplete job list", dict(rejected, jobs=page("jobs", [], total=1)), generic),
+            ("different build", dict(rejected, run=dict(run, head_sha=OTHER_SHA)), generic),
+            ("manual run", dict(rejected, run=dict(run, event="workflow_dispatch")), generic),
+            ("rerun", dict(rejected, run=dict(run, run_attempt=2)), generic),
+            ("jobs present", dict(rejected, jobs=page("jobs", world.jobs)), generic),
+            ("different job attempt", dict(failed, jobs=page("jobs", [*jobs[:-1], dict(jobs[-1], run_attempt=2)])),
+             generic),
+            ("missing E2E step", dict(failed, jobs=page("jobs", [*jobs[:-1], dict(jobs[-1], steps=[])])), generic),
+            ("successful run", dict(rejected, run=world.run, jobs=page("jobs", world.jobs)), generic),
+        ):
+            with self.subTest(case=case):
+                assert_diagnosis(json.dumps(evidence), expected)
+        with self.subTest(case="excessive nesting"):
+            assert_diagnosis('{"nested":' + '[' * 10_000 + '0' + ']' * 10_000 + '}', generic)
+
     def test_positive_ignores_skipped_gate_only_later_run(self):
         w = World()
         w.add_other("skipped")
