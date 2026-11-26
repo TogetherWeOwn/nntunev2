@@ -808,7 +808,11 @@ def prepare_baseline_readers(cluster, names, *, host):
         raw = base64.b64decode(env.pop("BOOTSTRAP_PLAN_B64"))
         env.pop("BOOTSTRAP_SETUP_PASSWORD")
         lifecycle = ReaderRoleLifecycle(raw, READER_ISSUER)
-        result = cluster.sql(lifecycle.prepare(), role=READER_ISSUER)
+        prepare = lifecycle.prepare()
+        if not pending:
+            cluster.denied("refuse the setup issuer as the reader issuer", prepare,
+                           "wrong custodian session", role=ISSUER)
+        result = cluster.sql(prepare, role=READER_ISSUER)
         checked(result, "prepare an unusable reader for the setup caller")
         oid = int(result.stdout)
         cluster.ok("read back pending reader attributes and a NULL password", f"""
@@ -954,6 +958,8 @@ def prove_reader_lifecycle(cluster, pending, *, scenario, database_oid, publish=
         GRANT CONNECT ON DATABASE postgres TO {READER_ISSUER};
         REVOKE CONNECT ON DATABASE postgres, template1 FROM PUBLIC;
     """)
+    cluster.denied("refuse reader activation from maintenance with the correct issuer and plan", activate,
+                   "wrong custodian session", role=READER_ISSUER, database=MAINTENANCE)
     cluster.ok("model a wider PUBLIC column grant", "GRANT UPDATE (id) ON reader_scope.leaf TO PUBLIC;", database=LAUNCH)
     cluster.denied("refuse the wider PUBLIC column grant", activate, "reader scope refused", **launch)
     cluster.ok("remove the synthetic wider grant", "REVOKE UPDATE (id) ON reader_scope.leaf FROM PUBLIC;", database=LAUNCH)
