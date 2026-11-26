@@ -433,7 +433,7 @@ pending. Record the specific gap and link the observation that shows it.
 
 Use one synthetic candidate SHA and the separate SHA-256 digests of its
 synthetic setup and baseline plans. In the bootstrap entry select `postgres`
-(OID `5`) on branch `fixture001` at `db.fixture.invalid:5432`. Record a
+(OID `5`) on branch `fixture001` at `db.fixture.invalid` on port `5432`. Record a
 matching primary TLS observation. Pin `fixture_issuer` (OID `41001`) for
 `fixture_creator` and `fixture_owner`, and `fixture_reader_issuer` (OID
 `41002`) for `Fixture-Protected-Reader`. Both session identities match the
