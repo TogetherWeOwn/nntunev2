@@ -10,6 +10,8 @@ test('invited playback ignores a retired audio error and retries a current audio
 	const { library, player } = PRIVATE_MUSIC;
 	const first = { id: '00000000-0000-4000-8000-000000000001', title: 'First tone', duration_ms: 14_000 };
 	const second = { id: '00000000-0000-4000-8000-000000000002', title: 'Second tone', duration_ms: 14_000 };
+	const firstPlayId = `private_browser_${'a'.repeat(22)}`;
+	const secondPlayId = `private_browser_${'b'.repeat(22)}`;
 	const tones = privateStagingAudio();
 	const firstTone = tones.find(({ file }) => file === 'tone-a.flac')!;
 	const secondTone = tones.find(({ file }) => file === 'tone-b.flac')!;
@@ -17,6 +19,7 @@ test('invited playback ignores a retired audio error and retries a current audio
 	const fixture = await mockInvitedLibraryPlayback(page, origin, {
 		libraryItems: () => [first, second],
 		playableTrackId: (id) => [first.id, second.id].find((trackId) => trackId === id),
+		playIdFor: (id) => id === first.id ? firstPlayId : secondPlayId,
 		audio: async (route: Route) => {
 			const isSecond = new URL(route.request().url()).pathname.startsWith(`${player.plays}/media/${second.id}/`);
 			if (isSecond && failSecond) return route.fulfill({ status: 503 });
@@ -97,8 +100,19 @@ test('invited playback ignores a retired audio error and retries a current audio
 	expect(await retired.evaluate((node: ProbedAudio) => {
 		if (node.isConnected) throw new Error('The first audio element is still attached');
 		Object.defineProperty(node, 'error', { value: { code: MediaError.MEDIA_ERR_NETWORK } });
-		return node.replayCapturedErrors?.();
-	})).toEqual({ registered: listenerCount, delivered: listenerCount });
+		const session = navigator.mediaSession;
+		const setPositionState = session?.setPositionState;
+		let systemPositionWrites = 0;
+		if (setPositionState) session.setPositionState = (state) => {
+			systemPositionWrites += 1;
+			setPositionState.call(session, state);
+		};
+		try {
+			return { ...node.replayCapturedErrors?.(), systemPositionWrites };
+		} finally {
+			if (setPositionState) session.setPositionState = setPositionState;
+		}
+	})).toEqual({ registered: listenerCount, delivered: listenerCount, systemPositionWrites: 0 });
 	await advancing(before + 0.2);
 	await expectSecondSelected();
 	await expect(status).toHaveText('Playing');
@@ -122,12 +136,15 @@ test('invited playback ignores a retired audio error and retries a current audio
 	expect(grants).toHaveLength(2);
 
 	failSecond = false;
+	const retryGrant = page.waitForResponse(origin + player.plays);
 	await retry.press('Enter');
+	const continuation = await retryGrant;
+	expect(continuation.request().postDataJSON()).toEqual({ ...grants[1], play_id: secondPlayId });
+	expect(continuation.ok()).toBe(true);
 	await expect(status).toHaveText('Playing');
 	await advancing(0.2);
 	await expectSecondSelected();
 	await expect(retry).toHaveCount(0);
 	expect(await audio.evaluate((node, original) => node === original, replacement)).toBe(true);
-	const secondGrant = grants[1]!;
-	expect(grants.slice(2)).toEqual([{ ...secondGrant, play_id: fixture.mediaPath(second.id).split('/').at(-1) }]);
+	expect(grants).toHaveLength(3);
 });
