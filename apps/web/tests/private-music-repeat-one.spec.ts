@@ -122,6 +122,7 @@ for (const { name, failFirstLoad } of [
 		await expectPlayingNearStart(initialPath);
 		await expect(retry).toHaveCount(0);
 		await expect(repeat).toHaveValue('one');
+		await expect(repeatStatus).toBeVisible();
 		await expect(repeatStatus).toHaveText('Repeat: One');
 
 		// Let Chromium play the fixture to completion at its normal speed.
