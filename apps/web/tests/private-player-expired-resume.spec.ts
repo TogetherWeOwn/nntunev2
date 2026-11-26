@@ -10,6 +10,7 @@ async function startPrivatePlayback({ page, context, origin }: InvitedPage) {
 	const tracks = ['Paused tone', 'First upcoming tone', 'Second upcoming tone'].map((title, index) => ({
 		id: `00000000-0000-4000-8000-00000000011${index}`, title, duration_ms: 14_000
 	}));
+	let libraryTracks = tracks;
 	const [selected] = tracks;
 	const tone = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
 	const member = 'synthetic-listener', binding = 'A'.repeat(43), playId = `private_browser_${'a'.repeat(22)}`;
@@ -28,7 +29,7 @@ async function startPrivatePlayback({ page, context, origin }: InvitedPage) {
 	await page.route(`${origin}/v1/me/likes/session`, async (route) => hasFixtureSession(await route.request().headerValue('cookie'), member)
 		? route.fulfill({ json: { session_binding: binding } }) : route.fulfill({ status: 401 }));
 	await page.route(origin + library.api, async (route) => hasFixtureSession(await route.request().headerValue('cookie'), member)
-		? route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: tracks }) : route.fulfill({ status: 401 }));
+		? route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: libraryTracks }) : route.fulfill({ status: 401 }));
 	await page.route(`${playsUrl}/events**`, (route) => {
 		listenEvents.push(route.request().url());
 		return route.fulfill({ status: 404 });
@@ -93,7 +94,8 @@ async function startPrivatePlayback({ page, context, origin }: InvitedPage) {
 		allowRenewal = renewal.promise;
 		return renewal.resolve;
 	};
-	return { audio, play, pause, selected, expectQueue, initial, continuation, plays, listenEvents, readRange,
+	const addLibraryTrack = (track: typeof selected) => { libraryTracks = [...libraryTracks, track]; };
+	return { audio, play, pause, selected, addLibraryTrack, expectQueue, initial, continuation, plays, listenEvents, readRange,
 		expireGrant, holdRenewal, playsUrl, mediaUrl: origin + mediaPath() };
 }
 
@@ -164,7 +166,7 @@ async function checkPauseDuringRenewal({ page, context, origin }: InvitedPage, n
 		if (!handler) throw new Error(`Missing Media Session ${action} handler`);
 		handler({ action });
 	}, action);
-	const { audio, play, pause, selected, expectQueue, initial, continuation, plays, listenEvents, readRange,
+	const { audio, play, pause, selected, addLibraryTrack, expectQueue, initial, continuation, plays, listenEvents, readRange,
 		expireGrant, holdRenewal, playsUrl, mediaUrl } = await startPrivatePlayback({ page, context, origin });
 	const probe = await audio.evaluateHandle((node: HTMLAudioElement) => {
 		const starts: number[] = [], discontinuities: string[] = [];
@@ -225,12 +227,12 @@ async function checkPauseDuringRenewal({ page, context, origin }: InvitedPage, n
 		if (navigateWhileHeld) {
 			await openNowPlaying();
 			const { library } = PRIVATE_MUSIC;
-			await Promise.all([
-				page.waitForResponse((response) => response.url() === origin + library.api && response.ok()),
-				main.getByRole('button', { name: 'Back', exact: true }).press('Enter')
-			]);
+			const newTrack = { id: '00000000-0000-4000-8000-000000000113', title: 'New Library tone', duration_ms: 14_000 };
+			addLibraryTrack(newTrack);
+			await main.getByRole('button', { name: 'Back', exact: true }).press('Enter');
 			await expect(page).toHaveURL(origin + library.path);
 			await expect(main.getByRole('heading', { name: 'Library', exact: true })).toBeVisible();
+			await expect(main.getByTestId(library.item).filter({ hasText: newTrack.title })).toBeVisible();
 			await expectQueue();
 			await expectPausedDecoder();
 			await openNowPlaying();
