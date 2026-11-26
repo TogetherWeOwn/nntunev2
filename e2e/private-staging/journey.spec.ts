@@ -15,9 +15,10 @@ import {
   assertCuratedLibrary, assertPrivateInvite, assertPrivateRefusals, PRIVATE_MUSIC,
 } from '../helpers/private-music-journey.js';
 import {
-  freshTrialPublication, parsePrivateStagingFixture, privateStagingAudio, PRIVATE_TRIAL_UPLOAD, SESSION_COOKIE,
+  parsePrivateStagingFixture, privateStagingAudio, PRIVATE_TRIAL_UPLOAD, SESSION_COOKIE,
 } from '../helpers/private-staging-fixture.js';
 import { privateRunIdentity, privateTrackObservation } from './track-evidence.js';
+import { uploadToLibrary } from './upload-to-library.js';
 
 const ORIGIN = 'https://staging.nntune.com';
 const REGISTER = '/v1/auth/passkey/register';
@@ -95,7 +96,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const response = await apiGet(context, url, access, 'private-library');
     const body = await readApiBody(response, url, 'private-library');
     const items = response.ok() ? JSON.parse(body) as { id: string }[] : [];
-    return { status: response.status(), ids: items.map(({ id }) => id) };
+    return { status: response.status(), items };
   };
   const post = async (context: typeof request, path: string, body: unknown, headers = access) => {
     const url = `${ORIGIN}${path}`;
@@ -151,23 +152,27 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     let priorIds: string[] = [];
     await expect.poll(async () => {
       const library = await getLibrary();
-      priorIds = library.ids;
+      priorIds = library.items.map(({ id }) => id);
       return library.status === 200 && priorIds.includes(fixture.companion.trackId);
     }, { timeout: 60_000, intervals: [1_000] }).toBe(true);
     await refresh.click();
     await expect(rowFor(fixture.companion.trackId)).toBeVisible();
-    const owner = await playwrightRequest.newContext();
-    const receipt = await post(owner, PRIVATE_TRIAL_UPLOAD, upload.body, {
-      ...access, 'Content-Type': 'audio/flac', Cookie: `${SESSION_COOKIE}=${fixture.ownerSession}`,
-    }).finally(() => owner.dispose());
-    expect(receipt.status).toBe(200);
-    const publication = freshTrialPublication(receipt.text, upload.sha256, priorIds);
-    await refresh.click();
-    const row = rowFor(publication.trackId);
-    await expect(row).toBeVisible();
-    expect((await getLibrary()).ids.filter((id) => id === publication.trackId)).toHaveLength(1);
-    observe('private-publication', publication, publication.trackId);
-    observe('private-library', publication, await row.getAttribute(PRIVATE_MUSIC.library.id));
+    const { publication, annotations } = await uploadToLibrary(
+      run, upload.sha256, priorIds,
+      async () => {
+        const owner = await playwrightRequest.newContext();
+        return post(owner, PRIVATE_TRIAL_UPLOAD, upload.body, {
+          ...access, 'Content-Type': 'audio/flac', Cookie: `${SESSION_COOKIE}=${fixture.ownerSession}`,
+        }).finally(() => owner.dispose());
+      },
+      async (trackId) => {
+        await refresh.click();
+        const row = rowFor(trackId);
+        await expect(row).toBeVisible();
+        return { ...await getLibrary(), renderedTrackId: await row.getAttribute(PRIVATE_MUSIC.library.id) };
+      },
+    );
+    test.info().annotations.push(...annotations);
     return publication;
   });
   const requestFreshPlay = async (context: typeof request, binding?: string) => {
@@ -327,7 +332,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const { retry } = await retryBrowserPlay(start, media);
     await verifyRange(media.source, upload.body);
     const library = await getLibrary();
-    expect(library.status === 200 && library.ids.includes(fresh.trackId)).toBe(true);
+    expect(library.status === 200 && library.items.some(({ id }) => id === fresh.trackId)).toBe(true);
     return { retry, mediaUrl: media.source.href };
   });
   await check('revoked-or-expired-refused', async () => {
