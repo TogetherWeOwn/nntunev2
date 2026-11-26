@@ -437,13 +437,15 @@ python3 -IB .github/scripts/database_bootstrap_reader_evidence.py < evidence.jso
   `reader_oid`). Record `result: passed` only for a completed, successful
   privilege check. Use JSON integers for OIDs and lowercase hex for digests.
 
-The protected baseline emits a fixed verdict. It does not emit an inventory
-digest. For `reader_privileges`, use a retained private readback that records
-the observed role identity, effective privilege result and covered inventory in
-the same read-only catalog snapshot. Use the same deterministic representation
-for all three inventories. Include object identities and their schema definitions
-or versions so a change to a definition changes the digest even when the object
-has the same name. Hash the definitions actually observed for each readback.
+The protected baseline emits only a fixed verdict. Arrange a separate authorized
+read-only catalog capture in advance. Take the snapshot while the scoped reader
+is active, before fencing or retirement. Retain the observed role identity,
+effective privilege result and covered inventory together from that snapshot.
+Follow the normal cleanup even if capture is incomplete. Use the same
+deterministic representation for all three inventories. Include object identities
+and their schema definitions or versions so a change to a definition changes the
+digest even when the object has the same name. Hash the definitions actually
+observed for each readback.
 If the privilege readback is unavailable, omit `reader_privileges` so the
 evidence stays pending.
 
@@ -456,11 +458,11 @@ reviewed reader and database covers a different inventory. Use the separately
 authorized read-only catalog check on the reviewed database to compare expected
 and observed object identities and definitions. Once the catalog agrees with the
 review, obtain a matched inventory and scoped privilege result from one
-authorized read-only catalog snapshot and rerun the offline check. If the reader
-has been retired and no matched readback is available, start a fresh protected
-baseline with fresh approval and a newly issued reader. Use that attempt's
-approved reader identity and readbacks for the comparison. Keep migration closed
-pending reconciliation.
+authorized read-only catalog snapshot while the scoped reader is active, then
+rerun the offline check. After reader retirement, use only a retained matched
+readback from the same attempt. If it is unavailable, keep the baseline pending
+and migration closed. The reader preparation helper requires an absent launch
+database.
 `consistent` confirms the supplied evidence agrees. The protected run's
 `empty` verdict, provenance and retirement evidence are still required.
 Keep credentials and raw SQL results out of the normalized record.
