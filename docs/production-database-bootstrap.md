@@ -106,8 +106,10 @@ admission, configure `production-db-bootstrap` **before** enabling the job.
 GitHub can create a missing Environment from a workflow reference without
 protection. Verify both `production-db-bootstrap` and `production-db-baseline`
 using the [Environment protection readback](#environment-protection-readback)
-before enabling the corresponding job. Keep Environment administration with
-the custodian and check rule changes before approval. One listed reviewer
+before enabling the corresponding job. Follow the
+[custodian handoff](#custodian-handoff) for the setup and baseline order.
+Keep Environment administration with the custodian and check rule changes
+before approval. One listed reviewer
 suffices on GitHub, so require only the approved independent user or team in
 each Environment. The release review and T0 code reviews are separate from
 this deployment approval.
@@ -205,6 +207,81 @@ this deployment approval.
    unresolved and exits nonzero. Keep that result alongside the Settings
    readback. The Settings readback covers administrator bypass only. An explicit
    REST value of `true` is a failed protection check.
+
+#### Offline before and after rehearsal
+
+Run this single case from the repository root. It uses the existing checker
+on temporary synthetic response bodies for both Environments. Reviewer
+identities in the fixture are synthetic.
+
+```sh
+python3 -B .github/scripts/test_database_bootstrap_environment_readback.py \
+  EnvironmentReadbackTests.test_custodian_handoff_before_and_after
+```
+
+| Synthetic fixture | `production-db-bootstrap` | `production-db-baseline` | Checker exit |
+| --- | --- | --- | --- |
+| Before | `main` branch and `main` tag refused | Administrator bypass enabled and refused | `1` |
+| After | Sole `main` branch and bypass disabled | Sole `main` branch and bypass disabled | `0` |
+
+Both after readbacks also include the sole approved reviewer and prevention
+of self-review. The result applies to the synthetic bodies. The custodian
+records the actual Settings and REST readbacks for the live handoff.
+
+### Custodian handoff
+
+| Workflow | Protected job Environment | Repository variable kept unset until that attempt is authorized |
+| --- | --- | --- |
+| [First-launch database bootstrap](../.github/workflows/deploy-database-bootstrap.yml) | `production-db-bootstrap` | `DATABASE_BOOTSTRAP_CANDIDATE_SHA` |
+| [First-launch database baseline](../.github/workflows/deploy-database-baseline.yml) | `production-db-baseline` | `DATABASE_BASELINE_CANDIDATE_SHA` |
+
+1. Keep both candidate variables unset while the prerequisites are gathered.
+   For the stock PostgreSQL staging target, carry the merged disposable
+   Stage A result into the fresh Stage B rerun, then qualify capacity,
+   scoped authority, and combined Tunnel/Access and origin TLS at Stage C0.
+   Before production database setup, complete the served private trial on
+   the approved staging target and capture the exact-candidate staging
+   evidence in steps 1–3 of
+   [Qualify the candidate](first-private-music-launch.md#qualify-the-candidate).
+   [Staging database qualification](../ops/staging-trial-pg/README.md)
+2. Obtain the GitHub custodian's recorded authorization for the separate
+   Environment change and record the independently approved reviewer for each
+   Environment. The custodian captures the before state, including an absent
+   Environment if applicable. In the approved change, explicitly configure
+   both Environments with their sole required reviewer, self-review
+   prevention, administrator bypass disabled, and a custom deployment rule
+   for the `main` **branch** only. Capture the after state and recheck Settings
+   using the [Environment protection readback](#environment-protection-readback).
+   If REST leaves only bypass unresolved, retain the nonzero result and the
+   custodian's explicit Settings readback. Any other discrepancy keeps the
+   handoff pending. Completing this change leaves both variables
+   unset and stages no authorization.
+3. Before the first protected write, verify SQL custodian authority, the
+   exact production branch and direct TLS route, and the ability to issue,
+   fence and retire the scoped roles. Verify the successful pre-bootstrap
+   snapshot and obtain independent release approval for the exact candidate
+   and protected setup plan. Only then use the bootstrap admission and pending
+   deployment checks above. The approved Environment reviewer authorizes that
+   exact pending attempt after verifying its pins and current protection.
+   [Setup role custody](#setup-role-custody-and-lifecycle) ·
+   [Snapshot and metering](#snapshot-and-metering) ·
+   [Production releases](../CONTRIBUTING.md#production-releases)
+4. When the setup attempt ends, clear its candidate variable and authorization.
+   Complete cleanup even when setup is refused, canceled or needs
+   reconciliation. Under [setup role custody](#setup-role-custody-and-lifecycle),
+   reconcile any uncertain issuance before proceeding. If the temporary
+   setup role was issued, retire it using the verified issuance OID,
+   require `retired`, and confirm removal of its credential, role and
+   sessions. If the attempt ended before issuance, verify and record that
+   the planned role is absent on the approved branch. Keep baseline pending
+   until cleanup, setup success and the new database OID, reader fence,
+   grants and sibling isolation are verified.
+5. Use the verified database OID and the separately issued reader OID for the
+   baseline plan. Recheck the baseline Environment and confirm approval of
+   the baseline candidate and plan. Obtain Environment approval for its exact
+   pending attempt as part of the [protected baseline](#protected-baseline)
+   sequence. Require `empty` and completed reader teardown before handing off
+   to the later migration and cutover gates.
 
 ### Setup plan and enforced limits
 
