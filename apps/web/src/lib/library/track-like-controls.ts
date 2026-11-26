@@ -35,7 +35,7 @@ export type TrackLikeControls = (id: string) => TrackLikeControl | undefined;
  * authorization epoch; currentOwner must stop returning it upon invalidation. */
 export function createTrackLikeControls(
 	currentOwner: () => TrackLikeOwner | undefined,
-	trackWrite?: (binding: string, result: Promise<unknown>) => void
+	trackWrite?: (binding: string, settled: Promise<void>) => void
 ) {
 	const pendingByOwner = new WeakMap<TrackLikeOwner, Set<string>>();
 
@@ -62,12 +62,15 @@ export function createTrackLikeControls(
 			const canWrite = () => stillCurrent() && (preference?.isCurrent?.() ?? true);
 			if (!canWrite() || inFlight.has(id)) return;
 			inFlight.add(id);
+			let finish!: () => void;
+			const settled = new Promise<void>((resolve) => { finish = resolve; });
 			try {
 				const started = await run(() => {
 					if (!canWrite()) return;
-					// Box network work so it never holds the auth fence.
+					// Box network work so it never holds the auth fence. Refresh tracks
+					// the write through confirmation, including any later fence checks.
 					const result = start().then((value) => ({ value }), (error: unknown) => ({ error }));
-					trackWrite?.(binding, result);
+					trackWrite?.(binding, settled);
 					return { result };
 				});
 				if (!started) return;
@@ -90,6 +93,7 @@ export function createTrackLikeControls(
 				// A lost auth fence is not a reason to replay or report against a new scope.
 			} finally {
 				inFlight.delete(id);
+				finish();
 			}
 		};
 		return {

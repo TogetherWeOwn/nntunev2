@@ -14,8 +14,11 @@ test('the invited Library preserves a Like confirmed during an older refresh', a
 	const createdAt = 1_700_000_000;
 	const refreshStarted = Promise.withResolvers<void>();
 	const releaseRefresh = Promise.withResolvers<void>();
-	let listings = 0, reads = 0, writes = 0;
-	let serverLiked = false, heldSnapshot = false;
+	const likesReadStarted = Promise.withResolvers<void>();
+	const tasteReadStarted = Promise.withResolvers<void>();
+	const releaseLikesRead = Promise.withResolvers<void>();
+	let listings = 0, reads = 0, tasteReads = 0, writes = 0;
+	let serverLiked = false;
 
 	await context.route('**/*', async (route) => {
 		const request = route.request();
@@ -37,20 +40,24 @@ test('the invited Library preserves a Like confirmed during an older refresh', a
 				const title = titles[listings++];
 				if (!title) return route.fulfill({ status: 500 });
 				if (listings === 2) {
-					heldSnapshot = serverLiked;
 					refreshStarted.resolve();
 					await releaseRefresh.promise;
 				}
 				return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: [{ id, title, like_target_id: id }] });
 			}
 			if (pathname === `${likesPath}/session`) return route.fulfill({ json: { session_binding: binding } });
-			const liked = listings === 2 ? heldSnapshot : serverLiked;
 			if (pathname === likesPath) {
-				reads += 1;
-				return route.fulfill({ json: { session_binding: binding, items: liked ? [{ ...preference, created_at: createdAt }] : [] } });
+				const items = serverLiked ? [{ ...preference, created_at: createdAt }] : [];
+				if (++reads === 2) {
+					likesReadStarted.resolve();
+					await releaseLikesRead.promise;
+				}
+				return route.fulfill({ json: { session_binding: binding, items } });
 			}
 			if (pathname === '/v1/me/taste/session') {
-				return route.fulfill({ json: { session_binding: binding, items: liked ? [{ ...preference, signal: 'love', until: null }] : [] } });
+			const items = serverLiked ? [{ ...preference, signal: 'love', until: null }] : [];
+			if (++tasteReads === 2) tasteReadStarted.resolve();
+			return route.fulfill({ json: { session_binding: binding, items } });
 			}
 			return route.fulfill({ status: 404 });
 		}
@@ -68,12 +75,16 @@ test('the invited Library preserves a Like confirmed during an older refresh', a
 		await refresh.click();
 		await refreshStarted.promise;
 		await expect(loading).toBeVisible();
+		await expect(like(titles[0])).toBeEnabled();
+		await Promise.all([likesReadStarted.promise, tasteReadStarted.promise]);
 		await like(titles[0]).click();
 		await expect(like(titles[0])).toHaveAttribute('aria-pressed', 'true');
+		await expect(like(titles[0])).toHaveAttribute('aria-disabled', 'false');
 		await expect(loading).toBeVisible();
 		expect(writes).toBe(1);
 	} finally {
 		releaseRefresh.resolve();
+		releaseLikesRead.resolve();
 	}
 
 	// A new title on the same ID proves the older refresh actually published.
@@ -86,5 +97,5 @@ test('the invited Library preserves a Like confirmed during an older refresh', a
 	await refresh.click();
 	await expect(like(titles[2])).toHaveAttribute('aria-pressed', 'false');
 	await expect(loading).toBeHidden();
-	expect([listings, reads, writes]).toEqual([3, 3, 1]);
+	expect([listings, reads, tasteReads, writes]).toEqual([3, 3, 3, 1]);
 });
