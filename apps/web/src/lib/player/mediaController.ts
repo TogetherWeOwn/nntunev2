@@ -163,8 +163,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				const liveRate = speed.read(rateTarget);
 				let seconds = 0;
 				if (recoverPosition) {
-					const { attachment, duration, elapsed } = get(absoluteSeek);
-					seconds = attachment === attachmentVersion && duration > 0 ? elapsed : audio.currentTime;
+					const { attachment, duration, elapsed, seeking } = get(absoluteSeek);
+					seconds = attachment === attachmentVersion && duration > 0 && !seeking ? elapsed : audio.currentTime;
 				}
 				const restore = trackId && Number.isFinite(seconds) && seconds > 0 ?
 					captureShareSeek(++positionIntent, { trackId, seconds }, matches) : undefined;
@@ -552,7 +552,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const previous = prior.attachment === attachment ? prior : emptySeek;
 		// An empty or failed private decoder cannot replace the last settled position.
 		const observation = selection?.prepare && !observed.duration && previous.duration
-			? { ...observed, duration: previous.duration, position: previous.elapsed }
+			? { ...observed, duration: previous.duration, position: previous.elapsed, seeking: previous.seeking }
 			: observed;
 		// In-flight time/progress updates move the thumb, not the seek comparison point.
 		const message = feedback ?? (nativeSeeking && observation.position !== seekAnchor ? '' : previous.feedback);
