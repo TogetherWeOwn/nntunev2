@@ -44,6 +44,17 @@ PRIVATE_TRACK_PROOFS = {
     PRIVATE_CUTOFF_PROOF: "revoked-or-expired-refused",
 }
 IDENTITY_PHASES = ("build-identity", "build-identity-final")
+# The ordinary Playwright JUnit reporter uses the spec filename and test title.
+ORDINARY_IDENTITY_CASES = {
+    "build-identity": (
+        "build-identity.spec.ts",
+        "deployed build matches the promotion SHA (exact-head staging evidence)",
+    ),
+    "build-identity-final": (
+        "zz-build-identity-final.spec.ts",
+        "deployed build still matches the promotion SHA at journey end (superseded-deploy guard)",
+    ),
+}
 RECORD = "Record candidate admission receipt"
 UPLOAD = "Upload candidate admission receipt"
 # Bind conservative dependency roots, not a hand-picked set of test helpers.
@@ -235,6 +246,8 @@ def junit_evidence(xml, contract):
                 if private:
                     require(selector == (PRIVATE, phase), "unexpected private identity case")
                     identities[phase]["deployments"] = private_deployments(value.get("deployments"), value["expected"])
+                else:
+                    require(selector == ORDINARY_IDENTITY_CASES[phase], "unexpected ordinary identity case")
     if private:
         require(all(rows.get((PRIVATE, phase)) == ["passed"] for phase in IDENTITY_PHASES),
                 "private identity cases did not pass exactly once")
