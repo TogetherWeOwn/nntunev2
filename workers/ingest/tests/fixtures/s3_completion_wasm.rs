@@ -811,7 +811,7 @@ fn read_inventory_status(
     checkpoint: &ResumeCheckpoint<'_>,
     retry_continuation: bool,
 ) -> Result<(bool, serde_json::Value), JsValue> {
-    // The callback models one complete page or a read with one continuation.
+    // Read at most two pages. Only a terminal page makes the inventory complete.
     // A thrown provider error leaves the caller without an inventory verdict.
     let page = |marker: JsValue| {
         read_page.call4(
@@ -837,7 +837,9 @@ fn read_inventory_status(
             }
             Err(error) => return Err(error),
         };
-        assert!(last.next_marker.is_none());
+        if last.next_marker.is_some() {
+            return Ok((false, inventory_status("pending", target, checkpoint)));
+        }
         first.parts.extend(last.parts);
     }
     let coherent = checkpoint.matches_parts(first.parts.iter().map(|part| CheckpointPart {
