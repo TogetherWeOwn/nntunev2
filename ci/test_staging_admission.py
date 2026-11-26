@@ -801,6 +801,33 @@ class VerifyTests(Base):
         w.add_other("skipped")
         self.assertEqual(w.verify()["result"], "satisfied")
 
+    def test_independent_same_sha_runs_use_deployment_history(self):
+        other_id = RUN_ID - 1
+        other_jobs = f"runs/{other_id}/jobs?filter=all&per_page=100&page=1"
+        selected_jobs = f"runs/{RUN_ID}/jobs?filter=all&per_page=100&page=1"
+        for api_conclusion in (None, "skipped", "success"):
+            with self.subTest(api_conclusion=api_conclusion):
+                w = World()
+                if api_conclusion is not None:
+                    # An older run can start deploying after the selected
+                    # run has begun its journey. Both push SHAs stay fixed.
+                    w.runs.append(dict(w.run, id=other_id, created_at=iso(-30), updated_at=iso(1)))
+                    w.others[other_id] = [
+                        dict(w.job("staging-web", -2.25, started=-2.75), id=201,
+                             run_id=other_id, conclusion="skipped"),
+                        dict(w.job("staging-api", -2.25, started=-2.75, steps=[
+                            w.step(sa.DEPLOY_STEPS["staging-api"], 1, api_conclusion)
+                        ]), id=202, run_id=other_id, conclusion=api_conclusion),
+                    ]
+                actions = FakeActions(w.routes())
+                if api_conclusion == "success":
+                    self.refused("^known intervening staging deployment; fresh journey required$",
+                                 w.verify_with_actions, actions)
+                else:
+                    self.assertEqual(w.verify_with_actions(actions), w.receipt)
+                self.assertNotIn(selected_jobs, actions.calls)
+                self.assertEqual(other_jobs in actions.calls, api_conclusion is not None)
+
     def test_hash_source_and_manifest_mismatch(self):
         w = World()
         self.assertWorldRefused(w, "manifest mismatch", manifest_hash=sa.digest(b"other"))
