@@ -35,6 +35,18 @@ or the readback points to a different candidate or rollout, leave the start
 pending and retain the original request pins. Continue read-only reconciliation
 without recording a run as confirmed or issuing a second dispatch.
 
+## Resume verification when the recorded run status is unavailable
+
+Run `102/1` is already recorded. A temporary failure reading its Actions
+status leaves the status and switch-off **Pending**. Keep the recorded run
+link, attempt and writer freeze. The next action is a read of that same attempt
+in the recorded repository (`GET /repos/example/fixture/actions/runs/102/attempts/1`).
+Do not list candidate runs again, dispatch another recovery or rerun the workflow.
+
+The next read reports `completed` with conclusion `success` for `102/1`.
+Record the status and continue with that attempt's recovery job, serving
+allocation and denial evidence before marking switch-off complete.
+
 ## Record the completed switch-off
 
 | Handoff field | Example entry |

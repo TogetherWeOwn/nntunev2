@@ -232,7 +232,7 @@ test('operator switch-off resumes read-only after incomplete deployment history'
   assert.deepEqual(rows, restoredHistory);
 });
 
-test('operator recovers the existing rollback run after the dispatch response is lost', () => {
+test('operator recovers the existing rollback run after the dispatch response is lost', async (t) => {
   const source = readFileSync(new URL(`../${workflow}`, import.meta.url), 'utf8');
   const job = source.split('\n  preflight:\n')[1]?.split(/\n {2}\S/)[0];
   assert.match(job, /^    name: production-preflight$/m);
@@ -288,9 +288,43 @@ test('operator recovers the existing rollback run after the dispatch response is
   assert.equal(confirmStart(listing, { ...preflight, inputs: { ...inputs, DEPLOY_MODE: 'promote' } }), pending);
   assert.equal(confirmStart(listing, { ...preflight, inputs: { ...inputs, INPUT_SHA: run.head_sha } }), pending);
   assert.equal(confirmStart(listing, { ...preflight, inputs: { ...inputs, RECOVERY_RUN_ID: '100' } }), pending);
-  assert.deepEqual(confirmStart(listing, preflight), {
+  const recorded = confirmStart(listing, preflight);
+  assert.deepEqual(recorded, {
     start: 'confirmed', runId: 102, attempt: 1, switchOff: 'pending',
   });
+
+  await t.test('a temporary status failure retries the recorded attempt read-only', () => {
+    const reads = [];
+    const readRun = (request) => {
+      reads.push(request);
+      if (reads.length === 1) throw new Error('synthetic status read unavailable');
+      return { ...run, status: 'completed', conclusion: 'success' };
+    };
+    const resume = (record) => {
+      const request = {
+        method: 'GET',
+        path: `/repos/${repository.full_name}/actions/runs/${record.runId}/attempts/${record.attempt}`,
+      };
+      let reply;
+      try {
+        reply = readRun(request);
+      } catch {
+        return { ...record, status: 'pending', nextRead: request };
+      }
+      const { nextRead, ...confirmed } = record;
+      return { ...confirmed, status: reply.status, conclusion: reply.conclusion };
+    };
+
+    const nextRead = { method: 'GET', path: '/repos/example/fixture/actions/runs/102/attempts/1' };
+    const unavailable = resume(recorded);
+    assert.deepEqual(unavailable, { ...recorded, status: 'pending', nextRead });
+    assert.deepEqual(reads, [nextRead]);
+    assert.equal(dispatches, 1);
+
+    assert.deepEqual(resume(unavailable), { ...recorded, status: 'completed', conclusion: 'success' });
+    assert.deepEqual(reads, [nextRead, nextRead]);
+  });
+
   assert.deepEqual(runs, [run]);
   assert.equal(dispatches, 1);
 });
