@@ -699,8 +699,6 @@ async fn prove_attempt(
         };
         let completion =
             SessionCompletion::prepare(binding, &context, receipts, &checkpoint).unwrap();
-        let provider_version = Cell::new(None);
-        let lost_provider_response = matches!(fault, Some(Fault::LostProviderCompletionResponse));
         let mut composite = Sha256::new();
         for part in &parts {
             composite.update(part.digest);
