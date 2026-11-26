@@ -205,6 +205,7 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   let seekContentRange = span;
   let fullRange = false;
   let fullRangeEnd = 65_616;
+  let mediaUnavailableOnce = false;
   let stallTail;
   let truncateTail;
   const fetches = [];
@@ -216,6 +217,11 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     const page = req.url.startsWith(pagePath);
     verifyGet(req, host, page, fullRange ? `bytes=0-${fullRangeEnd}` : undefined);
     fetches.push(page ? 'page' : 'media');
+    if (!page && mediaUnavailableOnce) {
+      mediaUnavailableOnce = false;
+      res.writeHead(503, { 'content-length': 0 }).end();
+      return;
+    }
     const bytes = Buffer.from(page ? fixture.digest_page()
       : fullRange ? fixture.full_ciphertext().subarray(0, fullRangeEnd + 1) : fixture.ciphertext());
     const headers = {
@@ -576,6 +582,33 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     assert.equal(flushed.get(otherPlay).flushed_bytes, 2);
     assert.equal(flushed.get(play).flushed_bytes, 3);
     assert.equal(alarm, null, 'the accepted batch needs no further retry');
+  });
+
+  await t.test('a temporarily unavailable range delivers and counts bytes only on retry', async (t) => {
+    const firstFetch = fetches.length;
+    const firstReport = reports.length;
+    const headers = { range: 'bytes=65535-65536' };
+    mediaUnavailableOnce = true;
+    t.after(() => { mediaUnavailableOnce = false; });
+
+    const refused = await request({}, '/play/track', bearer, headers);
+    assert.equal(refused.response.status, 502);
+    assert.equal(refused.response.headers.get('content-range'), null);
+    const error = JSON.parse(refused.bytes);
+    assert.equal(error.code, 'upstream_unavailable');
+    assert.equal(error.retryable, true);
+    assert.deepEqual(fetches.slice(firstFetch), ['media']);
+    assert.deepEqual(reports.slice(firstReport), []);
+
+    // verifyGet checks the same signed version and ciphertext range on both GETs.
+    const retry = await request({}, '/play/track', bearer, headers);
+    assert.equal(retry.response.status, 206);
+    assert.equal(retry.response.headers.get('content-range'), 'bytes 65535-65536/65537');
+    assert.deepEqual(retry.bytes, Buffer.from('YZ'));
+    assert.deepEqual(fetches.slice(firstFetch), ['media', 'media', 'page']);
+    assert.deepEqual(reports.slice(firstReport), [{
+      user_id: 'member', play_id: play, track_id: 'track', start: 65_535, end: 65_537, file_bytes: 65_537,
+    }]);
   });
 
   await t.test('a wrong encrypted object length delivers and counts no media', { timeout: 5_000 }, async (t) => {
