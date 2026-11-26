@@ -104,6 +104,10 @@ test('keyboard collection view changes preserve focus and invited Library playba
 		await expect(reverse).toHaveAttribute('aria-pressed', 'true');
 		await expect(list.getByRole('listitem')).toHaveText([/Field West/, /Field East/]);
 		await expect(current).toHaveAttribute(player.queueId, playing.id);
+		await page.keyboard.press('Tab');
+		await expect(view).not.toBeFocused();
+		await page.keyboard.press('Shift+Tab');
+		await expect(view).toBeFocused();
 	}
 
 	await types.getByRole('button', { name: 'Tracks', exact: true }).press('Enter');
