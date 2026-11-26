@@ -88,10 +88,16 @@ test('a delayed private track end leaves the selected replacement playing until 
 	for (const track of tracks) {
 		await page.getByTestId(library.item).filter({ hasText: track.title }).locator(library.select).click();
 	}
-	await transport.getByRole('button', { name: 'Play', exact: true }).click();
+	// The fixture learns the media path's session ID when it issues the first grant.
+	const [firstGrant] = await Promise.all([
+		page.waitForResponse((response) => response.url() === grantUrl && response.request().method() === 'POST' &&
+			response.request().postDataJSON()?.track_id === first.id),
+		transport.getByRole('button', { name: 'Play', exact: true }).click()
+	]);
+	expect(firstGrant.ok()).toBe(true);
+	const { session_id: session } = firstGrant.request().postDataJSON();
 	await expectPlaying(first);
 	const retired = await audio.elementHandle();
-	const session = grants[0].session_id;
 	const freshGrant = (track: typeof first) => ({ track_id: track.id, session_id: session });
 	expect(await finish()).toMatchObject({ trusted: true, source: origin + fixture.mediaPath(first.id) });
 	await expect(active).toHaveAttribute(player.queueId, first.id);
