@@ -1574,6 +1574,8 @@ jobs:
         run: python3 ci/test_staging_admission.py
       - name: Test ordinary API build artifact verification offline
         run: python3 -B ci/test_staging_api_candidate.py
+      - name: Unit-test staging queue readback (offline synthetic evidence only)
+        run: python3 -I ci/test_staging_queue_readback.py
       - name: Unit-test the private launch observation record (offline)
         run: python3 ci/test_production_observation.py
       - name: Unit-test staging Worker target and submission comparison (offline)
