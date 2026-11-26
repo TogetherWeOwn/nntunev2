@@ -190,6 +190,8 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   const signed = `v4.${payload}`;
   const bearer = `${signed}.${mac(grantKey, signed).toString('base64url')}`;
   const original = JSON.parse(fixture.custody(bearer, expires));
+  const sealedLength = fixture.full_ciphertext().length;
+  let reportedSealedLength = sealedLength;
   let snapshot = original;
   let resolveFault;
   let leaseNo = 0;
@@ -215,7 +217,7 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
       'content-length': bytes.length,
       'x-amz-version-id': page ? observedPageVersion : (mediaVersionOverride ?? 'version+/%?=&'),
     };
-    if (!page) headers['content-range'] = fullRange ? 'bytes 0-65616/65617' : seekContentRange;
+    if (!page) headers['content-range'] = fullRange ? `bytes 0-65616/${reportedSealedLength}` : seekContentRange;
     res.writeHead(page ? 200 : 206, headers);
     if (!page && stallTail) {
       res.once('close', () => stallTail(res.writableFinished));
@@ -392,11 +394,12 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   });
 
   fullRange = true;
+  const boundedSeek = { range: 'bytes=65534-65540' };
   await t.test('a bounded range crossing the short final chunk ends at media EOF', { timeout: 5_000 }, async () => {
     const firstFetch = fetches.length;
     const firstReport = reports.length;
     // request() drains the body to EOF before returning.
-    const { response, bytes } = await request({}, '/play/track', bearer, { range: 'bytes=65534-65540' });
+    const { response, bytes } = await request({}, '/play/track', bearer, boundedSeek);
     assert.equal(response.status, 206);
     assert.equal(response.headers.get('content-range'), 'bytes 65534-65536/65537');
     assert.deepEqual(bytes, Buffer.from('XYZ'));
@@ -404,6 +407,20 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     assert.deepEqual(reports.slice(firstReport), [{
       user_id: 'member', play_id: play, track_id: 'track', start: 65_534, end: 65_537, file_bytes: 65_537,
     }]);
+  });
+
+  await t.test('a wrong encrypted object length delivers and counts no media', { timeout: 5_000 }, async (t) => {
+    const firstFetch = fetches.length;
+    const firstReport = reports.length;
+    reportedSealedLength = sealedLength + 1;
+    t.after(() => { reportedSealedLength = sealedLength; });
+
+    const { response, bytes } = await request({}, '/play/track', bearer, boundedSeek);
+    assert.equal(response.status, 502);
+    assert.equal(response.headers.get('content-range'), null);
+    assert.equal(JSON.parse(bytes).code, 'upstream_unavailable');
+    assert.deepEqual(fetches.slice(firstFetch), ['media']);
+    assert.equal(reports.length, firstReport);
   });
 
   await t.test('canceling a v4 response stops a pending read at the HTTPS origin', { timeout: 5_000 }, async (t) => {
