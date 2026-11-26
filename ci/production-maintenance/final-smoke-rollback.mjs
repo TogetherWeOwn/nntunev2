@@ -18,6 +18,31 @@ const matches = (entry, expected) => Array.isArray(entry?.versions) && entry.ver
     actual?.version_id === v.version_id && actual.percentage === v.percentage));
 const seedDigest = createHash('sha256').update(readFileSync(new URL('./worker.mjs', import.meta.url))).digest('hex');
 
+export class RestoredModuleMismatchError extends Error {
+  constructor(recorded, restored) {
+    super(`Switch-off pending: restored maintenance module SHA-256 ${restored} differs from the rollback receipt ` +
+      `${recorded}. Keep the writer freeze and reconcile the pinned maintenance version and provider audit read-only.`);
+  }
+}
+
+// Only the single seeded module counts as readable maintenance content.
+function moduleDigest(version) {
+  const [module, ...extra] = Array.isArray(version.modules) ? version.modules : [];
+  const content = module?.content_base64;
+  if (extra.length || version.main_module !== 'worker.mjs' || module?.name !== 'worker.mjs' ||
+      typeof content !== 'string' || Buffer.from(content, 'base64').toString('base64') !== content) return null;
+  return createHash('sha256').update(Buffer.from(content, 'base64')).digest('hex');
+}
+
+export function rollbackNotice(command, error) {
+  if (command === 'admit-recovery' && error instanceof proof.ArtifactUnavailableError) {
+    return '::error::Switch-off pending: pinned rollback intent unavailable. Read the Actions artifact metadata for the original rollout and reconcile the pinned rollback allocation and provider audit read-only. Keep the original recovery inputs and writer freeze.';
+  }
+  // Both digests are of reviewed public code, not protected input.
+  if (error instanceof RestoredModuleMismatchError) return `::error::${error.message}`;
+  return '::error::Protected rollback check failed. Reconcile Worker, deployment, routes and provider audit before any retry.';
+}
+
 export async function finalSmokeRollback(command, env, request = fetch, now = Date.now, probe = smoke) {
   const prepare = command === 'prepare-recovery';
   const recovery = prepare || command === 'recover';
@@ -85,11 +110,18 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
     if (result.id !== worker || result.name !== name || !Number.isFinite(Date.parse(result.deployed_on)) ||
         !isDeepStrictEqual(result.references, references) || result.subdomain?.enabled !== false ||
         result.subdomain.previews_enabled !== false) throw new Error('Worker identity, routes or previews drifted');
-    const { result: version } = await api(`${pinned}/versions/${target.version}`, 'Rollback target version');
+    // Recovery cannot compare the receipt with this checkout, so it reads the module back.
+    const readModule = recovery && maintenance;
+    const { result: version } = await api(`${pinned}/versions/${target.version}${readModule ? '?include=modules' : ''}`,
+      'Rollback target version');
     const bindings = maintenance ? [] : [{ name: 'ASSETS', type: 'assets' }];
+    const digest = readModule ? moduleDigest(version) : null;
     if (version.id !== target.version || version.annotations?.['workers/tag'] !== (maintenance?.sha ?? previous.tag) ||
-        !isDeepStrictEqual(version.bindings, bindings)) {
+        !isDeepStrictEqual(version.bindings, bindings) || (readModule && !digest)) {
       throw new Error(maintenance ? 'Maintenance version drifted' : 'Previous version drifted');
+    }
+    if (readModule && digest !== maintenance.module_sha256) {
+      throw new RestoredModuleMismatchError(maintenance.module_sha256, digest);
     }
     const history = await api(deployments + page, 'Deployment history');
     const list = history.result.deployments;
@@ -197,11 +229,7 @@ if (import.meta.main) {
     if (verdict) writeFileSync(process.stdout.fd, `${verdict}\n`);
   } catch (error) {
     // Errors may contain protected input or provider data. Keep details in private custody.
-    if (command === 'admit-recovery' && error instanceof proof.ArtifactUnavailableError) {
-      console.error('::error::Switch-off pending: pinned rollback intent unavailable. Read the Actions artifact metadata for the original rollout and reconcile the pinned rollback allocation and provider audit read-only. Keep the original recovery inputs and writer freeze.');
-    } else {
-      console.error('::error::Protected rollback check failed. Reconcile Worker, deployment, routes and provider audit before any retry.');
-    }
+    console.error(rollbackNotice(command, error));
     process.exitCode = 1;
   }
 }

@@ -41,7 +41,8 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId, d
     created_on: new Date(now() + n * 1000).toISOString() });
   const rows = [deployment(1, [allocation(version)])];
   const seed = { id: version, bindings: kind === 'previous' ? [{ name: 'ASSETS', type: 'assets' }] : [],
-    annotations: { 'workers/tag': custody.previous?.tag ?? target.sha } };
+    annotations: { 'workers/tag': custody.previous?.tag ?? target.sha }, main_module: 'worker.mjs',
+    modules: [{ name: 'worker.mjs', content_type: 'application/javascript+module', content_base64: module.toString('base64') }] };
   const versions = [seed, { id: candidate, annotations: { 'workers/tag': `${sha}-12-1` } }];
   const state = { id: workerId, name: 'nntune-web', deployed_on: checkedAt, references: structuredClone(references),
     subdomain: { enabled: false, previews_enabled: false } };
@@ -74,7 +75,8 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId, d
     const pinned = `/workers/${workerId}`;
     switch (path) {
       case pinned: return response(state);
-      case `${pinned}/versions/${version}`: return response(seed);
+      case `${pinned}/versions/${version}`:
+      case `${pinned}/versions/${version}?include=modules`: return response(seed);
       case `${pinned}/versions/${candidate}`: return response(versions[1]);
       case `${pinned}/versions?page=1&per_page=100`: return response(versions, versions.length);
       case '/scripts/nntune-web/deployments?page=1&per_page=100':

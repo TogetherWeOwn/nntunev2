@@ -1479,6 +1479,8 @@ The approval and shared mutation lock apply even with new deployments disabled.
 Recovery verifies the intent and rollout before reservation. The plan expires
 after two minutes. Reconcile an expired or ambiguous reservation against audit.
 Verify restored build health and identity or the private maintenance behavior.
+Recovery reads back the pinned maintenance module. If its SHA-256 differs from
+custody `module_sha256`, switch-off stays pending and the error names both digests.
 
 If the recovery job reports **Switch-off pending: pinned rollback intent
 unavailable**, read the Actions artifact metadata on the original rollout run
