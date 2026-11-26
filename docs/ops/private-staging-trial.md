@@ -101,14 +101,14 @@ If dedicated PostgreSQL provisioning stops partway through, use the
 
 ### Read ordinary staging progress for a pinned candidate
 
-At the existing qualification callback, match the full commit SHA, run ID and
-attempt in the trial record to the automatic `main` push of `deploy.yml`.
+For a disarmed candidate, match the full recorded SHA, run ID and attempt to the
+automatic `main` push of `deploy.yml` at the qualification callback. For an
+armed run, use the [private journey proof](../first-private-music-launch.md#qualify-the-candidate).
 Read `GET /repos/TogetherWeOwn/nntunev2/actions/runs/<run-id>/attempts/<attempt>`
 and the same attempt's `/jobs?per_page=100&page=1` listing. Include every page
-and confirm `total_count` before treating an empty listing as evidence. Keep
-the recorded SHA, run and attempt through each read. These are read-only
-checks. Leave dispatch, reruns, cancellations and candidate selection out of
-this handoff.
+and confirm `total_count` before treating an empty listing as evidence. Take job
+IDs from that listing and match the SHA and run ID on each job read. This handoff
+uses GET requests only and retains the selected candidate.
 
 Use these synthetic snapshots of one attempt to rehearse the callback.
 
