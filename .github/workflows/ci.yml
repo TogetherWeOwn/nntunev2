@@ -1,3 +1,4 @@
+# guards: release:staging promotion ci-ok
 name: ci
 
 # `ci-ok` is a required check on main: its NAME must stay `ci-ok`, and every

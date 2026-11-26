@@ -90,8 +90,8 @@ class PublicPrSecurityTests(unittest.TestCase):
             "ci": "opened, synchronize, reopened",
             "codeql": "opened, synchronize, reopened",
             "gitleaks": "opened, synchronize, reopened",
-            "migrations-staging": "opened, edited, synchronize, reopened",
-            "pr-lint": "opened, edited, synchronize, reopened",
+            "migrations-staging": "opened, synchronize, reopened",
+            "pr-lint": "opened, synchronize, reopened",
             "pr-size": "opened, synchronize, reopened, labeled, unlabeled",
         }.items():
             with self.subTest(workflow=workflow):

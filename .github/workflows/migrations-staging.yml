@@ -1,3 +1,4 @@
+# guards: required:migrations-staging
 name: migrations-staging
 
 # Whether staging actually has a migration is verified against the
@@ -11,7 +12,9 @@ name: migrations-staging
 
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened]
+    types: [opened, synchronize, reopened]
+    # A PR against a stack branch must not get a verdict reusable on main.
+    branches: [main]
   # Required checks must report on merge_group; the queue run has no PR
   # file list, so it passes vacuously (renames were checked on the PR).
   merge_group:
@@ -22,7 +25,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  # Never cancel: Dependabot fires two pull_request events ~1s apart at PR
+  # Never cancel: Dependabot used to fire two pull_request events ~1s apart at PR
   # creation (opened, then edited) for the same head SHA, and cancelling the
   # first leaves a permanent CANCELLED required check in the rollup next to
   # its successful twin, which reads as a stuck PR. The job takes seconds,
