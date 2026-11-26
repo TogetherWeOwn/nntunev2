@@ -1,11 +1,16 @@
 import adapter from '@sveltejs/adapter-cloudflare';
-import { beforeEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import configure from '../vite.config.js';
 
 vi.mock('@sveltejs/adapter-cloudflare', { spy: true });
 
 beforeEach(() => {
+	vi.stubEnv('PUBLIC_API_BASE_URL', '');
 	vi.mocked(adapter).mockClear();
+});
+
+afterEach(() => {
+	vi.unstubAllEnvs();
 });
 
 test('disables Miniflare persistence for browser fixture previews', () => {
