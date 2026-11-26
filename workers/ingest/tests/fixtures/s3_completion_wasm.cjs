@@ -1,9 +1,12 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { readFile } = require('node:fs/promises');
+const { join } = require('node:path');
 const { test } = require('node:test');
 const {
-  s3_completion_test: complete, s3_fixture_retirement_test: retire,
+  s3_completion_test: complete, s3_completion_file_selection_test: resumeAfterSelection,
+  s3_fixture_retirement_test: retire,
   s3_multipart_delayed_status_test: completeWithDelayedStatus,
   s3_multipart_conflicting_status_test: completeWithConflictingStatus,
 } = require('./ingest_wasm.cjs');
@@ -273,9 +276,11 @@ function multipartCompletionReceipt(parts) {
   );
 }
 
-async function exerciseMultipartResume(t, mode) {
-  const partBytes = 5_244_160;
-  const tailBytes = wireHeaderLength + Math.ceil(partBytes / 65_536) * 16;
+const partBytes = 5_244_160;
+const plainChunkBytes = 65_536;
+
+async function exerciseMultipartResume(t, mode, run = () => complete(mode)) {
+  const tailBytes = wireHeaderLength + Math.ceil(partBytes / plainChunkBytes) * 16;
   const requests = [];
   const stored = new Map();
   const lateFailure = mode === 'multipart-resume-timeout' ? Promise.withResolvers() : null;
@@ -329,7 +334,7 @@ async function exerciseMultipartResume(t, mode) {
     return multipartCompletionReceipt(stored);
   });
   try {
-    assert.equal(await complete(mode), version);
+    assert.equal(await run({ requests, stored }), version);
   } finally {
     lateFailure?.resolve();
   }
@@ -344,6 +349,56 @@ test('resumes multipart upload with only the missing part and preserves the conf
 
 test('preserves the multipart retry receipt when the timed-out part request later fails',
   (t) => exerciseMultipartResume(t, 'multipart-resume-timeout'));
+
+async function multipartFlac(contentMarker) {
+  const source = await readFile(join(__dirname, '../../../../fixtures/synthetic-flac/admin-upload/fixture-1.flac'));
+  const streamInfoEnd = 42;
+  // The APPLICATION block differs within the first plaintext chunk, which is already confirmed.
+  const application = Buffer.from([0x02, 0, 0, 5, ...Buffer.from('nntu'), contentMarker]);
+  const paddingStart = streamInfoEnd + application.length;
+  const bytes = Buffer.alloc(partBytes);
+  source.copy(bytes, 0, 0, streamInfoEnd);
+  bytes[4] &= 0x7f;
+  application.copy(bytes, streamInfoEnd);
+  // Insert a last PADDING block before the original audio frames.
+  bytes.writeUInt32BE(0x81000000 + bytes.length - source.length - application.length - 4, paddingStart);
+  source.copy(bytes, bytes.length - (source.length - streamInfoEnd), streamInfoEnd);
+  return new File([bytes], 'track.flac', { type: 'audio/flac', lastModified: 0 });
+}
+
+test('keeps the same pending multipart attempt when a different FLAC is reselected', async (t) => {
+  const original = await multipartFlac(1);
+  const replacement = await multipartFlac(2);
+  assert.equal(replacement.name, original.name);
+  assert.equal(replacement.size, original.size);
+  assert.equal(replacement.lastModified, original.lastModified);
+  const bytes = new Uint8Array(await original.arrayBuffer());
+  const differentBytes = new Uint8Array(await replacement.arrayBuffer());
+  assert.notEqual(sha256(differentBytes), sha256(bytes));
+  // A check limited to the missing part would see identical bytes.
+  assert.equal(Buffer.compare(differentBytes.subarray(plainChunkBytes), bytes.subarray(plainChunkBytes)), 0);
+
+  const selections = [];
+  let confirmed;
+  await exerciseMultipartResume(t, 'multipart-resume', ({ requests, stored }) =>
+    resumeAfterSelection(bytes, async (offer, mismatch) => {
+      assert.deepEqual(JSON.parse(offer), {
+        session: 'fixture-session', bucket, key: mediaKey,
+        uploadId: new URLSearchParams(uploadQuery).get('uploadId'),
+        size: original.size, contentSha256: sha256(bytes), confirmedParts: 1,
+      });
+      assert.deepEqual(requests, [
+        `PUT partNumber=1&${uploadQuery}`, `PUT partNumber=2&${uploadQuery}`,
+      ]);
+      assert.deepEqual([...stored.keys()], [1]);
+      if (mismatch) assert.equal(stored.get(1), confirmed);
+      else confirmed = stored.get(1);
+      selections.push(mismatch);
+      assert.ok(selections.length <= 2);
+      return mismatch ? new Uint8Array(await original.arrayBuffer()) : differentBytes;
+    }));
+  assert.deepEqual(selections, [false, true]);
+});
 
 test('preserves confirmed progress when a pre-finalization multipart status reply arrives late', { timeout: 10_000 }, async (t) => {
   const requests = [];

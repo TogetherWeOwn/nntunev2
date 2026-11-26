@@ -19,7 +19,7 @@ use nntune_core::{
 use sha2::{Digest, Sha256};
 use wasm_bindgen_futures::JsFuture;
 use worker::{
-    js_sys::{Function, Promise},
+    js_sys::{Function, Promise, Uint8Array},
     wasm_bindgen::{self, prelude::*},
 };
 
@@ -50,7 +50,27 @@ pub async fn s3_completion_test(
         "path" => "https://fixture.test:8443/api",
         _ => "https://fixture.test:8443",
     };
-    run(&mode, endpoint, read_page, None, None, false).await
+    run(&mode, endpoint, read_page, None, None, false, None).await
+}
+
+#[wasm_bindgen]
+pub async fn s3_completion_file_selection_test(
+    source: Vec<u8>,
+    select_file: Function,
+) -> Result<String, JsValue> {
+    if source.len() != PART_BYTES {
+        return Err(JsValue::from_str("expected a two-part fixture source"));
+    }
+    run(
+        "multipart-resume",
+        "https://fixture.test:8443",
+        None,
+        None,
+        None,
+        false,
+        Some((&source, &select_file)),
+    )
+    .await
 }
 
 #[wasm_bindgen]
@@ -62,6 +82,7 @@ pub async fn s3_multipart_delayed_status_test(observe: Function) -> Result<Strin
         None,
         Some(&observe),
         false,
+        None,
     )
     .await
 }
@@ -75,6 +96,7 @@ pub async fn s3_multipart_conflicting_status_test(observe: Function) -> Result<S
         None,
         Some(&observe),
         true,
+        None,
     )
     .await
 }
@@ -110,7 +132,16 @@ pub async fn upload_for_playback(
     } else {
         "readback-playback"
     };
-    run(mode, &endpoint, None, reconcile_completion, None, false).await
+    run(
+        mode,
+        &endpoint,
+        None,
+        reconcile_completion,
+        None,
+        false,
+        None,
+    )
+    .await
 }
 
 async fn run(
@@ -120,6 +151,7 @@ async fn run(
     reconcile_completion: Option<Function>,
     observe: Option<&Function>,
     conflicting_status: bool,
+    file_selection: Option<(&[u8], &Function)>,
 ) -> Result<String, JsValue> {
     let configuration = id(7);
     let bucket = "fixture-bucket";
@@ -186,7 +218,9 @@ async fn run(
         "multipart-resume" | "multipart-resume-full" | "multipart-resume-timeout"
     );
     let resume_bytes;
-    let plaintext: &[u8] = if matches!(mode, "readback-publish" | "readback-playback") {
+    let plaintext: &[u8] = if let Some((source, _)) = file_selection {
+        source
+    } else if matches!(mode, "readback-publish" | "readback-playback") {
         TONE
     } else if multipart_resume {
         resume_bytes = vec![42; PART_BYTES];
@@ -342,6 +376,7 @@ async fn run(
             read_page,
             observe,
             conflicting_status,
+            file_selection.map(|(_, select_file)| (select_file, manifest.plaintext_sha256())),
         )
         .await;
     }
@@ -502,6 +537,7 @@ async fn resume_multipart<'a>(
     read_page: Option<Function>,
     observe: Option<&Function>,
     conflicting_status: bool,
+    file_selection: Option<(&Function, &[u8; 32])>,
 ) -> Result<String, JsValue> {
     let [first, second] = parts else {
         panic!("expected two fixture parts");
@@ -638,6 +674,9 @@ async fn resume_multipart<'a>(
     };
     assert!(matches_checkpoint(binding, &receipts, &checkpoint));
     if initial_saved.len() == 1 {
+        if let Some((select_file, source_digest)) = file_selection {
+            wait_for_original_file(&checkpoint, source_digest, select_file).await?;
+        }
         let receipt = match staged_inventory {
             Some(read_page) => recover_staged_part(&read_page, initial_saved[0], second)?,
             None => sender
@@ -789,6 +828,44 @@ fn checkpoint_part<'a>(receipt: &UploadedPart<'_>, etag: &'a str) -> CheckpointP
         len: receipt.len,
         etag,
         digest: receipt.digest,
+    }
+}
+
+// Fixture handoff only. The browser's IngestRequests.upload adapter must supply
+// its canonical pending attempt and saved plaintext digest before file selection.
+// Keep the authoritative checkpoint, sealed bytes and receipts with the sender.
+async fn wait_for_original_file(
+    pending: &ResumeCheckpoint<'_>,
+    source_digest: &[u8; 32],
+    select_file: &Function,
+) -> Result<(), JsValue> {
+    let target = pending.binding.plan.target;
+    let size = pending.binding.plan.plaintext_len;
+    let offer = JsValue::from_str(
+        &serde_json::json!({
+            "session": pending.binding.session,
+            "bucket": target.bucket,
+            "key": target.key,
+            "uploadId": target.upload_id,
+            "size": size,
+            "contentSha256": hex::encode(source_digest),
+            "confirmedParts": pending.parts.len(),
+        })
+        .to_string(),
+    );
+    let mut mismatch = false;
+    loop {
+        let selection = select_file.call2(&JsValue::UNDEFINED, &offer, &JsValue::from(mismatch))?;
+        let bytes = JsFuture::from(Promise::resolve(&selection))
+            .await?
+            .dyn_into::<Uint8Array>()
+            .map_err(|_| JsValue::from_str("no fixture file selected"))?;
+        if u64::from(bytes.length()) == size
+            && <[u8; 32]>::from(Sha256::digest(bytes.to_vec())) == *source_digest
+        {
+            return Ok(());
+        }
+        mismatch = true;
     }
 }
 
