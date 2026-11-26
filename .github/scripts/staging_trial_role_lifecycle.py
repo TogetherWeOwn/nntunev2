@@ -80,11 +80,13 @@ def check_catalog(isolated, fixture):
 def check_catalog_connections(isolated, owner, executor, *, fixture=False,
                               owner_guard="", executor_guard="", query=psql_output):
     begin = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n"
+    begin += require("pg_catalog.current_setting('server_version_num')::int / 10000 = 18")
     query(owner, begin + target(isolated, owner["PGUSER"], fixture) + owner_guard
           + require("SELECT datdba = to_regrole(current_user)::oid FROM pg_database "
-                    "WHERE datname = current_database()") + "COMMIT;\n", "isolated owner identity")
+                    "WHERE datname = current_database()") + "COMMIT;\n",
+          "isolated owner identity or server major (expected PostgreSQL 18)")
     print("isolated owner identity passed")
-    stage = "isolated executor identity or migration baseline"
+    stage = "isolated executor identity or migration baseline or server major (expected PostgreSQL 18)"
     verdict = query(executor, begin + target(isolated, executor["PGUSER"], fixture) + executor_guard
                     + require(f"to_regrole(current_user)::oid = {isolated['executor_oid']}") + baseline()
                     + f"SELECT ({ISOLATED_EXTENSION_CATALOG}) IS TRUE;\nCOMMIT;\n", stage)
