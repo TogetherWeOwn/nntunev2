@@ -160,6 +160,10 @@ def page(key, rows, total=None):
     return {"total_count": len(rows) if total is None else total, key: rows}
 
 
+def artifact_listing(name):
+    return f"runs/{RUN_ID}/artifacts?name={name}&per_page=100&page=1"
+
+
 class World:
     """Coherent synthetic run: one main-push attempt, three green jobs, one receipt."""
 
@@ -171,6 +175,7 @@ class World:
         self.receipt = sa.produce(make_env(**(env or {})), xml or make_junit(), self.policy,
                                   contract_bytes, manifest, private_pins=private_deployments,
                                   private_track_sha256=PRIVATE_AUDIO_SHA)
+        self.artifact_name = sa.artifact_name(SHA, RUN_ID, 1, self.receipt.get("journey"))
         self.workflow = {"id": WORKFLOW_ID, "path": sa.WORKFLOW, "state": "active"}
         repo = {"full_name": REPO, "id": REPO_ID}
         self.run = {"id": RUN_ID, "run_attempt": 1, "workflow_id": WORKFLOW_ID, "path": sa.WORKFLOW,
@@ -202,7 +207,7 @@ class World:
         self.archive = archive if archive is not None else make_zip(
             [("staging-admission.json", json.dumps(self.receipt))])
         self.artifact = {
-            "id": ARTIFACT_ID, "name": sa.artifact_name(SHA, RUN_ID, 1, self.receipt.get("journey")),
+            "id": ARTIFACT_ID, "name": self.artifact_name,
             "expired": False,
             "size_in_bytes": len(self.archive), "digest": "sha256:" + sa.digest(self.archive),
             "expires_at": iso(60 * 24),
@@ -228,7 +233,7 @@ class World:
                 page("workflow_runs", self.runs),
             f"runs/{RUN_ID}": self.run,
             f"runs/{RUN_ID}/attempts/1/jobs{base}": jobs or page("jobs", self.jobs),
-            f"runs/{RUN_ID}/artifacts{base}": artifacts or page(
+            artifact_listing(self.artifact_name): artifacts or page(
                 "artifacts", [self.artifact] if self.artifact is not None else []),
         }
         if self.artifact is not None:
@@ -521,7 +526,6 @@ class PrivateAdmissionTests(Base):
         first_job_listing = page("jobs", first_jobs)
         routes = world.routes(jobs=first_job_listing)
         self.assertEqual(world.verify(routes=routes)["result"], "satisfied")
-        artifact_listing = f"runs/{RUN_ID}/artifacts?per_page=100&page=1"
 
         # A successful single-job rerun supersedes attempt 1 but lacks its deployment jobs.
         world.run.update(run_attempt=2, updated_at=iso(-25))
@@ -529,7 +533,7 @@ class PrivateAdmissionTests(Base):
             "jobs", [dict(world.job("staging-ingest", -25, started=-30), run_attempt=2)])
         actions = FakeActions(routes)
         self.refused("^missing or ambiguous required staging job$", world.verify_with_actions, actions)
-        self.assertNotIn(artifact_listing, actions.calls)
+        self.assertFalse(any(call.startswith(f"runs/{RUN_ID}/artifacts?") for call in actions.calls))
 
         # Re-run all jobs with a fresh report and deployment pins for attempt 3.
         world.run.update(run_attempt=3, updated_at=iso(5))
@@ -548,8 +552,9 @@ class PrivateAdmissionTests(Base):
         routes[f"runs/{RUN_ID}/attempts/3/jobs?per_page=100&page=1"] = page("jobs", rerun_jobs)
         routes[f"artifacts/{ARTIFACT_ID}/zip"] = prior_archive
         routes[f"artifacts/{ARTIFACT_ID + 1}/zip"] = world.archive
+        listing = artifact_listing(current_artifact["name"])
 
-        routes[artifact_listing] = page("artifacts", [prior_artifact, current_artifact])
+        routes[listing] = page("artifacts", [current_artifact])
         actions = FakeActions(routes)
         verified = world.verify_with_actions(actions)
         self.assertEqual(verified["result"], "satisfied")
@@ -559,7 +564,7 @@ class PrivateAdmissionTests(Base):
         self.assertEqual(verified["coverage"], [{"id": name, "outcome": "passed"} for name in PRIVATE_CASES])
         self.assertNotIn(f"artifacts/{ARTIFACT_ID}/zip", actions.calls)
 
-        routes[artifact_listing] = page("artifacts", [prior_artifact])
+        routes[listing] = page("artifacts", [prior_artifact])
         actions = FakeActions(routes)
         self.refused("missing or ambiguous attempt-bound receipt", world.verify_with_actions, actions)
         self.assertFalse(any(call.endswith("/zip") for call in actions.calls))
@@ -1145,13 +1150,31 @@ class VerifyTests(Base):
         w.jobs[2]["steps"].append(dict(w.jobs[2]["steps"][0], number=9))
         self.assertWorldRefused(w, "steps must succeed in order")
 
-    def test_artifact_missing_duplicate_or_wrong_name(self):
+    def test_artifact_lookup_ignores_over_one_page_of_unrelated_artifacts(self):
         w = World()
-        w.artifact["name"] = "other"
-        self.assertWorldRefused(w, "missing or ambiguous")
+        unrelated = [dict(w.artifact, id=ARTIFACT_ID + offset, name=f"unrelated-{offset}")
+                     for offset in range(1, 102)]
+        unfiltered = f"runs/{RUN_ID}/artifacts?per_page=100&page=1"
+        routes = w.routes()
+        routes[unfiltered] = page("artifacts", unrelated[:100], total=len(unrelated) + 1)
+        actions = FakeActions(routes)
+
+        self.assertEqual(w.verify_with_actions(actions)["result"], "satisfied")
+        self.assertIn(artifact_listing(w.artifact["name"]), actions.calls)
+        self.assertNotIn(unfiltered, actions.calls)
+
+    def test_artifact_missing_duplicate_incomplete_or_wrong_name(self):
         w = World()
-        self.assertWorldRefused(w, "missing or ambiguous",
-                                routes=w.routes(artifacts=page("artifacts", [w.artifact, dict(w.artifact, id=901)])))
+        refusal = "missing or ambiguous attempt-bound receipt"
+        for rows, total, reason in (
+                ([], 0, refusal),
+                ([dict(w.artifact, name=w.artifact["name"] + "-other")], 1, refusal),
+                ([w.artifact, dict(w.artifact, id=ARTIFACT_ID + 1)], 2, refusal),
+                ([w.artifact], 2, "incomplete or exhausted artifacts listing")):
+            with self.subTest(total=total, rows=len(rows), reason=reason):
+                actions = FakeActions(w.routes(artifacts=page("artifacts", rows, total)))
+                self.refused(reason, w.verify_with_actions, actions)
+                self.assertFalse(any(call.endswith("/zip") for call in actions.calls))
 
     def test_artifact_provenance_and_expiry(self):
         for edit in (lambda a: a.update(expired=True),
@@ -1177,8 +1200,6 @@ class VerifyTests(Base):
                                 routes=w.routes(jobs=page("jobs", w.jobs, total=101)))
         self.assertWorldRefused(w, "incomplete or exhausted jobs",
                                 routes=w.routes(jobs=page("jobs", w.jobs, total=len(w.jobs) + 1)))
-        self.assertWorldRefused(w, "incomplete or exhausted artifacts",
-                                routes=w.routes(artifacts=page("artifacts", [w.artifact], total=2)))
         w.runs = w.runs * 1
         routes = w.routes()
         routes[f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push&head_sha={SHA}&per_page=100&page=1"] = page(
@@ -1317,7 +1338,7 @@ class SourceBindingTests(Base):
                 self.assertEqual(stopped.exception.code, 1)
                 self.assertEqual(error.getvalue(), f"::error::Candidate admission refused: {cli_refusal}\n")
                 self.assertEqual(output.getvalue(), "")
-                self.assertNotIn(f"runs/{RUN_ID}/artifacts?per_page=100&page=1", actions.calls)
+                self.assertFalse(any(call.startswith(f"runs/{RUN_ID}/artifacts?") for call in actions.calls))
                 live.assert_not_called()
                 return
             with patch.object(sa, "git", wraps=sa.git) as source_git:
@@ -1600,10 +1621,8 @@ class SourceBindingTests(Base):
             with self.subTest(field=field):
                 def wrong_receipt():
                     world = PrivateWorld()
-                    name = world.artifact["name"]
                     world.receipt[field] = value
                     world.set_archive()
-                    world.artifact["name"] = name
                     return world
 
                 self.refused(reason, self.run_main, private=True, mode="promote", world_factory=wrong_receipt)
