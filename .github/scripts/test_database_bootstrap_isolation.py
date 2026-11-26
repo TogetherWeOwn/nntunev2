@@ -2,6 +2,7 @@
 
 import base64
 import errno
+import hashlib
 import io
 import ipaddress
 import json
@@ -641,6 +642,7 @@ def prove_baseline(cluster):
                f'GRANT CONNECT ON DATABASE {LAUNCH} TO {READER};', role=CREATOR, switch=OWNER)
     fixture_plan = baseline.baseline_plan(json.dumps(plan | {"reader_role": READER}).encode())
     prove_missing_baseline_relation(cluster, fixture_plan)
+    prove_ineffective_baseline_grant(cluster, fixture_plan)
     cluster.ok("use the exact mixed-case SQL reader name", f'ALTER ROLE {READER} RENAME TO "{reader}";')
     calls = cluster.directory / "invocations"
     before = calls.stat().st_size
@@ -795,6 +797,77 @@ def prove_missing_baseline_relation(cluster, plan):
                        "ERROR:  P0001: reviewed baseline inventory differs", **reader)
     finally:
         cluster.ok("remove the reviewed inventory fixture", "DROP SCHEMA baseline_readiness_fixture CASCADE;", **launch)
+
+
+def prove_ineffective_baseline_grant(cluster, plan):
+    launch = {"database": LAUNCH, "role": MIGRATOR}
+    reader = {"database": LAUNCH, "role": READER}
+    script = Path(__file__).with_name("database_bootstrap_reader_evidence.py")
+    begin = "\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n"
+    sql = baseline.baseline_sql(plan).decode("ascii")
+    require(sql.startswith(begin), "read the migration inventory in the baseline snapshot")
+    observed_identity = f"{READER}|{plan.reader_oid}|{plan.database_oid}\n"
+    catalog = "1\ngrant_ledger.schema_migrations\ngrant_tracks.tracks\n"
+    readback_sql = begin + """
+        SELECT current_user, current_user::regrole::oid, oid
+        FROM pg_database WHERE datname = current_database();
+        SELECT version FROM grant_ledger.schema_migrations ORDER BY version;
+        SELECT n.nspname || '.' || c.relname
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname IN ('grant_ledger', 'grant_tracks') AND c.relkind = 'r'
+        ORDER BY 1;
+        SELECT EXISTS (
+            SELECT FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL aclexplode(c.relacl) acl
+            WHERE n.nspname = 'grant_tracks' AND c.relname = 'tracks'
+              AND acl.grantee = current_user::regrole AND acl.privilege_type = 'SELECT'
+        );
+    """ + sql.removeprefix(begin)
+    inventory = {
+        "branch_id": plan.branch_id, "database_oid": plan.database_oid,
+        "inventory_sha256": hashlib.sha256(catalog.encode()).hexdigest(),
+    }
+    review = inventory | {"reader_role": plan.reader_role, "reader_oid": plan.reader_oid}
+    cluster.ok("complete the synthetic migration and grant read access", f"""
+        BEGIN;
+        CREATE SCHEMA grant_ledger;
+        CREATE SCHEMA grant_tracks;
+        CREATE TABLE grant_ledger.schema_migrations (version int);
+        CREATE TABLE grant_tracks.tracks (id int);
+        INSERT INTO grant_ledger.schema_migrations VALUES (1);
+        GRANT USAGE ON SCHEMA grant_ledger, grant_tracks TO {READER};
+        GRANT SELECT ON grant_ledger.schema_migrations, grant_tracks.tracks TO {READER};
+        COMMIT;
+    """, **launch)
+    try:
+        for effective in (True, False):
+            if not effective:
+                cluster.ok("remove schema access while retaining the listed table grant",
+                           f"REVOKE USAGE ON SCHEMA grant_tracks FROM {READER};", **launch)
+            result = cluster.sql(readback_sql, **reader)
+            prefix = observed_identity + catalog + "t\n"
+            if result.returncode == 0:
+                checked(result, "read the complete bundle with effective access", prefix + "rows-present\n")
+                privilege_result = "passed"
+            else:
+                require(result.returncode == 3 and result.stdout == prefix
+                        and "ERROR:  P0001: baseline coverage refused" in result.stderr,
+                        "verify the listed grant survives the effective access failure")
+                privilege_result = "failed"
+            observed_catalog = result.stdout[len(observed_identity):len(observed_identity) + len(catalog)]
+            observed_inventory = inventory | {"inventory_sha256": hashlib.sha256(observed_catalog.encode()).hexdigest()}
+            evidence = {
+                "review": review, "inventory": observed_inventory,
+                "reader_privileges": review | observed_inventory | {"result": privilege_result},
+            }
+            verdict = command(sys.executable, "-IB", str(script), input_text=json.dumps(evidence), timeout=3)
+            expected = ((0, "database-bootstrap-reader-evidence: consistent\n", "") if effective else
+                        (1, "", "database-bootstrap-reader-evidence: pending\n"))
+            require((verdict.returncode, verdict.stdout, verdict.stderr) == expected,
+                    f"check the offline verdict with effective read access {effective}")
+    finally:
+        cluster.ok("remove both synthetic migration schemas", "DROP SCHEMA grant_ledger, grant_tracks CASCADE;",
+                   **launch)
 
 
 def prepare_baseline_readers(cluster, names, *, host):
