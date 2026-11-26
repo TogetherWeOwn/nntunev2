@@ -12607,6 +12607,9 @@ pub(crate) mod tests {
         sessions: RefCell<HashMap<String, crate::stripe::CheckoutSession>>,
         subscriptions: RefCell<HashMap<String, crate::stripe::Subscription>>,
         invoices: RefCell<HashMap<String, crate::stripe::Invoice>>,
+        /// Override one invoice listing after checking its requested scope.
+        scripted_invoice_list:
+            RefCell<Option<(crate::stripe::ListInvoices, crate::stripe::Invoice)>>,
         /// Remainder line pages per invoice: `list_invoice_lines` answers
         /// the next page from here, so tests pin the full-read follow-up
         /// instead of trusting the first page.
@@ -12893,6 +12896,10 @@ pub(crate) mod tests {
                 assert!(!self.forbid_invoice_reads, "unexpected invoice list read");
                 if self.fail("list_invoices") {
                     return self.err();
+                }
+                if let Some((expected, invoice)) = self.scripted_invoice_list.borrow_mut().take() {
+                    assert_eq!(req, expected);
+                    return Ok(vec![invoice]);
                 }
                 Ok(self
                     .invoices
@@ -14493,6 +14500,41 @@ pub(crate) mod tests {
         assert!(h.store.invoice_history.borrow().is_empty());
         assert_eq!(subscription(NOW, &cookie)["state"], "no_subscription");
 
+        // Return a misbound invoice even though the caller requests the exact
+        // subscription. The normal fixture filter would hide it from the fold.
+        let other_invoice = test_invoice(
+            "in_test_other",
+            customer,
+            "sub_test_other",
+            PRICE_PLUS,
+            BILLING_NOW,
+            first_end,
+            BILLING_NOW,
+        );
+        h.stripe
+            .invoices
+            .borrow_mut()
+            .insert(other_invoice.id.clone(), other_invoice.clone());
+        h.stripe.scripted_invoice_list.replace(Some((
+            crate::stripe::ListInvoices {
+                customer_id: Some(customer.into()),
+                subscription_id: Some(subscription_id.into()),
+                paid_only: true,
+                limit: 100,
+                starting_after: None,
+            },
+            other_invoice,
+        )));
+        webhook_ok(&signed(BILLING_NOW, &completed));
+        assert!(h.stripe.scripted_invoice_list.borrow().is_none());
+        let uncovered = live_for(&h, &user).unwrap();
+        assert_eq!(uncovered.stripe_subscription_id, subscription_id);
+        assert_eq!(uncovered.plan_id, "free");
+        assert_eq!(uncovered.paid_through_unix, None);
+        assert_eq!(uncovered.paid_invoice_id, None);
+        assert!(h.store.invoice_history.borrow().is_empty());
+        assert_eq!(decode(play_at(NOW, &cookie, &play), 402), unpaid);
+
         let assert_period = |end, invoices| {
             let live = live_for(&h, &user).unwrap();
             assert_eq!(live.stripe_subscription_id, subscription_id);
@@ -14553,6 +14595,8 @@ pub(crate) mod tests {
         assert_eq!(subscribed["state"], "active");
         assert_eq!(subscribed["status"], "active");
         assert_eq!(subscribed["planId"], PLAN_PLUS);
+        assert_eq!(active.paid_invoice_id.as_deref(), Some("in_test_1"));
+        assert_eq!(history["in_test_1"].stripe_subscription_id, subscription_id);
         assert_eq!(
             subscribed["currentPeriodEnd"],
             crate::ledger::iso8601_utc(first_end)
