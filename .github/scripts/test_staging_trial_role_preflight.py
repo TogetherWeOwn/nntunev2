@@ -45,15 +45,28 @@ class TrialBindingIdentityTests(unittest.TestCase):
         rows = {binding: (preflight.DATABASE, database_oid, name, number, name, number)
                 for binding, (name, number) in pins.items()}
         matched = dict.fromkeys(BINDING_ROLES, "matched")
-        self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, rows), matched)
+        origin_tls = dict.fromkeys(BINDING_ROLES, True)
+        handoff = list(rows.items())
+        identity = preflight.binding_identity_verdicts(database_oid, pins, handoff)
+        self.assertEqual(identity, matched)
+        self.assertEqual(preflight.binding_connection_verdict(identity, origin_tls), "qualified")
+
+        upload, auth, publish, enroll = BINDING_ROLES
+        for case, duplicate, expected in (
+            ("repeated label", handoff[0], {upload: "pending", enroll: "pending"}),
+            ("relabelled row", (enroll, rows[upload]), {enroll: "pending"}),
+        ):
+            with self.subTest(case=case):
+                identity = preflight.binding_identity_verdicts(database_oid, pins, [*handoff[:3], duplicate])
+                self.assertEqual(identity, {**matched, **expected})
+                self.assertEqual(preflight.binding_connection_verdict(identity, origin_tls), "pending")
 
         for binding in BINDING_ROLES:
             with self.subTest(binding=binding, case="missing"):
-                self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, {
-                    key: row for key, row in rows.items() if key != binding
-                }), {**matched, binding: "pending"})
+                self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, [
+                    result for result in handoff if result[0] != binding
+                ]), {**matched, binding: "pending"})
 
-        upload, auth, publish, enroll = BINDING_ROLES
         row = rows[publish]
         for case, observed, expected in (
             ("swapped roles", {upload: rows[auth], auth: rows[upload]},
@@ -68,12 +81,13 @@ class TrialBindingIdentityTests(unittest.TestCase):
             ("duplicate result", {publish: (row, row)}, {publish: "pending"}),
         ):
             with self.subTest(case=case):
-                self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, {**rows, **observed}),
+                results = list({**rows, **observed}.items())
+                self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, results),
                                  {**matched, **expected})
         for altered in ({**pins, auth: pins[upload]},
                         {**pins, auth: (pins[auth][0], pins[upload][1])},
                         {key: pin for key, pin in pins.items() if key != auth}):
-            self.assertEqual(preflight.binding_identity_verdicts(database_oid, altered, rows),
+            self.assertEqual(preflight.binding_identity_verdicts(database_oid, altered, handoff),
                              dict.fromkeys(BINDING_ROLES, "pending"))
 
     def test_disposable_binding_identity_query(self):
@@ -89,7 +103,7 @@ class TrialBindingIdentityTests(unittest.TestCase):
                 name, db_oid, login, login_oid, effective, effective_oid = result.split("|")
                 return name, int(db_oid), login, int(login_oid), effective, int(effective_oid)
 
-            rows = {binding: read_identity(role) for binding, role in BINDING_ROLES.items()}
+            rows = [(binding, read_identity(role)) for binding, role in BINDING_ROLES.items()]
             matched = dict.fromkeys(BINDING_ROLES, "matched")
             self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, rows), matched)
 
@@ -98,7 +112,7 @@ class TrialBindingIdentityTests(unittest.TestCase):
             run_psql(db, f"GRANT {auth_role} TO {upload_role} WITH INHERIT FALSE, SET TRUE;")
             switched = read_identity(upload_role, f"SET LOCAL ROLE {auth_role};\n")
             self.assertEqual(switched, (preflight.DATABASE, database_oid, *pins[upload], *pins[auth]))
-            self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, {**rows, upload: switched}),
+            self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, [(upload, switched), *rows[1:]]),
                              {**matched, upload: "pending"})
 
 

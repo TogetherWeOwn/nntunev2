@@ -743,12 +743,13 @@ result, with columns in query order.
 
 For the offline `binding_identity_verdicts` checker, pass the admitted
 `database_oid`, index the approved `(role_name, role_oid)` tuples into
-`role_pins` by full binding name, and index the observed six-field tuples
-into `rows` by the same labels. Keep OIDs as integers. Expect four `matched`
-identity verdicts for the table. Removing ENROLL's row leaves ENROLL `pending`.
-Swapping AUTH and PUBLISH's observed rows leaves both `pending`. Even with
-four identity matches, an absent or false cache result or missing origin TLS
-evidence keeps the handoff pending. [Offline role checker](../../.github/scripts/staging_trial_role_preflight.py)
+`role_pins` by full binding name, and pass the original results as a list of
+`(binding_name, observed_row)` pairs. Each observed row is a six-field tuple.
+Keep OIDs as integers. Expect four `matched` identity verdicts for the table.
+Replacing ENROLL's result with a copy of UPLOAD's leaves both bindings
+`pending`. Swapping AUTH and PUBLISH's observed rows leaves both `pending`.
+Even with four identity matches, an absent or false cache result or missing
+origin TLS evidence keeps the handoff pending. [Offline role checker](../../.github/scripts/staging_trial_role_preflight.py)
 
 Hosted execution requires a protected, read-only Worker probe using the same
 four dedicated bindings while the trial is disarmed, and a hosted caller
