@@ -220,11 +220,13 @@ Start the watch at the UTC `completed_at` of the successful **Verify production
 serves the promoted build** step in the pinned run and attempt's
 `deploy-production` job. Use the attempt-scoped Actions jobs readback
 (`actions/runs/{run_id}/attempts/{attempt_number}/jobs`) for that timestamp.
-Pair the smoke result with the live allocation verified by **Pin the final
-deployment before final smoke** in the same job. Take the final deployment
-and promoted version IDs from the protected rollout evidence and confirm that
-deployment serves that version at 100%. Record those IDs, the candidate SHA,
-run ID and attempt, and job evidence in the private release record.
+Pair the smoke result with the successful **Pin the final deployment before
+final smoke** step in the same job. In the opening readback, use the pinned
+production Web Worker's complete deployment history. Match the version tagged
+`<sha>-<run-id>-<attempt>` and take the deployment ID from the current 100%
+allocation, immediately preceded by the matching 5% and 50% rollout stages
+in rollout order. Record the deployment and version IDs, candidate SHA, run ID
+and attempt, and job evidence in the private release record.
 
 Keep the start pending if either the smoke or allocation evidence is missing.
 Exclude time and observations from staging, preflight, gradual promotion and
