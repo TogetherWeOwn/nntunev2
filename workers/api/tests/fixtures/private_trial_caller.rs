@@ -712,32 +712,10 @@ pub(crate) async fn verify_publication(
     }
     assert_eq!(set_duration(Some(14_000)).await, 1);
 
-    let published = async || {
-        use crate::private_catalogue_read::{lookup_scoped, PublicationScope};
-        lookup_scoped(
-            observer,
-            track,
-            PublicationScope {
-                environment: prepared.scope.environment,
-                library: prepared.scope.library,
-                provider_configuration: prepared.intent.identities[4],
-                bucket: "fixture-bucket",
-            },
-            None,
-            None,
-        )
-        .await
-        .unwrap()
-        .expect("the published track must resolve from an independent connection")
-        .0
-    };
-    let prior = published().await;
-    assert_eq!(prior.target.object, prepared.intent.identities[2]);
-    assert!(matches!(
-        prior.locator.binding(),
-        nntune_core::s3_locator::S3Binding::VersionId(version)
-            if version == &committed.outcome().media_version
-    ));
+    assert!(
+        published_media(track).await == published,
+        "before failed replacement"
+    );
     let replacement = Some(Target {
         invite_id: 931,
         job_id: storage_failure::JOB,
@@ -749,9 +727,12 @@ pub(crate) async fn verify_publication(
     .await;
     assert_eq!(
         (unconfirmed.status, unconfirmed.body),
-        (503, unavailable().body)
+        (503, crate::handlers::unavailable().body)
     );
-    assert!(published().await == prior);
+    assert!(
+        published_media(track).await == published,
+        "after failed replacement"
+    );
     assert!(exact_reference().await);
     let after = handle(&ctx, &library).await;
     assert_eq!((after.status, after.body), (200, listing.body));
