@@ -24,6 +24,9 @@ use nntune_ingest::{
 use serde_json::json;
 use tokio_postgres::Transaction;
 
+#[path = "independent_publications.rs"]
+mod independent_publications;
+
 const ALBUM: &str = "Synthetic Signals";
 const RAW_ERROR: &str = "§~synthetic-mirror-error~!";
 const RELEASE: &str = "ab320000-0000-4000-8000-000000000000";
@@ -47,6 +50,24 @@ fn scope_key(scope: &CompletionScope<'_>) -> [String; 8] {
         scope.revision.to_string(),
         scope.offset.to_string(),
     ]
+}
+
+async fn read_completion(
+    db: &Client,
+    scope: &CompletionScope<'_>,
+) -> Result<Option<CommittedOutcome>, PublicationError> {
+    Ok(db
+        .query_opt(READ, &[&&scope_key(scope)[..]])
+        .await?
+        .map(|row| CommittedOutcome {
+            map: row.get(0),
+            object: row.get(1),
+            generation: row.get(2),
+            configuration: row.get(3),
+            root_version: row.get(4),
+            media_version: row.get(5),
+            page_versions: row.get(6),
+        }))
 }
 
 #[derive(Clone, Copy)]
@@ -150,20 +171,11 @@ pub(super) async fn exercise(
                 Some(candidates),
                 (200, &body),
                 async |scope| {
-                    let row = db.query_opt(READ, &[&&scope_key(scope)[..]]).await?;
+                    let outcome = read_completion(db, scope).await?;
                     if matches!(media, Indeterminate(_)) {
                         return Err(PublicationError::Indeterminate);
                     }
-                    Ok(row.map(|row| {
-                        let mut outcome = CommittedOutcome {
-                            map: row.get(0),
-                            object: row.get(1),
-                            generation: row.get(2),
-                            configuration: row.get(3),
-                            root_version: row.get(4),
-                            media_version: row.get(5),
-                            page_versions: row.get(6),
-                        };
+                    Ok(outcome.map(|mut outcome| {
                         if let Conflicting(_, pin) = media {
                             [
                                 &mut outcome.map,
@@ -252,13 +264,14 @@ pub(super) async fn exercise(
     let sessions = both
         .each_ref()
         .map(|flac| hex::encode(flac.receipt.intent.identities[2]));
+    let fingerprints = [[0x83; 32], [0x84; 32]];
     let uploads = std::array::from_fn::<_, 2, _>(|i| VerifiedUpload {
         scope: CompletionScope {
             environment,
             library,
             principal: job.owner_id,
             session: &sessions[i],
-            fingerprint: &[0x83; 32],
+            fingerprint: &fingerprints[i],
             seal: both[i].receipt.intent.identities[3],
             revision: 1,
             offset: both[i].receipt.intent.plaintext_len as i64,
@@ -335,6 +348,9 @@ pub(super) async fn exercise(
         Ok(StageOutcome::Staged(_))
     ));
     tx.rollback().await.unwrap();
+
+    independent_publications::exercise(db, writer, objects, &uploads).await;
+
     let mut tx = writer.transaction().await.unwrap();
     let result = apply(&mut tx, Scoped(&uploads), false, 2).await;
     assert_counter(&result, json!({"outcome": "staged"}));

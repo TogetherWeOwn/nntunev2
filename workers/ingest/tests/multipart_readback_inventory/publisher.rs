@@ -315,16 +315,25 @@ async fn publisher_fixture(with_outcome: bool) {
     let map = hex::encode(map_id);
     let key = format!("media/{object}/{generation}");
     let page_key = format!("media-digests/{object}/{generation}/{map}/00000000");
-    let complete =
-        |fault| ReadbackFixture::complete(&padded, identities, map_id, &key, Some(fault));
+    const SECOND_MEDIA_VERSION: &str = "Second%2F+==";
+    let complete = |fault| {
+        ReadbackFixture::complete(
+            &padded,
+            identities,
+            map_id,
+            &key,
+            SECOND_MEDIA_VERSION,
+            fault,
+        )
+    };
     assert!(matches!(
-        complete(CompletionFault::MissingMiddlePart),
+        complete(Some(CompletionFault::MissingMiddlePart)),
         Err(FixtureCompletionError::Prepare(
             PrepareError::CheckpointMismatch
         ))
     ));
     assert!(matches!(
-        complete(CompletionFault::BadChecksum),
+        complete(Some(CompletionFault::BadChecksum)),
         Err(FixtureCompletionError::Receipt(MultipartError::Checksum))
     ));
     assert!(observer
@@ -332,7 +341,7 @@ async fn publisher_fixture(with_outcome: bool) {
         .await
         .unwrap()
         .is_none());
-    let second = ReadbackFixture::in_scope(&padded, identities, map_id, &key);
+    let second = complete(None).unwrap();
     let receipts = [second.sidecar_at(0, &page_key, FINAL_VERSION)];
     let inventory = second.inventory(&receipts);
     let corrupt = inventory
@@ -403,7 +412,7 @@ async fn publisher_fixture(with_outcome: bool) {
     staged.await.unwrap();
     tx.execute(
         "INSERT INTO public.storage_s3_locator_intents VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, NULL)",
-        &[object, root, &BUCKET, &key, &SHARED_VERSION],
+        &[object, root, &BUCKET, &key, &SECOND_MEDIA_VERSION],
     ).await.unwrap();
     tx.commit().await.unwrap();
 
