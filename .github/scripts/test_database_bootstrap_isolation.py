@@ -1119,6 +1119,33 @@ def verify_migrated_library_read(cluster):
         """, "fixture-job\nt\n", role=READER, database=LAUNCH)
 
 
+def verify_migrated_library_write_refusal(cluster):
+    insert = """
+        INSERT INTO public.library (idempotency_key, job_id, user_id)
+        VALUES ('fixture-library-insert', 'fixture-inserted', 'fixture-user')
+        RETURNING job_id;
+        """
+    update = """
+        UPDATE public.library SET job_id = 'fixture-updated'
+        WHERE idempotency_key = 'fixture-library' RETURNING job_id;
+        """
+    delete = """
+        DELETE FROM public.library
+        WHERE idempotency_key = 'fixture-library' RETURNING job_id;
+        """
+    cluster.ok("verify runtime CRUD on the migrated library", f"""
+        BEGIN READ WRITE;
+        SELECT session_user = '{RUNTIME}' AND current_user = '{RUNTIME}';
+        {insert}
+        {update}
+        {delete}
+        ROLLBACK;
+        """, "t\nfixture-inserted\nfixture-updated\nfixture-updated\n", role=RUNTIME, database=LAUNCH)
+    for operation, sql in (("INSERT", insert), ("UPDATE", update), ("DELETE", delete)):
+        cluster.denied(f"refuse reader {operation} on the migrated library",
+                       f"BEGIN READ WRITE;\n{sql}\nROLLBACK;", "ERROR:  42501:", role=READER, database=LAUNCH)
+
+
 def verify_launch_grants(cluster):
     cluster.ok("verify revoked PUBLIC access and transferred ownership on admission", f"""
         SELECT datallowconn AND datdba = '{OWNER}'::regrole
@@ -1198,6 +1225,7 @@ def verify_launch_grants(cluster):
         """, "t\n", role=READER, database=LAUNCH)
 
     verify_migrated_library_read(cluster)
+    verify_migrated_library_write_refusal(cluster)
 
     cluster.ok("verify staging login on its own database", "SELECT 1;", "1\n", role=STAGING, database=SIBLING)
     cluster.denied("refuse staging login on launch", "SELECT 1;", "permission denied for database",
