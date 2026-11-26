@@ -355,6 +355,33 @@ The release operator calls a stop while the job is still waiting.
 | On the pinned launch database `41001`, retirement commits with `retired`, the grants are revoked, and the role and its sessions are absent. | Record cleanup complete. The canceled attempt still has no baseline. |
 | Run `102`, attempt `1`, is proposed for the same setup target. | Require fresh approval, run-bound authorization and a new reader role. Verify a new baseline for the same database and branch before using it in the existing release handoff. |
 
+#### Interpret incomplete readback after setup
+
+Record setup and the read-only baseline separately in the private release
+record. Use the job URL and attempt for each fixed verdict. For setup,
+`database-bootstrap-setup: complete` must come from the successful protected
+setup job for the approved candidate and plan. Retain the branch and database
+OID from the [setup catalog readback](#hosted-execution-candidate). For the
+baseline, use the successful protected job for the plan pinned to that same
+branch and database OID and to its issued reader OID.
+
+Apply these decisions to the synthetic branch `fixture001` and database OID
+`41001` from the stop rehearsal above.
+
+| Existing evidence | Record and next read-only step |
+| --- | --- |
+| The protected setup job is confirmed to have never started, for example it was skipped before execution and there is no earlier setup attempt for the target. | Record setup as never run. Use the [catalog preflight](#what-the-source-check-establishes) to verify target absence on the approved maintenance route. |
+| The setup job record is missing, or setup returned `outcome-uncertain`. | Leave setup unverified. Read the approved run and attempt's job record and reconcile the target catalog under the existing setup procedure. |
+| Setup is verified complete. The baseline job never started, its verdict is unavailable, or the saved readback is incomplete. | Keep setup complete and baseline evidence pending. If a baseline attempt exists, read its job conclusion and fixed verdict and recover any private readback for that attempt. If the evidence is still unavailable, use the existing separately authorized read-only baseline path for the same database after reconciling any prior reader retirement. |
+| Setup is verified complete. The baseline returned `database-bootstrap-baseline: refused`. The disposable fixture exercises refusal when a leaf relation is unreadable or uses row-level security. | Keep setup complete and baseline evidence pending. `refused` supplies no specific cause. Use the approved read-only catalog route to reconcile the target OID, relation coverage and effective reader privileges before deciding whether the supported baseline can verify this target. |
+| Setup is verified complete. The matching baseline succeeded with `database-bootstrap-baseline: empty` and its readback is available. | Record verified empty at the observation time. Continue with the existing reader retirement and release handoff. A matching `rows-present` verdict instead follows the [release path for a database with data](first-private-music-launch.md#qualify-the-candidate). |
+
+Keep migration and cutover pending while their evidence is unresolved.
+If migrations may already have run, reconcile the saved migration run and
+the ledger against the reviewed manifest on the same pinned database using
+read-only access. Leave the database and applied migrations in place while
+recovering the missing observation.
+
 ### Setup role custody and lifecycle
 
 The dormant [role SQL](../.github/scripts/database_bootstrap_role.py)
