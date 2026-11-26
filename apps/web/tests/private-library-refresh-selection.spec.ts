@@ -16,7 +16,8 @@ for (const { name, retainSelection } of [
 	{ name: 'Refresh preserves the selected ID beside its same-title peer', retainSelection: true }
 ]) {
 	test(name, async ({ page, context, origin }) => {
-		const snapshots = [[selected, peer], retainSelection ? [updated, peer] : [peer]];
+		const refreshed = retainSelection ? [updated, peer] : [peer];
+		const snapshots = [[selected, peer], refreshed];
 		let listingReads = 0;
 		await context.route('**/*', async (route) => {
 			const request = route.request();
@@ -65,10 +66,9 @@ for (const { name, retainSelection } of [
 			refresh.click()
 		]);
 		expect(response.status()).toBe(200);
-		await expect(rows).toHaveCount(retainSelection ? 2 : 1);
-		// In the retained case the row count is unchanged while verification runs.
-		await expect(titleButton(retainSelection ? updated : peer)).toBeVisible();
-		await expect(checkbox(peer)).toBeVisible();
+		await expect(rows).toHaveCount(refreshed.length);
+		// The updated artist is the first sign of the new listing when both IDs remain.
+		for (const track of refreshed) await expect(titleButton(track)).toBeVisible();
 		await expect(checkbox(peer)).not.toBeChecked();
 		await expect(queue).toHaveCount(0);
 
