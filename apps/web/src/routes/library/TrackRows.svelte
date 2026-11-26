@@ -48,6 +48,7 @@
 		<!-- svelte-ignore a11y_no_noninteractive_tabindex: programmatic menu-return target only. -->
 		<!-- svelte-ignore a11y_no_noninteractive_element_interactions: modifier clicks extend the checkbox selection; keyboard equivalents are list-scoped on the Library page. -->
 		<li class="nt-library-item" data-testid="library-item" data-id={track.id}
+			data-library-key={libraryItemKey(track)}
 			tabindex="-1"
 			data-selected={selected ? '' : undefined}
 			use:contextMenu={(invoker, point) => ontrackmenu(track, invoker, point)}

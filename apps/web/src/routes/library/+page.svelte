@@ -386,11 +386,11 @@
 				? active : null;
 			// The old listing stays interactive while Refresh is pending. Read focus
 			// at publication, since the listener can tab into a group in the meantime.
-			const focusedGroup = authoritative && !authBoundary && !state.loadError && !state.libraryUnavailable &&
-				groupByArtist && typeof document !== 'undefined'
-				? document.activeElement?.closest('.nt-artist-group') : null;
-			const focusedId = focusedGroup ? focusedLibraryRowId() : null;
-			const priorRows = focusedId === null ? [] : renderedItems.map((track) => track.id);
+			const focusedRow = authoritative && !authBoundary && !state.loadError && !state.libraryUnavailable &&
+				groupByArtist ? focusedLibraryRow() : null;
+			const focusedGroup = focusedRow?.closest('.nt-artist-group');
+			const focusedKey = focusedGroup ? focusedRow?.getAttribute('data-library-key') ?? null : null;
+			const priorRows = focusedKey === null ? [] : renderedItems.map(libraryItemKey);
 			draggedLibraryItem = null;
 			if (authoritative && !authBoundary && !state.loadError && !state.libraryUnavailable) {
 				preserveTrackFocus(isCurrent);
@@ -493,13 +493,14 @@
 					}
 				});
 			}
-			if (focusedGroup && focusedId !== null) {
+			if (focusedGroup && focusedKey !== null) {
 				const { nextId, previousId } = selectedRowRecoveryIds(
-					priorRows, focusedId, renderedItems.map((track) => track.id)
+					priorRows, focusedKey, renderedItems.map(libraryItemKey)
 				);
-				focusAfterLibraryRowRemoval(nextId, previousId, () =>
-					isCurrent() && showingTracks && groupByArtist && !focusedGroup.isConnected
-				);
+				focusAfterLibraryRowRemoval(nextId, previousId, {
+					rowAttribute: 'data-library-key',
+					canRecover: () => isCurrent() && showingTracks && groupByArtist && !focusedGroup.isConnected
+				});
 			}
 			// Same-account refresh completion: the panel may have remounted
 			// (branch swap), so hand focus back to the filter input the user
@@ -1174,11 +1175,14 @@
 		void tick().then(() => clearButton?.focus({ preventScroll: true }));
 	}
 
-	/** ID of the library row holding focus, or null when focus is elsewhere. */
-	function focusedLibraryRowId(): string | null {
+	function focusedLibraryRow(): Element | null {
 		if (typeof document === 'undefined') return null;
-		const holder = document.activeElement?.closest?.('[data-testid="library-item"]');
-		return holder?.getAttribute('data-id') ?? null;
+		return document.activeElement?.closest?.('[data-testid="library-item"]') ?? null;
+	}
+
+	/** Playback ID of the library row holding focus, or null when focus is elsewhere. */
+	function focusedLibraryRowId(): string | null {
+		return focusedLibraryRow()?.getAttribute('data-id') ?? null;
 	}
 
 	function preserveTrackFocus(isCurrent: () => boolean): void {
@@ -1207,19 +1211,19 @@
 	 * that remain mounted — including the Clear selection button itself —
 	 * and any focus the user has already moved keep it.
 	 */
-	function focusAfterLibraryRowRemoval(
-		nextId: string | null, previousId: string | null, canRecover?: () => boolean
-	): void {
+	function focusAfterLibraryRowRemoval(nextKey: string | null, previousKey: string | null, {
+		rowAttribute = 'data-id', canRecover
+	}: { rowAttribute?: 'data-id' | 'data-library-key'; canRecover?: () => boolean } = {}): void {
 		void tick().then(() => {
 			if (typeof document === 'undefined' || canRecover?.() === false) return;
 			const active = document.activeElement;
 			if (active && active !== document.body) return;
-			for (const id of [nextId, previousId]) {
-				if (id === null) continue;
+			for (const key of [nextKey, previousKey]) {
+				if (key === null) continue;
 				// Find the row by attribute comparison, never selector
-				// interpolation: track ids are opaque server strings.
+				// interpolation: IDs and occurrence keys are opaque server strings.
 				const rowEl = [...document.querySelectorAll('[data-testid="library-item"]')].find(
-					(element) => element.getAttribute('data-id') === id
+					(element) => element.getAttribute(rowAttribute) === key
 				);
 				const target = rowEl?.querySelector<HTMLElement>(
 					'input[type="checkbox"]:not([disabled]), button:not([disabled])'
