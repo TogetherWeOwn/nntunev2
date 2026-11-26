@@ -123,19 +123,25 @@ test('a delayed private seek completion leaves the replacement seek pending', as
 			});
 			observer.observe(slider, { attributes: true, attributeFilter: ['aria-valuetext'] });
 		});
-		const completed = new Promise<{ trusted: boolean; before: ReturnType<typeof read>; after: ReturnType<typeof read> }>((resolve) => {
-			// The browser can emit timeupdate before seeked. Use the replacement's
-			// own seeked callback as the only settlement observation for this gesture.
+		const completed = new Promise<{ trusted: boolean; before?: ReturnType<typeof read>; after: ReturnType<typeof read> }>((resolve) => {
+			// Only the replacement's seeked event should publish a settled
+			// position here. Chromium can deliver timeupdate before it.
 			const gate = new AbortController();
-			node.addEventListener('timeupdate', (event) => event.stopImmediatePropagation(), { capture: true, signal: gate.signal });
+			for (const type of ['timeupdate', 'seeking', 'canplay', 'progress', 'durationchange']) {
+				node.addEventListener(type, (event) => {
+					if (!node.seeking) event.stopImmediatePropagation();
+				}, { capture: true, signal: gate.signal });
+			}
+			let before: ReturnType<typeof read> | undefined;
+			node.addEventListener('seeked', () => { before = read(); }, { capture: true, once: true });
+			// This listener is registered after the player's seeked handlers.
 			node.addEventListener('seeked', (event) => {
-				const before = read();
 				const trusted = event.isTrusted;
-				queueMicrotask(() => queueMicrotask(() => {
+				queueMicrotask(() => {
 					gate.abort();
 					resolve({ trusted, before, after: read() });
-				}));
-			}, { capture: true, once: true });
+				});
+			}, { once: true });
 		});
 		return { during, completed };
 	}, { old: retired, control });
@@ -155,7 +161,7 @@ test('a delayed private seek completion leaves the replacement seek pending', as
 
 	const completed = await probe.evaluate(({ completed }) => completed);
 	expect(completed.trusted).toBe(true);
-	expect(completed.before.status).toBe(during.before.status);
+	expect(completed.before?.status).toBe(during.before.status);
 	expect(completed.after).toMatchObject({ ...ready, seeking: false,
 		status: during.after.status?.replace('Seeking to ', '') });
 	expect(completed.after.position).toBeCloseTo(target, 2);
