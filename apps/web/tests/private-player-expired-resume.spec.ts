@@ -87,8 +87,11 @@ test('private Play resumes the same listen after its grant expires during Pause'
 		await pause.click();
 		await expect(audio).toHaveJSProperty('paused', true);
 		const resume = await audio.evaluateHandle((node: HTMLAudioElement) => {
-			const observation = { node, pausedAt: node.currentTime, starts: [] as number[] };
+			const observation = { node, pausedAt: node.currentTime, starts: [] as number[], discontinuities: [] as string[] };
 			node.addEventListener('play', () => observation.starts.push(node.currentTime), { once: true });
+			for (const event of ['seeking', 'emptied', 'loadstart']) {
+				node.addEventListener(event, () => observation.discontinuities.push(event), { once: true });
+			}
 			return observation;
 		});
 		now += grantLifetime;
@@ -108,9 +111,12 @@ test('private Play resumes the same listen after its grant expires during Pause'
 			renewal.resolve();
 		}
 		await expect.poll(() => resume.evaluate(({ node, pausedAt }) => !node.paused && !node.error && node.currentTime > pausedAt + 0.2)).toBe(true);
-		const { pausedAt, starts } = await resume.evaluate(({ pausedAt, starts }) => ({ pausedAt, starts }));
+		const { pausedAt, starts, discontinuities } = await resume.evaluate(({ pausedAt, starts, discontinuities }) =>
+			({ pausedAt, starts, discontinuities }));
 		expect(starts).toHaveLength(1);
-		expect(Math.abs(starts[0] - pausedAt)).toBeLessThan(0.05);
+		// The queued play event can run after the native decoder has advanced.
+		expect(starts[0]).toBeGreaterThanOrEqual(pausedAt - 0.05);
+		expect(discontinuities).toEqual([]);
 		await expect(audio).toHaveJSProperty('currentSrc', origin + mediaPath());
 		expect(await readRange()).toEqual({ status: 206, bytes: 'fLaC' });
 		await expectQueue();
