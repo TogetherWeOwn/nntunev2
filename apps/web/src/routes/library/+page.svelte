@@ -232,8 +232,13 @@
 			visibleItems.map((track) => track.id)
 		)
 	);
-	// The last append outcome stays until the next append or a boundary purge.
-	let appendFeedback: string | null = $state(null);
+	// A retry notice belongs to the refused selection. Completed outcomes stay
+	// visible until the next append or a boundary purge.
+	let appendOutcome = $state.raw<{ text: string; forSelection?: readonly string[] } | null>(null);
+	const appendFeedback = $derived(
+		appendOutcome && (appendOutcome.forSelection === undefined || appendOutcome.forSelection === selectedIds)
+			? appendOutcome.text : null
+	);
 	/**
 	 * Range anchor: the most recently activated selection checkbox, or null
 	 * after Clear selection, a boundary purge or a prune that dropped it.
@@ -426,7 +431,7 @@
 			// Purge on an auth boundary; reconcile against fresh membership only.
 			if (authoritative) {
 				if ((state.loadError && state.items.length === 0) || state.libraryUnavailable) {
-					if (selectedIds.length > 0 || appendFeedback !== null || rangeAnchorId !== null) {
+					if (selectedIds.length > 0 || appendOutcome !== null || rangeAnchorId !== null) {
 						purgeSelection();
 					}
 				} else if (!state.loadError) {
@@ -1241,13 +1246,16 @@
 
 	function appendSelectedIds(): void {
 		if (loading) {
-			appendFeedback = 'Could not add selected tracks while the Library is refreshing. Try again when it finishes.';
+			appendOutcome = {
+				text: 'Could not add selected tracks while the Library is refreshing. Try again when it finishes.',
+				forSelection: selectedIds
+			};
 			return;
 		}
 		const queue = queueController.snapshot;
 		const result = appendSelection(queue, selectedIds.filter(queueController.hasLibraryTrack), items);
 		if (!replaceQueue(result.queue)) return;
-		appendFeedback = appendResultLabel(result.added, result.skipped);
+		appendOutcome = { text: appendResultLabel(result.added, result.skipped) };
 	}
 
 
@@ -1487,7 +1495,7 @@
 		endTrackDrag();
 		selectedIds = createSelection();
 		rangeAnchorId = null;
-		appendFeedback = null;
+		appendOutcome = null;
 	}
 
 	function refresh(): Promise<void> {

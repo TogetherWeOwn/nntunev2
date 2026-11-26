@@ -2,7 +2,10 @@ import { expect } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { fixtureCookie, hasFixtureSession, observeMediaSources, test } from './helpers/private-music-fixture.js';
 
-test('the invited Library can retry a refused append of one selected track', async ({ page, context, origin }) => {
+for (const [retainSelection, title] of [
+	[true, 'the invited Library can retry a refused append of one selected track'],
+	[false, 'the invited Library clears the append refusal when the selected track disappears']
+] as const) test(title, async ({ page, context, origin }) => {
 	const { library, player } = PRIVATE_MUSIC;
 	const listener = 'synthetic-listener';
 	const binding = 'A'.repeat(43);
@@ -28,7 +31,8 @@ test('the invited Library can retry a refused append of one selected track', asy
 			listingReads += 1;
 			if (listingReads > 2) return route.fulfill({ status: 500 });
 			if (listingReads === 2) await refreshReply.promise;
-			return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: [selected, neighbor] });
+			const tracks = listingReads === 1 || retainSelection ? [selected, neighbor] : [neighbor];
+			return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: tracks });
 		}
 		if (path.startsWith('/api/') || path.startsWith('/v1/')) return route.fulfill({ status: 404 });
 		return route.continue();
@@ -70,13 +74,21 @@ test('the invited Library can retry a refused append of one selected track', asy
 	await expect(loading).toBeHidden();
 	await expect(page.getByTestId('library-stale-badge')).toHaveCount(0);
 	await expect(queue).toHaveCount(0);
-	await expect(append).toBeFocused();
-	await page.keyboard.press('Enter');
-	await expect(feedback).toHaveText('Added 1 track (0 already queued)');
-	await expect(queue).toHaveCount(1);
-	await expect(queue).toBeVisible();
-	await expect(queue).toHaveAttribute(player.queueId, selected.id);
-	await expect(checkbox(selected.id)).toBeChecked();
+	if (retainSelection) {
+		await expect(feedback).toBeVisible();
+		await expect(append).toBeFocused();
+		await page.keyboard.press('Enter');
+		await expect(feedback).toHaveText('Added 1 track (0 already queued)');
+		await expect(queue).toHaveCount(1);
+		await expect(queue).toBeVisible();
+		await expect(queue).toHaveAttribute(player.queueId, selected.id);
+		await expect(checkbox(selected.id)).toBeChecked();
+	} else {
+		await expect(checkbox(selected.id)).toHaveCount(0);
+		await expect(append).toBeDisabled();
+		await expect(page.getByTestId('append-result')).toHaveCount(0);
+	}
+	await expect(checkbox(neighbor.id)).toBeVisible();
 	await expect(checkbox(neighbor.id)).not.toBeChecked();
 	expect(listingReads).toBe(2);
 	expect(await mediaSources.evaluate((sources) => [...sources].filter(Boolean))).toEqual([]);
