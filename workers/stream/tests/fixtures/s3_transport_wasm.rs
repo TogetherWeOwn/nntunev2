@@ -26,6 +26,20 @@ const PAGE_VERSION: &str = "page+/%?=&";
 const LEN: u64 = 65_537;
 const ROOT: [u8; 32] = [7; 32];
 
+#[wasm_bindgen]
+pub fn delivered_meter_window(body: &[u8], user: &str, now: u32) -> Result<String, JsValue> {
+    use crate::{delivered::parse_delivered_report, meter_sink::MeterBook};
+
+    let interval = parse_delivered_report(body, user)
+        .map_err(|_| JsValue::from_str("invalid delivery report"))?;
+    let mut meter = MeterBook::new(user);
+    if !meter.record(&interval, u64::from(now)) {
+        return Err(JsValue::from_str("delivery report refused by meter"));
+    }
+    serde_json::to_string(&meter.pending_windows())
+        .map_err(|_| JsValue::from_str("invalid meter window"))
+}
+
 fn id(n: u8) -> [u8; 16] {
     [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, n]
 }

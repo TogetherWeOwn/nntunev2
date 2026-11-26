@@ -20,6 +20,7 @@ pub struct ObservedTarget<'a> {
     pub predicate_stale: bool,
     pub other_live_holder: bool,
     pub equal_end_provenance_changed: bool,
+    pub matching_proof_cancel_conflict: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub enum Target {
         predicate_stale: bool,
         other_live_holder: bool,
         equal_end_provenance_changed: bool,
+        matching_proof_cancel_conflict: bool,
     },
 }
 
@@ -70,6 +72,7 @@ pub fn classify_target(
             predicate_stale: row.predicate_stale,
             other_live_holder: row.other_live_holder,
             equal_end_provenance_changed: row.equal_end_provenance_changed,
+            matching_proof_cancel_conflict: row.matching_proof_cancel_conflict,
         }),
         _ => Err(Refused),
     }
@@ -96,25 +99,25 @@ pub fn validate_read_provenance(
     Ok(())
 }
 
-/// A non-explicit terminal fold cannot release an owned slot using proof
-/// that changed at the same paid end. The caller must refold from a fresh read.
-pub fn validate_terminal_provenance(
+/// When equal-end proof changed, the caller must refold before releasing an
+/// owned slot or accepting a conflicting cancellation flag on the current proof.
+pub fn validate_equal_end_provenance(
     outcome: &ReconcileOutcome,
     target: &Target,
 ) -> Result<(), Refused> {
-    if !outcome.explicit_stale
-        && crate::billing_reconcile::is_terminal_status(&outcome.row.status)
-        && matches!(
-            target,
-            Target::Owned {
-                equal_end_provenance_changed: true,
-                ..
-            }
-        )
-    {
-        return Err(Refused);
+    match target {
+        Target::Owned {
+            equal_end_provenance_changed: true,
+            matching_proof_cancel_conflict,
+            ..
+        } if !outcome.explicit_stale
+            && (*matching_proof_cancel_conflict
+                || crate::billing_reconcile::is_terminal_status(&outcome.row.status)) =>
+        {
+            Err(Refused)
+        }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Only a slot-reserving fold with exact-target read provenance can commit
@@ -174,12 +177,14 @@ mod tests {
                 predicate_stale: true,
                 other_live_holder: false,
                 equal_end_provenance_changed: false,
+                matching_proof_cancel_conflict: false,
             },
             ObservedTarget {
                 identity: identity("user-a", "sub-b"),
                 predicate_stale: false,
                 other_live_holder: false,
                 equal_end_provenance_changed: false,
+                matching_proof_cancel_conflict: false,
             },
         ] {
             assert_eq!(classify_target(&requested, &[row]), Err(Refused));
@@ -190,12 +195,14 @@ mod tests {
                 predicate_stale: false,
                 other_live_holder: false,
                 equal_end_provenance_changed: false,
+                matching_proof_cancel_conflict: false,
             },
             ObservedTarget {
                 identity: identity("user-a", "sub-a"),
                 predicate_stale: false,
                 other_live_holder: false,
                 equal_end_provenance_changed: false,
+                matching_proof_cancel_conflict: false,
             },
         ];
         assert_eq!(classify_target(&requested, &rows), Err(Refused));
@@ -209,6 +216,7 @@ mod tests {
             predicate_stale: false,
             other_live_holder: false,
             equal_end_provenance_changed: true,
+            matching_proof_cancel_conflict: false,
         }];
         let target = classify_target(&requested, &own).unwrap();
         assert_eq!(
@@ -236,11 +244,13 @@ mod tests {
             predicate_stale: true,
             other_live_holder: false,
             equal_end_provenance_changed: false,
+            matching_proof_cancel_conflict: false,
         };
         let own_fresh = Target::Owned {
             predicate_stale: false,
             other_live_holder: false,
             equal_end_provenance_changed: false,
+            matching_proof_cancel_conflict: false,
         };
         assert_eq!(
             classify_write(
@@ -267,6 +277,7 @@ mod tests {
             predicate_stale: false,
             other_live_holder: true,
             equal_end_provenance_changed: true,
+            matching_proof_cancel_conflict: false,
         };
         assert_eq!(
             classify_write(&requested, &occupied, &[], true),
