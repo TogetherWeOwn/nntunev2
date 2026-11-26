@@ -1,5 +1,7 @@
-"""Check the protected preflight SQL against hosted disposable PostgreSQL."""
+"""Check protected trial role preflight and target admission."""
 
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from staging_apply import StagingApplyError
+import staging_trial_role_lifecycle as lifecycle
 import staging_trial_role_preflight as preflight
 from test_apply_migration_postgres import run_psql
 from test_ingest_session_migration_postgres import scratch_database
@@ -100,6 +103,53 @@ class TrialBindingIdentityTests(unittest.TestCase):
 
 
 class TrialRolePreflightTests(unittest.TestCase):
+    def test_isolated_grant_refuses_disagreeing_database_oids_before_psql(self):
+        reader, writer = lifecycle.NAMES
+        scope = {"database_oid": 46001, "issuer_oid": 46002,
+                 "reader": [reader, 46003], "writer": [writer, 46004]}
+        target = {
+            "database_oid": scope["database_oid"], "executor_oid": 46005,
+            "direct": "127.0.0.1", "direct_port": 15432,
+            "routed": "127.0.0.1", "routed_port": 25432,
+            "owner": "trial_fixture_owner", "executor": "trial_fixture_executor",
+            "reader": reader, "writer": writer,
+        }
+        env = {preflight.SCOPE_ENV: json.dumps(scope)}
+        for role, route in lifecycle.ROUTES.items():
+            env[f"PRIVATE_TRIAL_{role}_URL"] = (
+                f"postgresql://{target[role.lower()]}:synthetic@{target[route]}:"
+                f"{target[f'{route}_port']}/{preflight.DATABASE}"
+            )
+        argv = ["staging_trial_role_lifecycle.py", "grant", "--isolated",
+                "--fixture-only-oid", str(scope["database_oid"])]
+
+        def dispatch(config):
+            output, errors = StringIO(), StringIO()
+            with patch.dict(os.environ, env | {lifecycle.CONFIG_ENV: json.dumps(config)}, clear=True), \
+                    patch("sys.argv", argv), redirect_stdout(output), redirect_stderr(errors), \
+                    patch.object(lifecycle.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        args=["psql"], returncode=0, stdout="", stderr="",
+                    )) as psql:
+                code = lifecycle.main()
+            return code, output.getvalue().splitlines(), errors.getvalue().strip(), psql
+
+        code, stages, error, psql = dispatch(target)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stages, [
+            "isolated executor authority passed", "isolated owner authority passed",
+            "staging CONNECT passed", "application grants passed", "exact application ACL passed",
+            "routed reader passed", "routed writer passed",
+        ])
+        self.assertEqual([call.kwargs["input"].splitlines()[0] for call in psql.call_args_list], [
+            "BEGIN READ ONLY;", "BEGIN READ ONLY;", "BEGIN READ WRITE;", "BEGIN READ WRITE;",
+            "BEGIN READ ONLY;", "BEGIN READ ONLY;", "BEGIN READ ONLY;",
+        ])
+
+        # Keep the scope, fixture pin, endpoints and all four logins fixed.
+        code, stages, error, psql = dispatch(target | {"database_oid": 46006})
+        self.assertEqual((code, stages, error), (1, [], "Trial role lifecycle refused"))
+        psql.assert_not_called()
+
     def test_isolation(self):
         with scratch_database(ADMIN, preflight.DATABASE) as db:
             run_psql(db, f"""
