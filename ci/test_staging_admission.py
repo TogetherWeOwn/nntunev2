@@ -92,7 +92,7 @@ def private_pins():
             for index, name in enumerate(("web", "api", "stream"), 1)}
 
 
-def private_report(pins, **track_overrides):
+def private_report(pins, *, observation_offset=0, **track_overrides):
     suite = ET.Element("testsuite")
     track = {"run_id": str(RUN_ID), "run_attempt": "1", "build_sha": SHA,
              "track_id": PRIVATE_TRACK_ID, "sha256": PRIVATE_AUDIO_SHA} | track_overrides
@@ -112,7 +112,7 @@ def private_report(pins, **track_overrides):
         case = ET.SubElement(suite, "testcase", classname="private-music", name=phase, retry="0")
         props = ET.SubElement(case, "properties")
         value = {"phase": phase, "web": SHA, "api": SHA, "expected": SHA,
-                 "observed_at": iso(minutes), "deployments": observations}
+                 "observed_at": iso(minutes + observation_offset), "deployments": observations}
         ET.SubElement(props, "property", name="candidate-identity", value=json.dumps(value))
     return suite
 
@@ -508,28 +508,55 @@ class PrivateAdmissionTests(Base):
         self.assertWorldRefused(world, "intervening staging deployment")
 
     def test_same_run_private_rerun_selects_only_the_current_attempt_artifact(self):
-        world = PrivateWorld()
+        world = PrivateWorld(private_report(private_pins(), observation_offset=-40))
+        world.receipt["recorded_at"] = iso(-40)
+        world.set_archive()
         prior_artifact = world.artifact
-        routes = world.routes()
-        world.run["run_attempt"] = 2
-        rerun_jobs = [dict(job, run_attempt=2) for job in world.jobs]
-        pins = {lane: dict(pin, run_attempt="2") for lane, pin in private_pins().items()}
-        report = ET.tostring(private_report(pins, run_attempt="2"))
-        world.receipt = sa.produce(make_env(GITHUB_RUN_ATTEMPT="2"), report, world.policy,
+        prior_archive = world.archive
+        world.run.update(created_at=iso(-60), updated_at=iso(-35))
+        first_attempt_offset = timedelta(minutes=40)
+        first_jobs = [dict(job, started_at=(sa.timestamp(job["started_at"]) - first_attempt_offset).isoformat(),
+                           completed_at=(sa.timestamp(job["completed_at"]) - first_attempt_offset).isoformat())
+                      for job in world.jobs]
+        first_job_listing = page("jobs", first_jobs)
+        routes = world.routes(jobs=first_job_listing)
+        self.assertEqual(world.verify(routes=routes)["result"], "satisfied")
+        artifact_listing = f"runs/{RUN_ID}/artifacts?per_page=100&page=1"
+
+        # A successful single-job rerun supersedes attempt 1 but lacks its deployment jobs.
+        world.run.update(run_attempt=2, updated_at=iso(-25))
+        routes[f"runs/{RUN_ID}/attempts/2/jobs?per_page=100&page=1"] = page(
+            "jobs", [dict(world.job("staging-ingest", -25, started=-30), run_attempt=2)])
+        actions = FakeActions(routes)
+        self.refused("^missing or ambiguous required staging job$", world.verify_with_actions, actions)
+        self.assertNotIn(artifact_listing, actions.calls)
+
+        # Re-run all jobs with a fresh report and deployment pins for attempt 3.
+        world.run.update(run_attempt=3, updated_at=iso(5))
+        rerun_jobs = [dict(job, run_attempt=3) for job in world.jobs]
+        pins = {lane: dict(pin, run_attempt="3", deployment_id="20000000" + pin["deployment_id"][8:])
+                for lane, pin in private_pins().items()}
+        replacement_track = "00000000-0000-4000-8000-000000000002"
+        report = ET.tostring(private_report(pins, run_attempt="3", track_id=replacement_track))
+        world.receipt = sa.produce(make_env(GITHUB_RUN_ATTEMPT="3"), report, world.policy,
                                    world.contract_bytes, world.manifest, private_pins=pins,
                                    private_track_sha256=PRIVATE_AUDIO_SHA)
         world.set_archive()
         current_artifact = dict(world.artifact, id=ARTIFACT_ID + 1,
-                                name=f"staging-admission-{SHA}-{RUN_ID}-2-private-music")
-        routes[f"runs/{RUN_ID}/attempts/2/jobs?per_page=100&page=1"] = page("jobs", rerun_jobs)
+                                name=f"staging-admission-{SHA}-{RUN_ID}-3-private-music")
+        routes = world.routes(jobs=first_job_listing)
+        routes[f"runs/{RUN_ID}/attempts/3/jobs?per_page=100&page=1"] = page("jobs", rerun_jobs)
+        routes[f"artifacts/{ARTIFACT_ID}/zip"] = prior_archive
         routes[f"artifacts/{ARTIFACT_ID + 1}/zip"] = world.archive
-        artifact_listing = f"runs/{RUN_ID}/artifacts?per_page=100&page=1"
 
         routes[artifact_listing] = page("artifacts", [prior_artifact, current_artifact])
         actions = FakeActions(routes)
         verified = world.verify_with_actions(actions)
         self.assertEqual(verified["result"], "satisfied")
-        self.assertEqual(verified["run_attempt"], "2")
+        self.assertEqual(verified["run_attempt"], "3")
+        self.assertEqual(verified["deployments"], pins)
+        self.assertEqual(verified["private_track"]["track_id"], replacement_track)
+        self.assertEqual(verified["coverage"], [{"id": name, "outcome": "passed"} for name in PRIVATE_CASES])
         self.assertNotIn(f"artifacts/{ARTIFACT_ID}/zip", actions.calls)
 
         routes[artifact_listing] = page("artifacts", [prior_artifact])
