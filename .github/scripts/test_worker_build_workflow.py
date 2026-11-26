@@ -4,9 +4,11 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+from textwrap import dedent
 import tomllib
 import unittest
 from unittest.mock import patch
@@ -129,6 +131,90 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         self.assertIn("needs.gate.outputs.private_trial_upload == '1'", items[cache])
         self.assertIn("if len(ids) != 4:", items[cache])
         self.assertIn('while IFS= read -r id; do\n            ./check_hyperdrive_cache.sh --config-id "$id"', items[cache])
+
+    def test_private_upload_requires_explicitly_disabled_cache_on_each_connection(self):
+        workflow = (ROOT / UPLOAD.WORKFLOW).read_text()
+        step = UPLOAD.step_text(UPLOAD.job_text(workflow, "staging-api"), "Require uncached private trial connections")
+        script = UPLOAD.run_script(step)
+        config_ids = {
+            role.lower(): f"{index:032x}"
+            for index, role in enumerate(("UPLOAD", "AUTH", "PUBLISH", "ENROLL"), 1)
+        }
+        bindings = {f"PRIVATE_TRIAL_{role.upper()}_DB_STAGING_ID": value for role, value in config_ids.items()}
+        ordinary_id = "c" * 32
+        config = ['[[env.staging.hyperdrive]]', 'binding = "HYPERDRIVE"', f'id = "{ordinary_id}"']
+        config.extend(STREAM_CONFIG.trial_db_bindings({"PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED": "true", **bindings}))
+        provider = "https://api.cloudflare.com/client/v4/accounts/" + "a" * 32 + "/hyperdrive/configs/"
+        # Cloudflare's GET wraps the config and its caching object in result.
+        responses = {
+            provider + config_id: {
+                "success": True, "errors": [], "messages": [],
+                "result": {
+                    "id": config_id, "name": f"trial-{role}",
+                    "origin": {
+                        "host": "trial-db.example.test", "database": "synthetic_trial",
+                        "scheme": "postgresql", "user": f"synthetic_{role}", "access_client_id": "fixture-client",
+                    },
+                    "mtls": {"sslmode": "verify-full", "ca_certificate_id": "b" * 32},
+                    "caching": {"disabled": True},
+                },
+            }
+            for role, config_id in config_ids.items()
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "wrangler.toml").write_text("\n".join(config))
+            (work / "check_hyperdrive_cache.sh").symlink_to(ROOT / "workers/api/check_hyperdrive_cache.sh")
+            # Give the workflow shell only the tools this fixture needs. Curl
+            # serves local fixtures and refuses URLs outside the four expected GETs.
+            for command in ("bash", "python3", "mktemp", "rm"):
+                path = shutil.which(command)
+                self.assertIsNotNone(path, command)
+                (work / command).symlink_to(path)
+            curl = work / "curl"
+            curl.write_text("#!" + sys.executable + " -I\n" + dedent("""\
+                import json
+                from pathlib import Path
+                import sys
+
+                args = sys.argv[1:]
+                url = args[-1]
+                response = json.loads(Path("provider.json").read_text())[url]
+                with Path("requests").open("a") as requests:
+                    requests.write(url + "\\n")
+                Path(args[args.index("-o") + 1]).write_text(json.dumps(response))
+                print(200)
+                """))
+            curl.chmod(0o700)
+            requests = work / "requests"
+
+            def run_cache_step():
+                (work / "provider.json").write_text(json.dumps(responses))
+                requests.write_text("")
+                return subprocess.run([str(work / "bash"), "-c", script], cwd=work, capture_output=True,
+                                      text=True, timeout=10, env={
+                                          "PATH": tmp, "TMPDIR": tmp,
+                                          "CLOUDFLARE_ACCOUNT_ID": "a" * 32,
+                                          "CLOUDFLARE_API_TOKEN": "fixture-token",
+                                      })
+
+            passed = run_cache_step()
+            self.assertEqual(passed.returncode, 0, passed.stderr)
+            self.assertCountEqual(requests.read_text().splitlines(), responses.keys())
+
+            for response in responses.values():
+                result = response["result"]
+                for caching in (None, {}, {"disabled": False}):
+                    with self.subTest(config=result["id"], caching=caching):
+                        if caching is None:
+                            del result["caching"]
+                        else:
+                            result["caching"] = caching
+                        refused = run_cache_step()
+                        self.assertEqual(refused.returncode, 1, refused.stderr)
+                        self.assertIn(f'config {result["id"]} must have query caching disabled', refused.stderr)
+                result["caching"] = {"disabled": True}
 
     def test_private_upload_is_default_off_and_uses_distinct_staging_bindings(self):
         self.assertEqual(STREAM_CONFIG.api_vars({}), [])
