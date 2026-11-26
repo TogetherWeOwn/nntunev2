@@ -77,8 +77,10 @@ until their evidence is available.
    on the pinned production branch and logical database. Require `empty` and
    confirm there are no live users or member data in the launch scope. Ledger
    and reference rows count as data. An unknown, incomplete or refused result
-   stops the release. With `rows-present`, use the normal fresh backup, isolated
-   restore and exact undo rehearsal for a schema or data change.
+   stops the release. [Check the saved manifest digest](#check-the-baseline-manifest-offline)
+   before carrying the baseline forward. With `rows-present`, use the normal
+   fresh backup, isolated restore and exact undo rehearsal for a schema or data
+   change.
 5. For a verified empty first release, take or qualify a fresh provider snapshot
    of the exact branch and scope before the first schema change, under the
    same write fence. Read back completion, capture time, expiry and coverage
@@ -95,6 +97,35 @@ until their evidence is available.
    the decision. This is separate from the PR reviewers' source approval.
    Dispatch only through the supported protected workflow with the existing
    environment and credential custodians. [Production release gates](../CONTRIBUTING.md#production-releases)
+
+### Check the baseline manifest offline
+
+Set `candidate_sha` to the full commit under **Candidate** and
+`baseline_manifest_sha256` to the saved manifest digest under **Production
+baseline** in the private release record. From a local clone containing the
+candidate commit and its manifest, compare the exact manifest bytes from that
+commit with the saved digest.
+
+```bash
+(
+  set -o pipefail
+  manifest_hash=$(git --no-replace-objects cat-file blob "${candidate_sha:?}:migrations/manifest.toml" | sha256sum) || exit 1
+  test "${manifest_hash%% *}" = "${baseline_manifest_sha256:?}"
+)
+```
+
+For a synthetic rehearsal, keep the candidate, protected run and attempt,
+branch, database OID, reader, required catalog objects and successful `empty`
+verdict fixed. Compare two saved handoffs against the same candidate.
+
+| Saved manifest digest | Result and next step |
+| --- | --- |
+| Digest from an earlier manifest revision with the same required catalog objects. | The comparison exits nonzero. Keep baseline evidence pending and migration closed. Read the pinned attempt's job and source SHA and reconcile the saved digest against that attempt's private evidence before accepting any correction. |
+| Digest of the manifest at `candidate_sha`. | The comparison exits zero. With the other baseline evidence verified, carry it forward to snapshot verification. |
+
+Keep the handoff pending if the candidate manifest cannot be read. A digest
+match verifies the manifest pin. The protected run's verdict and provenance,
+catalog coverage and reader retirement still require their existing evidence.
 
 ### Offline handoff example after a rerun
 
