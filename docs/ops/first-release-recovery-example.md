@@ -1,8 +1,41 @@
-# First-release handoff after switch-off
+# First-release switch-off handoff
 
-This synthetic example starts after the documented
-[switch-off and verification](../first-private-music-launch.md#switch-off-and-verify)
-have finished. All values and evidence references are illustrative.
+This synthetic example follows the documented
+[switch-off and verification](../first-private-music-launch.md#switch-off-and-verify).
+All values and evidence references are illustrative.
+
+## Recover the run reference after a lost start response
+
+The operator recorded the repository, time and inputs of the recovery request
+before sending it at 12:10 UTC. The request targeted `deploy-production.yml`
+on `main` with `mode=recover-worker`, reviewed
+`sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` and `recovery_run_id=101` for
+rollout attempt `1`. The request timed out before returning a run ID. Mark the
+start **Pending readback** and keep the switch-off fences in place. Do not
+dispatch again or rerun a workflow while resolving the start. An empty list
+can mean the first request is still becoming visible.
+
+Use authenticated Actions records to list `deploy-production.yml` workflow
+dispatches on `main` in the same repository for the recorded request window.
+Verify the workflow ID and path and that the run is on attempt `1`. Verify
+the submitted mode, candidate SHA and original rollout run ID for that same
+attempt. In this example those values come from `DEPLOY_MODE`, `INPUT_SHA`
+and `RECOVERY_RUN_ID` on the **Resolve and validate the promotion target**
+step in the attempt's `production-preflight` job log. The Actions `head_sha`
+identifies the workflow checkout. Verify the reviewed candidate against the
+submitted `sha` input.
+
+The complete readback identifies only run `102/1` and confirms all three
+inputs. Record its run link and continue verification on `102/1`.
+This confirms the start. Switch-off stays pending until the recovery job,
+serving allocation and denial readbacks agree.
+
+If the listing is incomplete or ambiguous, the input evidence is unavailable,
+or the readback points to a different candidate or rollout, leave the start
+pending and retain the original request pins. Continue read-only reconciliation
+without recording a run as confirmed or issuing a second dispatch.
+
+## Record the completed switch-off
 
 | Handoff field | Example entry |
 | --- | --- |
