@@ -822,6 +822,13 @@ def prove_ineffective_baseline_grant(cluster, plan):
             WHERE n.nspname = 'grant_tracks' AND c.relname = 'tracks'
               AND acl.grantee = current_user::regrole AND acl.privilege_type = 'SELECT'
         );
+        SELECT coalesce(string_agg(grant_name, ', ' ORDER BY grant_name), '') FROM (
+            SELECT acl.privilege_type || ' ON ' || n.nspname || '.' || c.relname AS grant_name
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL aclexplode(c.relacl) acl
+            WHERE n.nspname IN ('grant_ledger', 'grant_tracks')
+              AND acl.grantee = current_user::regrole AND acl.privilege_type <> 'SELECT'
+        ) grants;
     """ + sql.removeprefix(begin)
     inventory = {
         "branch_id": plan.branch_id, "database_oid": plan.database_oid,
@@ -840,31 +847,38 @@ def prove_ineffective_baseline_grant(cluster, plan):
         COMMIT;
     """, **launch)
     try:
-        for effective in (True, False):
-            if not effective:
-                cluster.ok("remove schema access while retaining the listed table grant",
-                           f"REVOKE USAGE ON SCHEMA grant_tracks FROM {READER};", **launch)
+        extra = "UPDATE ON grant_tracks.tracks"
+        for case, change, refusal, verdict_name in (
+            ("least-privilege", None, None, "consistent"),
+            ("over-privileged", f"GRANT UPDATE ON grant_tracks.tracks TO {READER};",
+             "baseline table privilege refused", f"pending (extra-grant: {extra})"),
+            ("ineffective", f"REVOKE UPDATE ON grant_tracks.tracks FROM {READER};"
+             f" REVOKE USAGE ON SCHEMA grant_tracks FROM {READER};", "baseline coverage refused", "pending"),
+        ):
+            if change:
+                cluster.ok(f"prepare the {case} reader grants", change, **launch)
             result = cluster.sql(readback_sql, **reader)
-            prefix = observed_identity + catalog + "t\n"
-            if result.returncode == 0:
+            observed_extra = extra if case == "over-privileged" else ""
+            prefix = observed_identity + catalog + f"t\n{observed_extra}\n"
+            if refusal is None:
                 checked(result, "read the complete bundle with effective access", prefix + "rows-present\n")
-                privilege_result = "passed"
+                privileges = {"result": "passed"}
             else:
                 require(result.returncode == 3 and result.stdout == prefix
-                        and "ERROR:  P0001: baseline coverage refused" in result.stderr,
-                        "verify the listed grant survives the effective access failure")
-                privilege_result = "failed"
+                        and f"ERROR:  P0001: {refusal}" in result.stderr,
+                        f"verify the listed grant survives the {case} privilege refusal")
+                privileges = {"result": "failed"} | ({"extra_grants": [observed_extra]} if observed_extra else {})
             observed_catalog = result.stdout[len(observed_identity):len(observed_identity) + len(catalog)]
             observed_inventory = inventory | {"inventory_sha256": hashlib.sha256(observed_catalog.encode()).hexdigest()}
             evidence = {
                 "review": review, "inventory": observed_inventory,
-                "reader_privileges": review | observed_inventory | {"result": privilege_result},
+                "reader_privileges": review | observed_inventory | privileges,
             }
             verdict = command(sys.executable, "-IB", str(script), input_text=json.dumps(evidence), timeout=3)
-            expected = ((0, "database-bootstrap-reader-evidence: consistent\n", "") if effective else
-                        (1, "", "database-bootstrap-reader-evidence: pending\n"))
+            line = f"database-bootstrap-reader-evidence: {verdict_name}\n"
+            expected = (0, line, "") if verdict_name == "consistent" else (1, "", line)
             require((verdict.returncode, verdict.stdout, verdict.stderr) == expected,
-                    f"check the offline verdict with effective read access {effective}")
+                    f"check the offline verdict for the {case} reader")
     finally:
         cluster.ok("remove both synthetic migration schemas", "DROP SCHEMA grant_ledger, grant_tracks CASCADE;",
                    **launch)

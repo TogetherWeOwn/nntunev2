@@ -7,6 +7,16 @@ import sys
 MAX_RECORD_BYTES = 4096
 CATALOG_PINS = {"branch_id", "database_oid", "inventory_sha256"}
 READER_PINS = {"reader_role", "reader_oid"}
+IDENTIFIER = r"[a-z_][a-z0-9_]{0,62}"
+PRIVILEGE = r"(?:SELECT|INSERT|UPDATE|DELETE|TRUNCATE|REFERENCES|TRIGGER|MAINTAIN|USAGE|CREATE|CONNECT|TEMPORARY|EXECUTE)"
+COLUMN_PRIVILEGE = r"(?:SELECT|INSERT|UPDATE|REFERENCES)"
+LARGE_OBJECT_PRIVILEGE = r"(?:SELECT|UPDATE)"
+EXTRA_GRANT = re.compile(
+    rf"(?:{PRIVILEGE} ON {IDENTIFIER}(?:\.{IDENTIFIER})?"
+    rf"|{COLUMN_PRIVILEGE} \((?:{IDENTIFIER})(?:, {IDENTIFIER})*\) ON {IDENTIFIER}(?:\.{IDENTIFIER})?"
+    rf"|{LARGE_OBJECT_PRIVILEGE} ON LARGE OBJECT [1-9][0-9]{{0,9}})"
+    r"(?: WITH GRANT OPTION)?"
+)
 
 
 def unique_fields(pairs):
@@ -22,6 +32,13 @@ def valid_oid(value):
 
 def valid_inventory_digest(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def valid_extra_grant(value):
+    if not isinstance(value, str) or EXTRA_GRANT.fullmatch(value) is None:
+        return False
+    large_object = re.search(r" ON LARGE OBJECT ([0-9]+)(?: WITH GRANT OPTION)?$", value)
+    return large_object is None or valid_oid(int(large_object.group(1)))
 
 
 def matches_pins(observed, expected):
@@ -60,13 +77,23 @@ def reader_evidence_verdict(raw):
         return "pending"
     if observed_digest != digest:
         return "pending (inventory-mismatch)"
-
     privileges = record.get("reader_privileges")
     covered_digest = privileges.get("inventory_sha256") if isinstance(privileges, dict) else None
     if not (
         valid_inventory_digest(covered_digest)
-        and matches_pins(privileges, review | {"inventory_sha256": covered_digest, "result": "passed"})
+        and isinstance(privileges, dict)
     ):
+        return "pending"
+    if isinstance(privileges, dict) and "extra_grants" in privileges:
+        privileges = dict(privileges)
+        extra = privileges.pop("extra_grants")
+        if (isinstance(extra, list) and extra
+                and all(valid_extra_grant(grant) for grant in extra)
+                and len(set(extra)) == len(extra)
+                and matches_pins(privileges, review | {"inventory_sha256": covered_digest, "result": "failed"})):
+            return f"pending (extra-grant: {', '.join(extra)})"
+        return "pending"
+    if not matches_pins(privileges, review | {"inventory_sha256": covered_digest, "result": "passed"}):
         return "pending"
     return "consistent" if covered_digest == digest else "pending (inventory-mismatch)"
 

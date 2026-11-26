@@ -247,6 +247,17 @@ def check_reader_privilege_binding():
 
     check("missing privilege evidence", {"review": review, "inventory": inventory})
     check("duplicate privilege object", b'{"reader_privileges": null, ' + json.dumps(record).encode()[1:])
+    over = privileges | {"result": "failed", "extra_grants": ["UPDATE ON fixture_catalog.required"]}
+    check("readback shows an extra table grant", record | {"reader_privileges": over},
+          "pending (extra-grant: UPDATE ON fixture_catalog.required)")
+    for case, override in {
+        "extra grant beside a passed result": {"result": "passed"},
+        "extra grant for another reader": {"reader_oid": 17003},
+        "empty extra grant list": {"extra_grants": []},
+        "repeated extra grant": {"extra_grants": ["UPDATE ON fixture_catalog.required"] * 2},
+        "unnamed extra grant": {"extra_grants": ["UPDATE"]},
+    }.items():
+        check(case, record | {"reader_privileges": over | override})
     check("oversized record", json.dumps(record).encode().ljust(4097))
     check("privileges match the approved reader and inventory", record, "consistent")
 
