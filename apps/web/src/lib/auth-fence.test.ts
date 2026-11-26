@@ -239,12 +239,12 @@ const candidate = { trackId: 'next' };
 it('only a matching owner, track and continuation can publish an uncredentialed media locator', async () => {
 	setup();
 	const prepare = vi.fn(async (req: { sessionBinding: string; playbackSessionId: string; trackId: string }) =>
-		({ ...req, playId: 'play-7', durationMs: 120_000 }));
+		({ data: { ...req, playId: 'play-7', durationMs: 120_000 } }));
 	const scope = createBrowserPlaybackGrant((await captureAuthFence())!, playbackBinding, prepare);
 	const publish = vi.fn<(_source: QueuedPlaySource, _duration: number) => void>();
 	for (const bad of [{ trackId: 'old' }, { playbackSessionId: 'another-tab' }, { sessionBinding: 'B'.repeat(42) + 'A' },
 		{ durationMs: 0 }, { durationMs: 1.5 }, { playId: 'different' }, { playId: '../escape' }]) {
-		prepare.mockImplementationOnce(async (req) => ({ ...req, playId: 'play-7', durationMs: 120_000, ...bad }));
+		prepare.mockImplementationOnce(async (req) => ({ data: { ...req, playId: 'play-7', durationMs: 120_000, ...bad } }));
 		expect(await scope.open({ ...candidate, playId: 'play-7' }, signal(), () => true, publish)).toBe(false);
 	}
 	expect(await scope.open({ ...candidate, playId: 'play-7' }, signal(), () => true, publish)).toBe(true);
@@ -272,7 +272,7 @@ it.each(['accepted', 'disabled', 'denied', 'superseded', 'cancelled', 'account s
 	const prepare = vi.fn(async (req: { sessionBinding: string; playbackSessionId: string; trackId: string }, transportSignal: AbortSignal) => {
 		started.resolve(transportSignal);
 		await finish.promise;
-		return reason === 'denied' ? undefined : { ...req, playId: 'play-7', durationMs: 120_000 };
+		return reason === 'denied' ? undefined : { data: { ...req, playId: 'play-7', durationMs: 120_000 } };
 	});
 	const scope = createBrowserPlaybackGrant(owner, playbackBinding, reason === 'disabled' ? undefined : prepare);
 	const attempt = new AbortController();

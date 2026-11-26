@@ -143,7 +143,7 @@ sys.stdout.buffer.write(buf.getvalue())`, intentFile], { input: readFileSync(joi
       GITHUB_JOB: 'recover-worker', GITHUB_SHA: 'c'.repeat(40), GITHUB_WORKFLOW_SHA: 'c'.repeat(40),
       RUNNER_TEMP: temp, GITHUB_OUTPUT: join(temp, 'output') };
   }
-  function admitWithFakeGitHub(env) {
+  function admitWithFakeGitHub(env, changeArtifactListing) {
     const repository = { id: 114, full_name: env.GITHUB_REPOSITORY };
     const route = '.github/workflows/deploy-production.yml';
     const responses = {
@@ -157,9 +157,12 @@ sys.stdout.buffer.write(buf.getvalue())`, intentFile], { input: readFileSync(joi
         workflow_run: { id: 12, repository_id: 114, head_repository_id: 114, head_branch: 'main', head_sha: run.head_sha } }] },
       [`artifacts?name=${claimName}&per_page=100&page=1`]: { total_count: claims.length, artifacts: claims },
     };
+    changeArtifactListing?.(responses['runs/12/artifacts?per_page=100&page=1']);
     writeFileSync(join(env.RUNNER_TEMP, 'gh'), `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs');
 if (process.env.INTENT_KEY !== undefined) process.exit(1);
 const route = process.argv[5].replace(/^repos\\/example\\/fixture\\/actions\\//, '');
+appendFileSync(process.env.RUNNER_TEMP + '/actions-reads', route + '\\n');
 if (route === 'artifacts/97/zip') process.stdout.write(Buffer.from('${zipped.stdout.toString('base64')}', 'base64'));
 else {
   const response = ${JSON.stringify(responses)}[route];
@@ -167,15 +170,16 @@ else {
   process.stdout.write(JSON.stringify(response));
 }
 `, { mode: 0o700 });
-    const result = spawnSync(process.execPath, ['ci/production-maintenance/final-smoke-rollback.mjs', 'admit-recovery'], {
+    return spawnSync(process.execPath, ['ci/production-maintenance/final-smoke-rollback.mjs', 'admit-recovery'], {
       env: { ...env, PATH: `${env.RUNNER_TEMP}:${process.env.PATH}`, GITHUB_REPOSITORY_ID: '114' },
       encoding: 'utf8', timeout: 15_000,
     });
-    assert.equal(result.status, 0, result.stderr);
   }
   async function enter(env) {
-    if (conclusion === 'cancelled') admitWithFakeGitHub(env);
-    else admitRecovery(env, evidence);
+    if (conclusion === 'cancelled') {
+      const result = admitWithFakeGitHub(env);
+      assert.equal(result.status, 0, result.stderr);
+    } else admitRecovery(env, evidence);
     const output = readFileSync(env.GITHUB_OUTPUT, 'utf8');
     const canSubmit = /^allow-submit=true$/m.test(output);
     assert.ok(output.includes(`claim-name=${claimName}\n`));
@@ -191,5 +195,5 @@ else {
     if (prepare) await transport.run('prepare-recovery', env);
     return transport.run('recover', { ...env, CLAIM_VERIFIED: 'true' }, clock);
   }
-  return { fresh, enter, steps, evidence, artifact, claimedRecovery };
+  return { fresh, enter, steps, evidence, artifact, claimedRecovery, admitWithFakeGitHub };
 }

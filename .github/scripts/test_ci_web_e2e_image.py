@@ -67,7 +67,7 @@ class TestWebPlaywrightImage(unittest.TestCase):
             self.assertIsNone(step_field(step, "continue-on-error"))
             self.assertIsNone(step_field(step, "if"))
         self.assertIn("web-e2e", step_field(self.jobs["ci-ok"], "needs"))
-        self.assertIn('all(.[]; .result == "success")', self.jobs["ci-ok"])
+        self.assertEqual(job_level_field(self.jobs["ci-ok"], "if"), "${{ always() }}")
         self.assertIn("python3 .github/scripts/test_ci_web_e2e_image.py", self.jobs["e2e-lint"])
 
     def test_shards_run_independently_with_distinct_reports(self):

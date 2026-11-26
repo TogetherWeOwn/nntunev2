@@ -103,12 +103,13 @@ until their evidence is available.
 ### Offline handoff example after a rerun
 
 In this synthetic handoff, `deploy.yml` reruns the same `<sha>` under the same
-`<run-id>`. The run-level artifact listing can contain receipts from both attempts.
+`<run-id>`. The run-level artifact listing can contain receipts from multiple
+attempts.
 
 | Artifact name | Handoff disposition |
 | --- | --- |
 | `staging-admission-<sha>-<run-id>-1-private-music` | Historical evidence from attempt 1, which the rerun superseded. |
-| `staging-admission-<sha>-<run-id>-2-private-music` | Use for verification when the run and required jobs identify attempt 2 and exactly one artifact has this name. |
+| `staging-admission-<sha>-<run-id>-<current-attempt>-private-music` | Use for verification when the run and required jobs identify the current attempt and exactly one artifact has this name. |
 
 If the handoff only identifies the run ID, the attempt records disagree, or
 the selected attempt has no unique matching artifact, record **Staging
@@ -116,6 +117,13 @@ admission** as Pending and **Dispatch readiness** as Blocked. Resolve the
 attempt and artifact from the same protected run before resuming step 3.
 The name selects the artifact for verification. The verifier still checks
 the archive digest and the receipt's own SHA, run ID and attempt.
+
+If attempt 2 reran only `staging-ingest`, the run can show green while the
+private journey and its Web, API and Stream deployments still belong to attempt
+1. Record attempt 2, the job that reran and the missing same-attempt jobs in the
+candidate record. Keep **Staging admission** Pending and **Dispatch readiness**
+Blocked. Follow the [unusable receipt handoff](#synthetic-handoff-for-an-unusable-receipt)
+to qualify a complete replacement attempt.
 
 ### Synthetic handoff for an unusable receipt
 
@@ -132,16 +140,47 @@ verdict Pending. In each case, record **Staging admission** as Pending and
 | SHA-256 mismatch | Record the verifier refusal when the downloaded ZIP differs from the Actions digest. Repeat qualification step 3 through the authorized Actions read path if the same artifact and attempt are still eligible. If the mismatch persists or the evidence is no longer eligible, qualify a replacement attempt. |
 
 Keep scheduled [trial cleanup](ops/private-staging-trial.md#retire-and-recover)
-on time. For a replacement, reconcile the prior invite and fixtures before using
+on time. For a replacement, reconcile the prior invite, upload, publication
+and fixture pins before using
 [fresh single-use inputs](ops/private-staging-trial.md#setup-and-trial).
-Repeat [qualification steps 1–3](#qualify-the-candidate) for the pinned SHA in
-one complete protected main-push `deploy.yml` attempt. For an eligible rerun,
-use **Re-run all jobs** and check the original workflow's compatibility with
-the [staging deploy lock](ops.md#staging-deploy-lock-cutover-and-rollback).
+
+During the next approved staging window, use **Re-run all jobs** only within
+GitHub's 30-day rerun window and if the original protected push uses the
+`deploy-staging-main` lock. Follow the
+[staging rollback procedure](ops.md#staging-deploy-lock-cutover-and-rollback)
+before starting the rerun. Pause merges, pushes and other staging reruns,
+drain active and queued deploys through post-deploy E2E, and keep the pause
+until the rerun finishes and staging serves the pinned SHA. If those conditions
+cannot be met, use a fresh protected push to `main` during an approved staging
+window and pin its reviewed SHA.
+
+Repeat [qualification steps 1–3](#qualify-the-candidate) on the selected build.
+Require successful deployment and journey jobs, a pass without a Playwright
+retry for every required case, and the verified receipt from one complete
+protected main-push `deploy.yml` attempt.
 [Select the replacement receipt by attempt](#offline-handoff-example-after-a-rerun).
-If a fresh protected push changes the SHA, review and pin that build first.
 Keep the original evidence under its own attempt. Record the selected run,
 attempt and artifact digest when the verifier emits matching staging pins.
+
+## Staging rollback rehearsal with launch readback pending
+
+This offline example uses placeholders. The maintenance seed was recorded
+earlier. The application candidate's release decision is `Pending` while the
+operator checks that fallback before dispatch.
+
+| Record | Example entry |
+| --- | --- |
+| Staging rollback rehearsal | **Passed.** Push-triggered staging `deploy.yml` run `<staging-run>` had `staging-web` conclude `success` on `<last-good-staging-sha>`. [**Re-run all jobs**](ops.md#staging-deploy-lock-cutover-and-rollback) produced attempt `<attempt>` with `staging-web` at `success`, passing health and the matching SHA from staging `/api/build`. |
+| Launch maintenance target | The maintenance seed record pins production Worker ID `<worker-id>` (`nntune-web`), `<maintenance-deployment>` and `<maintenance-version>` at 100%. |
+| Launch serving readback | **Missing.** The current launch allocation is unavailable. In the disagreement variant, the latest launch deployment reports 100% on `<other-launch-version>`. |
+| Handoff | In either variant, retain the staging pass, leave verification of the maintenance fallback open and keep the release decision `Pending`. |
+
+The next serving readback is the complete deployment history for the pinned
+Worker ID (`nntune-web`) in the pinned production account. Confirm that the
+current deployment is `<maintenance-deployment>` and serves
+`<maintenance-version>` at 100%, then continue the existing fallback checks.
+[Protected recovery](ops.md#protected-production-worker-recovery) ·
+[Switch-off verification](#switch-off-and-verify)
 
 ## Switch off and verify
 

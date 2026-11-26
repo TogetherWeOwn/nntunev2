@@ -20,7 +20,7 @@ function fixture(fetchFn = vi.fn<typeof fetch>(), canRecord = () => true) {
 	};
 	let source: BrowserPlaybackSource | undefined;
 	const grant = createBrowserPlaybackGrant(owner, binding, async ({ sessionBinding, playbackSessionId, trackId }) => ({
-		sessionBinding, playbackSessionId, trackId, playId, durationMs: 60_000
+		data: { sessionBinding, playbackSessionId, trackId, playId, durationMs: 60_000 }
 	}));
 	const sender = createListenEventSender({ owner, canRecord, grantForStart: () => source, fetchFn });
 	onTestFinished(() => { sender.dispose(); grant.dispose(); });

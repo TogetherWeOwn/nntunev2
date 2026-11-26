@@ -92,7 +92,7 @@ def private_pins():
             for index, name in enumerate(("web", "api", "stream"), 1)}
 
 
-def private_report(pins, **track_overrides):
+def private_report(pins, *, observation_offset=0, **track_overrides):
     suite = ET.Element("testsuite")
     track = {"run_id": str(RUN_ID), "run_attempt": "1", "build_sha": SHA,
              "track_id": PRIVATE_TRACK_ID, "sha256": PRIVATE_AUDIO_SHA} | track_overrides
@@ -112,7 +112,7 @@ def private_report(pins, **track_overrides):
         case = ET.SubElement(suite, "testcase", classname="private-music", name=phase, retry="0")
         props = ET.SubElement(case, "properties")
         value = {"phase": phase, "web": SHA, "api": SHA, "expected": SHA,
-                 "observed_at": iso(minutes), "deployments": observations}
+                 "observed_at": iso(minutes + observation_offset), "deployments": observations}
         ET.SubElement(props, "property", name="candidate-identity", value=json.dumps(value))
     return suite
 
@@ -597,28 +597,55 @@ class PrivateAdmissionTests(Base):
         self.assertWorldRefused(world, "intervening staging deployment")
 
     def test_same_run_private_rerun_selects_only_the_current_attempt_artifact(self):
-        world = PrivateWorld()
+        world = PrivateWorld(private_report(private_pins(), observation_offset=-40))
+        world.receipt["recorded_at"] = iso(-40)
+        world.set_archive()
         prior_artifact = world.artifact
-        routes = world.routes()
-        world.run["run_attempt"] = 2
-        rerun_jobs = [dict(job, run_attempt=2) for job in world.jobs]
-        pins = {lane: dict(pin, run_attempt="2") for lane, pin in private_pins().items()}
-        report = ET.tostring(private_report(pins, run_attempt="2"))
-        world.receipt = sa.produce(make_env(GITHUB_RUN_ATTEMPT="2"), report, world.policy,
+        prior_archive = world.archive
+        world.run.update(created_at=iso(-60), updated_at=iso(-35))
+        first_attempt_offset = timedelta(minutes=40)
+        first_jobs = [dict(job, started_at=(sa.timestamp(job["started_at"]) - first_attempt_offset).isoformat(),
+                           completed_at=(sa.timestamp(job["completed_at"]) - first_attempt_offset).isoformat())
+                      for job in world.jobs]
+        first_job_listing = page("jobs", first_jobs)
+        routes = world.routes(jobs=first_job_listing)
+        self.assertEqual(world.verify(routes=routes)["result"], "satisfied")
+        artifact_listing = f"runs/{RUN_ID}/artifacts?per_page=100&page=1"
+
+        # A successful single-job rerun supersedes attempt 1 but lacks its deployment jobs.
+        world.run.update(run_attempt=2, updated_at=iso(-25))
+        routes[f"runs/{RUN_ID}/attempts/2/jobs?per_page=100&page=1"] = page(
+            "jobs", [dict(world.job("staging-ingest", -25, started=-30), run_attempt=2)])
+        actions = FakeActions(routes)
+        self.refused("^missing or ambiguous required staging job$", world.verify_with_actions, actions)
+        self.assertNotIn(artifact_listing, actions.calls)
+
+        # Re-run all jobs with a fresh report and deployment pins for attempt 3.
+        world.run.update(run_attempt=3, updated_at=iso(5))
+        rerun_jobs = [dict(job, run_attempt=3) for job in world.jobs]
+        pins = {lane: dict(pin, run_attempt="3", deployment_id="20000000" + pin["deployment_id"][8:])
+                for lane, pin in private_pins().items()}
+        replacement_track = "00000000-0000-4000-8000-000000000002"
+        report = ET.tostring(private_report(pins, run_attempt="3", track_id=replacement_track))
+        world.receipt = sa.produce(make_env(GITHUB_RUN_ATTEMPT="3"), report, world.policy,
                                    world.contract_bytes, world.manifest, private_pins=pins,
                                    private_track_sha256=PRIVATE_AUDIO_SHA)
         world.set_archive()
         current_artifact = dict(world.artifact, id=ARTIFACT_ID + 1,
-                                name=f"staging-admission-{SHA}-{RUN_ID}-2-private-music")
-        routes[f"runs/{RUN_ID}/attempts/2/jobs?per_page=100&page=1"] = page("jobs", rerun_jobs)
+                                name=f"staging-admission-{SHA}-{RUN_ID}-3-private-music")
+        routes = world.routes(jobs=first_job_listing)
+        routes[f"runs/{RUN_ID}/attempts/3/jobs?per_page=100&page=1"] = page("jobs", rerun_jobs)
+        routes[f"artifacts/{ARTIFACT_ID}/zip"] = prior_archive
         routes[f"artifacts/{ARTIFACT_ID + 1}/zip"] = world.archive
-        artifact_listing = f"runs/{RUN_ID}/artifacts?per_page=100&page=1"
 
         routes[artifact_listing] = page("artifacts", [prior_artifact, current_artifact])
         actions = FakeActions(routes)
         verified = world.verify_with_actions(actions)
         self.assertEqual(verified["result"], "satisfied")
-        self.assertEqual(verified["run_attempt"], "2")
+        self.assertEqual(verified["run_attempt"], "3")
+        self.assertEqual(verified["deployments"], pins)
+        self.assertEqual(verified["private_track"]["track_id"], replacement_track)
+        self.assertEqual(verified["coverage"], [{"id": name, "outcome": "passed"} for name in PRIVATE_CASES])
         self.assertNotIn(f"artifacts/{ARTIFACT_ID}/zip", actions.calls)
 
         routes[artifact_listing] = page("artifacts", [prior_artifact])
@@ -1345,7 +1372,7 @@ class SourceBindingTests(Base):
         return self.git(*args).decode().strip()
 
     def run_main(self, candidate_files=None, trusted_files=None, current_files=None, private=False,
-                 mode="bootstrap-maintenance", world_factory=None, live_error=None):
+                 mode="bootstrap-maintenance", world_factory=None, live_error=None, cli_refusal=None, actions_hook=None):
         candidate = self.commit(candidate_files or self.files)
         trusted = self.commit(trusted_files or self.files, candidate)
         current = self.commit(current_files or trusted_files or self.files, trusted)
@@ -1365,7 +1392,7 @@ class SourceBindingTests(Base):
                 world = World(policy=self.policy, contract_bytes=self.contract,
                               xml=make_junit(final_sha=candidate).replace(
                                   b'classname="journey"', b'classname="signup.spec.ts"'))
-            actions = FakeActions(world.routes())
+            actions = FakeActions(world.routes(), hook=actions_hook)
         env = make_env(GITHUB_SHA=trusted, DEPLOY_SHA=candidate, GITHUB_EVENT_NAME="workflow_dispatch",
                        GITHUB_REPOSITORY_ID=str(REPO_ID), GITHUB_TOKEN="synthetic-token", DEPLOY_MODE=mode)
         with patch.object(sa, "ROOT", self.root), patch.dict(sa.os.environ, env, clear=True), \
@@ -1373,6 +1400,15 @@ class SourceBindingTests(Base):
                 patch.object(sa, "Actions", return_value=actions), \
                 patch.object(sa, "current_identity", side_effect=live_error) as live, \
                 patch("sys.stdout", new=io.StringIO()) as output:
+            if cli_refusal is not None:
+                with patch("sys.stderr", new=io.StringIO()) as error, self.assertRaises(SystemExit) as stopped:
+                    sa.cli()
+                self.assertEqual(stopped.exception.code, 1)
+                self.assertEqual(error.getvalue(), f"::error::Candidate admission refused: {cli_refusal}\n")
+                self.assertEqual(output.getvalue(), "")
+                self.assertNotIn(f"runs/{RUN_ID}/artifacts?per_page=100&page=1", actions.calls)
+                live.assert_not_called()
+                return
             with patch.object(sa, "git", wraps=sa.git) as source_git:
                 try:
                     sa.main()
@@ -1497,6 +1533,63 @@ class SourceBindingTests(Base):
 
         self.refused("^artifact content digest mismatch$", self.run_main, private=True, mode="promote",
                      world_factory=different_download)
+
+    def test_private_main_distinguishes_pending_and_failed_required_jobs(self):
+        self.install_private_contract()
+        _, lines = self.run_main(private=True, mode="promote")
+        self.assertEqual(json.loads(lines[0])["verified_private_music_staging"]["run_attempt"], "1")
+
+        def pending():
+            world = PrivateWorld()
+            world.run.update(status="in_progress", conclusion=None)
+            world.jobs[-1].update(status="queued", conclusion=None, started_at=None, completed_at=None)
+            return world
+
+        def failed():
+            world = pending()
+            world.jobs[2].update(conclusion="failure")
+            return world
+
+        def completed_failure():
+            world = failed()
+            world.run.update(status="completed", conclusion="failure")
+            world.jobs[-1].update(status="completed", conclusion="skipped", completed_at=iso(5))
+            return world
+
+        def incomplete_jobs():
+            world = PrivateWorld()
+            world.jobs.pop()
+            return world
+
+        def mismatched_jobs():
+            world = pending()
+            world.jobs[-1].update(run_attempt=2)
+            return world
+
+        def incoherent_jobs():
+            world = pending()
+            world.jobs[2]["conclusion"] = None
+            return world
+
+        wait = (f"post-deploy private music journey in staging run {RUN_ID}, attempt 1 is pending. "
+                "Wait for the attempt to finish, then recheck the evidence.")
+        investigate = (f"staging-stream in staging run {RUN_ID}, attempt 1 did not succeed. "
+                       "Inspect the job and return to candidate qualification.")
+        generic = "missing, unapproved, stale or incoherent evidence"
+        for factory, refusal in ((pending, wait), (failed, investigate), (completed_failure, investigate),
+                                 (incomplete_jobs, generic), (mismatched_jobs, generic), (incoherent_jobs, generic)):
+            with self.subTest(fixture=factory.__name__):
+                self.run_main(private=True, mode="promote", world_factory=factory, cli_refusal=refusal)
+
+        for update in ({"run_attempt": 2}, {"status": "completed", "conclusion": "success"}):
+            with self.subTest(run_changed_during_jobs_read=update):
+                def change_run(route, routes):
+                    if route == f"runs/{RUN_ID}/attempts/1/jobs?per_page=100&page=1":
+                        run_route = f"runs/{RUN_ID}"
+                        routes[run_route] = dict(routes[run_route], **update)
+
+                self.run_main(private=True, mode="promote", world_factory=pending, cli_refusal=generic,
+                              actions_hook=change_run)
 
     def test_private_producer_cli_binds_candidate_audio(self):
         fixture = self.install_private_contract()

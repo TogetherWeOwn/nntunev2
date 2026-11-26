@@ -84,7 +84,7 @@ impl OpenedUpload<'_> {
         .await
     }
 
-    pub(super) async fn commit_flac<'inventory, 'receipts: 'inventory>(
+    pub(crate) async fn commit_flac<'inventory, 'receipts: 'inventory>(
         self,
         writer: &mut Client,
         auth: Authorization<'_>,

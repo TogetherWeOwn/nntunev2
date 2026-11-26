@@ -474,6 +474,37 @@ test('recovery refuses unapproved or altered evidence and reconciles a prior fin
   assert.ok(transport.calls.every((method) => method === 'GET'));
 });
 
+test('recovery preparation requires the archived prior deployment identity', async (t) => {
+  const pinned = finalSmokeFixture(t, rollbackFixture);
+  const alternate = finalSmokeFixture(t, rollbackFixture);
+  alternate.custody.maintenance.deployment = alternate.id(9);
+  alternate.rows[0].id = alternate.custody.maintenance.deployment;
+  await pinned.prepare();
+  await alternate.run('record');
+  const pinnedHistory = structuredClone(pinned.rows);
+
+  for (const [archive, runId] of [[alternate, '13'], [pinned, '14']]) {
+    const { fresh, evidence } = recoveryFixture(t, archive, 'success');
+    const recovery = fresh(runId);
+    admitRecovery(recovery, evidence);
+    assert.match(readFileSync(recovery.GITHUB_OUTPUT, 'utf8'), /^allow-submit=true$/m);
+    assert.deepEqual(readFileSync(join(recovery.RUNNER_TEMP, intentFile)), readFileSync(join(archive.temp, intentFile)));
+
+    const allocation = join(recovery.RUNNER_TEMP, 'production-final-allocation.sealed');
+    const callCount = pinned.calls.length;
+    if (archive === alternate) {
+      await assert.rejects(pinned.run('prepare-recovery', recovery), /Rollback intent or final allocation is missing, invalid or stale/);
+      assert.equal(existsSync(allocation), false);
+      assert.deepEqual(pinned.calls.slice(callCount), []);
+    } else {
+      await pinned.run('prepare-recovery', recovery);
+      assert.ok(existsSync(allocation));
+      assert.deepEqual(pinned.calls.slice(callCount), ['GET', 'GET', 'GET', 'GET']);
+    }
+  }
+  assert.deepEqual(pinned.rows, pinnedHistory);
+});
+
 test('protected recovery wiring keeps the production lock and contains source and provider errors', () => {
   const job = workflow.split('\n  recover-worker:\n')[1].split('\n  release:\n')[0];
   assert.match(job, /if: inputs.mode == 'recover-worker'\n    needs: \[preflight, staging-evidence\]/);

@@ -56,10 +56,20 @@ runner. Retain only the output verdict and protected job URL in the readout.
 
 After an `admitted` result, use the default-off #1787 route only for the
 protected test window and execute the recording below. `finish` takes the
-same admission fields and checks plus the following checks and a
-`checkout_session` field, the original test
-Checkout Session ID. Verify the deployed identities on any staging
-configuration change and abort the run on deploy drift.
+same admission fields and checks, the finish checks below, and three fields.
+
+- `checkout_session` holds the original test Checkout Session ID.
+- `enrollment_id` holds the synthetic listener's lowercase user UUID from the
+  verified invite redemption. Confirm the selected Checkout belongs to that listener.
+- `playback_receipt` holds `build`, `checkout_session`, `enrollment_id`, `played_at`
+  and `metered_at`. Record the UUID of the listener whose authenticated session
+  supplied the playback and delivered usage observations. Record the two times
+  as positive UTC Unix seconds, with usage observed at or after playback. The
+  runner matches the receipt's build, Checkout and enrollment against the
+  selected run and refuses a mismatch before network readback.
+
+Verify the deployed identities on any staging configuration change and abort
+the run on deploy drift.
 
 | Finish check | Required observation |
 | --- | --- |
@@ -74,11 +84,9 @@ configuration change and abort the run on deploy drift.
 
 Before entering `playback_and_meter`, verify that the play, seek, delivered
 usage and replay observations came from the synthetic account and playback
-sequence in this admitted run. An earlier playback sequence for the same
-account and build cannot supply that attestation. The runner verifies the
-attested build SHA and reads back the selected Checkout Session by ID. The
-operator verifies playback provenance because the receipt carries only a
-build SHA for `playback_and_meter`.
+sequence in this admitted run. Use that sequence's observation times in
+`playback_receipt`. The runner then reads back the selected Checkout Session
+by ID.
 
 On success or interruption, close paid dispatch in the protected staging
 configuration first. Disable the dedicated test webhook destination, confirm
@@ -185,14 +193,15 @@ payment readback. Record the same-run Stream deployment separately under
 This example uses build `1111111111111111111111111111111111111111` and a
 synthetic invitee with user UUID `11111111-1111-4111-8111-111111111111`.
 Carry the admission fields, including the verified `stripe_account`, into
-`finish`. Record `checks.admitted` from the `admitted` verdict on that same
-build and run. Carry the underlying observations forward as follows.
+`finish` and record the invitee's UUID as `enrollment_id`. Record
+`checks.admitted` from the `admitted` verdict on that same build and run.
+Carry the underlying observations forward as follows.
 
 | Observation | Acceptance input |
 | --- | --- |
 | The invoice-history preflight at the pinned cutoff reports `total=3`, `exact=1`, `eligible_hydration=1`, `fresh=1`, `collision=0`, `incomplete=0` and exits 0 for the independently inventoried scope of three keys. | Record the SHA under `checks.invoice_history` at admission and carry it into `finish`. The comparison covers existing subscription targets. The new invitee's first Checkout is observed during the journey. |
 | The invitee completes `cs_test_fixtureSignup` for `sub_fixtureSignup`, and the signed delivery applies coverage once to that invitee. | Copy the original ID into `checkout_session` and record the SHA under `checks.payment_applied` in `finish`. The runner reads back the paid test session and its canceled subscription during closing verification. |
-| The same invitee plays the synthetic track over a ranged response, seeks, keeps playing and shows positive delivered usage. Replaying the meter window leaves the total flat. | Confirm the authenticated listener UUID matches the invitee above. Keep that UUID and the observed play and usage times in the protected job. Submit the build SHA under `checks.playback_and_meter` in `finish`. |
+| The same invitee plays the synthetic track over a ranged response, seeks, keeps playing and shows positive delivered usage. Replaying the meter window leaves the total flat. | Record the observed listener UUID as `playback_receipt.enrollment_id`. Include the candidate `build`, selected `checkout_session`, and observed `played_at` and `metered_at` times in the receipt. Record the SHA under `checks.playback_and_meter`. |
 
 Collect the remaining admission and finish checks from the same run. The
 [loopback clock fixture](../.github/scripts/test_paid_invite_clock.py)
