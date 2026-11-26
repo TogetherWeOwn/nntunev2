@@ -1029,19 +1029,21 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     const olderWriterGroup = 'deploy-staging-main';
     const mainRef = 'refs/heads/main';
     const lanes = ['staging-web', 'staging-api', 'staging-mb', 'staging-ingest', 'staging-stream', 'post-deploy-e2e', 'post-deploy-private-music'];
+    const dispatchFormat = "format('{0}-gate-{1}', github.workflow, github.ref)";
     const lockPattern = /^concurrency:\n  group: \$\{\{ (.+) \}\}\n  cancel-in-progress: false\n  queue: max$/m;
     const assertDeployLock = (body: string) => {
       const header = body.split('\njobs:\n')[0]!;
       expect(header).toMatch(/^on:\n  push:\n    branches: \[main\]\n  workflow_dispatch:\n    inputs:\n      private_trial_cleanup_scope_sha256:\n        description: [^\n]+\n        type: string\n        default: ''\n\n/m);
       const lock = header.match(lockPattern);
       expect(lock, 'queued workflow-level lock').not.toBeNull();
+      expect(lock![1], 'dispatch key must use the workflow and ref').toContain(dispatchFormat);
       const workflowName = header.match(/^name: ([\w-]+)$/m)?.[1];
       expect(workflowName).toBe('deploy');
       const groupFor = (event: string, hasScope: boolean, ref = mainRef): string => {
         const expression = lock![1]!
           .replace("github.event_name == 'push'", String(event === 'push'))
           .replace("inputs.private_trial_cleanup_scope_sha256 != ''", String(hasScope))
-          .replace("format('{0}-gate-{1}', github.workflow, github.ref)", "'diagnostic'");
+          .replace(dispatchFormat, "'diagnostic'");
         expect(expression, 'supported staging lock expression').toMatch(
           /^(?:true|false|'deploy-staging-main'|'diagnostic'|[\s()&|])+$/,
         );
@@ -1072,6 +1074,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
       deployWorkflow.replace(lock, lock.replace('\n  queue: max', '')),
       deployWorkflow.replace(lock, lock.replace('cancel-in-progress: false', 'cancel-in-progress: true')),
       deployWorkflow.replace(lock, lock.replace('github.ref)', 'github.run_id)')),
+      deployWorkflow.replace(lock, lock.replace(dispatchFormat, "'diagnostic'")),
       deployWorkflow.replace(lock, lock.replace("github.event_name == 'push'", 'false')),
       deployWorkflow.replace(lock, lock.replace(" || inputs.private_trial_cleanup_scope_sha256 != ''", '')),
       ...['gate', ...lanes, PRIVATE_TRIAL_CLEANUP_JOB].map(name =>
