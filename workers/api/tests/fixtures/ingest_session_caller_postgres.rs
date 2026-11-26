@@ -1209,4 +1209,17 @@ async fn prove_overlapping_completed_reads(
         assert_eq!(result.page_versions, acknowledged.page_versions);
     }
     assert_eq!(snapshot().await, before);
+
+    // Let the later cleanup case model elapsed time after this synthetic reuse.
+    assert_eq!(
+        observer
+            .execute(
+                "UPDATE public.storage_validated_digest_winners SET upload_until = '-infinity'
+                 WHERE object_id = $1::text::uuid AND upload_until = $2",
+                &[&acknowledged.object, &resume.usable_until()],
+            )
+            .await
+            .unwrap(),
+        1
+    );
 }
