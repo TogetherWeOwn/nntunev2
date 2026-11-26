@@ -24,7 +24,10 @@ VERSION = "11111111-1111-4111-8111-111111111111"
 DEPLOYMENT = "22222222-2222-4222-8222-222222222222"
 REDEPLOYMENT = "33333333-3333-4333-8333-333333333333"
 PRIVATE_DETAIL = "https://private.example.invalid/listen?token=disposable-canary&account=account@example.invalid"
-PRIVATE_MARKERS = (b"private.example.invalid", b"disposable-canary", b"account@example.invalid")
+CUTOFF_BINDING = "A" * 43
+OTHER_BINDING = "Q" * 43
+PRIVATE_MARKERS = (b"private.example.invalid", b"disposable-canary", b"account@example.invalid",
+                   CUTOFF_BINDING.encode(), OTHER_BINDING.encode())
 AUDIO_DIR = "fixtures/synthetic-flac/private-staging"
 TRACK_FILE = f"{AUDIO_DIR}/tone-a.flac"
 PUBLISHED_TRACK = "00000000-0000-4000-8000-000000000001"
@@ -71,7 +74,7 @@ def setup(root, env):
     write(root, "e2e/private-staging/fixture.spec.ts", f"""
 import {{ test }} from '@playwright/test';
 import {{ freshTrialPublication, privateStagingAudio }} from '../helpers/private-staging-fixture.js';
-import {{ privateRunIdentity, privateTrackObservation }} from './track-evidence.js';
+import {{ privateCutoffObservation, privateRunIdentity, privateTrackObservation }} from './track-evidence.js';
 const detail = {json.dumps(PRIVATE_DETAIL)};
 test(detail, async ({{}}, info) => {{
   console.log(detail);
@@ -94,7 +97,7 @@ test(detail, async ({{}}, info) => {{
   observe('private-publication', publication.trackId);
   observe('private-library', libraryRow.trackId);
   observe('private-play', playReceipt.trackId);
-  for (const type of ['private-anonymous-refusal', 'private-unlisted-refusal', 'private-cutoff-refusal'])
+  for (const type of ['private-anonymous-refusal', 'private-unlisted-refusal'])
     observe(type, publication.trackId);
   const phases = {json.dumps(admission.IDENTITY_PHASES)};
   for (const [index, phase] of phases.entries()) {{
@@ -107,7 +110,23 @@ test(detail, async ({{}}, info) => {{
     if (index === 0) for (const name of {json.dumps(required_criteria)}) {{
       const title = name === 'invite-acceptance' ? 'invite redemption and Library arrival' : name;
       if (name === 'invite-acceptance' && process.env.FIXTURE_OUTCOME === 'skip') await test.step.skip(title, async () => {{}});
-      else await test.step(title, async () => {{}});
+      else await test.step(title, async () => {{
+        if (name !== 'revoked-or-expired-refused') return;
+        // Both invitees had access before cutoff. Only the second one's access expires.
+        const revoked = {{ binding: '{CUTOFF_BINDING}', revokedAt: 1, expiresAt: 2 }};
+        const other = {{ binding: '{OTHER_BINDING}', revokedAt: Infinity, expiresAt: 1 }};
+        const statusAt = (account: typeof revoked, now: number) =>
+          Math.min(account.revokedAt, account.expiresAt) <= now ? 403 : 200;
+        const listener = process.env.FIXTURE_OUTCOME === 'other-listener' ? other : revoked;
+        if (statusAt(revoked, 0) !== 200 || statusAt(other, 0) !== 200 || statusAt(listener, 1) !== 403) {{
+          throw new Error('Expected the invited listener to cross cutoff from active to refused');
+        }}
+        const track = privateTrackObservation(run, publication, publication.trackId);
+        info.annotations.push({{
+          type: 'private-cutoff-refusal',
+          description: JSON.stringify({{ ...privateCutoffObservation(track, revoked.binding, listener.binding), ignored: detail }}),
+        }});
+      }});
     }}
   }}
 }});
@@ -346,6 +365,10 @@ def run_fixture(root):
                        ("play", "private-play")):
         properties = cases.findall(f"./testcase[@name='{case}']/properties/property[@name='{name}']")
         assert [json.loads(prop.attrib["value"]) for prop in properties] == [expected_track], name
+    cutoff_path = ".//testcase[@name='revoked-or-expired-refused']/properties/property[@name='private-cutoff-refusal']"
+    cutoff = json.loads(cases.find(cutoff_path).get("value"))
+    assert cutoff == expected_track | {"cutoff_listener": cutoff["cutoff_listener"],
+                                      "refused_listener": cutoff["cutoff_listener"]}
     assert all(marker not in report.read_bytes() for marker in PRIVATE_MARKERS)
     empty_policy = b'{"schema":1,"evaluator":"junit-map-v1","approvals":[]}'
     policy = root / admission.POLICY
@@ -420,6 +443,17 @@ def run_fixture(root):
     assert all(marker not in saved for marker in PRIVATE_MARKERS)
     recorded = json.loads(saved)
     assert recorded["result"] == "satisfied" and recorded["private_track"] == expected_track
+    receipt.unlink()
+    assert playwright("other-listener").returncode == 0, "the synthetic journey itself should pass"
+    mismatched = json.loads(ET.parse(report).find(cutoff_path).get("value"))
+    assert mismatched["cutoff_listener"] != mismatched["refused_listener"]
+    assert all(marker not in report.read_bytes() for marker in PRIVATE_MARKERS)
+    assert run(review_command).returncode != 0 and not summary.exists()
+    assert run(command).returncode != 0, "a refusal for the other invited listener qualified the candidate"
+    incomplete = json.loads(receipt.read_bytes())
+    assert incomplete["result"] == "incomplete" and incomplete["coverage"] == recorded["coverage"]
+    assert incomplete["reasons"] == ["private cutoff refusal does not identify the invited listener"]
+    report.write_bytes(original_report)
     policy.write_bytes(empty_policy)
     assert run(command).returncode != 0 and json.loads(receipt.read_bytes())["result"] == "incomplete"
 

@@ -17,7 +17,7 @@ import {
 import {
   freshTrialPublication, parsePrivateStagingFixture, privateStagingAudio, PRIVATE_TRIAL_UPLOAD, SESSION_COOKIE,
 } from '../helpers/private-staging-fixture.js';
-import { privateRunIdentity, privateTrackObservation } from './track-evidence.js';
+import { privateCutoffObservation, privateRunIdentity, privateTrackObservation } from './track-evidence.js';
 
 const ORIGIN = 'https://staging.nntune.com';
 const REGISTER = '/v1/auth/passkey/register';
@@ -103,6 +103,15 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const text = await readApiBody(response, url, 'private-api');
     return { status: response.status(), text };
   };
+  const listenerBinding = async (context: typeof request): Promise<string> => {
+    const url = `${ORIGIN}${SESSION_BINDING}`;
+    const response = await apiGet(context, url, access, 'private-listener-session');
+    const { session_binding: binding } = JSON.parse(await readApiBody(response, url, 'private-listener-session'));
+    if (response.status() !== 200 || typeof binding !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(binding)) {
+      throw new Error('Expected a live listener session binding');
+    }
+    return binding;
+  };
   const build = await check('build-identity', () => assertServingBuildMatchesPromotion(request, ORIGIN, 'build-identity'));
   const run = privateRunIdentity(build, process.env.GITHUB_RUN_ID, process.env.GITHUB_RUN_ATTEMPT);
   const missingInviteSignup = await check('missing invite refusal', async () => {
@@ -111,7 +120,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     return result.status;
   });
 
-  await check('invite redemption and Library arrival', async () => {
+  const invitedBinding = await check('invite redemption and Library arrival', async () => {
     await applyAccountToPage(page, null, ORIGIN);
     await page.goto(`${ORIGIN}${PRIVATE_MUSIC.signup.path}`);
     await waitForHydration(page, 'private-signup');
@@ -137,6 +146,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
       destination: new URL(page.url()).pathname, inviteFragmentCleared: !new URL(page.url()).hash,
       libraryStatus: library.status,
     });
+    return listenerBinding(page.request);
   });
 
   const rows = page.getByTestId(PRIVATE_MUSIC.library.item);
@@ -195,12 +205,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
       const account = await tryMintTestAccount(request, ORIGIN);
       if (!account || account.email === fixture.email) throw new Error('Expected a distinct synthetic session');
       await applyAccountToPage(await outsider.newPage(), account, ORIGIN);
-      const bindingUrl = `${ORIGIN}${SESSION_BINDING}`;
-      const session = await apiGet(outsider.request, bindingUrl, access, 'private-unlisted-session');
-      const { session_binding: binding } = JSON.parse(await readApiBody(session, bindingUrl, 'private-unlisted-session'));
-      if (session.status() !== 200 || typeof binding !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(binding)) {
-        throw new Error('Expected a live unlisted session binding');
-      }
+      const binding = await listenerBinding(outsider.request);
       const library = await getLibrary(outsider.request);
       const play = await requestFreshPlay(outsider.request, binding);
       // Without the selector, the API uses its separate native play path.
@@ -269,7 +274,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const positive = await retry();
     expect(positive.status).toBe(200);
     expect(isDeepStrictEqual(JSON.parse(positive.text), ack)).toBe(true);
-    return { retry, trackId: ack.trackId as unknown };
+    return { retry, binding, trackId: ack.trackId as unknown };
   };
   const first = await check('play', async () => {
     await expect(audio).toHaveCount(0);
@@ -324,16 +329,18 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     await delay(Math.max(0, fixture.expiresAt * 1000 - Date.now() - CUTOFF_LEAD_MS));
     const { start, media } = await playSelected(fresh.trackId);
     expect(media.sessionId === first.sessionId && media.playId !== first.playId).toBe(true);
-    const { retry } = await retryBrowserPlay(start, media);
+    const { retry, binding } = await retryBrowserPlay(start, media);
     await verifyRange(media.source, upload.body);
     const library = await getLibrary();
     expect(library.status === 200 && library.ids.includes(fresh.trackId)).toBe(true);
-    return { retry, mediaUrl: media.source.href };
+    return { retry, binding, mediaUrl: media.source.href };
   });
   await check('revoked-or-expired-refused', async () => {
     const remaining = fixture.expiresAt * 1000 - Date.now();
     if (remaining <= 0) throw new Error('Cohort cutoff preceded completion of the active journey');
     await delay(remaining + 2_000);
+    const refusedBinding = await listenerBinding(page.request);
+    if (refusedBinding !== cutoff.binding) throw new Error('Cutoff probes lost the active playback session');
     const revokedLibrary = (await getLibrary()).status;
     const revoked = await cutoff.retry();
     const range = await apiGet(page.request, cutoff.mediaUrl, rangeHeaders, 'private-range-cutoff');
@@ -346,7 +353,12 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     assertPrivateRefusals({
       missingInviteSignup, anonymousLibrary, uninvitedLibrary, uninvitedPlay, revokedLibrary, revokedPlay: revoked.status,
     }, remainingCuratedRows);
-    observe('private-cutoff-refusal', fresh, revoked.trackId);
+    if (await listenerBinding(page.request) !== refusedBinding) throw new Error('Cutoff probe session changed');
+    const track = privateTrackObservation(run, fresh, revoked.trackId);
+    test.info().annotations.push({
+      type: 'private-cutoff-refusal',
+      description: JSON.stringify(privateCutoffObservation(track, invitedBinding, refusedBinding)),
+    });
   });
   await check('build-identity-final', () => assertServingBuildMatchesPromotion(request, ORIGIN, 'build-identity-final'));
 });

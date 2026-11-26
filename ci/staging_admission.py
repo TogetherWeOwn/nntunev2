@@ -33,13 +33,14 @@ PRIVATE_JOURNEY = "post-deploy private music journey"
 PRIVATE_CRITERIA = frozenset({"upload-to-library", "play", "seek", "queue", "anonymous-refused",
                               "unlisted-refused", "revoked-or-expired-refused", "video-off"})
 PRIVATE_TRACK_FILE = "fixtures/synthetic-flac/private-staging/tone-a.flac"
+PRIVATE_CUTOFF_PROOF = "private-cutoff-refusal"
 PRIVATE_TRACK_PROOFS = {
     "private-publication": "upload-to-library",
     "private-library": "upload-to-library",
     "private-play": "play",
     "private-anonymous-refusal": "anonymous-refused",
     "private-unlisted-refusal": "unlisted-refused",
-    "private-cutoff-refusal": "revoked-or-expired-refused",
+    PRIVATE_CUTOFF_PROOF: "revoked-or-expired-refused",
 }
 IDENTITY_PHASES = ("build-identity", "build-identity-final")
 RECORD = "Record candidate admission receipt"
@@ -246,12 +247,20 @@ def junit_evidence(xml, contract):
     return coverage, identities, track_proofs
 
 
+def private_cutoff_track(value):
+    cutoff = value.get("cutoff_listener")
+    require(isinstance(cutoff, str) and UUID.fullmatch(cutoff) and cutoff == value.get("refused_listener"),
+            "private cutoff refusal does not identify the invited listener")
+    return {key: item for key, item in value.items() if key not in ("cutoff_listener", "refused_listener")}
+
+
 def private_track_evidence(track_proofs):
     observations = {}
     for selector, name, value in track_proofs:
         require(selector == (PRIVATE, PRIVATE_TRACK_PROOFS[name]) and name not in observations,
                 "misplaced or duplicate private track evidence")
-        observations[name] = parse_json(value.encode())
+        proof = parse_json(value.encode())
+        observations[name] = private_cutoff_track(proof) if name == PRIVATE_CUTOFF_PROOF else proof
     require(observations.keys() == PRIVATE_TRACK_PROOFS.keys(), "missing private track evidence")
     publication = observations["private-publication"]
     require(all(proof == publication for proof in observations.values()),

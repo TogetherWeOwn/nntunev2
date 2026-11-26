@@ -58,6 +58,7 @@ PRIVATE_CONTRACT_BYTES = json.dumps(PRIVATE_CONTRACT).encode()
 PRIVATE_AUDIO = (HERE.parent / "fixtures/synthetic-flac/private-staging/tone-a.flac").read_bytes()
 PRIVATE_AUDIO_SHA = sa.digest(PRIVATE_AUDIO)
 PRIVATE_TRACK_ID = "00000000-0000-4000-8000-000000000001"
+PRIVATE_LISTENER = "00000000-0000-4000-8000-000000000003"
 
 
 def make_policy(contract_bytes=CONTRACT_BYTES):
@@ -105,7 +106,10 @@ def private_report(pins, *, observation_offset=0, **track_overrides):
         if name in proofs:
             props = ET.SubElement(case, "properties")
             for proof in proofs[name]:
-                ET.SubElement(props, "property", name=proof, value=json.dumps(track))
+                value = track
+                if proof == "private-cutoff-refusal":
+                    value = track | {"cutoff_listener": PRIVATE_LISTENER, "refused_listener": PRIVATE_LISTENER}
+                ET.SubElement(props, "property", name=proof, value=json.dumps(value))
     observations = {lane: {k: v for k, v in pin.items() if k not in ("run_id", "run_attempt")}
                     for lane, pin in pins.items()}
     for phase, minutes in (("build-identity", -3), ("build-identity-final", -2)):
@@ -365,6 +369,20 @@ class PrivateAdmissionTests(Base):
                                      private_track_sha256=PRIVATE_AUDIO_SHA)
                 self.assertEqual(receipt["result"], "incomplete")
                 self.assertIn("private track evidence", receipt["reasons"][0])
+
+    def test_green_cutoff_requires_matching_listener_aliases(self):
+        for aliases in ({}, {"cutoff_listener": PRIVATE_LISTENER},
+                        {"cutoff_listener": "bad", "refused_listener": "bad"},
+                        {"cutoff_listener": PRIVATE_LISTENER, "refused_listener": PRIVATE_TRACK_ID}):
+            with self.subTest(aliases=aliases):
+                report = private_report(private_pins())
+                cutoff = report.find(".//property[@name='private-cutoff-refusal']")
+                value = json.loads(cutoff.get("value"))
+                del value["cutoff_listener"], value["refused_listener"]
+                cutoff.set("value", json.dumps(value | aliases))
+                receipt = PrivateWorld(report).receipt
+                self.assertEqual(receipt["result"], "incomplete")
+                self.assertEqual(receipt["reasons"], ["private cutoff refusal does not identify the invited listener"])
 
     def test_green_report_requires_private_play_observation(self):
         report = private_report(private_pins())

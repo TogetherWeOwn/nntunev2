@@ -205,6 +205,12 @@ the `tone-a.flac` bytes in that build. The receipt carries the shared identity
 as `private_track`. The verifier checks it against the selected attempt and
 candidate Git object.
 
+`private-cutoff-refusal` also carries `cutoff_listener` and `refused_listener`.
+These run-local UUID aliases must match. The journey assigns them from the
+session established by the synthetic invite and the authenticated session
+used for the cutoff probes. The aliases stay in JUnit. Session bindings,
+email addresses, and credentials stay out of JUnit and the receipt.
+
 The `build-identity` and `build-identity-final` cases use the same class and
 carry the existing `candidate-identity` properties, plus a `deployments` map
 with the four provider identity fields per lane. Read these independently
