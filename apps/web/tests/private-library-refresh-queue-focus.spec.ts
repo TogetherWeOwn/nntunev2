@@ -83,6 +83,7 @@ test('an invited Library refresh recovers focus when a queued track temporarily 
 	expect(await heldRow.evaluate((node) => node.isConnected)).toBe(true);
 	await expect(reorder).toBeEnabled();
 	await expect(refresh).toBeFocused();
+	expect(await heldRefresh.evaluate((node) => node === document.activeElement)).toBe(true);
 	await page.keyboard.press('Shift+Tab');
 	await expect(page.getByRole('button', { name: 'Copy queue as text', exact: true })).toBeFocused();
 	await page.keyboard.press('Tab');
