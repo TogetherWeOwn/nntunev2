@@ -80,7 +80,7 @@ test('the invited Library preserves a confirmed Like when another track write fa
 	try {
 		await first.click();
 		await expect.poll(() => writes).toEqual([`DELETE ${refusedPath}`]);
-		await second.click();
+		await Promise.all([page.waitForResponse(origin + confirmedPath), second.click()]);
 		await expect(second).toHaveAttribute('aria-pressed', 'true');
 		await expect(first).toHaveAttribute('aria-pressed', 'true');
 		await expect(error).toHaveCount(0);
