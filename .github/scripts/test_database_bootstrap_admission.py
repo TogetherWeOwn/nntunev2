@@ -181,8 +181,9 @@ def exercise(event_path):
 
 def check_reader_privilege_binding():
     script = Path(__file__).with_name("database_bootstrap_reader_evidence.py")
-    retained = b"fixture_catalog.retained\n"
-    reviewed = b"fixture_catalog.required\n" + retained
+    retained = b"fixture_catalog.retained: SELECT 1 AS id\n"
+    reviewed = b"fixture_catalog.required: SELECT 2 AS id\n" + retained
+    previous = b"fixture_catalog.required: SELECT 1 AS id\n" + retained
     inventory = {
         "branch_id": "fixture001", "database_oid": 17001,
         "inventory_sha256": hashlib.sha256(reviewed).hexdigest(),
@@ -202,13 +203,22 @@ def check_reader_privilege_binding():
         if (result.returncode, result.stdout, result.stderr) != expected:
             raise RuntimeError(f"reader privilege fixture: {case}")
 
+    # Both observations can follow the same migration run and cover the same reader.
+    previous_privileges = privileges | {"inventory_sha256": hashlib.sha256(previous).hexdigest()}
+    check("reader privileges cover the earlier definition of the same object",
+          record | {"reader_privileges": previous_privileges}, "pending (inventory-mismatch)")
+    check("earlier definition reported by a different reader",
+          record | {"reader_privileges": previous_privileges | {"reader_oid": 17003}})
+    check("earlier definition without a successful privilege check",
+          record | {"reader_privileges": previous_privileges | {"result": "failed"}})
+
     for case, override in {
         "another scoped reader": {"reader_role": "Fixture-Other-Reader", "reader_oid": 17003},
         "same name reissued": {"reader_oid": 17003},
         "same OID different role name": {"reader_role": "Fixture-Other-Reader"},
         "OID encoded as a float": {"reader_oid": 17002.0},
         "unsuccessful privilege result": {"result": "failed"},
-        "privileges checked against another inventory": {"inventory_sha256": "b" * 64},
+        "malformed privilege inventory digest": {"inventory_sha256": "b" * 63},
     }.items():
         check(case, record | {"reader_privileges": privileges | override})
     observed = inventory | {"inventory_sha256": hashlib.sha256(retained).hexdigest()}
