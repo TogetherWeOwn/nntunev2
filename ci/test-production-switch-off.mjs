@@ -191,6 +191,27 @@ test('interrupted recovery retries only with the sealed candidate identity', asy
   assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
 });
 
+test('switch-off stays pending before restore when the pinned maintenance module differs', async (t) => {
+  const transport = finalSmokeFixture(t, fixture);
+  await transport.run('record');
+  transport.shift();
+  const { evidence, fresh } = recoveryFixture(t, transport, 'success');
+  const env = fresh('13');
+  admitRecovery(env, evidence);
+  const altered = Buffer.from('export default { fetch: () => new Response(null, { status: 200 }) };\n');
+  transport.seed.modules[0].content_base64 = altered.toString('base64');
+  const observed = createHash('sha256').update(altered).digest('hex');
+  const recorded = transport.custody.maintenance.module_sha256;
+
+  const error = await transport.run('prepare-recovery', env)
+    .then(() => assert.fail('Recovery preparation reported success'), (e) => e);
+  assert.equal(rollbackNotice('prepare-recovery', error), `::error::Switch-off pending: pinned maintenance module SHA-256 ${observed} ` +
+    `differs from the rollback receipt ${recorded}. This run submitted no restore. Keep the writer freeze and ` +
+    'reconcile the pinned maintenance version and provider audit read-only.');
+  assert.equal(transport.calls.at(-1), 'GET');
+  assert.equal(transport.calls.includes('POST'), false);
+});
+
 test('switch-off stays pending when the restored maintenance module differs from the rollback receipt', async (t) => {
   const transport = finalSmokeFixture(t, fixture);
   await transport.run('record');
@@ -342,6 +363,104 @@ test('operator switch-off resumes read-only after incomplete deployment history'
   assert.match(readFileSync(resume.GITHUB_OUTPUT, 'utf8'), /^allow-submit=false$/m);
   assert.deepEqual(calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
   assert.deepEqual(rows, restoredHistory);
+});
+
+test('operator switch-off keeps a successful probe for an earlier maintenance deployment pending', async (t) => {
+  let readEarlierDeployment = false;
+  const transport = finalSmokeFixture(t, {
+    ...fixture,
+    deploymentReadback(receipt) {
+      if (!readEarlierDeployment) return receipt;
+      // Return the complete history as it appeared before the candidate rollout.
+      return { ...receipt, result: { deployments: [precedingMaintenance] },
+        result_info: { page: 1, total_count: 1, count: 1 } };
+    },
+  });
+  await transport.run('record');
+  const [precedingMaintenance] = transport.rows;
+  const { enter, fresh } = recoveryFixture(t, transport, 'success');
+  const selected = fresh('13');
+
+  const url = `https://api.cloudflare.com/client/v4/accounts/${selected.CLOUDFLARE_ACCOUNT_ID}/workers/scripts/nntune-web/deployments?page=1&per_page=100`;
+  async function readDeploymentHistory() {
+    const response = await transport.request(url, { method: 'GET', redirect: 'error',
+      headers: { Authorization: `Bearer ${selected.CLOUDFLARE_API_TOKEN}` } });
+    assert.equal(response.ok, true);
+    const { success, result } = await response.json();
+    assert.equal(success, true);
+    return result.deployments;
+  }
+
+  transport.shift();
+  const rollout = await readDeploymentHistory();
+  assert.equal(await enter(selected), 'Recorded maintenance allocation verified');
+  const [restoredDeployment, ...precedingRollout] = await readDeploymentHistory();
+  assert.match(restoredDeployment.annotations['workers/message'], /^First-release maintenance recovery [a-f0-9]{32}$/);
+  assert.deepEqual(precedingRollout, rollout);
+  assert.notEqual(precedingMaintenance.id, restoredDeployment.id);
+  assert.deepEqual(precedingMaintenance.versions, restoredDeployment.versions);
+
+  // The probe reports status and headers. Its deployment ID comes from the
+  // accompanying provider readback, using the same field as the recovery job.
+  async function verifyProbe() {
+    const health = await maintenanceWorker.fetch(new Request(`https://${selected.DOMAIN}`));
+    assert.equal(health.status, 503);
+    assert.equal(health.headers.get('cache-control'), 'no-store');
+    assert.equal(health.headers.get('x-robots-tag'), 'noindex');
+    const [serving] = await readDeploymentHistory();
+    assert.deepEqual(serving.versions, restoredDeployment.versions);
+    return serving.id === restoredDeployment.id ? 'complete' : 'pending';
+  }
+
+  const writes = transport.calls.filter((method) => method === 'POST').length;
+  const before = transport.calls.length;
+  readEarlierDeployment = true;
+  assert.equal(await verifyProbe(), 'pending');
+  readEarlierDeployment = false;
+  assert.equal(await verifyProbe(), 'complete');
+  assert.equal(writes, 1);
+  assert.deepEqual(transport.calls.slice(before), ['GET', 'GET']);
+
+  const guide = readFileSync(new URL('../docs/first-private-music-launch.md', import.meta.url), 'utf8');
+  const verification = guide.split('\n## Switch off and verify\n')[1]?.split('\n## ')[0];
+  assert.match(verification, /From the pinned Worker's deployment history, record the ID of the deployment\s+whose recovery marker and preceding rollout history match the selected\s+recovery attempt\./);
+  assert.match(verification, /Match the serving deployment ID from the provider readback accompanying\s+the probe to that recorded ID\./);
+  assert.match(verification, /If the IDs differ, keep switch-off \*\*Pending\*\* and the writer freeze\s+in place\. Repeat the authorized maintenance readback for the recorded\s+recovery deployment\./);
+});
+
+test('a truncated rollback intent download leaves recovery pending', async (t) => {
+  const transport = finalSmokeFixture(t, fixture);
+  await transport.prepare();
+  const { calls, rows, run, temp } = transport;
+  const { fresh, evidence } = recoveryFixture(t, transport, 'success');
+  const rollout = structuredClone(rows);
+  const original = readFileSync(join(temp, intentFile));
+  const before = calls.length;
+
+  const pending = fresh('13');
+  assert.throws(() => admitRecovery(pending, (repo) => {
+    const source = evidence(repo);
+    return {
+      ...source,
+      artifactFor(producer, name) {
+        const { artifact, archive } = source.artifactFor(producer, name);
+        return { artifact, archive: archive.subarray(0, archive.length - 1) };
+      },
+    };
+  }), /Sealed intent archive digest mismatch/);
+  assert.deepEqual(readdirSync(pending.RUNNER_TEMP), []);
+  assert.deepEqual(calls.slice(before), []);
+  assert.deepEqual(rows, rollout);
+  assert.deepEqual(readFileSync(join(temp, intentFile)), original);
+
+  const complete = fresh('14');
+  admitRecovery(complete, evidence);
+  assert.deepEqual(readFileSync(join(complete.RUNNER_TEMP, intentFile)), original);
+  assert.match(readFileSync(complete.GITHUB_OUTPUT, 'utf8'), /^allow-submit=true$/m);
+  await run('prepare-recovery', complete);
+  assert.ok(existsSync(join(complete.RUNNER_TEMP, 'production-final-allocation.sealed')));
+  assert.deepEqual(calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
+  assert.deepEqual(rows, rollout);
 });
 
 test('operator recovers the existing rollback run after the dispatch response is lost', async (t) => {

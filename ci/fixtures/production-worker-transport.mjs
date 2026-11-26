@@ -75,7 +75,10 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId, d
     const pinned = `/workers/${workerId}`;
     switch (path) {
       case pinned: return response(state);
-      case `${pinned}/versions/${version}`:
+      case `${pinned}/versions/${version}`: {
+        const { main_module, modules, ...withoutModules } = seed;
+        return response(withoutModules);
+      }
       case `${pinned}/versions/${version}?include=modules`: return response(seed);
       case `${pinned}/versions/${candidate}`: return response(versions[1]);
       case `${pinned}/versions?page=1&per_page=100`: return response(versions, versions.length);

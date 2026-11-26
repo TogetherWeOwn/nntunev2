@@ -18,10 +18,12 @@ const matches = (entry, expected) => Array.isArray(entry?.versions) && entry.ver
     actual?.version_id === v.version_id && actual.percentage === v.percentage));
 const seedDigest = createHash('sha256').update(readFileSync(new URL('./worker.mjs', import.meta.url))).digest('hex');
 
-export class RestoredModuleMismatchError extends Error {
-  constructor(recorded, restored) {
-    super(`Switch-off pending: restored maintenance module SHA-256 ${restored} differs from the rollback receipt ` +
-      `${recorded}. Keep the writer freeze and reconcile the pinned maintenance version and provider audit read-only.`);
+export class MaintenanceModuleMismatchError extends Error {
+  constructor(recorded, observed, phase) {
+    const subject = phase === 'post-write' ? 'restored maintenance module' : 'pinned maintenance module';
+    const action = phase === 'post-write' ? 'Keep the writer freeze' : 'This run submitted no restore. Keep the writer freeze';
+    super(`Switch-off pending: ${subject} SHA-256 ${observed} differs from the rollback receipt ${recorded}. ` +
+      `${action} and reconcile the pinned maintenance version and provider audit read-only.`);
   }
 }
 
@@ -39,7 +41,7 @@ export function rollbackNotice(command, error) {
     return '::error::Switch-off pending: pinned rollback intent unavailable. Read the Actions artifact metadata for the original rollout and reconcile the pinned rollback allocation and provider audit read-only. Keep the original recovery inputs and writer freeze.';
   }
   // Both digests are of reviewed public code, not protected input.
-  if (error instanceof RestoredModuleMismatchError) return `::error::${error.message}`;
+  if (error instanceof MaintenanceModuleMismatchError) return `::error::${error.message}`;
   return '::error::Protected rollback check failed. Reconcile Worker, deployment, routes and provider audit before any retry.';
 }
 
@@ -105,7 +107,7 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
   }
   const api = cloudflare(account, token, request);
   const pinned = `/workers/${worker}`;
-  async function live() {
+  async function live(phase) {
     const { result } = await api(pinned, 'Worker identity and exposure');
     if (result.id !== worker || result.name !== name || !Number.isFinite(Date.parse(result.deployed_on)) ||
         !isDeepStrictEqual(result.references, references) || result.subdomain?.enabled !== false ||
@@ -121,7 +123,7 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
       throw new Error(maintenance ? 'Maintenance version drifted' : 'Previous version drifted');
     }
     if (readModule && digest !== maintenance.module_sha256) {
-      throw new RestoredModuleMismatchError(maintenance.module_sha256, digest);
+      throw new MaintenanceModuleMismatchError(maintenance.module_sha256, digest, phase);
     }
     const history = await api(deployments + page, 'Deployment history');
     const list = history.result.deployments;
@@ -193,7 +195,7 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
       const { result: version } = await api(`${pinned}/versions/${candidate}`, 'Recorded candidate version');
       if (version.id !== candidate || version.annotations?.['workers/tag'] !== tag) throw new Error('Candidate version drifted');
     }
-    const before = await live();
+    const before = await live('preflight');
     const complete = restored(before);
     if (!complete && !isFinal(before)) throw new Error('Stale intent or newer or foreign active deployment');
     if (prepare) return seal(finalPath, { nonce, deployment: complete ? null : before[0].id, checkedAt: now() });
@@ -212,7 +214,7 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
   } catch {
     // A response can fail after committing. Always reconcile with GETs only.
   }
-  const after = await live();
+  const after = await live('post-write');
   if (!restored(after) || (acknowledged && after[0].id !== acknowledged)) {
     throw new Error('Restore result unresolved; reconcile allocation and provider audit before any retry');
   }
