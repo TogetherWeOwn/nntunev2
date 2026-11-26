@@ -251,10 +251,11 @@ signedInTest('a remounted Library player owns system Play and Pause', async ({ p
 		artist: 'Second Artist', release: 'Second Album'
 	};
 	const tracks = [first, second];
+	const wav = expectedSyntheticBody();
 	const fixture = await mockInvitedLibraryPlayback(page, origin, {
 		libraryItems: () => tracks,
 		playableTrackId: (id) => tracks.find((track) => track.id === id)?.id,
-		audio: expectedSyntheticBody(), audioContentType: 'audio/wav'
+		audio: (route) => serveRangedAudio(route, wav, 'audio/wav')
 	});
 	await recordSystemControls(page);
 	await fixture.signIn();
