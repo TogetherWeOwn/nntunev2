@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { open, readFile, writeFile } from 'node:fs/promises';
 import { finalSmokeFixture, mainSha, recoveryFixture } from './fixtures/production-worker-transport.mjs';
-import { intentFile, workflow } from './production-maintenance/recovery-evidence.mjs';
+import { admitRecovery, intentFile, workflow } from './production-maintenance/recovery-evidence.mjs';
 import maintenanceWorker from './production-maintenance/worker.mjs';
 
 const checkedAt = '2026-10-01T12:00:00Z';
@@ -379,6 +379,41 @@ test('operator switch-off keeps a successful probe for an earlier maintenance de
   assert.match(verification, /From the pinned Worker's deployment history, record the ID of the deployment\s+whose recovery marker and preceding rollout history match the selected\s+recovery attempt\./);
   assert.match(verification, /Match the serving deployment ID from the provider readback accompanying\s+the probe to that recorded ID\./);
   assert.match(verification, /If the IDs differ, keep switch-off \*\*Pending\*\* and the writer freeze\s+in place\. Repeat the authorized maintenance readback for the recorded\s+recovery deployment\./);
+});
+
+test('a truncated rollback intent download leaves recovery pending', async (t) => {
+  const transport = finalSmokeFixture(t, fixture);
+  await transport.prepare();
+  const { calls, rows, run, temp } = transport;
+  const { fresh, evidence } = recoveryFixture(t, transport, 'success');
+  const rollout = structuredClone(rows);
+  const original = readFileSync(join(temp, intentFile));
+  const before = calls.length;
+
+  const pending = fresh('13');
+  assert.throws(() => admitRecovery(pending, (repo) => {
+    const source = evidence(repo);
+    return {
+      ...source,
+      artifactFor(producer, name) {
+        const { artifact, archive } = source.artifactFor(producer, name);
+        return { artifact, archive: archive.subarray(0, archive.length - 1) };
+      },
+    };
+  }), /Sealed intent archive digest mismatch/);
+  assert.deepEqual(readdirSync(pending.RUNNER_TEMP), []);
+  assert.deepEqual(calls.slice(before), []);
+  assert.deepEqual(rows, rollout);
+  assert.deepEqual(readFileSync(join(temp, intentFile)), original);
+
+  const complete = fresh('14');
+  admitRecovery(complete, evidence);
+  assert.deepEqual(readFileSync(join(complete.RUNNER_TEMP, intentFile)), original);
+  assert.match(readFileSync(complete.GITHUB_OUTPUT, 'utf8'), /^allow-submit=true$/m);
+  await run('prepare-recovery', complete);
+  assert.ok(existsSync(join(complete.RUNNER_TEMP, 'production-final-allocation.sealed')));
+  assert.deepEqual(calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
+  assert.deepEqual(rows, rollout);
 });
 
 test('operator recovers the existing rollback run after the dispatch response is lost', async (t) => {
