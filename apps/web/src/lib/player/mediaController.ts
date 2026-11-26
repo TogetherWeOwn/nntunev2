@@ -689,17 +689,19 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			// Keep the ended track selected until the successor has a grant.
 			const handoff = () => preparePlay(track.id, () => evidence.isCurrent() && ownsOrigin(),
 				(grant) => playSelected(result.queue, index, grant, '', grant), { failureMessage });
-			await handoff();
-			// Offline, the same successor and its start position wait for one retry on reconnect.
-			// Play or Pause on the ended track supersedes that retry.
+			// Arm before the first grant settles so a reconnect during a stalled request is retained.
 			const armed = playIntent;
+			let onlineSeen = false, retryStarted = false;
 			if (failureMessage && listeners && globalThis.navigator?.onLine === false && evidence.isCurrent() && ownsOrigin()) {
 				reconnectHandoffAudio = audio;
 				globalThis.addEventListener?.('online', () => {
+					onlineSeen = true;
 					reconnectHandoffAudio = undefined;
-					if (!pendingGrant && playIntent === armed) void handoff();
+					if (!pendingGrant && playIntent === armed) { retryStarted = true; void handoff(); }
 				}, { once: true, signal: listeners });
 			}
+			await handoff();
+			if (onlineSeen && !retryStarted && !pendingGrant && playIntent === armed) void handoff();
 			return;
 		}
 		const streamUrl = streamFor(track);
