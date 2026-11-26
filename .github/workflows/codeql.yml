@@ -6,18 +6,18 @@ name: codeql
 
 # No path filters: the `baseline-codeql` ruleset requires CodeQL results on
 # every PR once main has analyses, so a filtered-out PR (Rust or docs only)
-# waits forever for results that never arrive. Every PR and every main push
-# is scanned so the rule always has a result to compare.
+# waits forever for results that never arrive. PR scans check changes before
+# merge. Daily scans of main refresh the default-branch alert state.
 on:
   pull_request:
     types: [opened, synchronize, reopened]
   # Merge queue validation: report on merge_group so the code_scanning rule
   # never stalls the queue.
   merge_group:
-  push:
-    branches: [main]
   schedule:
-    - cron: '23 3 * * 1'
+    - cron: '23 3 * * *'
+  # Dispatch on main when alert triage needs a fresh default-branch scan.
+  workflow_dispatch:
 
 permissions:
   contents: read
