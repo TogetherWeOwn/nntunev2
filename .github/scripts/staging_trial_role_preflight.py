@@ -1,4 +1,4 @@
-"""Qualify two newly issued staging trial logins before issuing app grants."""
+"""Qualify staging trial logins and evaluate scoped serving identities."""
 
 import json
 import os
@@ -6,7 +6,9 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from typing import NamedTuple
 
+from staging_api_identity import SHA, UUID, valid
 from staging_apply import SECRET_ENV, StagingApplyError, evidence_child_env, load_entries
 from staging_stream_config import TRIAL_DATABASES
 from staging_trial_schema import BASELINE, ROLE_RE
@@ -29,6 +31,18 @@ def oid(value, *, optional=False):
     return type(value) is int and (0 if optional else 1) <= value < 2**32
 
 
+def _valid_binding_role_pins(role_pins):
+    if type(role_pins) is not dict or role_pins.keys() != set(BINDINGS):
+        return False
+    pins = role_pins.values()
+    if any(type(pin) is not tuple or len(pin) != 2 or type(pin[0]) is not str
+           or not ROLE_RE.fullmatch(pin[0]) or pin[0].lower() == "public" or not oid(pin[1])
+           for pin in pins):
+        return False
+    return (len({name for name, _ in pins}) == len(BINDINGS)
+            and len({role_oid for _, role_oid in pins}) == len(BINDINGS))
+
+
 def binding_identity_verdicts(database_oid, role_pins, rows):
     """Compare one read-only result per binding against independently reviewed pins.
 
@@ -39,16 +53,8 @@ def binding_identity_verdicts(database_oid, role_pins, rows):
     are separate.
     """
     verdicts = {binding: "pending" for binding in BINDINGS}
-    if (not oid(database_oid) or type(role_pins) is not dict or role_pins.keys() != verdicts.keys()
+    if (not oid(database_oid) or not _valid_binding_role_pins(role_pins)
             or type(rows) is not dict or not rows.keys() <= verdicts.keys()):
-        return verdicts
-    pins = role_pins.values()
-    if any(type(pin) is not tuple or len(pin) != 2 or type(pin[0]) is not str
-           or not ROLE_RE.fullmatch(pin[0]) or pin[0].lower() == "public" or not oid(pin[1])
-           for pin in pins):
-        return verdicts
-    if (len({name for name, _ in pins}) != len(BINDINGS)
-            or len({role_oid for _, role_oid in pins}) != len(BINDINGS)):
         return verdicts
 
     for binding in BINDINGS:
@@ -59,6 +65,47 @@ def binding_identity_verdicts(database_oid, role_pins, rows):
                 and row == (DATABASE, database_oid, name, role_oid, name, role_oid)):
             verdicts[binding] = "matched"
     return verdicts
+
+
+class BindingReadback(NamedTuple):
+    build_sha: str
+    version_id: str
+    binding: str
+    rows: tuple[tuple, ...]
+
+
+def read_binding_identities(*, build_sha, version_id, database_oid, role_pins, query=None):
+    """Return per-binding SQL identity evidence for a pinned Worker candidate.
+
+    The optional query takes (build_sha, version_id, binding, sql). It must
+    execute the fixed SELECT on that candidate's named connection and return
+    a BindingReadback with independently observed build, version and binding.
+    The caller supplies the admitted candidate and role pins and separately
+    verifies config scope, origin TLS and caching.
+    """
+    pins = role_pins.copy() if _valid_binding_role_pins(role_pins) else {}
+    rows = {}
+    if (query is not None and pins and oid(database_oid)
+            and valid(SHA, build_sha) and valid(UUID, version_id)):
+        for binding in BINDINGS:
+            try:
+                result = query(build_sha, version_id, binding, BINDING_IDENTITY_SQL)
+            except Exception:
+                # Query failures may contain connection details.
+                continue
+            if type(result) is not BindingReadback:
+                continue
+            observed = (result.build_sha, result.version_id, result.binding)
+            if (all(type(value) is str for value in observed)
+                    and observed == (build_sha, version_id, binding)
+                    and type(result.rows) is tuple and len(result.rows) == 1):
+                rows[binding] = result.rows[0]
+    verdicts = binding_identity_verdicts(database_oid, pins, rows)
+    return {
+        binding: {"role": pins[binding][0] if pins else None, "database": DATABASE,
+                  "verdict": "pass" if verdicts[binding] == "matched" else "pending"}
+        for binding in BINDINGS
+    }
 
 
 def parse_scope(raw):
