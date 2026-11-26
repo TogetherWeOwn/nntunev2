@@ -89,6 +89,50 @@ it.each([A, B])('fences an earlier write when refreshing with binding %s', async
 	expect(fetcher).toHaveBeenCalledTimes(5);
 });
 
+it('rereads Likes when a refreshed listing arrives before write confirmation settles', async () => {
+	const { likes, fetcher } = setup();
+	const confirming = Promise.withResolvers<void>(), finishConfirmation = Promise.withResolvers<void>();
+	const earlyRead = Promise.withResolvers<void>();
+	const receipt = listing();
+	let previousListingCurrent = true, holdConfirmation = false;
+	const accountSession = {
+		...receipt.accountSession!,
+		run: async <T,>(work: () => T) => {
+			if (holdConfirmation) {
+				confirming.resolve();
+				await finishConfirmation.promise;
+			}
+			return work();
+		}
+	};
+	const items = [{ id: track }];
+	fetcher.mockResolvedValueOnce(list(A)).mockResolvedValueOnce(session(A));
+	await likes.publish({ ...receipt, accountSession, isCurrent: () => previousListingCurrent }, items);
+
+	fetcher.mockImplementationOnce(async () => { earlyRead.resolve(); return list(A); });
+	previousListingCurrent = false;
+	likes.beginRefresh();
+	await earlyRead.promise;
+	fetcher.mockImplementationOnce(async () => {
+		holdConfirmation = true;
+		return Response.json({ target_id: track, liked_at: 1 });
+	});
+	const toggle = likes.controls(track)!.toggle();
+	await confirming.promise;
+	try {
+		expect(likes.controls(track)).toMatchObject({ liked: false, pending: true });
+		fetcher.mockResolvedValueOnce(list(A, [liked])).mockResolvedValueOnce(session(A));
+		const refresh = likes.publish({ ...receipt, accountSession }, items);
+		finishConfirmation.resolve();
+		await Promise.all([refresh, toggle]);
+		expect(likes.controls(track)).toMatchObject({ liked: true, pending: false });
+		expect(fetcher).toHaveBeenNthCalledWith(5, expect.stringMatching(/\/v1\/me\/likes$/), expect.objectContaining({ method: 'GET' }));
+	} finally {
+		finishConfirmation.resolve();
+		await toggle;
+	}
+});
+
 const target = { kind: 'track', target_id: track };
 const hide = { ...target, signal: 'hide', until: null };
 const tasteReply = (row = hide, binding = A) => Response.json({ ...row, session_binding: binding });

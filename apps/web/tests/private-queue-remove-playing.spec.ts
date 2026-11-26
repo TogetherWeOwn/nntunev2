@@ -142,6 +142,13 @@ async function openInvitedQueue(page: Page, origin: string) {
 test('removing the upcoming private track preserves the playing receipt and skips it on natural end', async ({ page, origin }) => {
 	const { first, upcoming: removed, later: survivor, grantUrl, grants, mediaPath, tab, firstSource, queue, active, audio, player, assertQueue } =
 		await openInvitedQueue(page, origin);
+	const removedRow = queue.and(page.locator(`[${contract.queueId}="${removed.id}"]`));
+	const survivorRow = queue.and(page.locator(`[${contract.queueId}="${survivor.id}"]`));
+	const remove = removedRow.getByRole('button', { name: `Remove ${removed.title} from queue`, exact: true });
+	const survivorRemove = survivorRow.getByRole('button', { name: `Remove ${survivor.title} from queue`, exact: true });
+	await removedRow.getByRole('button', { name: `Play ${removed.title} next`, exact: true }).focus();
+	await page.keyboard.press('Tab');
+	await expect(remove).toBeFocused();
 
 	const currentAudio = await audio.elementHandle();
 	const beforeRemoval = await currentAudio.evaluate((node: HTMLAudioElement) => {
@@ -156,9 +163,15 @@ test('removing the upcoming private track preserves the playing receipt and skip
 		}, { once: true });
 		return node.currentTime;
 	});
-	await queue.and(page.locator(`[${contract.queueId}="${removed.id}"]`))
-		.getByRole('button', { name: `Remove ${removed.title} from queue`, exact: true }).click();
+	await page.keyboard.press('Enter');
 	await assertQueue([first.id, survivor.id]);
+	await expect(survivorRemove).toBeVisible();
+	await expect(survivorRemove).toBeEnabled();
+	await expect(survivorRemove).toBeFocused();
+	await page.keyboard.press('Tab');
+	await expect(survivorRow.getByRole('button', { name: `Select ${survivor.title}`, exact: true })).toBeFocused();
+	await page.keyboard.press('Shift+Tab');
+	await expect(survivorRemove).toBeFocused();
 	await expect(active).toHaveAttribute(contract.queueId, first.id);
 	await expect(audio).toHaveAttribute('src', firstSource);
 	await expect.poll(() => currentAudio.evaluate((node: HTMLAudioElement, before) => ({

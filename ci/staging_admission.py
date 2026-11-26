@@ -650,8 +650,9 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     else:
         journey_steps = ("Run full journey", "Enforce journey evidence gate (all-skipped must fail)", RECORD, UPLOAD)
     require_steps(journey, journey_steps, "journey, evaluator and receipt steps must succeed in order")
-    artifacts = actions.listing(f"runs/{run_id}/artifacts", "artifacts")
     name = artifact_name(sha, run_id, attempt, contract_journey)
+    query = urllib.parse.urlencode({"name": name})
+    artifacts = actions.listing(f"runs/{run_id}/artifacts?{query}", "artifacts")
     matches = [a for a in artifacts if a.get("name") == name]
     require(len(matches) == 1, "missing or ambiguous attempt-bound receipt")
     artifact = matches[0]

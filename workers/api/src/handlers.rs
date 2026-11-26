@@ -12038,6 +12038,7 @@ pub(crate) mod tests {
                         predicate_stale: false,
                         other_live_holder: false,
                         equal_end_provenance_changed: false,
+                        matching_proof_cancel_conflict: false,
                     }
                 } else {
                     Target::Absent
