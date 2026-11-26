@@ -1,6 +1,6 @@
 import { expect, type Page, type Request } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
-import { seekViaPlayerUi } from '../../../e2e/helpers/player-ui.js';
+import { fractionClickPoint, seekViaPlayerUi } from '../../../e2e/helpers/player-ui.js';
 import { mockInvitedLibraryPlayback } from './fixtures/invited-library-playback.js';
 import { test } from './helpers/private-music-fixture.js';
 
@@ -197,4 +197,127 @@ const checkInterruptedSeekRetry = (
 	expect(recovered?.headers()['range']).toBe(interrupted?.headers()['range']);
 	expect(mediaUrls).toEqual(new Set([source]));
 	expect(plays, 'Retry should confirm the original receipt without another admission').toEqual([admission, continuation]);
+});
+
+test('a delayed private range settles the latest seek on the same track', async ({ page, origin }) => {
+	const { library, player } = PRIVATE_MUSIC;
+	const next = { ...track, id: '00000000-0000-4000-8000-000000001104', title: 'Upcoming audio' };
+	const tracks = [track, next];
+	const body = silentWav();
+	const releaseFirstRead = Promise.withResolvers<void>();
+	const releaseLaterReads = Promise.withResolvers<void>();
+	let firstSeekRead: Request | undefined;
+	const grants: unknown[] = [];
+	const fixture = await mockInvitedLibraryPlayback(page, origin, {
+		libraryItems: () => tracks,
+		playableTrackId: (id) => tracks.find((item) => item.id === id)?.id,
+		audio: async (route) => {
+			const request = route.request();
+			const range = /^bytes=(\d+)-$/.exec(request.headers()['range'] ?? '');
+			const start = range ? Number(range[1]) : NaN;
+			if (!Number.isSafeInteger(start) || start >= body.length) return route.fulfill({ status: 416 });
+			// Leave the opening prefetch pending so the first seek needs a distant range.
+			if (start > 0 && start <= prefixBytes) return;
+			if (start > prefixBytes) {
+				firstSeekRead ??= request;
+				await (request === firstSeekRead ? releaseFirstRead : releaseLaterReads).promise;
+			}
+			const end = start === 0 ? prefixBytes - 1 : body.length - 1;
+			return route.fulfill({
+				status: 206, contentType: 'audio/wav', body: body.subarray(start, end + 1),
+				headers: { 'accept-ranges': 'bytes', 'cache-control': 'no-store', 'content-range': `bytes ${start}-${end}/${body.length}` }
+			});
+		}
+	});
+	page.on('request', (request) => {
+		if (request.url() === origin + player.plays) grants.push(request.postDataJSON());
+	});
+
+	await fixture.signIn();
+	await page.goto(origin + library.path);
+	const transport = page.getByRole('region', { name: 'Player', exact: true });
+	const audio = transport.getByTestId(player.audio);
+	const seek = transport.getByRole('slider', { name: 'Seek', exact: true });
+	const queueIds = () => page.getByTestId(player.queueItem)
+		.evaluateAll((items, attribute) => items.map((item) => item.getAttribute(attribute)), player.queueId);
+	for (const item of tracks) {
+		await page.getByTestId(library.item).filter({ hasText: item.title }).locator(library.select).click();
+	}
+	await expect.poll(queueIds).toEqual(tracks.map(({ id }) => id));
+	const [grant] = await Promise.all([
+		page.waitForResponse(origin + player.plays),
+		transport.getByRole('button', { name: 'Play', exact: true }).click()
+	]);
+	expect(grant.ok()).toBe(true);
+	const source = origin + fixture.mediaPath(track.id);
+	await expect(audio).toHaveJSProperty('currentSrc', source);
+	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) => !node.paused && node.currentTime > 0.2)).toBe(true);
+	await transport.getByRole('button', { name: 'Pause', exact: true }).click();
+	await expect(audio).toHaveJSProperty('paused', true);
+	await expect(seek).toBeEnabled();
+	const native = await audio.elementHandle();
+	const completions = await native.evaluateHandle((node: HTMLAudioElement) => {
+		const observed: { position: number; trusted: boolean }[] = [];
+		node.addEventListener('seeked', (event) => {
+			observed.push({ position: node.currentTime, trusted: event.isTrusted });
+		});
+		return observed;
+	});
+
+	const requests = await seek.evaluateHandle((slider: HTMLInputElement) => {
+		const positions: number[] = [];
+		// Read the browser's request before PlayerSeek restores the published value.
+		slider.addEventListener('input', (event) => {
+			if (event.isTrusted) positions.push(slider.valueAsNumber);
+		}, { capture: true });
+		return positions;
+	});
+	const sliderPosition = () => seek.evaluate((slider: HTMLInputElement) => slider.valueAsNumber);
+	try {
+		await seek.scrollIntoViewIfNeeded();
+		const point = fractionClickPoint((await seek.boundingBox())!, 0.82);
+		await page.mouse.move(point.x, point.y);
+		expect(firstSeekRead, 'The distant range should start with the first seek').toBeUndefined();
+		await page.mouse.down();
+		let firstPosition: number;
+		try {
+			await expect.poll(() => firstSeekRead?.url(), { message: 'The first seek should need a distant range' }).toBe(source);
+			await expect(seek).toHaveAttribute('aria-valuetext', 'Seeking to 0:11 of 0:14');
+			firstPosition = await sliderPosition();
+			// A small move changes the requested position within the same pending range.
+			await page.mouse.move(point.x + 2, point.y);
+		} finally {
+			await page.mouse.up();
+		}
+		const requested = await requests.jsonValue();
+		expect(requested).toHaveLength(2);
+		const [firstTarget, latestTarget] = requested;
+		expect(firstPosition).toBeCloseTo(firstTarget, 2);
+		expect(latestTarget, 'The second input should request a distinct position').toBeGreaterThan(firstTarget + 0.02);
+		await expect(audio).toHaveJSProperty('seeking', true);
+		await expect(seek).toHaveAttribute('aria-valuetext', 'Seeking to 0:11 of 0:14');
+		expect(await sliderPosition(), 'The pending slider should publish the second request').toBeCloseTo(latestTarget, 2);
+		expect(await native.evaluate((node: HTMLAudioElement) => node.currentTime)).toBeCloseTo(latestTarget, 2);
+		expect(await completions.jsonValue()).toEqual([]);
+
+		// Only the read started by the first gesture may supply bytes for this settlement.
+		releaseFirstRead.resolve();
+		expect((await firstSeekRead!.response())?.status()).toBe(206);
+		await expect(audio).toHaveJSProperty('seeking', false);
+		await expect(seek).toHaveAttribute('aria-valuetext', '0:11 of 0:14');
+		await expect.poll(() => completions.jsonValue()).toEqual([
+			{ position: expect.closeTo(latestTarget, 2), trusted: true }
+		]);
+		expect(await sliderPosition()).toBeCloseTo(latestTarget, 2);
+	} finally {
+		releaseFirstRead.resolve();
+		releaseLaterReads.resolve();
+	}
+	expect(await audio.evaluate((node: HTMLAudioElement, original) => ({
+		sameNode: node === original, source: node.currentSrc, paused: node.paused, error: node.error?.code ?? null
+	}), native)).toEqual({ sameNode: true, source, paused: true, error: null });
+	await expect(page.locator(player.currentQueueItem)).toHaveAttribute(player.queueId, track.id);
+	await expect(transport.getByTestId('library-now-playing')).toHaveText(track.title);
+	expect(await queueIds()).toEqual(tracks.map(({ id }) => id));
+	expect(grants).toEqual([{ track_id: track.id, session_id: source.split('/').at(-2) }]);
 });
