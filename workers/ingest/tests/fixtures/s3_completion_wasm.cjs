@@ -273,12 +273,15 @@ function multipartCompletionReceipt(parts) {
   );
 }
 
-test('resumes multipart upload with only the missing part and preserves the confirmed receipt', async (t) => {
+async function exerciseMultipartResume(t, mode) {
   const partBytes = 5_244_160;
   const tailBytes = wireHeaderLength + Math.ceil(partBytes / 65_536) * 16;
   const requests = [];
   const stored = new Map();
+  const lateFailure = mode === 'multipart-resume-timeout' ? Promise.withResolvers() : null;
   let interrupted;
+  let firstSignal;
+  let lateStatus;
   t.mock.method(globalThis, 'fetch', async (request) => {
     const url = new URL(request.url);
     const query = url.search.slice(1);
@@ -286,32 +289,61 @@ test('resumes multipart upload with only the missing part and preserves the conf
     if (request.method === 'PUT') {
       const number = Number(url.searchParams.get('partNumber'));
       assert.ok(number === 1 || number === 2);
-      assert.equal(stored.has(number), false, 'a confirmed part must never be overwritten');
       const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
       assert.equal(body.length, number === 1 ? partBytes : tailBytes);
+      const receipt = { etag: `"fixture-part-${number}"`, 'x-amz-checksum-sha256': checksum(body) };
       if (number === 2 && !interrupted) {
         assert.deepEqual([...stored.keys()], [1]);
         interrupted = body;
+        if (lateFailure) {
+          firstSignal = request.signal;
+          stored.set(number, receipt);
+          // Keep the provider reply pending even after the caller aborts.
+          await lateFailure.promise;
+          const response = new Response(null, { status: 503 });
+          lateStatus = response.status;
+          return response;
+        }
         throw new Error('synthetic interruption before storing part 2');
       }
       if (number === 2) {
         assert.deepEqual(body, interrupted);
+        if (lateFailure) {
+          assert.equal(firstSignal.aborted, true);
+          assert.deepEqual(stored.get(number), receipt);
+          // The sender drops the retry controller when it has consumed the reply.
+          request.signal.addEventListener('abort', () => queueMicrotask(lateFailure.resolve), { once: true });
+          return new Response(null, { headers: stored.get(number) });
+        }
       }
-      const receipt = { etag: `"fixture-part-${number}"`, 'x-amz-checksum-sha256': checksum(body) };
+      assert.equal(stored.has(number), false, 'a confirmed part must never be overwritten');
       stored.set(number, receipt);
       return new Response(null, { headers: receipt });
+    }
+    if (lateFailure) {
+      assert.equal(lateStatus, 503, 'the first request must fail before completion is sent');
     }
     const manifest = (await verifySignedRequest(request, 'POST', uploadQuery)).toString();
     assert.deepEqual([...stored.keys()], [1, 2]);
     assert.equal(manifest, multipartManifest(stored));
     return multipartCompletionReceipt(stored);
   });
-  assert.equal(await complete('multipart-resume'), version);
+  try {
+    assert.equal(await complete(mode), version);
+  } finally {
+    lateFailure?.resolve();
+  }
   assert.deepEqual(requests, [
     `PUT partNumber=1&${uploadQuery}`, `PUT partNumber=2&${uploadQuery}`,
     `PUT partNumber=2&${uploadQuery}`, `POST ${uploadQuery}`,
   ]);
-});
+}
+
+test('resumes multipart upload with only the missing part and preserves the confirmed receipt',
+  (t) => exerciseMultipartResume(t, 'multipart-resume'));
+
+test('preserves the multipart retry receipt when the timed-out part request later fails',
+  (t) => exerciseMultipartResume(t, 'multipart-resume-timeout'));
 
 test('preserves confirmed progress when a pre-finalization multipart status reply arrives late', { timeout: 10_000 }, async (t) => {
   const requests = [];
