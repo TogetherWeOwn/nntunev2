@@ -1240,6 +1240,10 @@
 	}
 
 	function appendSelectedIds(): void {
+		if (loading) {
+			appendFeedback = 'Could not add selected tracks while the Library is refreshing. Try again when it finishes.';
+			return;
+		}
 		const queue = queueController.snapshot;
 		const result = appendSelection(queue, selectedIds.filter(queueController.hasLibraryTrack), items);
 		if (!replaceQueue(result.queue)) return;
@@ -2031,9 +2035,9 @@
 					Append selected
 				</button>
 				<SelectionExport {items} {selectedIds} />
-				{#if appendFeedback}
-					<p data-testid="append-result" role="status">{appendFeedback}</p>
-				{/if}
+				<p aria-live="polite" aria-atomic="true" role={appendFeedback ? 'status' : undefined}
+					data-testid={appendFeedback ? 'append-result' : undefined}
+					class:nt-visually-hidden={!appendFeedback}>{appendFeedback}</p>
 				{#if hiddenSelectionCount > 0}
 					<p data-testid="selection-hidden-count">
 						{hiddenSelectionCount} selected {hiddenSelectionCount === 1 ? 'track is' : 'tracks are'} hidden by this {view === 'all' ? 'find' : 'view'}.
