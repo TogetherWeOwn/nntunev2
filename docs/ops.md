@@ -1657,6 +1657,8 @@ Use this summary for automatic `main` pushes whose source uses the
 is the submission time, while a rerun needs a different time origin.
 Save the [Actions run attempt][timing-run] as `run.json` and its complete
 [attempt jobs listing][timing-jobs] as `jobs.json` from the same snapshot.
+Use the attempt-specific jobs endpoint. Its scope is needed when a job
+omits `run_attempt`.
 If the listing is paginated, combine every page under `jobs` and retain
 `total_count`. Compute the summary locally from the saved JSON.
 

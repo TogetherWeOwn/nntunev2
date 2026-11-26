@@ -56,6 +56,7 @@ class StagingTimingTests(unittest.TestCase):
     def candidate(**over):
         return make_run(workflow="deploy.yml", **{
             "event": "push", "conclusion": "success", "created_at": "2026-01-02T10:00:00Z",
+            "path": ".github/workflows/deploy.yml@main",
             "run_started_at": "2026-01-02T10:00:01Z", "updated_at": "2026-01-02T10:49:00Z",
             **over,
         })
@@ -69,6 +70,7 @@ class StagingTimingTests(unittest.TestCase):
     def test_staging_timing_distinguishes_wait_and_writer_span(self):
         gate = self.job(1, "2026-01-02T10:12:00Z", "2026-01-02T10:13:00Z")
         journey = self.job(2, "2026-01-02T10:20:00Z", "2026-01-02T10:32:00Z")
+        del journey["run_attempt"]  # Optional in the documented attempt jobs response.
         skipped = self.job(3, "2026-01-02T10:00:00Z", "2026-01-02T10:33:00Z",
                            conclusion="skipped", runner_id=None)
         queued = self.job(4, "2026-01-02T10:00:01Z", None, status="queued", conclusion=None)
@@ -78,7 +80,8 @@ class StagingTimingTests(unittest.TestCase):
             (self.candidate(), [journey, skipped, gate], 720, 1200),
             (self.candidate(status="in_progress", conclusion=None), [queued, gate], 720, None),
             (self.candidate(conclusion="cancelled"), [cancelled, gate], 720, 60),
-            (self.candidate(run_id=11, status="pending", conclusion=None), [], None, None),
+            (self.candidate(run_id=11, path=".github/workflows/deploy.yml", status="pending",
+                            conclusion=None), [], None, None),
             (self.candidate(run_id=12, conclusion="failure"), [], None, None),
         ):
             with self.subTest(status=run["status"], conclusion=run["conclusion"]):
@@ -95,6 +98,7 @@ class StagingTimingTests(unittest.TestCase):
         run = self.candidate()
         for candidate, jobs, listing_fields in (
             (dict(run, run_attempt=2), [], {}),
+            (dict(run, path=".github/workflows/deploy.yml@other"), [], {}),
             (run, [dict(gate, run_attempt=2)], {}),
             (run, [dict(gate, run_id=11)], {}),
             (run, [dict(gate, head_sha="b" * 40)], {}),

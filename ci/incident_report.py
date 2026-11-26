@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Report trusted completed gates using the first-party keyed incident pattern.
 
-Use API job/step conclusions for incidents, or summarize staging timing from
-saved Actions metadata. No logs, artifacts, or exception response bodies.
+Only API job/step conclusions are public incident evidence: never logs,
+artifacts, secrets, triggering-run source, or exception response bodies.
+Offline staging timing uses saved Actions run and job metadata. Stdlib only.
 """
 
 import argparse
@@ -22,6 +23,7 @@ BAD = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"
 ACTIVE = {"queued", "in_progress", "waiting", "requested", "pending"}
 OUTCOMES = BAD | {"success", "skipped", "neutral", "stale"}
 MAX_STAGING_TIMING_INPUT = 2 * 1024 * 1024
+STAGING_PATHS = {".github/workflows/deploy.yml", ".github/workflows/deploy.yml@main"}
 # The successful evidence step prevents skipped/unconfigured jobs from closing
 # an incident. Keys are job names from the reviewed default-branch workflows.
 GATES = {
@@ -154,7 +156,7 @@ def staging_timing(evidence):
         status, conclusion = run["status"], run["conclusion"]
         if (type(run_id) is not int or run_id <= 0 or type(attempt) is not int or attempt != 1
                 or not re.fullmatch(r"[0-9a-f]{40}", sha)
-                or run["path"] != ".github/workflows/deploy.yml"
+                or run["path"] not in STAGING_PATHS
                 or run["event"] != "push" or run["head_branch"] != "main"
                 or run["head_repository"]["full_name"] != REPO
                 or not (status == "completed" and conclusion in OUTCOMES
@@ -168,6 +170,7 @@ def staging_timing(evidence):
         seen, starts, ends = set(), [], []
         for job in jobs:
             job_id, job_status, outcome = job["id"], job["status"], job["conclusion"]
+            # The attempt-specific endpoint scopes rows even when the optional field is absent.
             job_attempt = job.get("run_attempt", attempt)
             if (type(job_id) is not int or job_id <= 0 or job_id in seen
                     or type(job["run_id"]) is not int or job["run_id"] != run_id
