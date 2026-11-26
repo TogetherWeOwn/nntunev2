@@ -266,8 +266,8 @@ test('private staging invite serves curated audio and refuses access at cutoff',
       ack.playbackSessionId === media.sessionId && ack.playId === media.playId &&
       Number.isSafeInteger(ack.durationMs) && ack.durationMs > 0 && Object.keys(ack).length === 5).toBe(true);
     const target = { track_id: media.trackId, session_id: media.sessionId, play_id: media.playId };
-    const retry = async () => ({
-      ...await post(page.request, PRIVATE_MUSIC.player.plays, target,
+    const retry = async (context = page.request) => ({
+      ...await post(context, PRIVATE_MUSIC.player.plays, target,
         { ...access, [BROWSER_SELECTOR]: '1', [BROWSER_BINDING]: binding }),
       trackId: target.track_id,
     });
@@ -339,26 +339,23 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const remaining = fixture.expiresAt * 1000 - Date.now();
     if (remaining <= 0) throw new Error('Cohort cutoff preceded completion of the active journey');
     await delay(remaining + 2_000);
-    const refusedBinding = await listenerBinding(page.request);
-    if (refusedBinding !== cutoff.binding) throw new Error('Cutoff probes lost the active playback session');
-    const revokedLibrary = (await getLibrary()).status;
-    const revoked = await cutoff.retry();
-    const range = await apiGet(page.request, cutoff.mediaUrl, rangeHeaders, 'private-range-cutoff');
-    expect(range.status()).toBe(403);
-    await readApiBody(range, cutoff.mediaUrl, 'private-range-cutoff');
-    await page.goto(`${ORIGIN}${PRIVATE_MUSIC.library.path}`);
-    await expect(page.getByText(PRIVATE_MUSIC.library.forbidden, { exact: true })).toBeVisible();
-    const remainingCuratedRows = (await idsOf(rows, PRIVATE_MUSIC.library.id))
-      .filter((id) => publications.some((item) => item.trackId === id)).length;
-    assertPrivateRefusals({
-      missingInviteSignup, anonymousLibrary, uninvitedLibrary, uninvitedPlay, revokedLibrary, revokedPlay: revoked.status,
-    }, remainingCuratedRows);
-    if (await listenerBinding(page.request) !== refusedBinding) throw new Error('Cutoff probe session changed');
-    const track = privateTrackObservation(run, fresh, revoked.trackId);
-    test.info().annotations.push({
-      type: 'private-cutoff-refusal',
-      description: JSON.stringify(privateCutoffObservation(track, invitedBinding, refusedBinding)),
-    });
+    const observation = await privateCutoffObservation(page.request, invitedBinding, cutoff.binding, listenerBinding,
+      async (listener) => {
+        const revokedLibrary = (await getLibrary(listener)).status;
+        const revoked = await cutoff.retry(listener);
+        const range = await apiGet(listener, cutoff.mediaUrl, rangeHeaders, 'private-range-cutoff');
+        expect(range.status()).toBe(403);
+        await readApiBody(range, cutoff.mediaUrl, 'private-range-cutoff');
+        await page.goto(`${ORIGIN}${PRIVATE_MUSIC.library.path}`);
+        await expect(page.getByText(PRIVATE_MUSIC.library.forbidden, { exact: true })).toBeVisible();
+        const remainingCuratedRows = (await idsOf(rows, PRIVATE_MUSIC.library.id))
+          .filter((id) => publications.some((item) => item.trackId === id)).length;
+        assertPrivateRefusals({
+          missingInviteSignup, anonymousLibrary, uninvitedLibrary, uninvitedPlay, revokedLibrary, revokedPlay: revoked.status,
+        }, remainingCuratedRows);
+        return privateTrackObservation(run, fresh, revoked.trackId);
+      });
+    test.info().annotations.push({ type: 'private-cutoff-refusal', description: JSON.stringify(observation) });
   });
   await check('build-identity-final', () => assertServingBuildMatchesPromotion(request, ORIGIN, 'build-identity-final'));
 });

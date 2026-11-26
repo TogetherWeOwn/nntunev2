@@ -117,14 +117,20 @@ test(detail, async ({{}}, info) => {{
         const other = {{ binding: '{OTHER_BINDING}', revokedAt: Infinity, expiresAt: 1 }};
         const statusAt = (account: typeof revoked, now: number) =>
           Math.min(account.revokedAt, account.expiresAt) <= now ? 403 : 200;
-        const listener = process.env.FIXTURE_OUTCOME === 'other-listener' ? other : revoked;
-        if (statusAt(revoked, 0) !== 200 || statusAt(other, 0) !== 200 || statusAt(listener, 1) !== 403) {{
-          throw new Error('Expected the invited listener to cross cutoff from active to refused');
-        }}
-        const track = privateTrackObservation(run, publication, publication.trackId);
+        const outcome = process.env.FIXTURE_OUTCOME;
+        const listener = {{ account: outcome === 'other-listener' ? other : revoked }};
+        const proof = await privateCutoffObservation(listener, revoked.binding, listener.account.binding,
+          async (context) => context.account.binding,
+          async (context) => {{
+            if (statusAt(revoked, 0) !== 200 || statusAt(other, 0) !== 200 || statusAt(context.account, 1) !== 403) {{
+              throw new Error('Expected the invited listener to cross cutoff from active to refused');
+            }}
+            if (outcome === 'switched-session') context.account = other;
+            return privateTrackObservation(run, publication, publication.trackId);
+          }});
         info.annotations.push({{
           type: 'private-cutoff-refusal',
-          description: JSON.stringify({{ ...privateCutoffObservation(track, revoked.binding, listener.binding), ignored: detail }}),
+          description: JSON.stringify({{ ...proof, ignored: detail }}),
         }});
       }});
     }}
@@ -352,7 +358,7 @@ def run_fixture(root):
         return run(args, {"FIXTURE_OUTCOME": kind})
 
     report = root / "e2e/private-staging-results/admission.xml"
-    for refusal in ("failure", "skip", "expected", "retry", "other-track"):
+    for refusal in ("failure", "skip", "expected", "retry", "other-track", "switched-session"):
         assert playwright(refusal).returncode != 0 and not report.exists()
     result = playwright("pass")
     assert result.returncode == 0, (result.stdout, result.stderr)
@@ -446,7 +452,7 @@ def run_fixture(root):
     receipt.unlink()
     assert playwright("other-listener").returncode == 0, "the synthetic journey itself should pass"
     mismatched = json.loads(ET.parse(report).find(cutoff_path).get("value"))
-    assert mismatched["cutoff_listener"] != mismatched["refused_listener"]
+    assert mismatched["cutoff_listener"] != mismatched["refused_listener"], "report credited the named listener twice"
     assert all(marker not in report.read_bytes() for marker in PRIVATE_MARKERS)
     assert run(review_command).returncode != 0 and not summary.exists()
     assert run(command).returncode != 0, "a refusal for the other invited listener qualified the candidate"

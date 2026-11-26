@@ -21,16 +21,22 @@ export function privateTrackObservation(
   return { track_id: observedTrackId, sha256: publication.sha256, ...run };
 }
 
-export function privateCutoffObservation(
-  track: ReturnType<typeof privateTrackObservation>,
-  cutoffBinding: string,
-  refusedBinding: string,
+export async function privateCutoffObservation<Listener>(
+  listener: Listener,
+  invitedBinding: string,
+  playbackBinding: string,
+  readBinding: (listener: Listener) => Promise<string>,
+  probe: (listener: Listener) => Promise<ReturnType<typeof privateTrackObservation>>,
 ) {
+  const refusedBinding = await readBinding(listener);
+  if (refusedBinding !== playbackBinding) throw new Error('Cutoff probes lost the active playback session');
+  const track = await probe(listener);
+  if (await readBinding(listener) !== refusedBinding) throw new Error('Cutoff probe session changed');
   // Preserve equality in the report without exporting either session binding.
   const cutoffListener = randomUUID();
   return {
     ...track,
     cutoff_listener: cutoffListener,
-    refused_listener: cutoffBinding === refusedBinding ? cutoffListener : randomUUID(),
+    refused_listener: invitedBinding === refusedBinding ? cutoffListener : randomUUID(),
   };
 }
