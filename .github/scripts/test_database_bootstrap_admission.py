@@ -254,6 +254,7 @@ def check_reader_privilege_binding():
         "UPDATE (id) ON fixture_catalog.required",
         "UPDATE ON LARGE OBJECT 900001",
         "UPDATE ON fixture_catalog.required WITH GRANT OPTION",
+        "SELECT ON fixture_catalog.required WITH GRANT OPTION",
     ):
         check(f"readback names {grant}", record | {"reader_privileges": over | {"extra_grants": [grant]}},
               f"pending (extra-grant: {grant})")
@@ -268,6 +269,8 @@ def check_reader_privilege_binding():
         "unnamed extra grant": {"extra_grants": ["UPDATE"]},
         "large object OID exceeds PostgreSQL range": {"extra_grants": ["UPDATE ON LARGE OBJECT 4294967296"]},
         "column list has an empty name": {"extra_grants": ["UPDATE () ON fixture_catalog.required"]},
+        "column grant targets a large object": {"extra_grants": ["UPDATE (id) ON LARGE OBJECT 900001"]},
+        "column grant uses a table-only privilege": {"extra_grants": ["DELETE (id) ON fixture_catalog.required"]},
     }.items():
         check(case, record | {"reader_privileges": over | override})
     check("oversized record", json.dumps(record).encode().ljust(4097))

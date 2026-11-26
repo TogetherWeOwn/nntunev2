@@ -828,7 +828,8 @@ def prove_ineffective_baseline_grant(cluster, plan):
             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
             CROSS JOIN LATERAL aclexplode(c.relacl) acl
             WHERE n.nspname IN ('grant_ledger', 'grant_tracks')
-              AND acl.grantee = current_user::regrole AND acl.privilege_type <> 'SELECT'
+              AND acl.grantee = current_user::regrole
+              AND (acl.privilege_type <> 'SELECT' OR acl.is_grantable)
             UNION ALL
             SELECT acl.privilege_type || ' (' || a.attname || ') ON ' || n.nspname || '.' || c.relname
                    || CASE WHEN acl.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
@@ -837,13 +838,15 @@ def prove_ineffective_baseline_grant(cluster, plan):
             JOIN pg_namespace n ON n.oid = c.relnamespace
             CROSS JOIN LATERAL aclexplode(a.attacl) acl
             WHERE n.nspname IN ('grant_ledger', 'grant_tracks') AND a.attnum > 0
-              AND acl.grantee = current_user::regrole AND acl.privilege_type <> 'SELECT'
+              AND acl.grantee = current_user::regrole
+              AND (acl.privilege_type <> 'SELECT' OR acl.is_grantable)
             UNION ALL
             SELECT acl.privilege_type || ' ON LARGE OBJECT ' || l.oid
                    || CASE WHEN acl.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
             FROM pg_largeobject_metadata l
             CROSS JOIN LATERAL aclexplode(l.lomacl) acl
-            WHERE acl.grantee = current_user::regrole AND acl.privilege_type <> 'SELECT'
+            WHERE acl.grantee = current_user::regrole
+              AND (acl.privilege_type <> 'SELECT' OR acl.is_grantable)
         ) grants;
     """ + sql.removeprefix(begin)
     inventory = {
@@ -866,7 +869,10 @@ def prove_ineffective_baseline_grant(cluster, plan):
     try:
         for case, change, refusal, extra in (
             ("least-privilege", None, None, None),
-            ("over-privileged table grant", f"GRANT UPDATE ON grant_tracks.tracks TO {READER};",
+            ("over-privileged delegated SELECT", f"GRANT SELECT ON grant_tracks.tracks TO {READER} WITH GRANT OPTION;",
+             "baseline table privilege refused", "SELECT ON grant_tracks.tracks WITH GRANT OPTION"),
+            ("over-privileged table grant", f"REVOKE SELECT ON grant_tracks.tracks FROM {READER};"
+             f" GRANT SELECT, UPDATE ON grant_tracks.tracks TO {READER};",
              "baseline table privilege refused", "UPDATE ON grant_tracks.tracks"),
             ("over-privileged column grant", f"REVOKE UPDATE ON grant_tracks.tracks FROM {READER};"
              f" GRANT UPDATE (id) ON grant_tracks.tracks TO {READER};",
