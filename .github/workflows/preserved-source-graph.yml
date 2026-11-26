@@ -1,18 +1,10 @@
-# guards: paths
 name: preserved-source synthetic graph
 
 # This is one qualification control, not an acquisition boundary or approval
 # to consume a preserved source. The fixture creates only local Git objects.
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      - .github/workflows/preserved-source-graph.yml
-      - .github/scripts/*migration*.py
-      - .github/scripts/*graph*.py
-      - .github/scripts/test_ci_pnpm_retry.py
-      - .github/scripts/staging_api_schema_gate.py
-      - migrations/**
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
 
 permissions:
   contents: read
