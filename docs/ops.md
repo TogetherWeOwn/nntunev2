@@ -1488,11 +1488,11 @@ run, accepted SHA, hostname and rollout run and attempt in the private release
 record. Keep the custody and key in the protected Environment and leave the
 writer freeze in place. Use the pinned Worker's complete deployment history
 and provider audit to read back the recorded fallback at 100%, using the
-pinned maintenance version for a first release.
-Keep switch-off pending and continue the existing denial readbacks. Resolve
-the missing evidence through the existing protected recovery procedure before
-any write. An incomplete listing or mismatched producer uses the general
-protected rollback refusal and requires reconciliation of that evidence.
+pinned maintenance version for a first release. Keep switch-off pending and
+continue the existing denial readbacks. Record those results and the missing
+or expired artifact in the private release handoff. Keep reconciliation
+read-only while the original sealed intent is unavailable. An incomplete
+listing or mismatched producer uses the general protected rollback refusal.
 
 ### First private release handoff
 
