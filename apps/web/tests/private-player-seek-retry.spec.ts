@@ -1,4 +1,4 @@
-import { expect, type Request } from '@playwright/test';
+import { expect, type Page, type Request } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { seekViaPlayerUi } from '../../../e2e/helpers/player-ui.js';
 import { mockInvitedLibraryPlayback } from './fixtures/invited-library-playback.js';
@@ -31,6 +31,16 @@ function silentWav() {
 }
 
 test('private playback retries an interrupted seek from the requested position', async ({ page, origin }) => {
+	await checkInterruptedSeekRetry(page, origin);
+});
+
+test('private playback resumes at the volume selected while Retry is pending', async ({ page, origin }) => {
+	await checkInterruptedSeekRetry(page, origin, { changeVolumeWhilePending: true });
+});
+
+const checkInterruptedSeekRetry = (
+	page: Page, origin: string, { changeVolumeWhilePending = false } = {}
+) => test.step('Recover an interrupted private seek', async () => {
 	const { library, player } = PRIVATE_MUSIC;
 	const playsUrl = origin + player.plays;
 	const body = silentWav();
@@ -83,6 +93,7 @@ test('private playback retries an interrupted seek from the requested position',
 	const audio = transport.getByTestId(player.audio);
 	const status = transport.getByRole('status');
 	const retry = transport.getByRole('button', { name: 'Retry playback', exact: true });
+	const volume = transport.getByRole('slider', { name: /^Volume \d+%$/ });
 	const currentTrack = page.locator(player.currentQueueItem);
 	await page.getByTestId(library.item).filter({ hasText: track.title }).locator(library.select).click();
 	await expect(audio).toHaveCount(0);
@@ -101,6 +112,12 @@ test('private playback retries an interrupted seek from the requested position',
 	});
 	await expect(audio).toHaveJSProperty('currentSrc', source);
 	const native = (await audio.elementHandle())!;
+	if (changeVolumeWhilePending) {
+		await volume.press('End');
+		await volume.press('ArrowLeft');
+		await expect(volume).toHaveValue('99');
+		await expect(audio).toHaveJSProperty('volume', 0.99);
+	}
 	let target: number;
 	try {
 		const { surface, fraction } = await seekViaPlayerUi(page, audio, 0.8);
@@ -126,22 +143,52 @@ test('private playback retries an interrupted seek from the requested position',
 	expect(plays).toEqual([admission]);
 
 	const resumed = await native.evaluateHandle((node: HTMLAudioElement) => {
-		const observation = { position: null as number | null, trusted: false };
+		const observation = { position: null as number | null, trusted: false, volume: node.volume };
 		node.addEventListener('playing', (event) => {
 			observation.position = node.currentTime;
 			observation.trusted = event.isTrusted;
+			observation.volume = node.volume;
 		}, { once: true });
 		return observation;
 	});
-	await retry.click();
+	const holdReceipt = Promise.withResolvers<void>();
+	if (changeVolumeWhilePending) {
+		// Gate the exact continuation before the invited fixture validates and answers it.
+		await page.route(playsUrl, async (route) => {
+			if (route.request().postDataJSON()?.play_id === playId) await holdReceipt.promise;
+			await route.fallback();
+		});
+	}
+	try {
+		await retry.click();
+		if (changeVolumeWhilePending) {
+			await expect.poll(() => plays).toEqual([admission, continuation]);
+			await volume.press('ArrowLeft');
+			await expect(volume).toHaveValue('98');
+			await expect(volume).toHaveAccessibleName('Volume 98%');
+			expect(await native.evaluate((node: HTMLAudioElement) => ({
+				failed: node.error !== null, volume: node.volume
+			}))).toEqual({ failed: true, volume: 0.98 });
+			expect(receiptConfirmed).toBe(false);
+		}
+	} finally {
+		holdReceipt.resolve();
+	}
 	await expect(status).toHaveText('Playing');
-	await expect.poll(() => native.evaluate((node: HTMLAudioElement, observation) =>
-		observation.position !== null && !node.paused && !node.seeking && node.error === null &&
-			node.currentTime > observation.position + 0.2, resumed)).toBe(true);
+	await expect.poll(() => native.evaluate((node: HTMLAudioElement, observation) => {
+		const advancing = observation.position !== null && !node.paused && !node.seeking && node.error === null &&
+			node.currentTime > observation.position + 0.2;
+		return advancing ? { volume: node.volume } : null;
+	}, resumed)).toEqual({ volume: changeVolumeWhilePending ? 0.98 : expect.any(Number) });
 	const firstPlaying = await resumed.jsonValue();
 	expect(firstPlaying.trusted).toBe(true);
 	expect(firstPlaying.position).not.toBeNull();
 	expect(Math.abs(firstPlaying.position! - target)).toBeLessThan(0.1);
+	if (changeVolumeWhilePending) {
+		expect(firstPlaying.volume).toBe(0.98);
+		await expect(volume).toHaveValue('98');
+		await expect(volume).toHaveAccessibleName('Volume 98%');
+	}
 	await expect(retry).toHaveCount(0);
 	await expect(currentTrack).toHaveAttribute(player.queueId, track.id);
 	expect(await audio.evaluate((node, original) => node === original, native)).toBe(true);
