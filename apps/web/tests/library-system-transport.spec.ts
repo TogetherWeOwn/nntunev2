@@ -211,11 +211,15 @@ test("navigation to /pricing retires the app's system controls", async ({ page }
 });
 
 test('direct Library-to-demo navigation leaves the demo system controls usable', async ({ page }) => {
-	// Both players update the same Media Session during this navigation. Keep this
-	// check while the demo runs, since the remount below waits for a public route.
+	// Both players update the same Media Session during this navigation. Keep this case
+	// while /demo/player exists; the remount test below leaves Library through `/` instead.
 	const wav = expectedSyntheticBody();
 	await page.route('**/api/demo/audio**', (route) => serveRangedAudio(route, wav, 'audio/wav'));
 	await openWithSystemControls(page);
+	const libraryAudio = (await page.getByTestId('audio-player').elementHandle())!;
+	await libraryAudio.evaluate((el: HTMLAudioElement) => {
+		el.play = async () => { window.__librarySystemTransport.retiredPlays += 1; };
+	});
 	const session = await page.evaluateHandle(() => navigator.mediaSession);
 	await navigateInApp(page, '/demo/player');
 	await expect(page).toHaveURL(/\/demo\/player$/);
@@ -232,12 +236,19 @@ test('direct Library-to-demo navigation leaves the demo system controls usable',
 	await expect(demo).toHaveJSProperty('paused', true);
 	const time = () => demo.evaluate((el: HTMLAudioElement) => el.currentTime);
 	const pausedAt = await time();
+	await retiredAction(page, 'play');
+	expect(await demo.evaluate((el: HTMLAudioElement) => el.paused)).toBe(true);
+	expect(await systemSnapshot(page)).toEqual(current);
 	await systemAction(page, 'play');
 	await expect(demo).toHaveJSProperty('paused', false);
 	await expect.poll(time).toBeGreaterThan(pausedAt + 0.1);
+	await retiredAction(page, 'pause');
+	expect(await demo.evaluate((el: HTMLAudioElement) => el.paused)).toBe(false);
+	expect(await systemSnapshot(page)).toEqual(current);
 	await systemAction(page, 'pause');
 	await expect(demo).toHaveJSProperty('paused', true);
 	expect(await systemSnapshot(page)).toEqual(current);
+	expect(await page.evaluate(() => window.__librarySystemTransport.retiredPlays)).toBe(0);
 });
 
 signedInTest('a remounted Library player owns system Play and Pause', async ({ page, origin }) => {
