@@ -201,6 +201,7 @@ async fn publishes_and_admits_only_the_fresh_canonical_track() {
         .batch_execute("ALTER TABLE public.legacy_fixture RENAME TO library")
         .await
         .unwrap();
+    verify_replacement(&mut writer, &ctx, &unrelated, &fixture, &track).await;
     writer
         .execute(
             "UPDATE public.invite_codes SET revoked_at = 3 WHERE id = 901",
@@ -245,11 +246,106 @@ async fn publishes_and_admits_only_the_fresh_canonical_track() {
     assert_eq!(ids(handle(&legacy_ctx, &request).await), legacy_ids);
 }
 
+async fn verify_replacement(
+    writer: &mut Client,
+    ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
+    request: &Request,
+    original: &publication_fixture::PublicationFixture,
+    track: &str,
+) {
+    const COMPANION_JOB: &str = "catalogue-library-companion";
+    const REPLACEMENT_JOB: &str = "catalogue-library-replacement";
+    writer
+        .execute(
+            "INSERT INTO public.ingest_jobs (id, user_id, idempotency_key, accepted_at, status)
+             VALUES ($1, $3, $1, 1, 'done'), ($2, $3, $2, 1, 'done')",
+            &[&COMPANION_JOB, &REPLACEMENT_JOB, &ISSUER],
+        )
+        .await
+        .unwrap();
+    let policy = ctx.cfg.private_listening.as_ref();
+    let admission = Admission {
+        issuer: ISSUER,
+        recipient: OTHER_MEMBER,
+        invite_id: 902,
+        track_id: track,
+        job_id: JOB,
+        plaintext_sha256: original.source().plaintext_sha256,
+    };
+    let mut companion = original.occurrence(COMPANION_JOB, ISSUER, MBID);
+    companion.track.track_no = 150;
+    companion.track.title = "Synthetic companion";
+    let mut tx = writer.transaction().await.unwrap();
+    // Give the pre-existing canonical row a duration to preserve across replacement.
+    const STORED_DURATION_MS: i32 = 14_000;
+    assert_eq!(
+        tx.execute(
+            "UPDATE public.tracks SET duration_ms = $2 WHERE id = $1::text::uuid",
+            &[&track, &STORED_DURATION_MS],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let companion_id = stage(&mut tx, &companion, &original.source())
+        .await
+        .unwrap();
+    assert!(stage_admission(&tx, policy, admission).await.unwrap());
+    assert!(stage_admission(
+        &tx,
+        policy,
+        Admission {
+            track_id: &companion_id,
+            job_id: COMPANION_JOB,
+            ..admission
+        },
+    )
+    .await
+    .unwrap());
+    tx.commit().await.unwrap();
+
+    let listing = async || entries(handle(ctx, request).await);
+    let [companion_row, original_row]: [serde_json::Value; 2] = listing().await.try_into().unwrap();
+    assert_eq!(companion_row["id"], companion_id);
+    assert_eq!(original_row["id"], track);
+    assert_eq!(original_row["title"], "Fresh synthetic track");
+    assert_eq!(original_row["duration_ms"], STORED_DURATION_MS);
+
+    let replacement = publication_fixture::PublicationFixture::load_replacement(writer).await;
+    let source = replacement.source();
+    let mut next = replacement.occurrence(REPLACEMENT_JOB, ISSUER, MBID);
+    next.track.title = "Replacement match title";
+    let mut tx = writer.transaction().await.unwrap();
+    assert_eq!(stage(&mut tx, &next, &source).await.unwrap(), track);
+    assert!(stage_admission(
+        &tx,
+        policy,
+        Admission {
+            job_id: REPLACEMENT_JOB,
+            plaintext_sha256: source.plaintext_sha256,
+            ..admission
+        },
+    )
+    .await
+    .unwrap());
+    assert_eq!(
+        listing().await,
+        [companion_row.clone(), original_row.clone()]
+    );
+    tx.commit().await.unwrap();
+
+    // Library order reflects the new admission sequence. The canonical row is stable.
+    assert_eq!(listing().await, [original_row, companion_row]);
+}
+
 fn ids(response: Response) -> Vec<String> {
-    assert_eq!(response.status, 200);
-    serde_json::from_str::<Vec<serde_json::Value>>(&response.body)
-        .unwrap()
+    entries(response)
         .iter()
         .map(|entry| entry["id"].as_str().unwrap().to_owned())
         .collect()
+}
+
+fn entries(response: Response) -> Vec<serde_json::Value> {
+    assert_eq!(response.status, 200);
+    serde_json::from_str(&response.body).unwrap()
 }

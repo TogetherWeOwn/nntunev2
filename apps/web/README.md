@@ -17,8 +17,8 @@ pnpm --dir apps/web dev
 ## Checks
 
 Push the PR branch and open a draft PR while incomplete. GitHub Actions
-[CI](../../.github/workflows/ci.yml) runs `vitest`, `svelte-check`,
-`web-build`, `web-e2e` and `web-a11y` under the `ci-ok` gate. Full frontend
+[CI](../../.github/workflows/ci.yml) runs Vitest and Svelte Check in `web-checks`
+alongside `web-build`, `web-e2e` and `web-a11y` under the `ci-ok` gate. Full frontend
 suites/build verification belong there, not in a local CI mirror.
 
 Local tests are only for focused reproduction of one failing Actions test;

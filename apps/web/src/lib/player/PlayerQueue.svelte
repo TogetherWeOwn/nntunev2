@@ -231,12 +231,18 @@
 
 	async function reportMove(button: HTMLButtonElement, from: number, to: number): Promise<void> {
 		const heldFocus = document.activeElement === button;
+		const generation = confirmGeneration;
 		onmove?.(from, to);
 		await tick();
 		// Moving a keyed row can detach and reinsert its focused control.
-		if (!button.isConnected || button.disabled || !focusStranded(heldFocus, button)) return;
-		button.focus({ preventScroll: true });
-		button.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+		if (generation !== confirmGeneration || !button.isConnected || !focusStranded(heldFocus, button)) return;
+		if (!button.disabled) {
+			focusVisible(button);
+			return;
+		}
+		// At either end, the opposite step is still available on the moved row.
+		const row = button.closest('[data-testid="queue-item"]');
+		focusVisible(row?.querySelector<HTMLButtonElement>('button[data-queue-step]:enabled') ?? null);
 	}
 
 	/**
@@ -917,6 +923,7 @@
 			{/if}
 			<button
 				type="button"
+				data-queue-step
 				aria-label="Move {displayTitle(track)} up"
 				disabled={index === 0}
 				onclick={(event) => reportMove(event.currentTarget, index, index - 1)}
@@ -925,6 +932,7 @@
 			</button>
 			<button
 				type="button"
+				data-queue-step
 				aria-label="Move {displayTitle(track)} down"
 				disabled={index === trackCount - 1}
 				onclick={(event) => reportMove(event.currentTarget, index, index + 1)}
@@ -936,7 +944,7 @@
 					type="button"
 					aria-label="Move {displayTitle(track)} to top"
 					disabled={index === 0}
-					onclick={() => onmove?.(index, 0)}
+					onclick={(event) => reportMove(event.currentTarget, index, 0)}
 				>
 					Top
 				</button>
@@ -944,7 +952,7 @@
 					type="button"
 					aria-label="Move {displayTitle(track)} to bottom"
 					disabled={index === trackCount - 1}
-					onclick={() => onmove?.(index, trackCount - 1)}
+					onclick={(event) => reportMove(event.currentTarget, index, trackCount - 1)}
 				>
 					Bottom
 				</button>

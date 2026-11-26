@@ -1,38 +1,39 @@
 //! Assembles a one-part encrypted staging fixture with the signed S3 adapters.
 
+use crate::{
+    handlers::StoreError,
+    ingest_session_caller::{
+        self, Authorization, CommittedFlacUpload, CurrentAuthorization, PreparedUpload,
+    },
+    storage_digest_read::uuid_text,
+};
 use nntune_core::{
     digest_enrollment::{DigestEnrollment, OriginManifest},
+    digest_readback::EnrolledEnvelope,
     media::{Header, PLAIN_CHUNK_SIZE},
     media_envelope::{verify_enrolled_scheme2, wrap_scheme2, EnvelopeContext},
     origin_sealer::SealedChunk,
 };
-use nntune_ingest::digest_candidate_store::CandidateIntent;
-use sha2::{Digest, Sha256};
-
-#[cfg(target_arch = "wasm32")]
-use {
-    crate::{
-        handlers::StoreError,
-        ingest_session_caller::{
-            self, Authorization, CommittedFlacUpload, CurrentAuthorization, PreparedUpload,
-        },
-        storage_digest_read::uuid_text,
-    },
-    nntune_core::digest_readback::EnrolledEnvelope,
-    nntune_ingest::multipart::{
+use nntune_ingest::{
+    digest_candidate_store::CandidateIntent,
+    multipart::{
         readback_inventory::CompletedReadbackInventory,
         resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
-        s3_completion::S3CompletionSender,
         session_completion::SessionCompletion,
         session_outcome::CompletionScope,
         sidecar::SidecarPut,
         Plan,
     },
-    std::time::SystemTime,
-    tokio_postgres::Client,
 };
+use sha2::{Digest, Sha256};
+use std::time::SystemTime;
+use tokio_postgres::Client;
 
 use super::TrialError::{self, Refused, Unconfirmed};
+
+#[path = "sealed_fixture_storage.rs"]
+mod storage;
+pub(crate) use storage::TrialStorage;
 
 pub struct SealedFixture {
     pub context: EnvelopeContext,
@@ -118,13 +119,12 @@ impl SealedFixture {
 
     /// Run only after the exact candidate and reservation are durable, and
     /// after the owner, redeemed invite and current upload grant pass preflight.
-    #[cfg(target_arch = "wasm32")]
-    pub async fn send<T>(
+    pub(crate) async fn send<T>(
         &self,
         writer: &mut Client,
         auth: Authorization<'_>,
         prepared: PreparedUpload<'_>,
-        sender: &S3CompletionSender,
+        sender: &impl TrialStorage,
         bucket: &str,
         root: &[u8; 32],
         until: SystemTime,
@@ -149,10 +149,19 @@ impl SealedFixture {
         let [environment, library, object, generation] =
             [environment, library, object, generation].map(uuid_text);
         let key = format!("media/{object}/{generation}");
-        let opened =
-            ingest_session_caller::open_signed(writer, auth, prepared, sender, &key, until)
-                .await
-                .map_err(upload_error)?;
+        let opened = ingest_session_caller::open(
+            writer,
+            auth,
+            prepared,
+            until,
+            async |db, scope, lease, deadline| {
+                sender
+                    .open_upload(db, scope, lease, prepared.context, &key, deadline)
+                    .await
+            },
+        )
+        .await
+        .map_err(upload_error)?;
         let upload = opened.durable_target();
         let until = upload.usable_until();
         let target = upload.target();
@@ -201,7 +210,7 @@ impl SealedFixture {
             SessionCompletion::prepare(binding, &self.context, vec![uploaded], &checkpoint)
                 .map_err(|_| Unconfirmed)?;
         let completed = sender
-            .complete(completion, until)
+            .complete(upload, completion)
             .await
             .map_err(|_| Unconfirmed)?;
         sender
@@ -232,13 +241,13 @@ impl SealedFixture {
             retained_record: &self.record,
         };
         let committed = opened
-            .commit_signed_flac(
+            .commit_flac(
                 writer,
                 auth,
-                (&inventory, envelope),
-                sender,
+                &inventory,
                 retain_until,
                 reload,
+                async |deadline| sender.verify_readback(&inventory, envelope, deadline).await,
             )
             .await
             .map_err(upload_error)?;
@@ -257,7 +266,6 @@ impl SealedFixture {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 fn upload_error(error: ingest_session_caller::UploadError) -> TrialError {
     match error {
         ingest_session_caller::UploadError::Refused => Refused,

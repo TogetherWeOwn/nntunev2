@@ -26,6 +26,12 @@ class DnsOwnershipTest(unittest.TestCase):
             ("fixture-zone", "created-record"),
         )
 
+    def test_matching_readbacks_with_changed_origin_never_select_a_delete(self):
+        by_id = replace(CREATED, content="192.0.2.11")
+        by_name = replace(CREATED, content="192.0.2.11")
+
+        self.assertIsNone(select_owned_record(CREATED, by_id, (by_name,)))
+
     def test_same_name_replacement_never_selects_a_delete(self):
         replacement = replace(CREATED, record_id="replacement-record")
         for by_id, by_name in (

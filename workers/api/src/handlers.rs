@@ -6969,6 +6969,10 @@ where
     response
         .extra_headers
         .push(("cache-control".into(), "private, no-store".into()));
+    response.extra_headers.push((
+        "x-nntune-playback-ttl".into(),
+        receipt.grant.exp_unix.saturating_sub(ctx.now).to_string(),
+    ));
     response
 }
 
@@ -12034,6 +12038,7 @@ pub(crate) mod tests {
                         predicate_stale: false,
                         other_live_holder: false,
                         equal_end_provenance_changed: false,
+                        matching_proof_cancel_conflict: false,
                     }
                 } else {
                     Target::Absent
@@ -12607,6 +12612,9 @@ pub(crate) mod tests {
         sessions: RefCell<HashMap<String, crate::stripe::CheckoutSession>>,
         subscriptions: RefCell<HashMap<String, crate::stripe::Subscription>>,
         invoices: RefCell<HashMap<String, crate::stripe::Invoice>>,
+        /// Override one invoice listing after checking its requested scope.
+        scripted_invoice_list:
+            RefCell<Option<(crate::stripe::ListInvoices, crate::stripe::Invoice)>>,
         /// Remainder line pages per invoice: `list_invoice_lines` answers
         /// the next page from here, so tests pin the full-read follow-up
         /// instead of trusting the first page.
@@ -12893,6 +12901,10 @@ pub(crate) mod tests {
                 assert!(!self.forbid_invoice_reads, "unexpected invoice list read");
                 if self.fail("list_invoices") {
                     return self.err();
+                }
+                if let Some((expected, invoice)) = self.scripted_invoice_list.borrow_mut().take() {
+                    assert_eq!(req, expected);
+                    return Ok(vec![invoice]);
                 }
                 Ok(self
                     .invoices
@@ -14397,6 +14409,32 @@ pub(crate) mod tests {
             decode(call_at(now, "GET", path, Some(cookie), vec![], None), 200)
         };
         let subscription = |now, cookie: &str| billing_read(now, "/v1/me/subscription", cookie);
+        let refresh = |now, cookie: &str| {
+            let refreshed = call_at(
+                now,
+                "POST",
+                "/v1/session/refresh",
+                Some(cookie),
+                vec![],
+                None,
+            );
+            assert_eq!(refreshed.status, 200, "{}", refreshed.body);
+            let refreshed_cookie = cookie_of(&refreshed);
+            assert!(
+                refreshed_cookie != cookie,
+                "refresh must replace the cookie"
+            );
+            let stale = call_at(
+                now,
+                "GET",
+                "/v1/me/subscription",
+                Some(cookie),
+                vec![],
+                None,
+            );
+            assert_eq!(stale.status, 401);
+            refreshed_cookie
+        };
         let play = json!({"track_id":"track-9", "session_id":"tab-a"});
         let play_at = |now, cookie: &str, body: &Value| {
             call_at(
@@ -14428,6 +14466,10 @@ pub(crate) mod tests {
         assert_eq!(account.stripe_customer_id.as_deref(), Some(customer));
         assert_eq!(subscription(NOW, &cookie)["state"], "no_subscription");
         assert_eq!(decode(play_call(&h, &cookie, play.clone()), 402), unpaid);
+
+        let cookie = refresh(NOW, &cookie);
+        assert_eq!(subscription(NOW, &cookie)["state"], "no_subscription");
+        assert_eq!(decode(play_at(NOW, &cookie, &play), 402), unpaid);
 
         let stripe_period = |id: &str, start, end| {
             let mut remote = test_subscription(subscription_id, customer, "active", PRICE_PLUS);
@@ -14492,6 +14534,42 @@ pub(crate) mod tests {
         assert!(h.store.webhook_events.borrow().is_empty());
         assert!(h.store.invoice_history.borrow().is_empty());
         assert_eq!(subscription(NOW, &cookie)["state"], "no_subscription");
+        assert_eq!(decode(play_at(NOW, &cookie, &play), 402), unpaid);
+
+        // Return a misbound invoice even though the caller requests the exact
+        // subscription. The normal fixture filter would hide it from the fold.
+        let other_invoice = test_invoice(
+            "in_test_other",
+            customer,
+            "sub_test_other",
+            PRICE_PLUS,
+            BILLING_NOW,
+            first_end,
+            BILLING_NOW,
+        );
+        h.stripe
+            .invoices
+            .borrow_mut()
+            .insert(other_invoice.id.clone(), other_invoice.clone());
+        h.stripe.scripted_invoice_list.replace(Some((
+            crate::stripe::ListInvoices {
+                customer_id: Some(customer.into()),
+                subscription_id: Some(subscription_id.into()),
+                paid_only: true,
+                limit: 100,
+                starting_after: None,
+            },
+            other_invoice,
+        )));
+        webhook_ok(&signed(BILLING_NOW, &completed));
+        assert!(h.stripe.scripted_invoice_list.borrow().is_none());
+        let uncovered = live_for(&h, &user).unwrap();
+        assert_eq!(uncovered.stripe_subscription_id, subscription_id);
+        assert_eq!(uncovered.plan_id, "free");
+        assert_eq!(uncovered.paid_through_unix, None);
+        assert_eq!(uncovered.paid_invoice_id, None);
+        assert!(h.store.invoice_history.borrow().is_empty());
+        assert_eq!(decode(play_at(NOW, &cookie, &play), 402), unpaid);
 
         let assert_period = |end, invoices| {
             let live = live_for(&h, &user).unwrap();
@@ -14512,29 +14590,11 @@ pub(crate) mod tests {
         assert_eq!(receipts.len(), 1);
         assert!(receipts.contains(event_id));
         let subscribed = subscription(NOW, &cookie);
+        assert_eq!(subscribed["state"], "active");
+        let first_play = decode(play_at(NOW, &cookie, &play), 200);
 
         let refresh_at = NOW + 1;
-        let refreshed = call_at(
-            refresh_at,
-            "POST",
-            "/v1/session/refresh",
-            Some(&cookie),
-            vec![],
-            None,
-        );
-        assert_eq!(refreshed.status, 200, "{}", refreshed.body);
-        let refreshed_cookie = cookie_of(&refreshed);
-        assert_ne!(refreshed_cookie, cookie);
-        let stale = call_at(
-            refresh_at,
-            "GET",
-            "/v1/me/subscription",
-            Some(&cookie),
-            vec![],
-            None,
-        );
-        assert_eq!(stale.status, 401);
-        let cookie = refreshed_cookie;
+        let cookie = refresh(refresh_at, &cookie);
 
         let replay_at = refresh_at + 1;
         webhook_ok(&signed(replay_at as i64, &completed));
@@ -14550,9 +14610,10 @@ pub(crate) mod tests {
         );
 
         assert_eq!(subscription(replay_at, &cookie), subscribed);
-        assert_eq!(subscribed["state"], "active");
         assert_eq!(subscribed["status"], "active");
         assert_eq!(subscribed["planId"], PLAN_PLUS);
+        assert_eq!(active.paid_invoice_id.as_deref(), Some("in_test_1"));
+        assert_eq!(history["in_test_1"].stripe_subscription_id, subscription_id);
         assert_eq!(
             subscribed["currentPeriodEnd"],
             crate::ledger::iso8601_utc(first_end)
@@ -14569,8 +14630,10 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         );
+        // The same tab can replace its first grant after the second refresh.
         let issued = decode(play_at(replay_at, &cookie, &play), 200);
         let play_id = issued["play_id"].as_str().unwrap();
+        assert_ne!(play_id, first_play["play_id"].as_str().unwrap());
         let record = |bytes| {
             let window = crate::ledger::prepare_play_window(
                 &user,

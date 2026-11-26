@@ -45,15 +45,28 @@ class TrialBindingIdentityTests(unittest.TestCase):
         rows = {binding: (preflight.DATABASE, database_oid, name, number, name, number)
                 for binding, (name, number) in pins.items()}
         matched = dict.fromkeys(BINDING_ROLES, "matched")
-        self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, rows), matched)
+        origin_tls = dict.fromkeys(BINDING_ROLES, True)
+        handoff = list(rows.items())
+        identity = preflight.binding_identity_verdicts(database_oid, pins, handoff)
+        self.assertEqual(identity, matched)
+        self.assertEqual(preflight.binding_connection_verdict(identity, origin_tls), "qualified")
+
+        upload, auth, publish, enroll = BINDING_ROLES
+        for case, duplicate, expected in (
+            ("repeated label", handoff[0], {upload: "pending", enroll: "pending"}),
+            ("relabelled row", (enroll, rows[upload]), {enroll: "pending"}),
+        ):
+            with self.subTest(case=case):
+                identity = preflight.binding_identity_verdicts(database_oid, pins, [*handoff[:3], duplicate])
+                self.assertEqual(identity, {**matched, **expected})
+                self.assertEqual(preflight.binding_connection_verdict(identity, origin_tls), "pending")
 
         for binding in BINDING_ROLES:
             with self.subTest(binding=binding, case="missing"):
-                self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, {
-                    key: row for key, row in rows.items() if key != binding
-                }), {**matched, binding: "pending"})
+                self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, [
+                    result for result in handoff if result[0] != binding
+                ]), {**matched, binding: "pending"})
 
-        upload, auth, publish, enroll = BINDING_ROLES
         row = rows[publish]
         for case, observed, expected in (
             ("swapped roles", {upload: rows[auth], auth: rows[upload]},
@@ -68,12 +81,13 @@ class TrialBindingIdentityTests(unittest.TestCase):
             ("duplicate result", {publish: (row, row)}, {publish: "pending"}),
         ):
             with self.subTest(case=case):
-                self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, {**rows, **observed}),
+                results = list({**rows, **observed}.items())
+                self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, results),
                                  {**matched, **expected})
         for altered in ({**pins, auth: pins[upload]},
                         {**pins, auth: (pins[auth][0], pins[upload][1])},
                         {key: pin for key, pin in pins.items() if key != auth}):
-            self.assertEqual(preflight.binding_identity_verdicts(database_oid, altered, rows),
+            self.assertEqual(preflight.binding_identity_verdicts(database_oid, altered, handoff),
                              dict.fromkeys(BINDING_ROLES, "pending"))
 
     def test_disposable_binding_identity_query(self):
@@ -89,7 +103,7 @@ class TrialBindingIdentityTests(unittest.TestCase):
                 name, db_oid, login, login_oid, effective, effective_oid = result.split("|")
                 return name, int(db_oid), login, int(login_oid), effective, int(effective_oid)
 
-            rows = {binding: read_identity(role) for binding, role in BINDING_ROLES.items()}
+            rows = [(binding, read_identity(role)) for binding, role in BINDING_ROLES.items()]
             matched = dict.fromkeys(BINDING_ROLES, "matched")
             self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, rows), matched)
 
@@ -98,7 +112,7 @@ class TrialBindingIdentityTests(unittest.TestCase):
             run_psql(db, f"GRANT {auth_role} TO {upload_role} WITH INHERIT FALSE, SET TRUE;")
             switched = read_identity(upload_role, f"SET LOCAL ROLE {auth_role};\n")
             self.assertEqual(switched, (preflight.DATABASE, database_oid, *pins[upload], *pins[auth]))
-            self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, {**rows, upload: switched}),
+            self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, [(upload, switched), *rows[1:]]),
                              {**matched, upload: "pending"})
 
 
@@ -149,6 +163,51 @@ class TrialRolePreflightTests(unittest.TestCase):
         code, stages, error, psql = dispatch(target | {"database_oid": 46006})
         self.assertEqual((code, stages, error), (1, [], "Trial role lifecycle refused"))
         psql.assert_not_called()
+
+    def test_operator_summary_includes_binding_identities_only_with_reader(self):
+        database_oid = 40200
+        build, version = "a" * 40, "12345678-0000-4000-8000-000000000001"
+        pins = {binding: (role, index) for index, (binding, role) in enumerate(BINDING_ROLES.items(), 40201)}
+        scope = {"database_oid": database_oid, "issuer_oid": 0,
+                 "reader": [READER, 40301], "writer": [WRITER, 40302]}
+        auth = "PRIVATE_TRIAL_AUTH_DB"
+        baseline_report = "### Staging trial roles before application grants\n\n- database isolation — pass\n"
+
+        with TemporaryDirectory() as tmp:
+            summary = Path(tmp) / "summary.md"
+            with (
+                patch.dict(os.environ, {
+                    preflight.SCOPE_ENV: json.dumps(scope), preflight.SECRET_ENV: "synthetic-url",
+                    "GITHUB_STEP_SUMMARY": str(summary),
+                }, clear=True),
+                patch.object(preflight, "evidence_child_env", return_value={"PGPASSWORD": "fixture"}),
+                patch.object(preflight, "load_entries", return_value=[
+                    {"file": preflight.BASELINE, "sha256": DIGEST, "target": "app"},
+                ]),
+                patch.object(preflight, "observe", return_value={"database isolation": True}),
+            ):
+                self.assertEqual(preflight.main(), 0)
+                self.assertEqual(summary.read_text(), baseline_report)
+                for pending in (None, auth):
+                    with self.subTest(pending=pending):
+                        def query(build_sha, version_id, binding, sql):
+                            observed_db, observed_oid = preflight.DATABASE, database_oid
+                            pin = pins[binding]
+                            if binding == pending:
+                                observed_db, observed_oid = "unexpected_fixture_db", 40998
+                                pin = ("unexpected_fixture_role", 40999)
+                            row = (observed_db, observed_oid, *pin, *pin)
+                            return preflight.BindingReadback(build, version, binding, (row,))
+
+                        summary.write_text("")
+                        self.assertEqual(preflight.main(query=query, build_sha=build, version_id=version,
+                                                        role_pins=pins), 0)
+                        expected = baseline_report + "\n### Staging trial binding SQL identities\n\n"
+                        for binding, role in BINDING_ROLES.items():
+                            verdict = "pending" if binding == pending else "pass"
+                            expected += (f"- `{binding}` — {verdict} (expected role `{role}`, "
+                                         f"expected database `{preflight.DATABASE}`)\n")
+                        self.assertEqual(summary.read_text(), expected)
 
     def test_isolation(self):
         with scratch_database(ADMIN, preflight.DATABASE) as db:
@@ -241,6 +300,121 @@ class TrialRolePreflightTests(unittest.TestCase):
 
 
 class TrialConnectionReadbackTests(unittest.TestCase):
+    def test_pinned_binding_readback_passes_and_detects_wrong_wiring(self):
+        build, version = "a" * 40, "12345678-0000-4000-8000-000000000001"
+        pins = {binding: (role, role_oid) for role_oid, (binding, role) in
+                enumerate(BINDING_ROLES.items(), 40201)}
+        scope = dict(build_sha=build, version_id=version, database_oid=40200, role_pins=pins)
+        connected = pins.copy()
+        calls = []
+
+        def query(build_sha, version_id, binding, sql):
+            calls.append((build_sha, version_id, binding, sql))
+            role = connected[binding]
+            row = (preflight.DATABASE, 40200, *role, *role)
+            return preflight.BindingReadback(build, version, binding, (row,))
+
+        passed = {binding: {"role": role, "database": preflight.DATABASE, "verdict": "pass"}
+                  for binding, role in BINDING_ROLES.items()}
+        self.assertEqual(preflight.read_binding_identities(**scope, query=query), passed)
+        self.assertEqual(calls, [(build, version, binding, preflight.BINDING_IDENTITY_SQL)
+                                 for binding in BINDING_ROLES])
+
+        _, auth, publish, _ = BINDING_ROLES
+        connected[auth] = connected[publish]
+        self.assertEqual(preflight.read_binding_identities(**scope, query=query),
+                         {**passed, auth: {**passed[auth], "verdict": "pending"}})
+
+        pending = {binding: {**evidence, "verdict": "pending"} for binding, evidence in passed.items()}
+        self.assertEqual(preflight.read_binding_identities(**scope), pending)
+        calls.clear()
+        for invalid in ({"version_id": "latest"}, {"build_sha": "main"}, {"database_oid": 0}):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(preflight.read_binding_identities(**{**scope, **invalid}, query=query), pending)
+
+        unpinned = {binding: {**evidence, "role": None} for binding, evidence in pending.items()}
+        for case, invalid_pins in (
+            ("missing role pin", {binding: pin for binding, pin in pins.items() if binding != auth}),
+            ("duplicate role oid", {**pins, auth: (pins[auth][0], pins[publish][1])}),
+            ("public role", {**pins, auth: ("public", pins[auth][1])}),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(preflight.read_binding_identities(**{**scope, "role_pins": invalid_pins},
+                                                                 query=query), unpinned)
+        self.assertEqual(calls, [])
+
+    def test_binding_readback_leaves_unverified_results_pending(self):
+        build, version = "a" * 40, "12345678-0000-4000-8000-000000000001"
+        pins = {binding: (role, role_oid) for role_oid, (binding, role) in
+                enumerate(BINDING_ROLES.items(), 40201)}
+        upload, auth, *_ = BINDING_ROLES
+        receipts = {binding: preflight.BindingReadback(build, version, binding,
+                    ((preflight.DATABASE, 40200, *pin, *pin),)) for binding, pin in pins.items()}
+        receipt = receipts[auth]
+        expected = {binding: {"role": role, "database": preflight.DATABASE,
+                              "verdict": "pending" if binding == auth else "pass"}
+                    for binding, role in BINDING_ROLES.items()}
+
+        for case, response in (
+            ("stale build", receipt._replace(build_sha="b" * 40)),
+            ("stale version", receipt._replace(version_id="12345678-0000-4000-8000-000000000002")),
+            ("wrong binding", receipt._replace(binding=upload)),
+            ("duplicate rows", receipt._replace(rows=receipt.rows * 2)),
+            ("missing rows", receipt._replace(rows=())),
+            ("query error", OSError("synthetic connection details")),
+        ):
+            def query(build_sha, version_id, binding, sql):
+                if binding != auth:
+                    return receipts[binding]
+                if isinstance(response, OSError):
+                    raise response
+                return response
+
+            with self.subTest(case=case):
+                self.assertEqual(preflight.read_binding_identities(
+                    build_sha=build, version_id=version, database_oid=40200, role_pins=pins, query=query), expected)
+
+    def test_timed_out_binding_preserves_sibling_evidence_and_keeps_preflight_pending(self):
+        build, version = "a" * 40, "12345678-0000-4000-8000-000000000001"
+        database_oid = 40200
+        pins = {binding: (role, role_oid) for role_oid, (binding, role) in
+                enumerate(BINDING_ROLES.items(), database_oid + 1)}
+        auth = "PRIVATE_TRIAL_AUTH_DB"
+        expected_calls = [(build, version, binding, preflight.BINDING_IDENTITY_SQL)
+                          for binding in BINDING_ROLES]
+        complete_tls = dict.fromkeys(BINDING_ROLES, True)
+
+        for timed_out, overall in ((None, "qualified"), (auth, "pending")):
+            with self.subTest(timed_out=timed_out):
+                calls = []
+
+                def query(build_sha, version_id, binding, sql):
+                    calls.append((build_sha, version_id, binding, sql))
+                    if binding == timed_out:
+                        raise subprocess.TimeoutExpired(
+                            ["synthetic-reader", "synthetic-connection-details"], 1,
+                            output=b"synthetic-partial-row", stderr=b"synthetic-reader-diagnostics")
+                    pin = pins[binding]
+                    row = (preflight.DATABASE, database_oid, *pin, *pin)
+                    return preflight.BindingReadback(build, version, binding, (row,))
+
+                with redirect_stdout(StringIO()) as stdout, redirect_stderr(StringIO()) as stderr:
+                    evidence = preflight.read_binding_identities(
+                        build_sha=build, version_id=version, database_oid=database_oid,
+                        role_pins=pins, query=query)
+
+                self.assertEqual(calls, expected_calls)
+                self.assertEqual(evidence, {
+                    binding: {"role": role, "database": preflight.DATABASE,
+                              "verdict": "pending" if binding == timed_out else "pass"}
+                    for binding, role in BINDING_ROLES.items()
+                })
+                self.assertEqual((stdout.getvalue(), stderr.getvalue()), ("", ""))
+                # The connection check expects the underlying identity verdict vocabulary.
+                identities = {binding: "matched" if result["verdict"] == "pass" else "pending"
+                              for binding, result in evidence.items()}
+                self.assertEqual(preflight.binding_connection_verdict(identities, complete_tls), overall)
+
     def test_matching_identity_requires_origin_tls_for_every_binding(self):
         bindings = ("PRIVATE_TRIAL_UPLOAD_DB", "PRIVATE_TRIAL_AUTH_DB",
                     "PRIVATE_TRIAL_PUBLISH_DB", "PRIVATE_TRIAL_ENROLL_DB")

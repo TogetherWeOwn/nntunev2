@@ -108,8 +108,17 @@ numeric `?pr=` suffix copied from the PR Checks tab.
 Before merging, open the linked runs, verify the current head and base, and
 confirm the required checks and the reviewers' decisions at their sources.
 GitHub reports body edits and base retargets as the same `edited` activity.
-Posting evidence as a comment avoids starting another `migrations-staging` run.
-Edit the PR body when its description or Attestation needs a substantive correction.
+The required `migrations-staging` and `pr-lint` PR triggers target `main`.
+Stacked PRs still run `ci-ok`, including its migration gate. Push an updated
+PR head after retargeting a stacked PR to `main` so it gets both required
+checks. For stacks that already received either check against another base,
+verify both runs were created after the retarget and the migration snapshot
+records `main` at the new head before merging.
+For substantive title, description or Attestation corrections at the same
+head, close and reopen the PR to re-run the title, PR standards and migration
+checks with the current metadata. For same-head graph evidence, reopening also
+refreshes the graph controls in the required `migrations-gate` job. Post ordinary
+evidence updates as comments.
 
 ### Changed-lines mutation gate
 
@@ -149,13 +158,14 @@ and keeps one advisory comment on pull requests over the 400-line threshold.
 Counted lines are additions + deletions excluding lockfiles, generated files
 and fixtures. The labeller lives once in the org
 [TogetherWeOwn/.github](https://github.com/TogetherWeOwn/.github) repository
-(`CI-STANDARD.md`, "Advisory PR-size labels"); the workflow here is a thin
+(`STANDARD.md`, "PR size gate"); the workflow here is a thin
 caller with both `uses:` refs pinned to one central SHA and `exclude-extra:
 ""` (none today — the central exclusions already cover this repo's lockfiles
-and fixture/test data). The labelling job is advisory only: it is not a required check
-(not in the `protect-main` required checks) and never blocks a merge
-by itself. The gate job (`pr-size-gate`) in the same workflow *is*
-required and blocks over-limit PRs. A Monday run of the same workflow
+and fixture/test data). The required `pr-size-gate` job opts in to advisory
+labelling. Every gate run attempts to refresh the size label before evaluating
+the diff, including the last run in a PR's concurrency group. The advisory step
+handles its own failures and the gate decides the check result.
+A Monday run of the same workflow
 (`17 7 * * 1`) prints the weekly tally of merged pull requests per size; the
 labels are the durable record behind it.
 

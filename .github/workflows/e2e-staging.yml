@@ -135,10 +135,10 @@ jobs:
         working-directory: e2e
         run: npm ci
 
-      - name: Install Playwright chromium
+      - name: Install Playwright Chromium headless shell
         if: steps.staging.outputs.configured == 'true'
         working-directory: e2e
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps --only-shell chromium
 
       - name: Run synthetic smoke
         if: steps.staging.outputs.configured == 'true'
@@ -341,10 +341,10 @@ jobs:
         working-directory: e2e
         run: npm ci
 
-      - name: Install Playwright chromium
+      - name: Install Playwright Chromium headless shell
         if: steps.staging.outputs.configured == 'true'
         working-directory: e2e
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps --only-shell chromium
 
       # No NZB is staged for this run: the secret-held real-NZB leg is
       # retired under the CC0-only fixture rule

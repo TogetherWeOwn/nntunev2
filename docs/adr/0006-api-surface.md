@@ -267,3 +267,71 @@ least-privilege credential.
   stream-grant verification (forged, expired and wrong-track grants
   refused before any source contact). Compatibility credentials cannot
   authenticate native REST.
+
+### First Library membership handoff
+
+The first-membership producer is undecided. The protected private-listening
+caller authenticates a stepped-up issuer, resolves the recipient from a
+separately selected redeemed invite, and commits a publication and an
+invite-scoped browser admission. Its replay verifies the committed
+publication and admission for that recipient. The admission record binds
+`(invite_id, recipient_id, track_id, accepted_seq, object_id)` and carries no
+destination in `public.libraries`. `library_scope.library_id` in that policy
+identifies a shared storage namespace. It cannot select a member's Library.
+[Protected caller](../../workers/api/src/handlers/private_trial/caller.rs) ·
+[Replay](../../workers/api/src/handlers/private_trial/replay.sql) ·
+[Admission write](../../workers/api/src/private_library_admit.sql)
+
+Any first-membership writer requires an explicit server-side caller from a
+separately specified entitled catalogue-add flow. That caller must prove a
+current authorized action for one active owner, one independently selected
+active Library owned by that account, and one exact canonical occurrence.
+Bind the owner's identity to the authenticated principal for an owner action.
+Any delegated action requires explicit authority to act for that owner and
+proof of the same destination binding. The publisher's job owner, invite
+issuer role, invite redemption, browser visibility and playback entitlement
+alone convey no such authority. The producer decision must name the actor,
+the action that authorizes the write, how the destination is selected, and
+how the authorization expires or is revoked before use. It must also define
+how to recognize a retry and prevent an already committed action from
+recreating a membership the owner later removed.
+
+For an already trusted S3 publication, resolve the local `tracks.id` from
+the committed publisher result and revalidate the current source binding
+(`track_id`, `source_job_id`, `accepted_seq`, `object_id`) against that result
+and its verified object/version in the approved shared storage scope. A
+superseded source, an unavailable or deleting object, a recording MBID, and
+a raw track UUID cannot supply this proof. If a future producer uses private
+listening as an input, it also needs the exact currently eligible invite and
+recipient admission matched to that same source. The separate write authority
+above is still required. [Publication integration](https://github.com/TogetherWeOwn/nntunev2/pull/1744) ·
+[Publisher](../../workers/ingest/src/catalogue_publication.rs) ·
+[Source binding](../../workers/ingest/src/catalogue_publication/source.sql) ·
+[Browser projection](../../workers/api/src/private_library_page.sql)
+
+The S3 publisher records this proof in `catalogue_s3_sources`. Before using
+it for membership, specify how the S3 binding satisfies the curated-source
+requirement in [ADR 0002](0002-data-model.md), which describes `track_sources`.
+For any admitted local release, the same transaction must also follow ADR
+0002's release serializer and conditional art invalidation rules. Under that
+serializer, compare the selected artwork source before and after membership
+insertion. Invalidate the cached artwork pointer in the membership transaction
+only when that selection changes.
+
+Once a producer is specified, prove the handoff in disposable PostgreSQL with
+synthetic data. Start with a committed publication and two empty Libraries
+owned by the same account. Lock the active account, then the selected active
+Library, and validate the authorization and publication through commit under
+the [deletion rules](0002-data-model.md). Create exactly one
+`(library_id, track_id)` row in the selected Library. An authorized retry
+while that row exists preserves `added_at`. Replaying the committed action
+after removal must leave the row absent. Check that an expired action,
+account or Library deletion marker, superseded source, or rolled-back write
+leaves both Libraries empty when they started empty. For local releases,
+exercise both artwork cases with synthetic rows. A selection change clears
+the cached pointer in the membership commit, and an unchanged selection
+preserves it. Playlist edits and foreign-member refusals remain covered by
+the playlist contract.
+[Playlist persistence rehearsal](https://github.com/TogetherWeOwn/nntunev2/pull/1526) ·
+[Unmounted playlist store](https://github.com/TogetherWeOwn/nntunev2/pull/1570) ·
+[Companion exact occurrence rehearsal](https://github.com/TogetherWeOwn/nntunev2/pull/1984)

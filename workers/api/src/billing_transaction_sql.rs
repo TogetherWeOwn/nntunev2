@@ -7,23 +7,31 @@
 //! fixtures need their own trusted relation-specific SQL; no schema name is an
 //! input to these production primitives.
 
+use tokio_postgres::types::{ToSql, Type};
+
 /// Excludes subscription DML until the enclosing transaction ends.
 pub const LOCK_SUBSCRIPTIONS: &str = "LOCK TABLE public.subscriptions IN SHARE ROW EXCLUSIVE MODE";
 
-/// Global key lookup for stale, live-slot, and equal-end proof observations.
+/// Global key lookup for staleness, live-slot ownership, and conflicts that
+/// require a fresh fold.
 /// `IS TRUE` makes SQL NULL semantics yield an unambiguous stale predicate.
 /// The owner is deliberately not part of the lookup predicate.
+/// Keep the stale predicate in sync with the upsert's UPDATE guards. Both
+/// run under the same lock, so this lookup can explain an empty RETURNING result.
 pub const LOOKUP_TARGET: &str = "SELECT user_id, stripe_subscription_id, \
     (to_timestamp($2::bigint) IS NOT NULL AND paid_through_at IS NOT NULL AND \
     (to_timestamp($2::bigint) < paid_through_at OR \
-    (to_timestamp($2::bigint) = paid_through_at AND $3::text IS NULL AND \
-    paid_invoice_id IS NOT NULL))) IS TRUE AS predicate_stale, \
+    (to_timestamp($2::bigint) = paid_through_at AND (($3::text IS NULL AND \
+    paid_invoice_id IS NOT NULL) OR paid_invoice_id IS DISTINCT FROM $4::text OR \
+    plan_id IS DISTINCT FROM $5::text)))) IS TRUE AS predicate_stale, \
     EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = subscriptions.user_id \
     AND live.stripe_subscription_id <> subscriptions.stripe_subscription_id \
     AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')) AS other_live_holder, \
     (to_timestamp($2::bigint) = paid_through_at AND \
     (paid_invoice_id IS DISTINCT FROM $4::text OR plan_id IS DISTINCT FROM $5::text)) \
-    IS TRUE AS equal_end_provenance_changed \
+    IS TRUE AS equal_end_provenance_changed, \
+    (paid_invoice_id = $3::text AND plan_id = $6::text AND cancel_at_period_end <> $7::boolean) \
+    IS TRUE AS matching_proof_cancel_conflict \
     FROM public.subscriptions WHERE stripe_subscription_id = $1";
 
 /// The production subscription write has the same 15
@@ -61,7 +69,7 @@ const MATCH_HISTORY_REPLAY: &str = concat!(
 );
 
 /// Ordered parameters for the global lookup: key, incoming paid-through epoch,
-/// incoming paid invoice ID, read anchor, read plan. Do not filter on owner.
+/// incoming paid invoice ID, read anchor, read plan, incoming plan and cancel flag.
 #[derive(Debug, PartialEq, Eq)]
 pub struct LookupBinds<'a> {
     pub subscription_id: &'a str,
@@ -69,17 +77,21 @@ pub struct LookupBinds<'a> {
     pub paid_invoice_id: Option<&'a str>,
     pub read_anchor: Option<&'a str>,
     pub read_plan: Option<&'a str>,
+    pub plan: &'a str,
+    pub cancel_at_period_end: bool,
 }
 
 impl<'a> LookupBinds<'a> {
-    pub fn ordered(&self) -> (&str, Option<i64>, Option<&str>, Option<&str>, Option<&str>) {
-        (
-            self.subscription_id,
-            self.paid_through_seconds,
-            self.paid_invoice_id,
-            self.read_anchor,
-            self.read_plan,
-        )
+    pub fn typed(&self) -> [(&(dyn ToSql + Sync), Type); 7] {
+        [
+            (&self.subscription_id, Type::TEXT),
+            (&self.paid_through_seconds, Type::INT8),
+            (&self.paid_invoice_id, Type::TEXT),
+            (&self.read_anchor, Type::TEXT),
+            (&self.read_plan, Type::TEXT),
+            (&self.plan, Type::TEXT),
+            (&self.cancel_at_period_end, Type::BOOL),
+        ]
     }
 }
 
@@ -92,7 +104,7 @@ pub(crate) enum ReconcileProbe {
     BeforeInsertCommit(Option<std::rc::Rc<std::cell::Cell<bool>>>),
     ObserveStaleRefusal(std::rc::Rc<std::cell::Cell<bool>>),
     ObserveTargetRefusal(std::rc::Rc<std::cell::Cell<bool>>),
-    ObserveTerminalProvenanceRefusal(std::rc::Rc<std::cell::Cell<bool>>),
+    ObserveEqualEndProvenanceRefusal(std::rc::Rc<std::cell::Cell<bool>>),
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
@@ -107,10 +119,9 @@ pub(crate) async fn apply_reconcile_transaction(
 ) -> Result<(), crate::handlers::StoreError> {
     use crate::billing_store_classification::{
         classify_explicit_stale, classify_target, classify_write, has_slot_suppression_proof,
-        validate_read_provenance, validate_terminal_provenance, Identity, ObservedTarget, Target,
+        validate_equal_end_provenance, validate_read_provenance, Identity, ObservedTarget, Target,
     };
     use crate::{billing_reconcile::reconcile_lock_statement, handlers::StoreError};
-    use tokio_postgres::types::{ToSql, Type};
     let row = &outcome.row;
     let work = async {
         transaction
@@ -141,18 +152,13 @@ pub(crate) async fn apply_reconcile_transaction(
             paid_invoice_id: row.paid_invoice_id.as_deref(),
             read_anchor: outcome.read_anchor.as_deref(),
             read_plan: outcome.read_plan.as_deref(),
+            plan: &row.plan_id,
+            cancel_at_period_end: row.cancel_at_period_end,
         };
-        let (subscription_id, paid_through, paid_invoice, read_anchor, read_plan) = binds.ordered();
         let observed_rows = transaction
             .query_typed(
                 crate::billing_transaction_sql::LOOKUP_TARGET,
-                &[
-                    (&subscription_id, Type::TEXT),
-                    (&paid_through, Type::INT8),
-                    (&paid_invoice, Type::TEXT),
-                    (&read_anchor, Type::TEXT),
-                    (&read_plan, Type::TEXT),
-                ],
+                &binds.typed(),
             )
             .await
             .map_err(|_| StoreError)?;
@@ -167,6 +173,8 @@ pub(crate) async fn apply_reconcile_transaction(
                     predicate_stale: found.try_get("predicate_stale")?,
                     other_live_holder: found.try_get("other_live_holder")?,
                     equal_end_provenance_changed: found.try_get("equal_end_provenance_changed")?,
+                    matching_proof_cancel_conflict: found
+                        .try_get("matching_proof_cancel_conflict")?,
                 })
             })
             .collect::<Result<Vec<_>, tokio_postgres::Error>>()
@@ -195,9 +203,9 @@ pub(crate) async fn apply_reconcile_transaction(
         } else {
             validate_read_provenance(&outcome, matches!(&target, Target::Owned { .. }))
                 .map_err(|_| StoreError)?;
-            validate_terminal_provenance(&outcome, &target).map_err(|_| {
+            validate_equal_end_provenance(&outcome, &target).map_err(|_| {
                 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-                if let ReconcileProbe::ObserveTerminalProvenanceRefusal(refused) = &probe {
+                if let ReconcileProbe::ObserveEqualEndProvenanceRefusal(refused) = &probe {
                     refused.set(true);
                 }
                 StoreError
@@ -362,17 +370,17 @@ mod tests {
             LOCK_SUBSCRIPTIONS,
             "LOCK TABLE public.subscriptions IN SHARE ROW EXCLUSIVE MODE"
         );
-        assert_eq!(LOOKUP_TARGET, "SELECT user_id, stripe_subscription_id, (to_timestamp($2::bigint) IS NOT NULL AND paid_through_at IS NOT NULL AND (to_timestamp($2::bigint) < paid_through_at OR (to_timestamp($2::bigint) = paid_through_at AND $3::text IS NULL AND paid_invoice_id IS NOT NULL))) IS TRUE AS predicate_stale, EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = subscriptions.user_id AND live.stripe_subscription_id <> subscriptions.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')) AS other_live_holder, (to_timestamp($2::bigint) = paid_through_at AND (paid_invoice_id IS DISTINCT FROM $4::text OR plan_id IS DISTINCT FROM $5::text)) IS TRUE AS equal_end_provenance_changed FROM public.subscriptions WHERE stripe_subscription_id = $1");
+        assert_eq!(LOOKUP_TARGET, "SELECT user_id, stripe_subscription_id, (to_timestamp($2::bigint) IS NOT NULL AND paid_through_at IS NOT NULL AND (to_timestamp($2::bigint) < paid_through_at OR (to_timestamp($2::bigint) = paid_through_at AND (($3::text IS NULL AND paid_invoice_id IS NOT NULL) OR paid_invoice_id IS DISTINCT FROM $4::text OR plan_id IS DISTINCT FROM $5::text)))) IS TRUE AS predicate_stale, EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = subscriptions.user_id AND live.stripe_subscription_id <> subscriptions.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')) AS other_live_holder, (to_timestamp($2::bigint) = paid_through_at AND (paid_invoice_id IS DISTINCT FROM $4::text OR plan_id IS DISTINCT FROM $5::text)) IS TRUE AS equal_end_provenance_changed, (paid_invoice_id = $3::text AND plan_id = $6::text AND cancel_at_period_end <> $7::boolean) IS TRUE AS matching_proof_cancel_conflict FROM public.subscriptions WHERE stripe_subscription_id = $1");
     }
 
     #[test]
-    fn write_retains_legacy_binds_with_owner_and_live_slot_guards() {
+    fn write_retains_legacy_binds_with_provenance_owner_and_live_slot_guards() {
         let existing = crate::billing_reconcile::store_reconciled_subscription_statement();
         let expected = existing.replacen(
             "INSERT INTO subscriptions ",
             "INSERT INTO public.subscriptions ",
             1,
-        ) + " AND subscriptions.user_id = EXCLUDED.user_id AND (EXCLUDED.status NOT IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused') OR NOT EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = EXCLUDED.user_id AND live.stripe_subscription_id <> EXCLUDED.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused'))) RETURNING user_id, stripe_subscription_id";
+        ) + " AND (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND (subscriptions.paid_invoice_id IS DISTINCT FROM $13 OR subscriptions.plan_id IS DISTINCT FROM $14)) IS NOT TRUE AND subscriptions.user_id = EXCLUDED.user_id AND (EXCLUDED.status NOT IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused') OR NOT EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = EXCLUDED.user_id AND live.stripe_subscription_id <> EXCLUDED.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused'))) RETURNING user_id, stripe_subscription_id";
         assert_eq!(WRITE_SUBSCRIPTION.trim(), expected);
 
         // Pin the insert bind order and the three additional fold inputs.
@@ -408,24 +416,58 @@ mod tests {
             paid_invoice_id: Some("invoice-example"),
             read_anchor: Some("original-anchor"),
             read_plan: Some("plus"),
+            plan: "pro",
+            cancel_at_period_end: true,
         };
-        assert_eq!(
-            binds.ordered(),
-            (
-                "sub-example",
-                Some(42),
-                Some("invoice-example"),
-                Some("original-anchor"),
-                Some("plus")
-            )
-        );
         let nulls = LookupBinds {
             subscription_id: "sub-null",
             paid_through_seconds: None,
             paid_invoice_id: None,
             read_anchor: None,
             read_plan: None,
+            plan: "free",
+            cancel_at_period_end: false,
         };
-        assert_eq!(nulls.ordered(), ("sub-null", None, None, None, None));
+        for (binds, expected) in [
+            (
+                binds,
+                [
+                    "\"sub-example\"",
+                    "Some(42)",
+                    "Some(\"invoice-example\")",
+                    "Some(\"original-anchor\")",
+                    "Some(\"plus\")",
+                    "\"pro\"",
+                    "true",
+                ],
+            ),
+            (
+                nulls,
+                [
+                    "\"sub-null\"",
+                    "None",
+                    "None",
+                    "None",
+                    "None",
+                    "\"free\"",
+                    "false",
+                ],
+            ),
+        ] {
+            let params = binds.typed();
+            assert_eq!(
+                params.clone().map(|(_, ty)| ty),
+                [
+                    Type::TEXT,
+                    Type::INT8,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::BOOL
+                ]
+            );
+            assert_eq!(params.map(|(value, _)| format!("{value:?}")), expected);
+        }
     }
 }
