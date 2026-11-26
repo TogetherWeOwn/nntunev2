@@ -1,8 +1,8 @@
-import { expect } from '@playwright/test';
+import { expect, type Locator } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { fixtureCookie, hasFixtureSession, test } from './helpers/private-music-fixture.js';
 
-test('the invited Library queues the admitted track chosen from Unknown artist', async ({
+test('the invited Library regroups by keyboard and queues the chosen admission', async ({
 	page, context, origin
 }) => {
 	const { library, player } = PRIVATE_MUSIC;
@@ -57,6 +57,19 @@ test('the invited Library queues the admitted track chosen from Unknown artist',
 	const headingAndRowOrder = () => headings.or(rows).evaluateAll((nodes, idAttribute) =>
 		nodes.map((node) => node.getAttribute(idAttribute) ?? node.textContent?.trim()), library.id
 	);
+	const groupedOrder = [
+		alderTrack.artist, alderTrack.id, willowTrack.artist, willowTrack.id,
+		'Unknown artist', target.id, otherAdmission.id
+	];
+	const actions = rows.getByRole('button', { name: `More actions for ${target.title}`, exact: true });
+	async function tabTo(control: Locator, key: 'Tab' | 'Shift+Tab') {
+		for (let steps = 0; steps < 24; steps++) {
+			if (await control.evaluate((node) => node === document.activeElement)) break;
+			await page.keyboard.press(key);
+		}
+		await expect(control).toBeFocused();
+	}
+
 	await expect(toggle).toHaveAttribute('aria-pressed', 'false');
 	await expect.poll(headingAndRowOrder).toEqual(tracks.map((track) => track.id));
 
@@ -64,14 +77,31 @@ test('the invited Library queues the admitted track chosen from Unknown artist',
 	await expect(queue).toHaveCount(0);
 	await toggle.click();
 	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
-	await expect.poll(headingAndRowOrder).toEqual([
-		alderTrack.artist, alderTrack.id, willowTrack.artist, willowTrack.id,
-		'Unknown artist', target.id, otherAdmission.id
-	]);
+	await expect.poll(headingAndRowOrder).toEqual(groupedOrder);
+	await expect(queue).toHaveCount(0);
+	await tabTo(actions, 'Tab');
+
+	// The artist headings are static. Return to the shared grouping toggle to close them.
+	await tabTo(toggle, 'Shift+Tab');
+	await page.keyboard.press('Space');
+	await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+	await expect.poll(headingAndRowOrder).toEqual(tracks.map((track) => track.id));
+	await expect(toggle).toBeFocused();
 	await expect(queue).toHaveCount(0);
 
-	await rows.getByRole('button', { name: `More actions for ${target.title}`, exact: true }).click();
-	await page.getByRole('menuitem', { name: 'Add to queue', exact: true }).click();
+	await page.keyboard.press('Enter');
+	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+	await expect.poll(headingAndRowOrder).toEqual(groupedOrder);
+	await expect(toggle).toBeFocused();
+	await expect(queue).toHaveCount(0);
+
+	await tabTo(actions, 'Tab');
+	await page.keyboard.press('Enter');
+	await expect(page.getByRole('menuitem', { name: 'Play now', exact: true })).toBeFocused();
+	await page.keyboard.press('ArrowDown');
+	await page.keyboard.press('ArrowDown');
+	await expect(page.getByRole('menuitem', { name: 'Add to queue', exact: true })).toBeFocused();
+	await page.keyboard.press('Enter');
 	await expect(queue).toHaveCount(1);
 	await expect(queue).toBeVisible();
 	await expect(queue).toHaveAttribute(player.queueId, target.id);

@@ -221,6 +221,36 @@ pub(crate) async fn verify_registration(
     ).await.unwrap().get::<_, bool>(0));
 }
 
+async fn set_fixture_locator_version(db: &mut Client, object: &str, from: &str, to: &str) {
+    // Commit the single-row fault so the real replay transaction on a fresh
+    // connection can read it. The append-only trigger is enabled at commit.
+    let tx = db.transaction().await.unwrap();
+    tx.batch_execute(
+        "SET LOCAL lock_timeout = '2s';
+         ALTER TABLE public.storage_s3_locator_intents
+           DISABLE TRIGGER storage_s3_locator_intent_append_only",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tx.execute(
+            "UPDATE public.storage_s3_locator_intents SET s3_version_id = $3
+             WHERE object_id = $1::text::uuid AND s3_version_id = $2",
+            &[&object, &from, &to],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    tx.batch_execute(
+        "ALTER TABLE public.storage_s3_locator_intents
+           ENABLE TRIGGER storage_s3_locator_intent_append_only",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
 pub(crate) async fn verify_publication(
     observer: &Client,
     upload_writer: &mut Client,
@@ -535,7 +565,9 @@ pub(crate) async fn verify_publication(
         )
         .await
         .unwrap();
-    let first = {
+    // Keep the first response only as a test oracle. The retry receives no
+    // acknowledgement from the original publication request.
+    let original_ack = {
         let mut gate = connection().await;
         let gate = gate.transaction().await.unwrap();
         let gate_pid = gate
@@ -556,9 +588,83 @@ pub(crate) async fn verify_publication(
         gate.commit().await.unwrap();
         pending.await
     };
-    assert_eq!(first.status, 200);
+
+    #[derive(Debug, PartialEq)]
+    struct PublicationReceipt {
+        track_id: String,
+        media_version: String,
+        locator_row_version: String,
+        other_row_versions: Vec<String>,
+    }
+
+    let outcome = committed.outcome();
+    let publication_receipt = async || {
+        let row = observer.query_one(
+            "SELECT s.track_id::text, l.s3_version_id, l.xmin::text,
+                    ARRAY[t.xmin::text, s.xmin::text, a.xmin::text, r.xmin::text, u.xmin::text, p.xmin::text]
+             FROM public.catalogue_s3_sources s
+             JOIN public.tracks t ON t.id = s.track_id
+             JOIN public.private_library_admissions a
+               ON (a.track_id, a.accepted_seq, a.object_id) = (s.track_id, s.accepted_seq, s.object_id)
+             JOIN public.storage_validated_digest_references r
+               ON r.reference_id = s.track_id AND r.object_id = s.object_id
+             JOIN public.storage_s3_locator_intents l ON l.object_id = s.object_id
+             JOIN public.ingest_session_reservations u ON u.multipart_object_id = s.object_id
+             JOIN public.storage_digest_inventory_intents p ON p.map_id = u.completed_map_id
+             WHERE s.source_job_id = $1 AND a.invite_id = 931 AND u.id = $2::text::uuid
+               AND u.terminal_reason = 'completed' AND u.write_lease_id IS NULL
+               AND p.map_id = $3::text::uuid AND p.media_version = $4 AND p.page_versions = $5",
+            &[&JOB, &prepared.scope.session, &outcome.map, &outcome.media_version, &outcome.page_versions],
+        ).await.unwrap();
+        PublicationReceipt {
+            track_id: row.get(0),
+            media_version: row.get(1),
+            locator_row_version: row.get(2),
+            other_row_versions: row.get(3),
+        }
+    };
+    let original = publication_receipt().await;
+    assert_eq!(original.media_version, outcome.media_version);
+
+    let other_version = "synthetic-replay-other-media-version";
+    let mut fault_writer = connection().await;
+    set_fixture_locator_version(
+        &mut fault_writer,
+        &outcome.object,
+        &original.media_version,
+        other_version,
+    )
+    .await;
+    let mismatched = publication_receipt().await;
+    assert_eq!(mismatched.track_id, original.track_id);
+    assert_eq!(mismatched.media_version, other_version);
+    assert_eq!(mismatched.other_row_versions, original.other_row_versions);
+    let refused = publish(&mut connection().await, upload_writer, Some(scope.bucket)).await;
+    let sealed = unavailable();
+    assert_eq!((refused.status, refused.body), (503, sealed.body));
+    assert_eq!(refused.extra_headers, sealed.extra_headers);
+    assert!(refused.set_cookie.is_none() && refused.retry_after.is_none());
+    assert_eq!(publication_receipt().await, mismatched);
+
+    set_fixture_locator_version(
+        &mut fault_writer,
+        &outcome.object,
+        other_version,
+        &original.media_version,
+    )
+    .await;
+    let restored = publication_receipt().await;
+    assert_eq!(restored.track_id, original.track_id);
+    assert_eq!(restored.media_version, original.media_version);
+    assert_eq!(restored.other_row_versions, original.other_row_versions);
+    let first = publish(&mut connection().await, upload_writer, Some(scope.bucket)).await;
+    assert_eq!((original_ack.status, first.status), (200, 200));
+    assert_eq!(first.body, original_ack.body);
+    assert_eq!(first.extra_headers, original_ack.extra_headers);
     let body: serde_json::Value = serde_json::from_str(&first.body).unwrap();
     let track = body["trackId"].as_str().unwrap();
+    assert_eq!(track, original.track_id);
+    assert_eq!(publication_receipt().await, restored);
     assert_eq!(
         body["sha256"],
         "c935d3368a1f2f22ca87b8ccfa6b9facae070e6e07be1e16abff513835a5f259"

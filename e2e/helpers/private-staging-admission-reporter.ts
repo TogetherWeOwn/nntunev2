@@ -82,7 +82,10 @@ export default class PrivateStagingAdmissionReporter implements Reporter {
           annotations.push(property('candidate-identity', identity));
         }
         for (const proof of proofs[name as keyof typeof proofs] ?? []) {
-          const value = exactlyOne(properties(result, proof, trackFields));
+          const fields = proof === 'private-cutoff-refusal'
+            ? { ...trackFields, cutoff_listener: uuid, refused_listener: uuid }
+            : trackFields;
+          const value = exactlyOne(properties(result, proof, fields));
           annotations.push(property(proof, value));
         }
         const evidence = annotations.length ? `<properties>${annotations.join('')}</properties>` : '';
