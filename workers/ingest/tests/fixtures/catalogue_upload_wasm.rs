@@ -158,6 +158,9 @@ pub(super) async fn publish(
     let seek = verified
         .flac_plaintext_range(&object.media, &object.plaintext_sha256, 5020..5021)
         .expect("the committed tone has a later seek anchor");
+    let retry_seek = verified
+        .flac_plaintext_range(&object.media, &object.plaintext_sha256, 10_030..10_032)
+        .expect("the committed tone spans the final seek anchor");
 
     // Install the rehearsal storage locator from the committed outcome. The
     // production publication writer owns the track and source projections.
@@ -288,6 +291,7 @@ pub(super) async fn publish(
         "track": track,
         "mediaVersion": committed.media_version,
         "seek": seek,
+        "retrySeek": retry_seek,
     })
     .to_string()
 }
