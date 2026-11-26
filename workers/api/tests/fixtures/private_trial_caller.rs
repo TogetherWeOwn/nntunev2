@@ -520,8 +520,71 @@ pub(crate) async fn verify_publication(
         .status,
         403
     );
+    // A different completed job can reference the same deduplicated object,
+    // so both catalogue receipts have identical upload bytes, digest and pins.
+    let unrelated_job = "synthetic-unrelated-replay-job";
+    let unrelated_track: String = observer
+        .query_one(
+            "WITH other_job AS (
+                 INSERT INTO public.ingest_jobs (id, user_id, idempotency_key, accepted_at, status)
+                 VALUES ($1, $2, $1, 1, 'done') RETURNING id, accepted_seq
+             ), other_track AS (
+                 INSERT INTO public.tracks (release_id, title, medium_no, track_no, duration_ms)
+                 SELECT release_id, 'Unrelated replay control', medium_no, 2, duration_ms
+                 FROM public.tracks WHERE id = $3::text::uuid RETURNING id
+             ), other_source AS (
+                 INSERT INTO public.catalogue_s3_sources (track_id, source_job_id, accepted_seq, object_id)
+                 SELECT t.id, j.id, j.accepted_seq, s.object_id
+                 FROM other_job j CROSS JOIN other_track t CROSS JOIN public.catalogue_s3_sources s
+                 WHERE s.track_id = $3::text::uuid RETURNING track_id, object_id
+             )
+             INSERT INTO public.storage_validated_digest_references (environment_id, library_id, reference_id, object_id)
+             SELECT r.environment_id, r.library_id, s.track_id, r.object_id
+             FROM other_source s JOIN public.storage_validated_digest_references r USING (object_id)
+             WHERE r.reference_id = $3::text::uuid RETURNING reference_id::text",
+            &[&unrelated_job, &owner, &track],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_ne!(unrelated_track, track);
+    let point_admission_at = async |from: &str, to: &str| {
+        assert_eq!(observer.execute(
+            "UPDATE public.private_library_admissions a SET track_id = s.track_id, accepted_seq = s.accepted_seq
+             FROM public.catalogue_s3_sources s
+             WHERE a.invite_id = 931 AND a.track_id = $1::text::uuid
+               AND s.track_id = $2::text::uuid AND a.object_id = s.object_id",
+            &[&from, &to],
+        ).await.unwrap(), 1);
+    };
+    // Leave the recipient and committed upload intact, with only the unrelated
+    // receipt eligible by admission. The retry still targets the original job.
+    point_admission_at(track, &unrelated_track).await;
+    let refused = publish(&mut publication, upload_writer, Some("fixture-bucket")).await;
+    let unavailable = crate::handlers::unavailable();
+    assert_eq!((refused.status, refused.body), (503, unavailable.body));
+    point_admission_at(&unrelated_track, track).await;
     let replay = publish(&mut publication, upload_writer, Some("fixture-bucket")).await;
     assert_eq!((replay.status, replay.body), (200, first.body));
+
+    for statement in [
+        "DELETE FROM public.storage_validated_digest_references WHERE reference_id = $1::text::uuid",
+        "DELETE FROM public.catalogue_s3_sources WHERE track_id = $1::text::uuid",
+        "DELETE FROM public.tracks WHERE id = $1::text::uuid",
+    ] {
+        assert_eq!(observer.execute(statement, &[&unrelated_track]).await.unwrap(), 1);
+    }
+    assert_eq!(
+        observer
+            .execute(
+                "DELETE FROM public.ingest_jobs WHERE id = $1",
+                &[&unrelated_job]
+            )
+            .await
+            .unwrap(),
+        1
+    );
+
     assert_eq!(
         publish(
             &mut publication,
