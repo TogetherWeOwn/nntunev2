@@ -174,7 +174,7 @@ test('Media Session Pause holds after private grant renewal until explicit Play'
 		for (const event of ['seeking', 'emptied', 'loadstart']) {
 			node.addEventListener(event, () => discontinuities.push(event));
 		}
-		return { node, starts, discontinuities, pausedAtGesture: false };
+		return { node, starts, discontinuities, pausedAtGesture: [] as boolean[] };
 	});
 
 	// A matching Play action on an already-playing decoder does not renew or restart it.
@@ -214,25 +214,38 @@ test('Media Session Pause holds after private grant renewal until explicit Play'
 	await expect(audio).toHaveJSProperty('paused', true);
 	expect(plays).toEqual([initial, continuation]);
 
-	// Capture the state at the explicit gesture as well as after the receipt arrives.
+	// Capture the state at each trusted Play gesture while waiting for the previous attempt to clear.
 	await play.evaluate((button, observation) => {
 		button.addEventListener('click', (event) => {
-			observation.pausedAtGesture = event.isTrusted && observation.node.paused && observation.starts.length === 0;
-		}, { capture: true, once: true });
+			observation.pausedAtGesture.push(event.isTrusted && observation.node.paused && observation.starts.length === 0);
+		}, { capture: true });
 	}, probe);
-	await play.click();
+	const expectedPlays = [initial, continuation, continuation];
+	const releaseResume = holdRenewal();
+	try {
+		// A response can finish before the Player clears its pending renewal. Only an
+		// accepted Play can send the next continuation. Hold that reply during the poll.
+		await expect.poll(async () => {
+			if (plays.length === 2) await play.click();
+			return plays;
+		}).toEqual(expectedPlays);
+		await expect(audio).toHaveJSProperty('paused', true);
+		expect(await probe.evaluate(({ starts }) => starts)).toEqual([]);
+	} finally {
+		releaseResume();
+	}
 	await expect.poll(() => audio.evaluate((node: HTMLAudioElement, { original, saved }) =>
 		node === original.node && !node.paused && !node.error && node.currentTime > saved + 0.2,
 	{ original: probe, saved })).toBe(true);
 	const { starts, discontinuities, pausedAtGesture } = await probe.evaluate(({ starts, discontinuities, pausedAtGesture }) =>
 		({ starts, discontinuities, pausedAtGesture }));
-	expect(pausedAtGesture).toBe(true);
+	expect(pausedAtGesture.length).toBeGreaterThan(0);
+	expect(pausedAtGesture).not.toContain(false);
 	expect(starts).toEqual([saved]);
 	expect(discontinuities).toEqual([]);
 	await expect(audio).toHaveJSProperty('currentSrc', mediaUrl);
 	await expectQueue();
-	// The superseded renewal is not published to the client. Explicit Play reuses the same receipt.
-	expect(plays).toEqual([initial, continuation, continuation]);
+	expect(plays).toEqual(expectedPlays);
 	expect(listenEvents).toEqual([]);
 	await probe.dispose();
 });
