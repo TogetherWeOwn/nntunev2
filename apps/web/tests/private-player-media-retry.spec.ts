@@ -52,7 +52,7 @@ const test = base.extend<{ origin: string }>({
 test.use({ serviceWorkers: 'block' });
 
 async function checkRelayRetry(page: Page, origin: string, {
-	refuseFirstContinuation = false, resumedSpeed = initialSpeed
+	refuseFirstContinuation = false, resumedSpeed = initialSpeed, muteWhilePending = false
 } = {}) {
 	const context = page.context();
 	const { library, player: contract } = PRIVATE_MUSIC;
@@ -171,6 +171,7 @@ async function checkRelayRetry(page: Page, origin: string, {
 		});
 		return observation;
 	});
+	const mute = player.getByRole('button', { name: 'Mute', exact: true });
 	try {
 		if (refuseFirstContinuation) {
 			const refused = page.waitForResponse(playsUrl);
@@ -197,6 +198,14 @@ async function checkRelayRetry(page: Page, origin: string, {
 		expect(continuationConfirmed).toBe(false);
 		expect(mediaRequests).toEqual([mediaUrl]);
 		expect(await audioFailed()).toBe(true);
+		if (muteWhilePending) {
+			await expect(audio).toHaveJSProperty('muted', false);
+			await expect(mute).toHaveAttribute('aria-pressed', 'false');
+			await mute.click();
+			await expect(audio).toHaveJSProperty('muted', true);
+			await expect(mute).toHaveAttribute('aria-pressed', 'true');
+			expect(continuationConfirmed).toBe(false);
+		}
 	} finally {
 		releaseContinuation.resolve();
 	}
@@ -210,6 +219,10 @@ async function checkRelayRetry(page: Page, origin: string, {
 	await expect(retry).toHaveCount(0);
 	await expect(audio).toHaveAttribute('src', mediaPath);
 	await assertSelection();
+	if (muteWhilePending) {
+		await expect(audio).toHaveJSProperty('muted', true);
+		await expect(mute).toHaveAttribute('aria-pressed', 'true');
+	}
 	expect(plays).toEqual(expectedPlays);
 	// A single resumed FLAC load may legitimately make several byte-range requests.
 	expect(mediaRequests.length).toBeGreaterThan(1);
@@ -226,4 +239,8 @@ test('invited Library Retry resumes at the speed chosen while its receipt was pe
 
 test('invited Library playback waits for another Retry after a temporary receipt failure', async ({ page, origin }) => {
 	await checkRelayRetry(page, origin, { refuseFirstContinuation: true });
+});
+
+test('invited Library Retry resumes with mute chosen while its receipt was pending', async ({ page, origin }) => {
+	await checkRelayRetry(page, origin, { muteWhilePending: true });
 });
