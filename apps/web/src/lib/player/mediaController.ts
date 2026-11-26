@@ -160,7 +160,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				}
 				const rateTarget = { audio, matches: matchesAttempt };
 				const liveRate = speed.read(rateTarget);
-				const seconds = recoverPosition ? audio.currentTime : 0;
+				const seconds = recoverPosition ? get(absoluteSeek).elapsed : 0;
 				const restore = trackId && Number.isFinite(seconds) && seconds > 0 ?
 					captureShareSeek(++positionIntent, { trackId, seconds }, matches) : undefined;
 				if (!matchesAttempt()) return;
@@ -525,11 +525,15 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 
 	function observeAbsoluteSeek(audio: HTMLAudioElement, matches: () => boolean, feedback?: string, replay = false, nativeSeeking = false, onUnavailable?: () => void): void {
 		const attachment = attachmentVersion;
-		const observation = readAbsoluteSeek(audio);
-		if (!observation.enabled) onUnavailable?.();
+		const observed = readAbsoluteSeek(audio);
+		if (!observed.enabled) onUnavailable?.();
 		if (!matches()) return;
 		const prior = get(absoluteSeek);
 		const previous = prior.attachment === attachment ? prior : emptySeek;
+		// An empty or failed private decoder cannot replace the last settled position.
+		const observation = selection?.prepare && !observed.duration && previous.duration
+			? { ...observed, duration: previous.duration, position: previous.elapsed }
+			: observed;
 		// In-flight time/progress updates move the thumb, not the seek comparison point.
 		const message = feedback ?? (nativeSeeking && observation.position !== seekAnchor ? '' : previous.feedback);
 		if (feedback !== undefined || nativeSeeking || !observation.seeking) seekAnchor = observation.position;

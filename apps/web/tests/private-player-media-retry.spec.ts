@@ -50,7 +50,7 @@ const test = base.extend<{ origin: string }>({
 
 test.use({ serviceWorkers: 'block' });
 
-async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinuation = false } = {}) {
+async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinuation = false, expireWhilePlaying = false } = {}) {
 	const context = page.context();
 	const { library, player: contract } = PRIVATE_MUSIC;
 	const tone = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
@@ -61,7 +61,8 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 	const mediaRequests: string[] = [];
 	const releaseContinuation = Promise.withResolvers<void>();
 	let playbackSessionId = '';
-	let failFirstLoad = true;
+	let failFirstLoad = !expireWhilePlaying;
+	let grantExpired = false;
 	let continuationConfirmed = false;
 
 	await context.route('**/*', (route) => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
@@ -81,7 +82,7 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 			await call.headerValue('x-nntune-session-binding') !== binding) return route.fulfill({ status: 400 });
 		if (!playbackSessionId && input.play_id === undefined) {
 			playbackSessionId = input.session_id;
-		} else if (input.session_id !== playbackSessionId || input.play_id !== playId) {
+		} else if (input.session_id !== playbackSessionId || input.play_id !== playId || (expireWhilePlaying && !grantExpired)) {
 			return route.fulfill({ status: 409 });
 		} else if (refuseFirstContinuation && plays.length === 2) {
 			return route.fulfill({ status: 503 });
@@ -107,7 +108,10 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 			failFirstLoad = false;
 			return route.fulfill({ status: 503 });
 		}
-		if (!continuationConfirmed) return route.fulfill({ status: 409 });
+		if (!continuationConfirmed) {
+			if (grantExpired) return route.fulfill({ status: 404 });
+			if (!expireWhilePlaying) return route.fulfill({ status: 409 });
+		}
 		return serveFlac(route, tone.body);
 	});
 
@@ -115,6 +119,7 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 	const audio = player.getByTestId(contract.audio);
 	const status = player.getByRole('status');
 	const retry = player.getByRole('button', { name: 'Retry playback', exact: true });
+	const seek = player.getByRole('slider', { name: 'Seek', exact: true });
 	const playbackFailure = 'This audio could not be loaded or played. Retry playback or choose another track.';
 	const audioFailed = () => audio.evaluate((node: HTMLAudioElement) => node.paused && node.error !== null);
 	const expectNoPlaybackRequest = () => expect(page.waitForRequest(
@@ -139,10 +144,37 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 
 	const initialMedia = page.waitForResponse((response) => response.url().startsWith(mediaPrefix));
 	await player.getByRole('button', { name: 'Play', exact: true }).click();
-	expect((await initialMedia).status()).toBe(503);
+	let checkpoint: number | undefined;
+	if (expireWhilePlaying) {
+		expect((await initialMedia).ok()).toBe(true);
+		await expect(status).toHaveText('Playing');
+		await expect.poll(async () => Number(await seek.inputValue())).toBeGreaterThan(2);
+		const slider = (await seek.elementHandle())!;
+		grantExpired = true;
+		const expiredRead = page.waitForResponse((response) => response.url().startsWith(mediaPrefix) && response.status() === 404);
+		try {
+			checkpoint = await audio.evaluate((node: HTMLAudioElement, control: HTMLInputElement) => {
+				const elapsed = control.valueAsNumber;
+				node.addEventListener('playing', () => { node.dataset.resumedAt = String(node.currentTime); }, { once: true });
+				// Force Chromium to reread the expired locator even if the tone is fully buffered.
+				node.load();
+				return elapsed;
+			}, slider);
+		} finally {
+			await slider.dispose();
+		}
+		await expiredRead;
+	} else expect((await initialMedia).status()).toBe(503);
+
+	const expectCheckpoint = async () => {
+		if (checkpoint === undefined) return;
+		await expect(seek).toBeDisabled();
+		await expect(seek).toHaveValue(String(checkpoint));
+	};
 	await expect(status).toHaveText(playbackFailure);
 	await expect(retry).toBeEnabled();
 	await expect.poll(audioFailed).toBe(true);
+	await expectCheckpoint();
 	await assertSelection();
 
 	await expectNoPlaybackRequest();
@@ -152,7 +184,10 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 	expect(plays).toEqual([start]);
 	const mediaPath = mediaPathFor(playbackSessionId);
 	const mediaUrl = origin + mediaPath;
-	expect(mediaRequests).toEqual([mediaUrl]);
+	const failedMediaRequests = [...mediaRequests];
+	if (expireWhilePlaying) expect(failedMediaRequests.length).toBeGreaterThan(1);
+	else expect(failedMediaRequests).toEqual([mediaUrl]);
+	expect(new Set(failedMediaRequests)).toEqual(new Set([mediaUrl]));
 	await expect(audio).toHaveAttribute('src', mediaPath);
 
 	const continuation = { ...start, play_id: playId };
@@ -167,8 +202,9 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 			await expect(retry).toBeEnabled();
 			await expectNoPlaybackRequest();
 			expect(plays).toEqual([start, continuation]);
-			expect(mediaRequests).toEqual([mediaUrl]);
+			expect(mediaRequests).toEqual(failedMediaRequests);
 			expect(await audioFailed()).toBe(true);
+			await expectCheckpoint();
 			await expect(audio).toHaveAttribute('src', mediaPath);
 			await assertSelection();
 		}
@@ -177,20 +213,24 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 		await expect.poll(() => plays).toEqual(expectedPlays);
 		// Hold the receipt response and check that Retry has not reloaded the decoder.
 		await expectNoPlaybackRequest();
-		expect(mediaRequests).toEqual([mediaUrl]);
+		expect(mediaRequests).toEqual(failedMediaRequests);
 		expect(await audioFailed()).toBe(true);
 	} finally {
 		releaseContinuation.resolve();
 	}
 	await expect(status).toHaveText('Playing');
-	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) =>
-		!node.paused && node.error === null && node.currentTime > 0.2)).toBe(true);
+	await expect.poll(() => audio.evaluate((node: HTMLAudioElement, elapsed) =>
+		!node.paused && node.error === null && node.currentTime > elapsed + 0.2, checkpoint ?? 0)).toBe(true);
+	if (checkpoint !== undefined) {
+		await expect(audio).toHaveAttribute('data-resumed-at', /\d/);
+		expect(Math.abs(Number(await audio.getAttribute('data-resumed-at')) - checkpoint)).toBeLessThan(0.3);
+	}
 	await expect(retry).toHaveCount(0);
 	await expect(audio).toHaveAttribute('src', mediaPath);
 	await assertSelection();
 	expect(plays).toEqual(expectedPlays);
 	// A single resumed FLAC load may legitimately make several byte-range requests.
-	expect(mediaRequests.length).toBeGreaterThan(1);
+	expect(mediaRequests.length).toBeGreaterThan(failedMediaRequests.length);
 	expect(new Set(mediaRequests)).toEqual(new Set([mediaUrl]));
 }
 
@@ -200,4 +240,8 @@ test('invited Library playback retries a failed relay using the original receipt
 
 test('invited Library playback waits for another Retry after a temporary receipt failure', async ({ page, origin }) => {
 	await checkRelayRetry(page, origin, { refuseFirstContinuation: true });
+});
+
+test('invited Library playback resumes from its last position after an expired renewal returns 503', async ({ page, origin }) => {
+	await checkRelayRetry(page, origin, { expireWhilePlaying: true, refuseFirstContinuation: true });
 });
