@@ -12,7 +12,9 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
 If dedicated PostgreSQL provisioning stops partway through, use the
 [Stage C recovery handoff](private-staging-trial-recovery.md) before retrying.
 
-1. **Prepare the isolated database.** Run the [catalog preflight](#isolated-database-catalog-preflight)
+1. **Prepare the isolated database.** For the dedicated PostgreSQL target,
+   verify the [storage handoff](#storage-closeout-before-stage-c1) before C1
+   provisioning or database writes. Run the [catalog preflight](#isolated-database-catalog-preflight)
    before preparing ACLs or issuing either login. If the isolated branch has
    ambient database grants, qualify the [database ACL preparation](#isolated-database-acl-preparation)
    before issuance. Issue the two dedicated SQL logins through the branch's
@@ -557,6 +559,59 @@ handoff on paper.
    staging fixture`. Record the planned cleanup separately from the stopped
    journey. End the exercise before dispatch.
 
+## Storage closeout before Stage C1
+
+The protected storage-only rollout owner provides the closeout receipt. The
+database preparation operator reads it before any C1 provisioning or database
+write. Compare it with the approved storage attempt and record the receipt
+reference and the outcome in the protected C1 record. Keep the trial disarmed
+and the database lane read-only until all three checks pass.
+
+1. **Identify the run.** Match the storage rollout attempt, reviewed merge and
+   dispatch commits, and the disposable scope SHA-256. Match the protected
+   main `staging-trial-provider-preflight` run ID, attempt `1`, job ID and
+   tested SHA to that dispatch. Require the job's executed storage probe and
+   its fixed `qualified` verdict. A local disposable pass or a skipped probe
+   leaves storage qualification pending. Refer any stop to the storage owner
+   for reconciliation before accepting the handoff.
+2. **Verify exact absence.** After the probe and before disposal, require
+   independent provider reads for the selected version's empty `404` and the
+   sibling's matching ETag. At closeout require both pinned versions absent by
+   exact-version HEAD and an empty scoped inventory of versions, delete markers
+   and multipart uploads. Match the storage owner's completed DNS closeout to
+   the exact attempt and require the recorded Caddy, staging Environment and
+   scoped resource disposal readbacks. A delete acknowledgement or a successful
+   Compose `down` alone leaves closeout pending.
+3. **Verify writer release.** Require the timestamped release and successful
+   free readback on the original shared writer lock after verified closeout.
+   A line saying the launcher will release, a retained writer, an unavailable
+   readback or another holder at readback leaves the handoff pending. Use the
+   existing writer coordination before C1 writes. A prior release does not
+   establish that the window is available now.
+
+### Offline storage handoff walkthrough
+
+Use the following synthetic readbacks as one receipt. The labels stand in for
+protected references and full digests. No workflow or provider calls are
+needed to walk through the C1 decision.
+
+| Check | Synthetic evidence |
+| --- | --- |
+| Run | Approved attempt `storage-02` pins merge `M2`, dispatch `D2` and scope digest `S2`. Its protected run `8202`, attempt `1`, job `9202`, tested `D2` with the `S2` dispatch. The probe recorded `qualified` at `10:00 UTC`. |
+| Independent verification | At `10:01 UTC`, admin HEAD for scope `S2` reads selected `v2-selected` as empty `404` and the sibling `v2-sibling` as `200` with its original ETag. By `10:03 UTC`, exact HEAD confirms both absent and inventory shows zero versions, delete markers and uploads. At `10:03 UTC`, the storage owner records completed closeout for `storage-02` with passing DNS, Caddy, Environment and scoped resource disposal readbacks. |
+| Writer | At `10:04 UTC` the storage owner records release and a free readback on the same shared writer lock. |
+
+The database operator accepts the storage prerequisite for `storage-02` at
+`10:05 UTC`. Independently change job `9202` to a job from attempt `storage-01`,
+remove the exact HEAD read for `v2-sibling` while leaving its delete success,
+or replace the free readback with a retained writer. Each change leaves C1
+pending. So does moving the release to `10:02 UTC`, before absence was verified,
+or recording that another holder took the lock before readback. A stop before
+dispatch also leaves C1 pending even if rollback verifies absence and writer
+release. The storage owner resolves missing storage or DNS evidence. The
+database operator still needs the separate database admission, rehearsal and
+connection evidence for their respective stages.
+
 ## Stage C2 Hyperdrive origin connection
 
 **Setup pending.** The dedicated PostgreSQL trial uses four distinct Hyperdrive
@@ -585,7 +640,7 @@ For the dedicated stock PostgreSQL route, use the
 and Tunnel capacity readback and the separate operator connection.
 
 C1 provisioning waits for completed C0, a passing disposable rehearsal from
-the merged source and the staging writer handoff after storage qualification.
+the merged source and the [verified storage handoff](#storage-closeout-before-stage-c1).
 C2 verifies the actual serving connections after authorized provisioning.
 Collect both readbacks independently for each of the four bindings, using its
 own `<hyperdrive-config-id>`. Keep each config unchanged across its readback
