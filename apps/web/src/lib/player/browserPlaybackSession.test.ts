@@ -3,7 +3,7 @@ import { captureSystemActions, expireInsideRequestWindow, grantReply, initial, r
 import { get } from 'svelte/store';
 test('new plays use the acknowledged mode in the same tab and continuations keep the established source', async () => {
 	const system = captureSystemActions();
-	const { player, media, queue, fetchFn, starts, refresh, src, attach, toggleDuringFirstPlay, requests } = setup();
+	const { player, media, queue, fetchFn, starts, refresh, src, attach, delayGrant, toggleDuringFirstPlay, requests } = setup();
 	media.captureShareSeek(media.beginShareInput(), { trackId: 'first', seconds: 18 }, () => true);
 	expect([player.privateListening?.enabled, src(), fetchFn.mock.calls.length, media.sharePosition()]).toEqual([false, '', 0, 0]);
 	await toggleDuringFirstPlay();
@@ -24,9 +24,14 @@ test('new plays use the acknowledged mode in the same tab and continuations keep
 	expect([src(), audio.currentTime, audio.load.mock.calls.length]).toEqual([first, 36, 1]);
 	expect(requests().slice(2).map((body) => body.play_id)).toEqual(Array(3).fill('play-1'));
 	media.sleepTimer.start({ kind: 'duration', ms: 60_000 }, 'Armed');
+	const successor = delayGrant();
 	system.get('nexttrack')!();
-	expect([src(), fetchFn.mock.calls.length]).toEqual(['', 5]);
-	system.get('play')!();
+	await successor.started;
+	const pending = { source: src(), audio: media.audio, request: requests().at(-1) };
+	successor.reply(undefined);
+	expect(pending.source).toBe(first);
+	expect(pending.audio).toBe(audio);
+	expect(pending.request).toEqual({ track_id: 'second', session_id: tab });
 	await vi.waitFor(() => expect([src(), media.audio?.paused, get(media.sleepTimer).armed]).toEqual([`/v1/plays/media/second/${tab}/play-2`, false, true]));
 	expect(queue.snapshot.tracks).toEqual(initial.tracks);
 	await player.setPrivateListening(false);

@@ -1,43 +1,19 @@
-import { fileURLToPath } from 'node:url';
-import { expect, test, type Request, type Route } from '@playwright/test';
-import { preview } from 'vite';
+import { expect, type Request } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { privateStagingAudio } from '../../../e2e/helpers/private-staging-fixture.js';
+import { fixtureCookie, hasFixtureSession, serveFlac, test } from './helpers/private-music-fixture.js';
 
-const fixtureCookie = 'private_music_fixture_session';
+const listener = 'synthetic-listener';
 const binding = 'A'.repeat(43);
 const isListener = async (request: Request) =>
-	(await request.headerValue('cookie'))?.split('; ').includes(`${fixtureCookie}=synthetic-listener`);
+	hasFixtureSession(await request.headerValue('cookie'), listener);
 
-function serveFlac(route: Route, body: Buffer) {
-	const range = /^bytes=(\d+)-(\d*)$/.exec(route.request().headers()['range'] ?? '');
-	const start = range ? Number(range[1]) : 0;
-	const end = range?.[2] ? Math.min(Number(range[2]), body.length - 1) : body.length - 1;
-	if (start > end) return route.fulfill({ status: 416, headers: { 'content-range': `bytes */${body.length}` } });
-	return route.fulfill({
-		status: range ? 206 : 200, contentType: 'audio/flac', body: body.subarray(start, end + 1),
-		headers: { 'accept-ranges': 'bytes', ...(range && { 'content-range': `bytes ${start}-${end}/${body.length}` }) }
-	});
-}
-
-test.use({ serviceWorkers: 'block' });
-
-test('invited Library playback opens a fresh receipt to repeat the current track on natural end', async ({ page, context }) => {
-	test.setTimeout(45_000);
-	// Arm private playback only in this loopback browser-fixtures preview.
-	const previous = process.env['PUBLIC_BROWSER_PLAYBACK'];
-	process.env['PUBLIC_BROWSER_PLAYBACK'] = '1';
-	const server = await preview({
-		root: fileURLToPath(new URL('../', import.meta.url)), mode: 'browser-fixtures',
-		preview: { host: '127.0.0.1', port: 0 }
-	}).finally(() => {
-		if (previous === undefined) delete process.env['PUBLIC_BROWSER_PLAYBACK'];
-		else process.env['PUBLIC_BROWSER_PLAYBACK'] = previous;
-	});
-	try {
-		const address = server.httpServer.address();
-		if (!address || typeof address === 'string') throw new Error('Missing private fixture TCP address');
-		const origin = `http://127.0.0.1:${address.port}`;
+for (const { name, failFirstLoad } of [
+	{ name: 'invited Library playback opens a fresh receipt to repeat the current track on natural end', failFirstLoad: false },
+	{ name: 'invited Library playback repeats the recovered track on natural end after Retry', failFirstLoad: true }
+]) {
+	test(name, async ({ page, context, origin }) => {
+		test.setTimeout(45_000);
 		const { library, player: contract } = PRIVATE_MUSIC;
 		const grantUrl = origin + contract.plays;
 		const tracks = privateStagingAudio().map(({ file, body }, index) => ({
@@ -52,9 +28,11 @@ test('invited Library playback opens a fresh receipt to repeat the current track
 		const mediaRequests = new Set<string>();
 		let issued = 0;
 		let activeMedia: { path: string; body: Buffer } | undefined;
+		let initialMediaFailed = false;
+		let continued = false;
 
 		await context.route('**/*', (route) => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
-		await context.addCookies([{ name: fixtureCookie, value: 'synthetic-listener', url: origin, httpOnly: true }]);
+		await context.addCookies([{ name: fixtureCookie, value: listener, url: origin, httpOnly: true }]);
 		await page.route(`${origin}/v1/me/likes/session`, async (route) => (await isListener(route.request()))
 			? route.fulfill({ json: { session_binding: binding } }) : route.fulfill({ status: 401 }));
 		await page.route(origin + library.api, async (route) => {
@@ -74,9 +52,16 @@ test('invited Library playback opens a fresh receipt to repeat the current track
 				await call.headerValue('x-nntune-session-binding') !== binding) return route.fulfill({ status: 400 });
 			const { track_id, session_id, play_id } = call.postDataJSON() ?? {};
 			const track = tracks.find(({ id }) => id === track_id);
-			if (!track || typeof session_id !== 'string' || !/^[0-9a-f-]{36}$/.test(session_id) ||
-				play_id !== undefined) return route.fulfill({ status: 400 });
-			activeMedia = { path: pathFor(track.id, session_id, ++issued), body: track.body };
+			if (!track || typeof session_id !== 'string' || !/^[0-9a-f-]{36}$/.test(session_id)) {
+				return route.fulfill({ status: 400 });
+			}
+			if (play_id === undefined) {
+				activeMedia = { path: pathFor(track.id, session_id, ++issued), body: track.body };
+			} else {
+				if (!initialMediaFailed || continued || issued !== 1 || play_id !== playIdFor(1) ||
+					activeMedia?.path !== pathFor(track.id, session_id, 1)) return route.fulfill({ status: 409 });
+				continued = true;
+			}
 			return route.fulfill({ json: { trackId: track.id, playbackSessionId: session_id,
 				sessionBinding: binding, playId: playIdFor(issued), durationMs: track.duration_ms } });
 		});
@@ -85,6 +70,11 @@ test('invited Library playback opens a fresh receipt to repeat the current track
 			if (call.method() !== 'GET' || !await isListener(call) || !activeMedia || call.url() !== origin + activeMedia.path) {
 				return route.fulfill({ status: 404 });
 			}
+			if (failFirstLoad && issued === 1 && !continued) {
+				if (initialMediaFailed) return route.fulfill({ status: 409 });
+				initialMediaFailed = true;
+				return route.fulfill({ status: 503 });
+			}
 			return serveFlac(route, activeMedia.body);
 		});
 
@@ -92,10 +82,12 @@ test('invited Library playback opens a fresh receipt to repeat the current track
 		const queue = page.getByTestId(contract.queueItem);
 		const active = page.locator(contract.currentQueueItem);
 		const player = page.getByRole('region', { name: 'Player', exact: true });
+		const retry = player.getByRole('button', { name: 'Retry playback', exact: true });
 		const audio = page.getByTestId(contract.audio);
 		const queueIds = () => queue.evaluateAll((items, attr) => items.map((item) => item.getAttribute(attr)), contract.queueId);
 		const expectPlayingNearStart = (path: string) => expect.poll(() => audio.evaluate((node: HTMLAudioElement, src) =>
-			node.currentSrc === src && !node.paused && !node.ended && node.currentTime > 0.2 && node.currentTime < 3,
+			node.currentSrc === src && !node.paused && !node.ended && node.error === null &&
+				node.currentTime > 0.2 && node.currentTime < 3,
 			origin + path
 		), 'private receipt audio plays near the start').toBe(true);
 
@@ -105,15 +97,33 @@ test('invited Library playback opens a fresh receipt to repeat the current track
 		}
 		await expect.poll(queueIds).toEqual([first.id, successor.id]);
 		await expect(active).toHaveAttribute(contract.queueId, first.id);
-		await page.getByLabel('Repeat', { exact: true }).selectOption('one');
-		await expect(page.getByTestId('repeat-status')).toHaveText('Repeat: One');
+		const repeat = page.getByLabel('Repeat', { exact: true });
+		const repeatStatus = page.getByTestId('repeat-status');
+		await repeat.selectOption('one');
+		await expect(repeatStatus).toHaveText('Repeat: One');
 		await expect(audio).toHaveCount(0);
 		expect(grants).toHaveLength(0);
 		const firstGrant = page.waitForRequest(grantUrl);
 		await player.getByRole('button', { name: 'Play', exact: true }).click();
 		const tab: string = (await firstGrant).postDataJSON().session_id;
 		const initialPath = pathFor(first.id, tab, 1);
+		const start = { track_id: first.id, session_id: tab };
+		const expectedGrants: (typeof start & { play_id?: string })[] = [start];
+		if (failFirstLoad) {
+			await expect(retry).toBeEnabled();
+			await expect(audio).toHaveAttribute('src', initialPath);
+			await expect.poll(() => audio.evaluate((node: HTMLAudioElement) =>
+				node.paused && node.error !== null)).toBe(true);
+			expect(initialMediaFailed).toBe(true);
+			expect(grants.map((request) => request.postDataJSON())).toEqual(expectedGrants);
+			await retry.press('Enter');
+			expectedGrants.push({ ...start, play_id: playIdFor(1) });
+		}
 		await expectPlayingNearStart(initialPath);
+		await expect(retry).toHaveCount(0);
+		await expect(repeat).toHaveValue('one');
+		await expect(repeatStatus).toBeVisible();
+		await expect(repeatStatus).toHaveText('Repeat: One');
 
 		// Let Chromium play the fixture to completion at its normal speed.
 		const end = await audio.evaluate((node: HTMLAudioElement) => new Promise<{
@@ -131,17 +141,16 @@ test('invited Library playback opens a fresh receipt to repeat the current track
 		await expectPlayingNearStart(replayPath);
 		await expect(active, 'natural completion keeps the first track selected').toHaveAttribute(contract.queueId, first.id);
 		await expect(player.getByTestId('library-now-playing')).toHaveText(first.title);
+		await expect(repeat).toHaveValue('one');
+		await expect(repeatStatus).toBeVisible();
+		await expect(repeatStatus).toHaveText('Repeat: One');
 		await expect.poll(queueIds).toEqual([first.id, successor.id]);
 		expect([...mediaRequests]).toEqual([initialPath, replayPath]);
 		// A repeat is a fresh start for the same tab, with no retry play ID.
-		expect(grants.map((request) => request.postDataJSON())).toEqual([
-			{ track_id: first.id, session_id: tab }, { track_id: first.id, session_id: tab }
-		]);
+		expect(grants.map((request) => request.postDataJSON())).toEqual([...expectedGrants, start]);
 		const grantStarts = await page.evaluate((url) =>
 			performance.getEntriesByName(url, 'resource').map(({ startTime }) => startTime), grantUrl);
-		expect(grantStarts).toHaveLength(2);
-		expect(grantStarts[1], 'the second grant starts after the trusted end').toBeGreaterThanOrEqual(end.at);
-	} finally {
-		await server.close();
-	}
-});
+		expect(grantStarts).toHaveLength(expectedGrants.length + 1);
+		expect(grantStarts.at(-1), 'the replay grant starts after the trusted end').toBeGreaterThanOrEqual(end.at);
+	});
+}

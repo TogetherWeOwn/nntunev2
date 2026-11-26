@@ -81,6 +81,30 @@ class EnvironmentReadbackTests(unittest.TestCase):
                                         f"{BASELINE}: saved REST protection evidence matches\n")
         self.assertEqual(result.stderr, "")
 
+    def test_custodian_handoff_before_and_after(self):
+        # A same-named tag expands bootstrap access. Baseline bypass is separately enabled.
+        self.save(BOOTSTRAP, "branch-policies", {
+            "total_count": 2,
+            "branch_policies": [{"type": "branch", "name": "main"}, {"type": "tag", "name": "main"}],
+        })
+        self.save(BASELINE, "environment", self.baseline | {"can_admins_bypass": True})
+        before = self.readback()
+        self.assertEqual((before.returncode, before.stdout, before.stderr), (
+            1,
+            f"{BOOTSTRAP}: refused: a complete branch policy response must contain only branch main\n"
+            f"{BASELINE}: refused: REST reports administrator bypass enabled\n",
+            "",
+        ))
+
+        save_complete_readback(self.directory)
+        after = self.readback()
+        self.assertEqual((after.returncode, after.stdout, after.stderr), (
+            0,
+            f"{BOOTSTRAP}: saved REST protection evidence matches\n"
+            f"{BASELINE}: saved REST protection evidence matches\n",
+            "",
+        ))
+
     def test_missing_misidentified_or_unprotected_environment(self):
         (self.directory / f"{BOOTSTRAP}.environment.json").unlink()
         self.assert_blocked(BOOTSTRAP, "unresolved: missing or invalid Environment response")

@@ -10,6 +10,7 @@ import sys
 STAGING = "staging.nntune.com"
 STRIPE = "api.stripe.com"
 MAX_BYTES = 64 * 1024
+ENROLLMENT_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 PREREQUISITES = (
     "staging_isolated", "invoice_history", "effective_privileges",
     "stream_deployed", "stripe_configuration", "synthetic_scope", "teardown_ready",
@@ -66,7 +67,7 @@ def get_json(host, path, headers):
 def validate_evidence(evidence, sha, phase):
     required = {"app", "environment", "origin", "build", "stripe_account", "checks"}
     if phase == "finish":
-        required.add("checkout_session")
+        required.update(("checkout_session", "enrollment_id", "playback_receipt"))
     require(isinstance(evidence, dict) and evidence.keys() == required, "missing_evidence")
     require((evidence["app"], evidence["environment"], evidence["origin"])
             == ("nntune-v2", "staging", f"https://{STAGING}"), "wrong_target")
@@ -79,6 +80,22 @@ def validate_evidence(evidence, sha, phase):
     if phase == "finish":
         require(matches(evidence["checkout_session"], r"cs_test_[A-Za-z0-9]{1,128}"),
                 "stripe_mode")
+        validate_playback_receipt(evidence, sha)
+
+
+def validate_playback_receipt(evidence, sha):
+    enrollment_id = evidence["enrollment_id"]
+    require(matches(enrollment_id, ENROLLMENT_ID), "invalid_enrollment")
+    receipt = evidence["playback_receipt"]
+    fields = {"build", "checkout_session", "enrollment_id", "played_at", "metered_at"}
+    require(isinstance(receipt, dict) and receipt.keys() == fields, "invalid_playback_receipt")
+    played_at, metered_at = receipt["played_at"], receipt["metered_at"]
+    require(type(played_at) is int and type(metered_at) is int and 0 < played_at <= metered_at,
+            "invalid_playback_receipt")
+    require(receipt["build"] == sha, "wrong_build")
+    require(receipt["checkout_session"] == evidence["checkout_session"], "playback_checkout_mismatch")
+    require(matches(receipt["enrollment_id"], ENROLLMENT_ID), "invalid_playback_receipt")
+    require(receipt["enrollment_id"] == enrollment_id, "playback_enrollment_mismatch")
 
 
 def verify_staging_build(sha, access):

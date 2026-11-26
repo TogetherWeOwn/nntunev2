@@ -7,9 +7,10 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { finalSmokeFixture, mainSha, recoveryError, recoveryFixture } from './fixtures/production-worker-transport.mjs';
 import { seedTransport } from './fixtures/production-maintenance-seed.mjs';
-import { admitRecovery } from './production-maintenance/recovery-evidence.mjs';
+import { admitRecovery, intentFile } from './production-maintenance/recovery-evidence.mjs';
 import { seedMaintenance } from './production-maintenance/seed.mjs';
 import worker from './production-maintenance/worker.mjs';
+import promotionProof from './release-promotion-proof.cjs';
 
 for (const path of ['/', '/api/build', '/api/health', '/_app/immutable/app.js']) {
   test(`maintenance fails closed on ${path}`, async () => {
@@ -359,6 +360,69 @@ test('a regression during the release watch restores the verified previous Worke
   assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
 });
 
+test('a successful first release hands its original intent to recovery preparation', async (t) => {
+  const transport = finalSmokeFixture(t, rollbackFixture);
+  const { candidate, custody, env, rows, run, temp } = transport;
+  await transport.prepare();
+  assert.deepEqual(rows[0].versions, [{ version_id: candidate, percentage: 100 }]);
+  assert.equal(rows[3].id, custody.maintenance.deployment);
+  assert.deepEqual(rows[3].versions, [{ version_id: custody.maintenance.version, percentage: 100 }]);
+
+  const [admission, deploy] = workflow.split('\n  deploy-production:\n');
+  const verify = admission.split('      - name: Verify candidate deployment and accepted journey receipt\n')[1];
+  const candidatePin = 'DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}';
+  assert.ok(verify.includes(candidatePin));
+  const production = deploy.split('\n  bootstrap-maintenance:\n')[0];
+  const staging = readFileSync(new URL('../.github/workflows/deploy.yml', import.meta.url), 'utf8')
+    .split('\n  post-deploy-private-music:\n')[1];
+  const runAttempt = '${{ github.run_id }}-${{ github.run_attempt }}';
+  const uploads = [
+    [staging, 'Upload candidate admission receipt',
+      'staging-admission-${{ github.sha }}-' + runAttempt + '-private-music', 'staging-admission.json'],
+    [production, 'Preserve sealed rollback intent before shifting traffic',
+      'production-rollback-intent-' + runAttempt, '${{ runner.temp }}/' + intentFile],
+    [production, 'Upload production promotion proof',
+      'production-promotion-${{ needs.preflight.outputs.sha }}-' + runAttempt, '${{ runner.temp }}/promotion.json'],
+  ];
+  for (const [job, step, name, path] of uploads) {
+    const upload = job.split(`\n      - name: ${step}\n`)[1]?.split('\n      - ')[0];
+    assert.ok(upload, `missing upload step: ${step}`);
+    assert.match(upload, /^ {8}uses: actions\/upload-artifact@/m);
+    assert.ok(upload.split('\n').includes(`          name: ${name}`), `wrong artifact name: ${step}`);
+    assert.ok(upload.split('\n').includes(`          path: ${path}`), `wrong artifact path: ${step}`);
+  }
+  const [pin, publication] = production.split('      - name: Record successful production promotion\n');
+  assert.match(pin, /PROMOTED_VERSION: \$\{\{ steps\.gradual\.outputs\.promoted-version-id \}\}/);
+  const [recordStep] = publication.split('      - name: Upload production promotion proof\n');
+  assert.ok(recordStep.includes(candidatePin));
+  assert.match(recordStep, /PROMOTED_VERSION_ID: \$\{\{ steps\.gradual\.outputs\.promoted-version-id \}\}/);
+  const record = recordStep.match(/node <<'NODE'\n([\s\S]*?)^ {10}NODE$/m);
+  assert.ok(record, 'production must supply the promotion receipt writer');
+  const result = spawnSync(process.execPath, ['-'], {
+    input: record[1], encoding: 'utf8', timeout: 5_000,
+    env: { DEPLOY_SHA: sha, PROMOTED_VERSION_ID: candidate, RUNNER_TEMP: temp,
+      GITHUB_REPOSITORY: env.GITHUB_REPOSITORY, GITHUB_RUN_ID: env.GITHUB_RUN_ID,
+      GITHUB_RUN_ATTEMPT: env.GITHUB_RUN_ATTEMPT },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const receipt = promotionProof.validateReceipt(JSON.parse(readFileSync(join(temp, 'promotion.json'), 'utf8')), {
+    repo: env.GITHUB_REPOSITORY, sha, runId: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT,
+  });
+  assert.equal(receipt.promoted_version_id, candidate);
+
+  const { fresh, evidence } = recoveryFixture(t, transport, 'success');
+  const recovery = { ...fresh('13'), DEPLOY_SHA: receipt.sha, RECOVERY_RUN_ID: receipt.run_id };
+  const before = structuredClone(rows);
+  admitRecovery(recovery, evidence);
+  assert.match(readFileSync(recovery.GITHUB_OUTPUT, 'utf8'), /^allow-submit=true$/m);
+  assert.deepEqual(readFileSync(join(recovery.RUNNER_TEMP, intentFile)), readFileSync(join(temp, intentFile)));
+  const callCount = transport.calls.length;
+  await run('prepare-recovery', recovery);
+  assert.ok(existsSync(join(recovery.RUNNER_TEMP, 'production-final-allocation.sealed')));
+  assert.deepEqual(transport.calls.slice(callCount), ['GET', 'GET', 'GET', 'GET']);
+  assert.deepEqual(rows, before);
+});
+
 test('first-release switch-off recovers maintenance from a fresh runner and repeats without writes', async (t) => {
   const transport = finalSmokeFixture(t, { ...rollbackFixture, sha: mainSha() }, 'lost');
   assert.equal(transport.custody.previous, undefined);
@@ -380,6 +444,46 @@ test('first-release switch-off recovers maintenance from a fresh runner and repe
   assert.ok(transport.calls.slice(afterRecovery).every((method) => method === 'GET'));
   assert.deepEqual(transport.rows[0].versions, [{ version_id: version, percentage: 100 }]);
   assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
+});
+
+test('recovery refuses a readable rollback intent for another build', async (t) => {
+  const pinned = finalSmokeFixture(t, rollbackFixture);
+  const other = finalSmokeFixture(t, { ...rollbackFixture, sha: 'e'.repeat(40) });
+  await pinned.prepare();
+  await other.run('record');
+  const { fresh, evidence } = recoveryFixture(t, pinned, 'success');
+  const { evidence: otherEvidence } = recoveryFixture(t, other, 'success');
+  const rollout = structuredClone(pinned.rows);
+  const before = pinned.calls.length;
+  const intent = 'production-rollback-intent.sealed';
+  const plan = 'production-final-allocation.sealed';
+
+  const pending = fresh('13');
+  admitRecovery(pending, (repo) => {
+    const selected = evidence(repo);
+    const otherSource = otherEvidence(repo);
+    const { run: otherRun } = otherSource.source('12', '1');
+    return {
+      ...selected,
+      artifactFor(run, name) {
+        assert.equal(run.head_sha, pinned.env.DEPLOY_SHA);
+        return otherSource.artifactFor(otherRun, name);
+      },
+    };
+  });
+  assert.deepEqual(readFileSync(join(pending.RUNNER_TEMP, intent)), readFileSync(join(other.temp, intent)));
+  await assert.rejects(pinned.run('prepare-recovery', pending), /Rollback intent or final allocation is missing, invalid or stale/);
+  assert.equal(existsSync(join(pending.RUNNER_TEMP, plan)), false);
+  assert.deepEqual(pinned.calls.slice(before), []);
+  assert.deepEqual(pinned.rows, rollout);
+
+  const exact = fresh('14');
+  admitRecovery(exact, evidence);
+  assert.deepEqual(readFileSync(join(exact.RUNNER_TEMP, intent)), readFileSync(join(pinned.temp, intent)));
+  await pinned.run('prepare-recovery', exact);
+  assert.ok(existsSync(join(exact.RUNNER_TEMP, plan)));
+  assert.deepEqual(pinned.calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
+  assert.deepEqual(pinned.rows, rollout);
 });
 
 test('recovery refuses superseding deployments and any second unresolved submission', async (t) => {
@@ -408,6 +512,37 @@ test('recovery refuses unapproved or altered evidence and reconciles a prior fin
   steps.push({ name: 'Restore recorded maintenance after failed final smoke', status: 'completed', conclusion: 'failure', number: 30 });
   await assert.rejects(enter(fresh('13')), /readback only/);
   assert.ok(transport.calls.every((method) => method === 'GET'));
+});
+
+test('recovery preparation requires the archived prior deployment identity', async (t) => {
+  const pinned = finalSmokeFixture(t, rollbackFixture);
+  const alternate = finalSmokeFixture(t, rollbackFixture);
+  alternate.custody.maintenance.deployment = alternate.id(9);
+  alternate.rows[0].id = alternate.custody.maintenance.deployment;
+  await pinned.prepare();
+  await alternate.run('record');
+  const pinnedHistory = structuredClone(pinned.rows);
+
+  for (const [archive, runId] of [[alternate, '13'], [pinned, '14']]) {
+    const { fresh, evidence } = recoveryFixture(t, archive, 'success');
+    const recovery = fresh(runId);
+    admitRecovery(recovery, evidence);
+    assert.match(readFileSync(recovery.GITHUB_OUTPUT, 'utf8'), /^allow-submit=true$/m);
+    assert.deepEqual(readFileSync(join(recovery.RUNNER_TEMP, intentFile)), readFileSync(join(archive.temp, intentFile)));
+
+    const allocation = join(recovery.RUNNER_TEMP, 'production-final-allocation.sealed');
+    const callCount = pinned.calls.length;
+    if (archive === alternate) {
+      await assert.rejects(pinned.run('prepare-recovery', recovery), /Rollback intent or final allocation is missing, invalid or stale/);
+      assert.equal(existsSync(allocation), false);
+      assert.deepEqual(pinned.calls.slice(callCount), []);
+    } else {
+      await pinned.run('prepare-recovery', recovery);
+      assert.ok(existsSync(allocation));
+      assert.deepEqual(pinned.calls.slice(callCount), ['GET', 'GET', 'GET', 'GET']);
+    }
+  }
+  assert.deepEqual(pinned.rows, pinnedHistory);
 });
 
 test('protected recovery wiring keeps the production lock and contains source and provider errors', () => {

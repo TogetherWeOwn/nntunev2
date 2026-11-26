@@ -1,8 +1,8 @@
+# guards: release:staging promotion ci-ok
 name: ci
 
 # `ci-ok` is a required check on main: its NAME must stay `ci-ok`, and every
-# gating job id must be listed in its `needs` (report-only jobs such as
-# worker-wasm-sizes are excluded by design).
+# gating job id must be listed in its `needs`.
 
 on:
   pull_request:
@@ -13,16 +13,17 @@ on:
   merge_group:
   push:
     branches: [main]
+  schedule:
+    - cron: '37 3 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  # merge_group refs are per-queue-entry (`gh-readonly-queue/...`) and must
-  # run to completion: cancelling a queue validation run ejects the entry.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'merge_group' }}
+  # Separate PR replacement from queue validation, main pushes and nightly runs.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -31,14 +32,17 @@ env:
   PNPM_VERSION: 10.34.7
 
 jobs:
+  # Trust the same accounts as the native Rust route. PR retries use GitHub-hosted.
   ci-commits:
     name: ci-commits
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.actor) && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.triggering_actor) && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.event.pull_request.user.login) && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404' && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-24.04' }}
     timeout-minutes: 5
     outputs:
       merge_sha: ${{ steps.commits.outputs.merge_sha }}
       base_sha: ${{ steps.commits.outputs.base_sha }}
       head_sha: ${{ steps.commits.outputs.head_sha }}
+      coverage_complete: ${{ steps.coverage.outputs.complete }}
+      skip: ${{ steps.coverage.outputs.skip }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,6 +51,13 @@ jobs:
       - name: Resolve tested commit and comparison range
         id: commits
         run: python3 -I .github/scripts/migrations_base.py >> "$GITHUB_OUTPUT"
+      - name: Plan test coverage for these exact revisions
+        id: coverage
+        env:
+          BASE_SHA: ${{ steps.commits.outputs.base_sha }}
+          MERGE_SHA: ${{ steps.commits.outputs.merge_sha }}
+          HEAD_SHA: ${{ steps.commits.outputs.head_sha }}
+        run: python3 -I .github/scripts/ci_coverage.py "$GITHUB_EVENT_NAME" "$BASE_SHA" "$MERGE_SHA" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
       - name: Install the pinned workflow YAML scanner
         run: |
           python3.12 -m venv "$RUNNER_TEMP/ci-python"
@@ -60,6 +71,49 @@ jobs:
         run: python3 .github/scripts/check_workflow_pr_shas.py --base "$BASE_SHA" --tested "$MERGE_SHA"
       - name: Test the workflow SHA ratchet
         run: python3 -m unittest discover -s .github/scripts -p test_workflow_pr_shas.py
+      - name: Test CI coverage selection from Git
+        run: python3 -m unittest discover -s .github/scripts -p test_ci_coverage.py
+
+  early:
+    name: early CI checks
+    needs: [ci-commits, public-text, nzb-guard]
+    # An unavailable comparison still launches full tests. ci-ok rejects it.
+    if: ${{ !cancelled() && needs.public-text.result == 'success' && needs.nzb-guard.result == 'success' }}
+    outputs:
+      skip: ${{ needs.ci-commits.outputs.skip }}
+    runs-on: &trusted-pr-runner ${{ github.event_name == 'pull_request' && github.run_attempt == 1 && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.actor) && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.triggering_actor) && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.event.pull_request.user.login) && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404' && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
+    timeout-minutes: 3
+    permissions:
+      actions: read # Read exact-head results from the existing early PR workflows.
+    steps:
+      - name: Record lint, secret scan and size checks for the PR head
+        if: github.event_name == 'pull_request' && needs.ci-commits.outputs.head_sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.ci-commits.outputs.head_sha }}
+          HEAD_REPO_ID: ${{ github.event.pull_request.head.repo.id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          workflows=(gitleaks pr-size)
+          if [[ "$GITHUB_BASE_REF" == main ]]; then workflows+=(pr-lint); fi
+          # Required workflows own their verdicts. GitHub may omit PR links
+          # on a run, so a source-head match is informational only.
+          for workflow in "${workflows[@]}"; do
+            result=$(timeout 10s gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow.yml/runs" \
+              -f head_sha="$HEAD_SHA" -f per_page=50 |
+              jq -c --arg sha "$HEAD_SHA" --arg ref "$GITHUB_HEAD_REF" --arg repo "$HEAD_REPO_ID" \
+                --arg workflow "$workflow" --arg pr "$PR_NUMBER" --arg base "$GITHUB_BASE_REF" '
+                [.workflow_runs[] | select(.head_sha == $sha and .head_branch == $ref
+                  and (.head_repository.id | tostring) == $repo
+                  and ((.pull_requests | length) == 0 or any(.pull_requests[];
+                    (.number | tostring) == $pr and .base.ref == $base))
+                  and (.event == "pull_request" or ($workflow == "pr-size" and .event == "pull_request_review")))]
+                | max_by(.id) // {}') || result='{}'
+            conclusion=$(jq -r '.conclusion // .status // "not reported"' <<< "$result")
+            printf -- '- %s reported %s for `%s` %s\n' "$workflow" "$conclusion" "$HEAD_SHA" \
+              "$(jq -r '.html_url // ""' <<< "$result")" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
   # PR-only public security caller; never scan push/queue/dispatch events.
   # Keep this in the ci-ok dependency graph rather than waiting across workflows.
   public-pr-security:
@@ -74,8 +128,15 @@ jobs:
     uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@c05610872587137c3c492b7025f02585a1b8ba7d # v0.11.0
 
   rust-test:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'rust-test') }}
     name: rust test (native)
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'merge_group'
+      && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.actor)
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.triggering_actor)
+      && vars.CI_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -121,7 +182,7 @@ jobs:
   # in the nntune-subsonic tests in rust-test.
   fixture-check:
     name: fixture-check
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -138,7 +199,7 @@ jobs:
   # ci-ok's needs.
   nzb-guard:
     name: nzb-guard
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,8 +220,10 @@ jobs:
           echo "no tracked *.nzb files — clean"
 
   rust-wasm:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'rust-wasm') }}
     name: rust check (wasm32)
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -211,7 +274,7 @@ jobs:
   # weakening the policy. Keep this job id in ci-ok's needs.
   cargo-deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -258,11 +321,14 @@ jobs:
   # Compressed-size budget: every backend Worker release module must gzip
   # to at most 3,000,000 bytes (see BUDGET_BYTES in the script). A missing,
   # unbuildable, or over-budget module fails this job, and the job is a
-  # required member of ci-ok, so the budget fails the build fail-closed.
+  # required member of ci-ok when the classifier selects it.
+  # The budget step also publishes the raw/gzip size report from this build.
   # Keep this job id in ci-ok's needs.
   worker-wasm-budget:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'worker-wasm-budget') }}
     name: worker wasm budget (enforcing)
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -279,40 +345,8 @@ jobs:
         run: python3 .github/scripts/test_check_worker_wasm_budget.py
       - name: Unit-test the budget check build paths
         run: python3 .github/scripts/test_check_worker_wasm_budget_builds.py
-      - name: Build Workers and enforce the compressed-size budget
+      - name: Build Workers, report sizes and enforce the compressed-size budget
         run: python3 .github/scripts/check_worker_wasm_budget.py
-
-  # Per-Worker compressed Wasm sizes: builds each Worker's release
-  # wasm32 cdylib, measures raw + gzip bytes, and publishes a per-Worker
-  # size table to the job summary. REPORT-ONLY: this job id is
-  # deliberately NOT in ci-ok's needs, the script exits 0 even when a
-  # Worker build fails (failures become error rows), and the job itself
-  # has continue-on-error -- so a size increase (or a broken report step)
-  # can never fail the build. No thresholds, no dependency-gate changes.
-  worker-wasm-sizes:
-    name: worker wasm sizes (report-only)
-    runs-on: ubuntu-latest
-    # Six Workers x 300 s per-Worker timeout = 30 min worst case, with 5 min
-    # headroom (see report_worker_wasm_sizes.py BUILD_TIMEOUT_SECONDS).
-    timeout-minutes: 35
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Unit-test the size reporter
-        run: python3 .github/scripts/test_report_worker_wasm_sizes.py
-      - name: Unit-test the size reporter I/O errors
-        run: python3 .github/scripts/test_report_worker_wasm_io_errors.py
-      - name: Build and report per-Worker compressed Wasm sizes
-        run: python3 .github/scripts/report_worker_wasm_sizes.py
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
   # internal hostnames, instance-UI paths and agent names in tracked text.
@@ -323,7 +357,7 @@ jobs:
   # allow-listed in the script until it is retired).
   public-text:
     name: public-text
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -367,8 +401,8 @@ jobs:
         run: python3 .github/scripts/test_ci_fixture_secrets.py
       - name: Test workflow and offline account-export boundaries
         run: python3 .github/scripts/test_workflow_policy_hardening.py && python3 .github/scripts/test_staging_apply.py && python3 scripts/test_account_export.py
-      - name: Test the read-only Subsonic staging observer offline
-        run: python3 -I .github/scripts/test_subsonic_staging_observer.py
+      - name: Test the offline staging observer and private trial capacity readback
+        run: python3 -I .github/scripts/test_subsonic_staging_observer.py && python3 -I scripts/test_staging_trial_c0_readback.py
       - name: Test Subsonic staging off-and-drained verifier and adapter offline
         run: python3 -I .github/scripts/test_subsonic_staging_cleanup.py && python3 -I .github/scripts/test_subsonic_staging_off_drain.py
       - name: Test Subsonic staging telemetry, health and API identity offline
@@ -407,7 +441,7 @@ jobs:
   # id in ci-ok's needs.
   cargo-pool:
     name: cargo-pool
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -462,7 +496,7 @@ jobs:
   # hosted runners can hit a five-minute job limit after all steps pass.
   binding-parity:
     name: binding-parity
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -496,7 +530,7 @@ jobs:
 
   migrations-gate:
     name: migrations-gate
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 10
     needs: ci-commits
     steps:
@@ -536,8 +570,10 @@ jobs:
           python3 .github/scripts/test_migrations_gate_root_validity.py
 
   test-nntp:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'test-nntp') }}
     name: test-nntp
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -634,6 +670,8 @@ jobs:
           case "$first" in fixture:[0-9]*) ;; *) exit 1 ;; esac
 
   api:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'api') }}
     name: api
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -707,8 +745,10 @@ jobs:
         run: python3 .github/scripts/worker_span_runtime.py --self-test
 
   mb-import-etl:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'mb-import-etl') }}
     name: mb-import-etl
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -774,12 +814,16 @@ jobs:
         env:
           BOOTSTRAP_VERDICT: ${{ steps.bootstrap.outputs.verdict }}
         run: test "$BOOTSTRAP_VERDICT" = passed
+      - name: Compare inherited SELECT grant paths and offline Reader receipts
+        run: exec python3 -B .github/scripts/test_database_bootstrap_inherited_select.py
 
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,
   # to an empty throwaway database (twice, to prove idempotency) and runs
   # workers/api/tests/sql/*.sql against it. The database is an ephemeral
   # service container; its password is a throwaway, not a secret.
   api-migrations:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'api-migrations') }}
     name: api-migrations
     runs-on: ubuntu-latest
     # Allow cold Rust builds to finish before the PostgreSQL test deadline.
@@ -1125,8 +1169,10 @@ jobs:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
 
   rust-mb:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'rust-mb') }}
     name: rust (workers/mb)
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1153,7 +1199,7 @@ jobs:
   # id in ci-ok's needs.
   config-parity:
     name: config-parity
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1180,7 +1226,7 @@ jobs:
   # ci-ok's needs.
   dependabot-coverage:
     name: dependabot-coverage
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1193,12 +1239,14 @@ jobs:
         run: python3 .github/scripts/test_check_dependabot_coverage.py
 
   rust-ingest:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'rust-ingest') }}
     name: rust (workers/ingest)
     environment:
       name: ci-fixtures
       deployment: false
     env:
-      FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
+      FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1246,8 +1294,10 @@ jobs:
       - run: cargo check --locked --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
 
   rust-repair:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'rust-repair') }}
     name: rust (workers/repair)
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1278,6 +1328,8 @@ jobs:
   # shipped image (pinned par2cmdline-turbo build + server) builds from a
   # clean checkout. Keep this job id in ci-ok's needs.
   repair-container:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'repair-container') }}
     name: repair-container image
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1309,8 +1361,10 @@ jobs:
           python3 containers/repair/tests/test_image_repair.py repair-smoke
 
   rust-transcode:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'rust-transcode') }}
     name: rust (workers/transcode)
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1338,6 +1392,8 @@ jobs:
   # carries libopus, and encodes deterministically. Keep this job id in
   # ci-ok's needs.
   transcode-container:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'transcode-container') }}
     name: transcode-container image
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1379,6 +1435,8 @@ jobs:
   # refusal guards) against an ephemeral postgres service. Trust auth keeps
   # passwords out of the workflow file. Keep this job id in ci-ok's needs.
   mb-import:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'mb-import') }}
     name: mb-import integration
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1438,7 +1496,7 @@ jobs:
   # Keep this job id in ci-ok's needs.
   cache-policy:
     name: cache-policy
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1467,7 +1525,7 @@ jobs:
   # in ci-ok's needs.
   production-secrets-shape:
     name: production-secrets-shape
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1496,7 +1554,7 @@ jobs:
   # Keep this job id in ci-ok's needs.
   release-proof:
     name: release-proof
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1514,6 +1572,8 @@ jobs:
         run: node --test ci/test-production-maintenance.mjs ci/test-production-switch-off.mjs
       - name: Unit-test candidate staging admission (offline synthetic evidence only)
         run: python3 ci/test_staging_admission.py
+      - name: Test ordinary API build artifact verification offline
+        run: python3 -B ci/test_staging_api_candidate.py
       - name: Unit-test the private launch observation record (offline)
         run: python3 ci/test_production_observation.py
       - name: Unit-test staging Worker target and submission comparison (offline)
@@ -1548,7 +1608,7 @@ jobs:
   # Keep this job id in ci-ok's needs.
   docs-links:
     name: docs-links
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     needs: ci-commits
     env:
@@ -1737,10 +1797,12 @@ jobs:
           python3 .github/scripts/test_check_traceability_list_format.py
           python3 .github/scripts/test_check_traceability_drift_strings.py
 
-  svelte-check:
-    name: svelte-check
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  web-checks:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'web-checks') }}
+    name: web-checks
+    runs-on: *trusted-pr-runner
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: apps/web
@@ -1766,44 +1828,22 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm check
-
-  vitest:
-    name: vitest
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: apps/web
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # The pinned self-installer runs one `npm ci` with no retry, so retry
-      # it once in-job. Each attempt recreates its bootstrap dir and exports
-      # PATH/PNPM_HOME only on success; a second failure fails the job.
-      - id: pnpm-setup
-        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
-        continue-on-error: true
-        with:
-          version: ${{ env.PNPM_VERSION }}
-      - name: Retry pnpm bootstrap once
-        if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
-        with:
-          version: ${{ env.PNPM_VERSION }}
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-          cache-dependency-path: apps/web/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm test
+      - id: install
+        run: pnpm install --frozen-lockfile
+      - name: Svelte Check
+        timeout-minutes: 15
+        run: pnpm check
+      # Run after a failed Svelte Check when setup succeeded.
+      - name: Vitest
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 15
+        run: pnpm test
 
   web-build:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'web-build') }}
     name: web-build
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 15
     defaults:
       run:
@@ -1869,6 +1909,8 @@ jobs:
         run: python3 "$GITHUB_WORKSPACE/.github/scripts/test_check_web_bundle_budget.py"
 
   web-e2e:
+    needs: [early, web-build]
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'web-e2e') }}
     name: web-e2e (${{ matrix.shard }}/2)
     strategy:
       fail-fast: false
@@ -1878,7 +1920,7 @@ jobs:
       name: ci-fixtures
       deployment: false
     env:
-      FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
+      FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     # Budget measured 2026-10-26/27: suite (1,425-1,613 tests) reports
     # 18.8-20.6 minutes; container setup (image pull + pnpm install)
@@ -2021,8 +2063,10 @@ jobs:
   # also runs inside the full web-e2e suite. Keep this job id in ci-ok's
   # needs; re-pin the container with the web lock.
   history-fixture:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'history-fixture') }}
     name: history-fixture
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     container: mcr.microsoft.com/playwright:v1.65.1-noble@sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579
     timeout-minutes: 15
     defaults:
@@ -2067,8 +2111,10 @@ jobs:
           if-no-files-found: error
 
   web-a11y:
+    needs: early
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'web-a11y') }}
     name: web-a11y
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     container: mcr.microsoft.com/playwright:v1.65.1-noble@sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579
     timeout-minutes: 15
     defaults:
@@ -2109,7 +2155,7 @@ jobs:
   # no Cloudflare API, network, or deploy. Keep this job id in ci-ok's needs.
   tail-projection:
     name: tail-projection
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2152,6 +2198,8 @@ jobs:
         run: node --experimental-vm-modules --test workers/observability/tests/render-health-alert.test.mjs
 
   worker-release-builds:
+    needs: [early, worker-wasm-budget]
+    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), 'worker-release-builds') }}
     name: worker release builds
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -2387,6 +2435,26 @@ jobs:
           mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
           test "${#wranglers[@]}" -eq 1
           python3 -I .github/scripts/check_worker_upload.py --wrangler "${wranglers[0]}"
+      # The staging writer still builds from its checkout. Publish the
+      # ordinary build for offline verification on the existing CI runner.
+      - name: Prepare ordinary staging API candidate
+        id: api-candidate
+        if: >-
+          ${{ github.repository == 'TogetherWeOwn/nntunev2' && github.event_name == 'push' &&
+              github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha &&
+              github.run_attempt == 1 }}
+        continue-on-error: true
+        run: python3 -B ci/staging_api_candidate.py
+      - name: Upload ordinary staging API candidate
+        if: steps.api-candidate.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.api-candidate.outputs.name }}
+          path: ${{ steps.api-candidate.outputs.path }}
+          retention-days: 2
+          compression-level: 1
+          if-no-files-found: error
       - name: Upload Worker build logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -2399,7 +2467,7 @@ jobs:
   changed-lines-mutation:
     name: changed-lines-mutation
     needs: ci-commits
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2421,27 +2489,34 @@ jobs:
         run: echo 'Mutation skipped because this run has no pull request diff.' | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Aggregate required check: every dependency must succeed, including
-  # when a required job fails, is cancelled, or is skipped. GitHub's needs
+  # except for skips explicitly selected by the coverage plan. GitHub's needs
   # names job IDs, not matrix legs: the web-e2e entry covers both shards.
   ci-ok:
     name: ci-ok
-    needs: [ci-commits, rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, database-bootstrap-fixture, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds, changed-lines-mutation]
+    needs: [ci-commits, early, rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, database-bootstrap-fixture, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, web-checks, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds, changed-lines-mutation]
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: *trusted-pr-runner
     timeout-minutes: 5
     steps:
       - run: |
-          # Only the PR-only caller may skip, and only outside pull_request.
-          # A private PR skips the caller but fails ci-ok without scanning.
-          if ! jq -e --arg event "$CI_EVENT_NAME" '
-            length > 1 and
+          # A private PR still fails without the required public security scan.
+          if [[ "$CI_COVERAGE_COMPLETE" != true ]] || ! jq -e --arg event "$CI_EVENT_NAME" --argjson skip "$CI_SKIP" '
+            . as $jobs |
+            ($skip | type == "array" and length == (unique | length)) and
+            ($event == "pull_request" or $skip == []) and
+            all($skip[]; . as $job | $job != "public-pr-security" and ($jobs | has($job))) and
+            .["ci-commits"].result == "success" and .early.result == "success" and
             .["public-pr-security"].result == (if $event == "pull_request" then "success" else "skipped" end) and
-            (del(.["public-pr-security"]) | all(.[]; .result == "success"))
+            (del(.["public-pr-security"]) | to_entries | all(.[];
+              .key as $job | .value.result ==
+                (if ($skip | index($job)) != null then "skipped" else "success" end)))
           ' <<< "$NEEDS_JSON" > /dev/null; then
-            echo "ci-ok: a required job did not succeed"
+            echo "ci-ok: missing CI coverage evidence or unexpected job result"
             exit 1
           fi
           echo "ci-ok: all required jobs passed"
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           CI_EVENT_NAME: ${{ github.event_name }}
+          CI_COVERAGE_COMPLETE: ${{ needs.ci-commits.outputs.coverage_complete }}
+          CI_SKIP: ${{ needs.ci-commits.outputs.skip }}

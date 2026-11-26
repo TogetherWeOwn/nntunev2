@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
 """Report per-Worker compressed Wasm sizes (warning-only, never fails).
 
-CI checks wasm32 targets but reports no per-Worker sizes, so size
-regressions stay invisible until a deploy breaks. This script builds each
-Worker crate for ``wasm32-unknown-unknown --release``, measures the raw
-and gzip-compressed bytes of the resulting cdylib ``.wasm``, and prints a
-per-Worker markdown table to stdout (appended to ``$GITHUB_STEP_SUMMARY``
-when set, so it shows on the CI run and its PR).
+This standalone report builds Worker crates for
+``wasm32-unknown-unknown --release``, measures the raw and gzip-compressed
+bytes of the resulting cdylib ``.wasm``, and prints a per-Worker markdown
+table to stdout (also appended to ``$GITHUB_STEP_SUMMARY`` when set).
+CI publishes its size report from ``check_worker_wasm_budget.py``.
 
 Warning-only by construction:
 
 * per-Worker build or measurement failures become ``error`` rows, never a
   nonzero exit;
-* the script exits 0 whenever it runs to completion;
-* the CI job running it is kept out of the required-checks aggregate, so
-  neither a size increase nor a broken report step can fail the build.
-
-Size enforcement, if ever wanted, belongs to a separate gated lane with
-its own thresholds -- not this report. No dependency gates are changed
-here.
+* the script exits 0 whenever it runs to completion.
 
 The sizes are a proxy, not the exact deploy bundle: plain
 ``cargo build --release`` cdylib output compressed with gzip level 9,
@@ -46,10 +39,8 @@ from pathlib import Path
 
 TARGET = "wasm32-unknown-unknown"
 
-# Per-Worker cargo timeout, in seconds. A hung build must not take the whole
-# report down: six Workers x 300 s = 30 min worst case, inside the CI job's
-# 35-minute timeout. Timeouts become ``error`` rows so collect_rows() keeps
-# measuring the remaining Workers.
+# Per-Worker cargo timeout, in seconds. Timeouts become ``error`` rows so
+# collect_rows() keeps measuring the remaining Workers.
 BUILD_TIMEOUT_SECONDS = 300
 
 # One entry per Worker. ``kind`` selects how the crate is addressed:

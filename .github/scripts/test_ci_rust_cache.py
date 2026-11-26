@@ -33,8 +33,14 @@ STANDALONE_WORKSPACES = {
     "rust-repair": "workers/repair",
     "rust-transcode": "workers/transcode",
 }
-# Floor on cached Rust lanes so deleting cache steps cannot pass vacuously.
-MIN_CACHE_STEPS = 11
+# Require the cache in each remaining build lane, even if another job adds one.
+REQUIRED_CACHE_JOBS = {
+    *STANDALONE_WORKSPACES,
+    "rust-test",
+    "rust-wasm",
+    "test-nntp",
+    "worker-wasm-budget",
+}
 
 
 def with_input(step_chunk, name):
@@ -59,22 +65,17 @@ def cache_steps(job_chunk):
 def cache_errors(text):
     """Policy violations in a ci.yml source; empty when compliant."""
     errors = []
-    jobs = split_jobs(text)
-    total = 0
-    for job_id, chunk in jobs.items():
+    cached_jobs = set()
+    for job_id, chunk in split_jobs(text).items():
         for step in cache_steps(chunk):
-            total += 1
+            cached_jobs.add(job_id)
             if with_input(step, "save-if") != SAVE_IF_MAIN:
                 errors.append(f"{job_id}: rust-cache must save only on main")
-    if total < MIN_CACHE_STEPS:
-        errors.append(f"expected >= {MIN_CACHE_STEPS} rust-cache steps, found {total}")
-    for job_id, workspace in STANDALONE_WORKSPACES.items():
-        steps = cache_steps(jobs.get(job_id, ""))
-        if not steps:
-            errors.append(f"{job_id}: missing rust-cache step")
-        for step in steps:
-            if with_input(step, "workspaces") != workspace:
+            workspace = STANDALONE_WORKSPACES.get(job_id)
+            if workspace and with_input(step, "workspaces") != workspace:
                 errors.append(f"{job_id}: rust-cache must name workspaces: {workspace}")
+    for job_id in sorted(REQUIRED_CACHE_JOBS - cached_jobs):
+        errors.append(f"{job_id}: missing rust-cache step")
     return errors
 
 
@@ -135,11 +136,20 @@ class TestRustCachePolicy(unittest.TestCase):
                 )
 
     def test_deleted_cache_step_fails(self):
-        """Deleting a standalone lane's cache step is caught."""
-        chunk = split_jobs(self.ci)["rust-ingest"]
-        step = cache_steps(chunk)[0]
-        errors = cache_errors(self.ci.replace(step + "\n", "", 1))
-        self.assertIn("rust-ingest: missing rust-cache step", errors)
+        """Each build lane needs its cache even with an extra cache elsewhere."""
+        jobs = split_jobs(self.ci)
+        extra = cache_steps(jobs["rust-test"])[0]
+        for job_id in sorted(REQUIRED_CACHE_JOBS):
+            with self.subTest(job=job_id):
+                chunk = jobs[job_id]
+                step = cache_steps(chunk)[0]
+                without_cache = self.ci.replace(chunk, chunk.replace(step + "\n", ""), 1)
+                # Add a correctly configured cache to the unrelated ci-commits job.
+                mutated = without_cache.replace(
+                    jobs["ci-commits"], jobs["ci-commits"] + "\n" + extra, 1
+                )
+                self.assertEqual(cache_steps(split_jobs(mutated)["ci-commits"]), [extra])
+                self.assertEqual(cache_errors(mutated), [f"{job_id}: missing rust-cache step"])
 
     def test_real_coverage_is_compliant(self):
         """The committed coverage.yml cancels superseded runs."""

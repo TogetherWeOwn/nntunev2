@@ -157,7 +157,7 @@ the current product decision. [LRCLIB software licence](https://github.com/tranx
 
 ## Validation and upkeep
 
-The existing GitHub Actions `ci` workflow's `vitest` job discovers
+The Vitest step in the GitHub Actions `web-checks` job discovers
 `apps/web/src/lib/attributions/attributions.test.ts`; no new gate or script is
 needed. Tests reject missing/empty fields, invalid URLs, unknown states, malformed
 records and duplicate identities. Drift checks compare **all direct package

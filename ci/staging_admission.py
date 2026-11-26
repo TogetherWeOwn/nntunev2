@@ -4,6 +4,7 @@
 The production CLI reads only reviewed policy from its main workflow checkout,
 Git objects and authenticated Actions metadata. Offline fixtures call the pure
 functions; there is deliberately no production policy/API/local-receipt override.
+The offline terminal-push diagnostic cannot produce a receipt or verified pins.
 """
 
 import argparse
@@ -74,6 +75,16 @@ PRIVATE_DEPLOY_STEPS = {**DEPLOY_STEPS, "staging-stream": "Deploy stream to stag
 
 class Refused(Exception):
     pass
+
+
+class PrivateJobRefused(Refused):
+    def __init__(self, job_name, run_id, attempt, pending):
+        super().__init__("required job did not pass in selected attempt")
+        target = f"{job_name} in staging run {run_id}, attempt {attempt}"
+        if pending:
+            self.action = f"{target} is pending. Wait for the attempt to finish, then recheck the evidence."
+        else:
+            self.action = f"{target} did not succeed. Inspect the job and return to candidate qualification."
 
 
 def require(condition, reason):
@@ -537,6 +548,44 @@ class Actions:
         return list(found.values())
 
 
+def diagnose_terminal_push(sha, evidence):
+    run = evidence.get("run")
+    require(isinstance(run, dict) and SHA.fullmatch(sha) and run.get("head_sha") == sha
+            and run.get("path") == WORKFLOW and run.get("head_branch") == "main"
+            and run.get("event") == "push" and run.get("status") == "completed"
+            and run.get("conclusion") == "failure" and decimal(run.get("run_attempt")) == "1",
+            "expected a failed automatic staging push for the selected build")
+    run_id = decimal(run.get("id"))
+    job_page, annotations = evidence.get("jobs"), evidence.get("annotations")
+    require(isinstance(job_page, dict) and isinstance(annotations, list), "incomplete evidence")
+    jobs, count = job_page.get("jobs"), job_page.get("total_count")
+    require(isinstance(jobs, list) and type(count) is int and count == len(jobs) <= 100
+            and all(isinstance(row, dict) for row in (*jobs, *annotations)), "incomplete evidence")
+
+    target = f"Staging run {run_id}, attempt 1"
+    if not jobs:
+        require(any(note.get("annotation_level") == "failure"
+                    and note.get("message") == "Queue is full for concurrency group 'deploy-staging-main'"
+                    for note in annotations), "missing workflow queue rejection annotation")
+        return (f"{target} was rejected before jobs by the deploy-staging-main queue. "
+                "Exact-build qualification is pending. The next eligible automatic staging admission can "
+                "provide evidence for the build it runs.")
+
+    journeys = [job for job in jobs if job.get("name") == JOURNEY]
+    require(len(journeys) == 1, "missing or ambiguous full journey job")
+    job = journeys[0]
+    require(decimal(job.get("run_id")) == run_id and decimal(job.get("run_attempt")) == "1"
+            and job.get("head_sha") == sha and job.get("status") == "completed"
+            and job.get("conclusion") == "failure", "missing matching failed full journey job")
+    steps = job.get("steps")
+    require(isinstance(steps, list) and all(isinstance(step, dict) for step in steps), "invalid journey steps")
+    journey_steps = [step for step in steps if step.get("name") == "Run full journey"]
+    require(len(journey_steps) == 1 and journey_steps[0].get("status") == "completed"
+            and journey_steps[0].get("conclusion") == "failure", "missing failed full journey step")
+    return (f"{target} was admitted, and the full E2E journey failed. "
+            "Inspect the journey job and return to candidate qualification.")
+
+
 def unchanged_by_job(job, opening, source, producer_source_ok, deploy_step):
     reason = "known intervening staging deployment; fresh journey required"
     require(job.get("status") == "completed" and job.get("conclusion") in TERMINAL_CONCLUSIONS, reason)
@@ -584,18 +633,26 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     selected = max(same, key=lambda r: int(decimal(r.get("id"))))
     run_id = decimal(selected.get("id"))
     attempt = decimal(selected.get("run_attempt"))
+    wrong_attempt = "wrong, superseded or unsuccessful staging attempt"
 
     def run_identity(run):
         require(decimal(run.get("id")) == run_id and decimal(run.get("run_attempt")) == attempt
                 and decimal(run.get("workflow_id")) == workflow_id and run.get("path") == WORKFLOW
                 and run.get("head_sha") == sha and run.get("head_branch") == "main"
-                and run.get("event") == "push" and run.get("status") == "completed"
-                and run.get("conclusion") == "success", "wrong, superseded or unsuccessful staging attempt")
+                and run.get("event") == "push", wrong_attempt)
         for key in ("repository", "head_repository"):
             require(run.get(key, {}).get("full_name") == repo
                     and decimal(run.get(key, {}).get("id")) == repository_id, "foreign repository producer")
+
+    def run_succeeded(run):
+        return run.get("status") == "completed" and run.get("conclusion") == "success"
+
     run = actions.api(f"runs/{run_id}")
     run_identity(run)
+    status, conclusion = run.get("status"), run.get("conclusion")
+    active = status in PENDING_RUN_STATES and conclusion is None
+    terminal = status == "completed" and conclusion in TERMINAL_CONCLUSIONS
+    require(run_succeeded(run) or (private and (active or terminal)), wrong_attempt)
     producer_source_ok(run["head_sha"])
     jobs = actions.listing(f"runs/{run_id}/attempts/{attempt}/jobs", "jobs")
     selected_jobs = {}
@@ -604,9 +661,26 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
         require(len(matches) == 1, "missing or ambiguous required staging job")
         job = matches[0]
         require(decimal(job.get("run_id")) == run_id and decimal(job.get("run_attempt")) == attempt
-                and job.get("head_sha") == sha and job.get("status") == "completed"
-                and job.get("conclusion") == "success", "required job did not pass in selected attempt")
+                and job.get("head_sha") == sha, "required job did not pass in selected attempt")
         selected_jobs[name] = job
+    if private:
+        completed = [job for job in selected_jobs.values() if job.get("status") == "completed"
+                     and job.get("conclusion") in TERMINAL_CONCLUSIONS]
+        waiting = [job for job in selected_jobs.values() if active and job.get("status") in PENDING_RUN_STATES
+                   and job.get("conclusion") is None]
+        require(len(completed) + len(waiting) == len(selected_jobs), "required job did not pass in selected attempt")
+        unsuccessful = [job for job in completed if job["conclusion"] != "success"]
+        failed = min(unsuccessful, key=lambda job: job["conclusion"] != "failure", default=None)
+        if failed or waiting:
+            # A rerun can start while its previous attempt's jobs are being read.
+            latest = actions.api(f"runs/{run_id}")
+            run_identity(latest)
+            require((latest.get("status"), latest.get("conclusion")) == (status, conclusion), wrong_attempt)
+            job = failed or waiting[0]
+            raise PrivateJobRefused(job["name"], run_id, attempt, pending=failed is None)
+    require(run_succeeded(run), wrong_attempt)
+    require(all(job.get("status") == "completed" and job.get("conclusion") == "success"
+                for job in selected_jobs.values()), "required job did not pass in selected attempt")
     journey = selected_jobs[journey_job]
     if private:
         for lane, step in deploy_steps.items():
@@ -615,8 +689,9 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     else:
         journey_steps = ("Run full journey", "Enforce journey evidence gate (all-skipped must fail)", RECORD, UPLOAD)
     require_steps(journey, journey_steps, "journey, evaluator and receipt steps must succeed in order")
-    artifacts = actions.listing(f"runs/{run_id}/artifacts", "artifacts")
     name = artifact_name(sha, run_id, attempt, contract_journey)
+    query = urllib.parse.urlencode({"name": name})
+    artifacts = actions.listing(f"runs/{run_id}/artifacts?{query}", "artifacts")
     matches = [a for a in artifacts if a.get("name") == name]
     require(len(matches) == 1, "missing or ambiguous attempt-bound receipt")
     artifact = matches[0]
@@ -672,14 +747,28 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
             if job.get("name") in deploy_steps:
                 unchanged_by_job(job, opening, other.get("head_sha"), producer_source_ok, deploy_steps[job["name"]])
     # Re-resolve after download and drift discovery: a rerun cannot mix attempts.
-    run_identity(actions.api(f"runs/{run_id}"))
+    latest = actions.api(f"runs/{run_id}")
+    run_identity(latest)
+    require(run_succeeded(latest), wrong_attempt)
     return receipt
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("produce", "produce-private", "verify"))
+    parser.add_argument("mode", choices=("produce", "produce-private", "verify", "diagnose-terminal-push"))
+    parser.add_argument("candidate_sha", nargs="?", help="pinned source SHA for diagnose-terminal-push")
     args = parser.parse_args()
+    if args.mode == "diagnose-terminal-push":
+        if args.candidate_sha is None:
+            parser.error("diagnose-terminal-push requires the pinned candidate SHA")
+        try:
+            evidence = parse_json(sys.stdin.buffer.read(MAX_JSON + 1))
+        except RecursionError:
+            raise Refused("terminal evidence is nested too deeply") from None
+        print(diagnose_terminal_push(args.candidate_sha, evidence), file=sys.stderr)
+        sys.exit(1)
+    if args.candidate_sha is not None:
+        parser.error("candidate_sha is only for diagnose-terminal-push")
     env = os.environ
     policy = parse_json((ROOT / POLICY).read_bytes())
     contract_bytes = (ROOT / CONTRACT).read_bytes() if (ROOT / CONTRACT).is_file() else b""
@@ -749,10 +838,18 @@ def main():
     print("candidate deployment and applicable journey receipt verified (not operational acceptance)")
 
 
-if __name__ == "__main__":
+def cli():
     try:
         main()
+    except PrivateJobRefused as error:
+        # This refusal contains only checked-in job names and validated decimal IDs.
+        print(f"::error::Candidate admission refused: {error.action}", file=sys.stderr)
+        sys.exit(1)
     except (Refused, OSError, KeyError, TypeError, ValueError):
         # Do not echo arbitrary API, XML, URLs or parser content into logs.
         print("::error::Candidate admission refused: missing, unapproved, stale or incoherent evidence", file=sys.stderr)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    cli()

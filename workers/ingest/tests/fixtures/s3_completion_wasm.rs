@@ -25,6 +25,8 @@ mod catalogue;
 const FLAC: &[u8] = b"fLaC\x80\0\0\x22\0\x10\0\x10\0\0\0\0\0\0\x0a\xc4\x40\x70\0\0\0\x13\
     \x46\xd2\xbe\x27\x5e\xd2\xdd\x86\xab\x2b\x53\x88\xf7\x34\x6d\x15\
     \xff\xf8\x69\x02\0\x0f\xb7\0\x2a\x7a\xdd\xff\xf8\x69\x02\x01\x02\x81\0\x2a\x9d\x1d";
+const TONE: &[u8] =
+    include_bytes!("../../../../fixtures/synthetic-flac/private-staging/tone-a.flac");
 
 fn id(value: u8) -> [u8; 16] {
     let mut bytes = [value; 16];
@@ -123,23 +125,13 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         .to_string());
     }
     let readback = mode.starts_with("readback");
-    let multipart_resume = mode == "multipart-resume";
-    let padded;
+    let multipart_resume = matches!(mode, "multipart-resume" | "multipart-resume-full");
+    let resume_bytes;
     let plaintext: &[u8] = if matches!(mode, "readback-publish" | "readback-playback") {
-        // Add one FLAC PADDING block so the suffix crosses into a second
-        // encrypted chunk while preserving the existing valid audio frames.
-        let padding = PLAIN_CHUNK_SIZE as usize + 1 - FLAC.len() - 4;
-        let mut bytes = FLAC[..42].to_vec();
-        bytes[4] = 0;
-        bytes.push(0x81);
-        bytes.extend_from_slice(&(padding as u32).to_be_bytes()[1..]);
-        bytes.resize(bytes.len() + padding, 0);
-        bytes.extend_from_slice(&FLAC[42..]);
-        padded = bytes;
-        &padded
+        TONE
     } else if multipart_resume {
-        padded = vec![42; PART_BYTES];
-        &padded
+        resume_bytes = vec![42; PART_BYTES];
+        &resume_bytes
     } else if readback {
         FLAC
     } else {
@@ -167,7 +159,9 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         [1, 2, 0xab, 0xcd].map(|value| hex::encode(id(value)));
     let key = format!("media/{object}/{generation}");
     let budget = match mode {
-        "readback-publish" | "readback-playback" | "multipart-resume" => 5000,
+        "readback-publish" | "readback-playback" | "multipart-resume" | "multipart-resume-full" => {
+            5000
+        }
         "deadline" => 200,
         "expired" | "reconcile-expired" => 0,
         _ => 2000,
@@ -195,11 +189,21 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
             &key
         };
         let upload = sender
-            .initiate(&context, bucket, requested_key, until)
+            .initiate(
+                &context,
+                bucket,
+                requested_key,
+                &super::session_upload::completion_marker("fixture-lease"),
+                until,
+            )
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
         assert_eq!(upload.configuration(), configuration);
-        if mode != "init-upload-completion-head" && !readback {
+        if !matches!(
+            mode,
+            "init-upload-completion-head" | "init-completion-response-lost"
+        ) && !readback
+        {
             return Ok(upload.target().upload_id.into());
         }
         Some(upload)
@@ -268,7 +272,15 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         envelope_scheme: 2,
     };
     if multipart_resume {
-        return resume_multipart(&sender, binding, &context, &parts, until).await;
+        return resume_multipart(
+            &sender,
+            binding,
+            &context,
+            &parts,
+            until,
+            mode == "multipart-resume",
+        )
+        .await;
     }
     let [part] = parts.as_slice() else {
         panic!("expected one fixture part");
@@ -314,10 +326,13 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
     };
     let completion =
         SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint).unwrap();
-    let completed = sender
-        .complete(completion, until)
-        .await
-        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let completed = if initiated.is_some() {
+        let durable = DurableUpload::new(target, &context, binding.session, until);
+        sender.complete(&durable, completion).await
+    } else {
+        sender.complete_fixture(completion, until).await
+    }
+    .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     if mode == "head-context" {
         context.identities[1] = id(8);
     }
@@ -387,57 +402,65 @@ async fn resume_multipart<'a>(
     context: &'a EnvelopeContext,
     parts: &[UploadPart<'a>],
     until: std::time::SystemTime,
+    interrupt_second: bool,
 ) -> Result<String, JsValue> {
     let [first, second] = parts else {
         panic!("expected two fixture parts");
     };
     let dispatch_error = |error| JsValue::from_str(&format!("{error:?}"));
     let (target, _, _, _) = first.request();
-    let saved_etag;
-    let saved;
     let mut receipts = {
         let upload = DurableUpload::new(target, context, binding.session, until);
-        let confirmed = sender
+        let first = sender
             .put_part(binding, context, first, &upload, until)
             .await
             .map_err(dispatch_error)?;
-        saved_etag = confirmed.etag().to_owned();
-        saved = [checkpoint_part(&confirmed, &saved_etag)];
-        assert!(matches!(
-            sender
-                .put_part(binding, context, second, &upload, until)
-                .await,
-            Err(DispatchError::Unconfirmed(None))
-        ));
-        vec![confirmed]
+        let second = sender
+            .put_part(binding, context, second, &upload, until)
+            .await;
+        if interrupt_second {
+            assert!(matches!(second, Err(DispatchError::Unconfirmed(None))));
+            vec![first]
+        } else {
+            vec![first, second.map_err(dispatch_error)?]
+        }
     };
+    let etags: Vec<_> = receipts
+        .iter()
+        .map(|receipt| receipt.etag().to_owned())
+        .collect();
+    let mut saved: Vec<_> = receipts
+        .iter()
+        .zip(&etags)
+        .map(|(receipt, etag)| checkpoint_part(receipt, etag))
+        .collect();
 
     let checkpoint = ResumeCheckpoint {
         binding,
         parts: &saved,
     };
     // The fixture stands in for the caller's checkpoint store and scoped
-    // handoff. The ciphertext and verified receipt survive the interruption.
-    let upload = DurableUpload::new(target, context, binding.session, until);
+    // handoff. The sealed bytes and verified receipts survive across attempts.
     assert!(matches_checkpoint(binding, &receipts, &checkpoint));
-    for part in &parts[checkpoint.parts.len()..] {
-        receipts.push(
-            sender
-                .put_part(binding, context, part, &upload, until)
-                .await
-                .map_err(dispatch_error)?,
-        );
+    let resumed_etag;
+    let upload = DurableUpload::new(target, context, binding.session, until);
+    if saved.len() == 1 {
+        let receipt = sender
+            .put_part(binding, context, second, &upload, until)
+            .await
+            .map_err(dispatch_error)?;
+        resumed_etag = receipt.etag().to_owned();
+        saved.push(checkpoint_part(&receipt, &resumed_etag));
+        receipts.push(receipt);
     }
-    let second_etag = receipts[1].etag().to_owned();
-    let completed_parts = [saved[0], checkpoint_part(&receipts[1], &second_etag)];
     let completed_checkpoint = ResumeCheckpoint {
         binding,
-        parts: &completed_parts,
+        parts: &saved,
     };
     let completion = SessionCompletion::prepare(binding, context, receipts, &completed_checkpoint)
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     let completed = sender
-        .complete(completion, until)
+        .complete(&upload, completion)
         .await
         .map_err(dispatch_error)?;
     let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {

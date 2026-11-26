@@ -269,6 +269,15 @@ impl<'a> Completion<'a> {
         let [version] = reply.version_headers else {
             return Err(CompletionVersion);
         };
+        self.bind_version(context, version)
+    }
+
+    fn bind_version(
+        &self,
+        context: &EnvelopeContext,
+        version: &str,
+    ) -> Result<CompletedVersionedMedia> {
+        use MultipartError::{CompletionIdentity, CompletionVersion};
         // Bound the allocation and refuse coalesced field values. Do not trim,
         // decode or replace an opaque version (including with an ETag).
         if version.len() > 1024 || version.contains(',') {
@@ -278,7 +287,7 @@ impl<'a> Completion<'a> {
         let locator = S3Locator::new(
             target.bucket.into(),
             target.key.into(),
-            S3Binding::VersionId((*version).into()),
+            S3Binding::VersionId(version.into()),
         )
         .map_err(|error| match error {
             nntune_core::s3_locator::S3LocatorError::Binding => CompletionVersion,
