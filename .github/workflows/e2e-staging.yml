@@ -5,7 +5,7 @@ name: e2e-staging
 # Cloudflare Access via the QA service-token pair).
 #
 # Sequencing: this workflow no longer triggers on push. The full journey
-# runs after smoke passes, and only when deploy.yml calls this workflow with
+# (`e2e` job) runs only when deploy.yml calls this workflow with
 # `post_deploy: true` from a job that `needs` successful `staging-web` and
 # `staging-api` jobs of the same run/revision — a skipped or failed deploy therefore
 # cannot produce a full-journey PASS. Scheduled and manually dispatched
@@ -95,12 +95,12 @@ concurrency:
 
 jobs:
   e2e:
-    # The release readers require this exact name for the only called job.
-    name: ${{ inputs.post_deploy && 'full journey (signup → library → meter → limits)' || 'synthetic smoke (health)' }}
+    name: ${{ inputs.post_deploy && 'full journey (signup → library → meter → limits)' || 'synthetic smoke (health)' }} # Exact name used by staging admission.
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.post_deploy && 40 || 10 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 10
         with:
           persist-credentials: false
 
@@ -130,6 +130,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: steps.staging.outputs.configured == 'true'
+        timeout-minutes: 10
         with:
           # Keep in sync with @types/node major in e2e/package.json.
           node-version: 26
@@ -138,11 +139,13 @@ jobs:
 
       - name: Install dependencies
         if: steps.staging.outputs.configured == 'true'
+        timeout-minutes: 10
         working-directory: e2e
         run: npm ci
 
       - name: Install Playwright Chromium headless shell
         if: steps.staging.outputs.configured == 'true'
+        timeout-minutes: 10
         working-directory: e2e
         run: npx playwright install --with-deps --only-shell chromium
 

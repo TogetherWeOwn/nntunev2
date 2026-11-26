@@ -959,6 +959,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     expect(job).not.toMatch(/^    (if|needs):/m);
     expect(job).not.toContain('continue-on-error');
 
+    expect(job.split('\n      - name: Run synthetic smoke\n')[0]!.match(/^        timeout-minutes: 10$/gm)).toHaveLength(4);
     expect(job).toMatch(/Run synthetic smoke[\s\S]*Run full journey[\s\S]*Enforce journey evidence gate[\s\S]*Record candidate admission receipt[\s\S]*Upload candidate admission receipt/);
     expect(stagingStep('Run synthetic smoke')).toContain("\n        if: success() && steps.staging.outputs.configured == 'true'\n");
     expect(stagingStep('Record candidate admission receipt')).toContain("\n        if: ${{ !cancelled() && (steps.journey-gate.outcome == 'success' || steps.journey-gate.outcome == 'failure') }}\n");
