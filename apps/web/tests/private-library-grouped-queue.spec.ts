@@ -78,6 +78,7 @@ test('the invited Library regroups by keyboard and queues the chosen admission',
 	await toggle.click();
 	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
 	await expect.poll(headingAndRowOrder).toEqual(groupedOrder);
+	await expect(queue).toHaveCount(0);
 	await tabTo(actions, 'Tab');
 
 	// The artist headings are static. Return to the shared grouping toggle to close them.
@@ -86,6 +87,7 @@ test('the invited Library regroups by keyboard and queues the chosen admission',
 	await expect(toggle).toHaveAttribute('aria-pressed', 'false');
 	await expect.poll(headingAndRowOrder).toEqual(tracks.map((track) => track.id));
 	await expect(toggle).toBeFocused();
+	await expect(queue).toHaveCount(0);
 
 	await page.keyboard.press('Enter');
 	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
