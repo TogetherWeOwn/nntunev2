@@ -9,47 +9,38 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from test_ci_pnpm_retry import split_jobs, split_steps, step_field
+from test_ci_pnpm_retry import (
+    check_required_step, job_level_field, job_needs, split_jobs, split_steps, step_field,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
+WORKFLOWS = ROOT / ".github/workflows"
+RESOLVE = 'python3 -I .github/scripts/migrations_base.py >> "$GITHUB_OUTPUT"'
 
 
 class TestPreservedSourceGraphWorkflow(unittest.TestCase):
-    def test_event_gate_and_concurrency_match(self):
-        text = (ROOT / ".github/workflows/preserved-source-graph.yml").read_text()
-        self.assertIn(
-            "\non:\n  pull_request:\n"
-            "    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]\n\n",
-            text,
-        )
-        job = split_jobs(text)["synthetic-graph"]
-        self.assertIn("\n    if: >-\n", job)
-        condition = job.split("\n    if: >-\n", 1)[1].split("\n    runs-on:", 1)[0]
-        condition = " ".join(line.strip() for line in condition.splitlines())
-        predicate = (
-            "(contains(fromJSON('[\"opened\",\"synchronize\",\"reopened\",\"ready_for_review\"]'), github.event.action) || "
-            "(github.event.action == 'edited' && "
-            "!(github.event.sender.login == 'cubic-dev-ai[bot]' && github.event.changes.body != null && "
-            "github.event.changes.title == null && github.event.changes.base == null)) || "
-            "(contains(fromJSON('[\"labeled\",\"unlabeled\"]'), github.event.action) && "
-            "!(github.event.sender.type == 'Bot' && "
-            "contains(fromJSON('[\"size/S\",\"size/M\",\"size/L\",\"size/XL\"]'), github.event.label.name))))"
-        )
-        self.assertEqual("${{ " + predicate + " }}", condition)
-        concurrency = text.split("\nconcurrency:\n", 1)[1].split("\njobs:", 1)[0]
-        group, cancel = concurrency.split("\n  group: >-\n", 1)[1].split("\n  cancel-in-progress: ", 1)
-        self.assertEqual("true", cancel.strip())
-        self.assertEqual(
-            "${{ " + predicate + " && format('preserved-source-graph-{0}', github.event.pull_request.number) "
-            "|| format('preserved-source-graph-skipped-{0}', github.run_id) }}",
-            " ".join(line.strip() for line in group.splitlines()),
-        )
-
     def test_head_and_graph_control_are_wired(self):
-        text = (ROOT / ".github/workflows/preserved-source-graph.yml").read_text()
-        self.assertNotIn("pull_request_target:", text)
+        text = (WORKFLOWS / "preserved-source-graph.yml").read_text()
+        self.assertTrue(text.startswith("# guards: paths\n"))
+        events = text.split("\non:\n", 1)[1].split("\npermissions:\n", 1)[0].strip("\n")
+        self.assertEqual(
+            "  pull_request:\n"
+            "    types: [opened, synchronize, reopened]\n"
+            "    paths:\n"
+            "      - .github/workflows/preserved-source-graph.yml\n"
+            "      - .github/workflows/ci.yml\n"
+            "      - .github/scripts/*migration*.py\n"
+            "      - .github/scripts/*graph*.py\n"
+            "      - .github/scripts/staging_api_schema_gate.py\n"
+            "      - .github/scripts/test_ci_pnpm_retry.py\n"
+            "      - migrations/**",
+            events,
+        )
         self.assertIn("permissions:\n  contents: read\n", text)
+        self.assertIn("\nconcurrency:\n"
+                      "  group: preserved-source-graph-${{ github.event.pull_request.number }}\n"
+                      "  cancel-in-progress: true\n", text)
         jobs = split_jobs(text)
         self.assertEqual({"synthetic-graph"}, set(jobs))
         job = jobs["synthetic-graph"]
@@ -62,19 +53,45 @@ class TestPreservedSourceGraphWorkflow(unittest.TestCase):
         self.assertEqual("${{ github.sha }}", step_field(checkout, "ref"))
         self.assertEqual("0", step_field(checkout, "fetch-depth"))
         self.assertEqual("false", step_field(checkout, "persist-credentials"))
-        self.assertIn('python3 -I .github/scripts/migrations_base.py >> "$GITHUB_OUTPUT"', identity)
+        self.assertIn(RESOLVE, identity)
         self.assertIn("git --version", identity)
         self.assertIn("GitFixture.test_preserved_source_requires_original_graph_and_data_objects", graph)
         self.assertNotIn("continue-on-error:", job)
-        self.assertEqual(1, job.count("\n    if:"))
-        for step in steps:
-            self.assertIsNone(step_field(step, "if"))
+        self.assertNotIn("if:", job)
+
+    def test_same_head_refresh_uses_unfiltered_required_reopen(self):
+        ci = (WORKFLOWS / "ci.yml").read_text()
+        uncommented = "\n".join(line for line in ci.splitlines() if not line.lstrip().startswith("#"))
+        self.assertIn("\non:\n  pull_request:\n    types: [opened, synchronize, reopened]\n  merge_group:\n",
+                      uncommented)
+        jobs = split_jobs(ci)
+        self.assertEqual([], check_required_step("ci-commits", jobs["ci-commits"], RESOLVE))
+        for job in (jobs["ci-commits"], jobs["migrations-gate"]):
+            checkout = split_steps(job)[0]
+            self.assertIsNone(step_field(checkout, "ref"), "use the event's integration commit")
+            self.assertEqual("0", step_field(checkout, "fetch-depth"))
+            self.assertEqual("false", step_field(checkout, "persist-credentials"))
+            self.assertIsNone(job_level_field(job, "if"))
+            self.assertIsNone(job_level_field(job, "continue-on-error"))
+
+        controls = next(step for step in split_steps(jobs["migrations-gate"])
+                        if step_field(step, "name") == "Run migration gate self-tests")
+        self.assertIn("\n          python3 .github/scripts/test_migrations_rename_check.py\n", controls)
+        self.assertIn("\n          python3 .github/scripts/test_graph_qualification_context.py && "
+                      "python3 .github/scripts/test_graph_control_accounting.py || exit $?\n", controls)
+        self.assertIsNone(step_field(controls, "if"))
+        self.assertIsNone(step_field(controls, "continue-on-error"))
+        self.assertIn("ci-commits", job_needs(jobs["migrations-gate"]))
+        self.assertTrue({"ci-commits", "migrations-gate"} <= set(job_needs(jobs["ci-ok"])))
 
     def test_identity_uses_actual_merge_parents(self):
-        text = (ROOT / ".github/workflows/preserved-source-graph.yml").read_text()
+        text = (WORKFLOWS / "preserved-source-graph.yml").read_text()
         identity = split_steps(split_jobs(text)["synthetic-graph"])[1]
         script = identity.split("        run: |\n", 1)[1]
         script = "\n".join(line.removeprefix("          ") for line in script.splitlines())
+        ci_jobs = split_jobs((WORKFLOWS / "ci.yml").read_text())
+        selector = next(step_field(step, "run") for step in split_steps(ci_jobs["ci-commits"])
+                        if step_field(step, "id") == "commits")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
 
@@ -90,6 +107,9 @@ class TestPreservedSourceGraphWorkflow(unittest.TestCase):
             git("checkout", "-qb", "feature")
             git("commit", "--allow-empty", "-qm", "head")
             head = git("rev-parse", "HEAD")
+            git("checkout", "-qb", "previous-base", stale)
+            git("merge", "--no-ff", "-qm", "original integration", head)
+            previous = git("rev-parse", "HEAD")
             git("checkout", "-q", "main")
             git("commit", "--allow-empty", "-qm", "actual base")
             base = git("rev-parse", "HEAD")
@@ -101,15 +121,17 @@ class TestPreservedSourceGraphWorkflow(unittest.TestCase):
             shutil.copy2(ROOT / ".github/scripts/migrations_base.py", scripts)
             event, output = root / "event.json", root / "output"
 
-            def run(expected_merge=merge, expected_head=head, event_base=stale):
-                event.write_text(json.dumps({"pull_request": {
-                    "base": {"sha": event_base}, "head": {"sha": expected_head},
+            def run(command=script, action="reopened", expected_merge=merge,
+                    expected_head=head, event_base=stale):
+                event.write_text(json.dumps({"action": action, "pull_request": {
+                    "number": 1, "base": {"sha": event_base}, "head": {"sha": expected_head},
+                    "body": "Updated attestation" if action == "reopened" else "Original attestation",
                 }}))
                 output.write_text("")
                 env = {**os.environ, "GITHUB_SHA": expected_merge, "GITHUB_REF": "refs/pull/1/merge",
                        "GITHUB_EVENT_NAME": "pull_request", "GITHUB_EVENT_PATH": str(event),
                        "GITHUB_OUTPUT": str(output)}
-                return subprocess.run(["bash", "-eo", "pipefail", "-c", script], cwd=root,
+                return subprocess.run(["bash", "-eo", "pipefail", "-c", command], cwd=root,
                                       env=env, capture_output=True, text=True)
 
             for event_base in (stale, base):
@@ -118,6 +140,28 @@ class TestPreservedSourceGraphWorkflow(unittest.TestCase):
                 self.assertEqual({"merge_sha": merge, "base_sha": base, "head_sha": head},
                                  dict(line.split("=") for line in output.read_text().splitlines()))
                 self.assertIn("git version", result.stdout)
+
+            git("checkout", "--detach", previous)
+            result = run(selector, action="opened", expected_merge=previous)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual({"merge_sha": previous, "base_sha": stale, "head_sha": head},
+                             dict(line.split("=") for line in output.read_text().splitlines()))
+            git("checkout", "-q", "main")
+            for event_base in (stale, base):
+                result = run(selector, event_base=event_base)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual({"merge_sha": merge, "base_sha": base, "head_sha": head},
+                                 dict(line.split("=") for line in output.read_text().splitlines()))
+            for mismatch in ({"expected_merge": previous}, {"expected_head": base}):
+                self.assertNotEqual(0, run(selector, **mismatch).returncode)
+                self.assertEqual("", output.read_text())
+
+            reversed_merge = git("commit-tree", f"{merge}^{{tree}}", "-p", head, "-p", base,
+                                 "-m", "integration with swapped parents")
+            git("checkout", "--detach", reversed_merge)
+            self.assertNotEqual(0, run(selector, expected_merge=reversed_merge).returncode)
+            self.assertEqual("", output.read_text())
+            git("checkout", "-q", "main")
             self.assertNotEqual(0, run(expected_merge=base).returncode)
             self.assertNotEqual(0, run(expected_head=base).returncode)
             git("checkout", "-q", "main^1")
