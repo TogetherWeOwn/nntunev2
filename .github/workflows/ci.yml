@@ -1570,6 +1570,8 @@ jobs:
         run: node --test ci/test-production-maintenance.mjs ci/test-production-switch-off.mjs
       - name: Unit-test candidate staging admission (offline synthetic evidence only)
         run: python3 ci/test_staging_admission.py
+      - name: Test ordinary API build artifact verification offline
+        run: python3 -B ci/test_staging_api_candidate.py
       - name: Unit-test the private launch observation record (offline)
         run: python3 ci/test_production_observation.py
       - name: Unit-test staging Worker target and submission comparison (offline)
@@ -2431,6 +2433,26 @@ jobs:
           mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
           test "${#wranglers[@]}" -eq 1
           python3 -I .github/scripts/check_worker_upload.py --wrangler "${wranglers[0]}"
+      # The staging writer still builds from its checkout. Publish the
+      # ordinary build for offline verification on the existing CI runner.
+      - name: Prepare ordinary staging API candidate
+        id: api-candidate
+        if: >-
+          ${{ github.repository == 'TogetherWeOwn/nntunev2' && github.event_name == 'push' &&
+              github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha &&
+              github.run_attempt == 1 }}
+        continue-on-error: true
+        run: python3 -B ci/staging_api_candidate.py
+      - name: Upload ordinary staging API candidate
+        if: steps.api-candidate.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.api-candidate.outputs.name }}
+          path: ${{ steps.api-candidate.outputs.path }}
+          retention-days: 2
+          compression-level: 1
+          if-no-files-found: error
       - name: Upload Worker build logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
