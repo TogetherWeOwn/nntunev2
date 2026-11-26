@@ -45,8 +45,12 @@ class TestMigrationWorkflow(unittest.TestCase):
         ]
         self.assertEqual(1, len(checkout_steps), "retain one integration checkout")
         checkout = checkout_steps[0]
-        selector = next(step for step in steps if step_level_field(step, "run") == SELECT)
-        ratchet = next(step for step in steps if step_level_field(step, "run") == RATCHET)
+        command_steps = {}
+        for command in (SELECT, RATCHET):
+            matching = [step for step in steps if step_level_field(step, "run") == command]
+            self.assertEqual(1, len(matching), f"expected one step running {command}")
+            command_steps[command] = matching[0]
+        selector, ratchet = command_steps[SELECT], command_steps[RATCHET]
         self.assertLess(steps.index(checkout), steps.index(selector))
         self.assertLess(steps.index(selector), steps.index(ratchet))
         self.assertEqual("0", step_field(checkout, "fetch-depth"))
