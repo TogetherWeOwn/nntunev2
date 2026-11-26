@@ -12,7 +12,9 @@ import { loadTrackTaste, type TrackTaste } from './taste.js';
 export function createLibraryTrackLikes(onInvalidated?: () => void) {
 	const retry = 'Account likes are unavailable. Refresh the library to try again.';
 	let active: AbortController | undefined;
-	let owner = $state.raw<TrackLikeOwner & { targets: Map<string, string | undefined> }>();
+	type LibraryLikeOwner = TrackLikeOwner & { targets: Map<string, string | undefined> };
+	let owner = $state.raw<LibraryLikeOwner>();
+	let refreshing: { owner: LibraryLikeOwner; confirmed: Map<string, TrackTaste | null> } | undefined;
 	let feedback = $state('');
 	const writes = new Map<string, Set<Promise<unknown>>>();
 	const controls = createTrackLikeControls(() => owner, (binding, result) => {
@@ -29,6 +31,12 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 		active?.abort();
 		active = undefined;
 		owner = undefined;
+		refreshing = undefined;
+	}
+
+	function beginRefresh() {
+		if (owner) refreshing = { owner, confirmed: new Map() };
+		else retire();
 	}
 
 	function invalidate() {
@@ -39,6 +47,7 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 	}
 
 	async function publish(receipt: LibraryRefreshUpdate, items: readonly LibraryItem[]) {
+		const overlap = refreshing;
 		retire();
 		const { sessionBinding: binding, accountSession, runIfCurrent: run } = receipt;
 		if (!binding || !accountSession || !run || !receipt.isCurrent() || !receipt.authoritative || receipt.authBoundary) return;
@@ -71,12 +80,30 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 				const unlisted = list.items.length < MAX_LIKES ? false : undefined;
 				// Explicit taste rows and confirmed writes take precedence over the Likes snapshot.
 				const preferences = new SvelteMap<string, TrackTaste | null>(saved?.tracks);
-				owner = {
-					binding, client: new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, session }), targets, readiness: () => receipt,
+				// Carry only confirmations from this refresh and only to the same verified account.
+				if (overlap?.owner.binding === binding && overlap.owner.readiness()?.accountSession === accountSession) {
+					for (const target of targets.values()) {
+						if (!target) continue;
+						const confirmed = overlap.confirmed.get(target);
+						if (confirmed !== undefined) preferences.set(target, confirmed);
+					}
+				}
+				// A pending listing request does not revoke verified Like targets. Retiring
+				// this owner still fences them on publication, failure, or auth change.
+				const likeReceipt: LibraryRefreshUpdate = {
+					...receipt,
+					isCurrent: () => !signal.aborted && accountSession.isCurrent() &&
+						(receipt.isCurrent() || refreshing?.owner === next),
+					runIfCurrent: (work) => accountSession.run(() => likeReceipt.isCurrent() ? work() : undefined)
+				};
+				const next: LibraryLikeOwner = {
+					binding, client: new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, session }), targets, readiness: () => likeReceipt,
 					liked: (id) => preferences.has(id) ? preferences.get(id)?.signal === 'love' : liked.has(id) || unlisted,
 					confirm: (id, confirmedId, value) => {
 						if (id !== confirmedId) return invalidate();
-						preferences.set(id, value ? { signal: 'love', until: null } : null);
+						const preference: TrackTaste | null = value ? { signal: 'love', until: null } : null;
+						preferences.set(id, preference);
+						if (refreshing?.owner === next) refreshing.confirmed.set(id, preference);
 						feedback = '';
 					},
 					failed: (_id, error, taste) => {
@@ -84,6 +111,7 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 						else feedback = `Could not confirm that ${taste ? 'track preference' : 'Like'} change. Try again or refresh the library.`;
 					},
 					taste: saved && {
+						isCurrent: receipt.isCurrent,
 						read: (id) => preferences.has(id) ? preferences.get(id) : saved.complete ? null : undefined,
 						verify,
 						invalidate,
@@ -93,6 +121,7 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 						}
 					}
 				};
+				owner = next;
 				feedback = '';
 			});
 		} catch {
@@ -100,7 +129,7 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 		}
 	}
 
-	return { publish, clear: () => { retire(); feedback = ''; }, invalidate, retire, get feedback() { return feedback; }, controls(id: string) {
+	return { beginRefresh, publish, clear: () => { retire(); feedback = ''; }, invalidate, retire, get feedback() { return feedback; }, controls(id: string) {
 		const target = owner?.targets.get(id);
 		return target ? controls(target) : undefined;
 	} };

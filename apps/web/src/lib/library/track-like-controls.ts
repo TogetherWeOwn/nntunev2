@@ -7,13 +7,15 @@ export interface TrackLikeOwner {
 	client: Parameters<typeof setTrackLike>[0];
 	/** The host supplies the server-verified binding for this authorization epoch. */
 	readonly binding: string;
-	/** Latest listing publication for this owner only. Return the published object, not a copy. */
+	/** Verified Like readiness for this owner. Return the same object until it is retired. */
 	readiness: () => LibraryRefreshUpdate | undefined;
 	/** Undefined until the track and its confirmed Like state are known in this scope. */
 	liked: (id: string) => boolean | undefined;
 	confirm: (requestId: string, confirmedId: string, liked: boolean) => void;
 	failed: (id: string, error: unknown, taste?: boolean) => void;
 	taste?: {
+		/** Preferences can require a newer listing than the Like button. */
+		isCurrent?: () => boolean;
 		read: (id: string) => TrackTaste | null | undefined;
 		confirm: (id: string, value: TrackTaste | null) => void;
 		verify: () => Promise<boolean>;
@@ -57,11 +59,12 @@ export function createTrackLikeControls(
 		const stillCurrent = () => currentOwner() === owner && owner.readiness() === receipt &&
 			receipt.isCurrent() && owner.liked(id) === liked && taste?.read(id) === saved;
 		const write = async <T,>(start: () => Promise<T>, confirm: (value: T) => void, preference?: typeof taste) => {
-			if (!stillCurrent() || inFlight.has(id)) return;
+			const canWrite = () => stillCurrent() && (preference?.isCurrent?.() ?? true);
+			if (!canWrite() || inFlight.has(id)) return;
 			inFlight.add(id);
 			try {
 				const started = await run(() => {
-					if (!stillCurrent()) return;
+					if (!canWrite()) return;
 					// Box network work so it never holds the auth fence.
 					const result = start().then((value) => ({ value }), (error: unknown) => ({ error }));
 					trackWrite?.(binding, result);
@@ -71,12 +74,12 @@ export function createTrackLikeControls(
 				const result = await started.result;
 				let verified = true;
 				if (!('error' in result) && preference) {
-					const proof = await run(() => stillCurrent() ? { result: preference.verify().catch(() => false) } : undefined);
+					const proof = await run(() => canWrite() ? { result: preference.verify().catch(() => false) } : undefined);
 					if (!proof) return;
 					verified = await proof.result;
 				}
 				await run(() => {
-					if (!stillCurrent()) return;
+					if (!canWrite()) return;
 					if ('error' in result) {
 						if (preference) owner.failed(id, result.error, true);
 						else owner.failed(id, result.error);

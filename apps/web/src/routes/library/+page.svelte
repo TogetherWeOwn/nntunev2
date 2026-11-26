@@ -366,6 +366,7 @@
 				accountTrackLikes ??= createLibraryTrackLikes(() => { trackMenu = null; });
 				void accountTrackLikes.publish(receipt, state.items);
 			} else if (revoked) accountTrackLikes?.clear();
+			else if (state.loading) accountTrackLikes?.beginRefresh();
 			else accountTrackLikes?.retire();
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
