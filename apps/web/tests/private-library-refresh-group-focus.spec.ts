@@ -13,7 +13,12 @@ for (const { title, empty } of [
 		const listener = 'synthetic-listener';
 		const binding = 'A'.repeat(43);
 		const verifierPath = '/v1/me/likes/session';
-		const removed = { id: '00000000-0000-4000-8000-000000000001', title: 'Synthetic Prelude', artist: 'Willow' };
+		const removed = {
+			id: '00000000-0000-4000-8000-000000000001',
+			occurrence_key: '00000000-0000-4000-8000-000000000005:1',
+			title: 'Synthetic Prelude',
+			artist: 'Willow'
+		};
 		const survivor = { id: '00000000-0000-4000-8000-000000000002', title: 'Synthetic Finale', artist: 'Alder' };
 		const kept = [
 			{ ...survivor, occurrence_key: '00000000-0000-4000-8000-000000000003:1' },
