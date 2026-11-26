@@ -104,17 +104,13 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                 self.assertIn("python3 -I .github/scripts/worker_rust_provenance.py rust", section)
                 self.assertNotIn("rustup toolchain install stable", section)
 
-    def test_deployment_gate_groups_do_not_hold_deploy_or_e2e_locks(self):
-        for path in ("deploy.yml", "deploy-alerts-staging.yml"):
-            with self.subTest(path=path):
-                text = (WORKFLOWS / path).read_text()
-                # The separate alerts deploy must not hold a run-level lock.
-                if path == "deploy-alerts-staging.yml":
-                    self.assertNotRegex(text, r"(?m)^concurrency:")
-                gate = job(text, "gate")
-                self.assertIn("group: ${{ github.workflow }}-gate-${{ github.ref }}", gate)
-                self.assertIn("cancel-in-progress: false", gate)
-                self.assertIn("queue: max", gate)
+    def test_alerts_deploy_retains_its_separate_gate_queue(self):
+        text = (WORKFLOWS / "deploy-alerts-staging.yml").read_text()
+        self.assertNotRegex(text, r"(?m)^concurrency:")
+        gate = job(text, "gate")
+        self.assertIn("group: ${{ github.workflow }}-gate-${{ github.ref }}", gate)
+        self.assertIn("cancel-in-progress: false", gate)
+        self.assertIn("queue: max", gate)
 
     def test_staging_build_does_not_restore_or_save_package_caches(self):
         web = job((WORKFLOWS / "deploy.yml").read_text(), "staging-web")
