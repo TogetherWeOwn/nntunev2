@@ -114,9 +114,9 @@ Use these synthetic snapshots of one attempt to rehearse the callback.
 
 | Saved evidence | What to inspect on the next callback |
 | --- | --- |
-| The run is `pending` with a null conclusion and a complete zero-job listing. | Read the same attempt's jobs listing for `gate`. For a terminal zero-job failure, take `check_suite_id` from the attempt response, list that suite's check runs, then read their annotations and require `Queue is full` for `deploy-staging-main` before recording a queue rejection. Use the pinned `<attempt>` in every run and jobs route. |
+| The run is `pending` with a null conclusion and a complete zero-job listing. | Read the same attempt's jobs listing for `gate`. A terminal zero-job failure has no jobs, check runs or annotations in REST. Before recording a queue rejection, open that attempt's run summary at `https://github.com/TogetherWeOwn/nntunev2/actions/runs/<run-id>/attempts/<attempt>` and confirm the `Queue is full` message for `deploy-staging-main`. Without it, report the failure as unclassified. Use the pinned `<attempt>` in every run and jobs route. |
 | The job named `gate` is `queued` with runner ID `0`, an empty runner name and no steps. | Read `GET /repos/TogetherWeOwn/nntunev2/actions/jobs/<job-id>` for `gate` and check for runner assignment or execution. Actions can populate `started_at` while the job is still queued. |
-| `Deploy to staging` and `Deploy api to staging` succeeded, and the full journey is queued, running or lacks a successful result. | Read the attempt's post-deploy smoke and full-journey job details. If they share a job, check `Run synthetic smoke` before `Run full journey`. Inspect the journey step, evidence gate and receipt record and upload steps. A failed smoke with a skipped journey is a smoke failure. |
+| `Deploy to staging` and `Deploy api to staging` succeeded, and the full journey is queued, running or lacks a successful result. | Read the attempt's `post-deploy-e2e / synthetic smoke (health)` job for `Run synthetic smoke`, then its `post-deploy-e2e / full journey (…)` job for `Run full journey`, the evidence gate and the receipt record and upload steps. A failed smoke with a skipped journey is a smoke failure. |
 
 In all three snapshots, record qualification as pending. Report the pinned
 attempt, last confirmed step and next read-only endpoint in the handoff.
