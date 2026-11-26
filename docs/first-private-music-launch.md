@@ -213,6 +213,26 @@ Access writers as required by [protected recovery](ops.md#protected-production-w
 See the [synthetic post-recovery handoff](ops/first-release-recovery-example.md)
 for an example of recording the serving build and the pending release decision.
 
+### Read the recorded rollback attempt before jobs appear
+
+In this example the operator has already identified the exact `recover-worker`
+dispatch for the reviewed SHA and original rollout. The recorded rollback is
+run `102`, attempt `1`, in the synthetic repository `example/fixture`. Read both
+`GET /repos/example/fixture/actions/runs/102/attempts/1` and
+`GET /repos/example/fixture/actions/runs/102/attempts/1/jobs`. Confirm the status
+response identifies the recorded run and attempt. Both reads succeeded and the
+complete jobs response is `{"total_count":0,"jobs":[]}`.
+
+| Actions run status | Verification entry | Next action |
+| --- | --- | --- |
+| `pending` | **Pending**. Actions has yet to list any jobs. | Repeat the status and jobs reads for `102/1`. |
+| `completed` | **Missing required verification**. The terminal run has no recovery job evidence. | Reconcile the missing `recover-worker` evidence for `102/1` under the protected recovery procedure above. |
+
+Keep switch-off **Pending**, the recorded run and attempt, and the writer
+freeze in both cases. Do not dispatch another recovery or rerun the workflow
+from this readback. Switch-off requires the recovery job, pinned serving
+allocation and denial evidence in step 3.
+
 ## Watch the first 30 minutes
 
 Assign a named watcher and a backup with recovery access before promotion.

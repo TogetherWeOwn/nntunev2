@@ -340,15 +340,18 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn("environment:\n      name: staging\n      deployment: false", preflight)
         self.assertIn('[[ "$REVIEWED_REF" =~ ^[0-9a-f]{40}$ && "$REVIEWED_REF" == "$GITHUB_SHA" ]]', preflight)
         self.assertIn('[[ "$SCOPE_SHA256" =~ ^[0-9a-f]{64}$ ]]', preflight)
-        setup, probe = preflight.split("- name: Run the bound disposable provider probe\n")
-        self.assertNotIn("secrets.", text.split("- name: Run the bound disposable provider probe\n")[0])
+        probe_step = "- name: Run the bound disposable provider probe\n"
+        setup, probe_and_report = preflight.split(probe_step)
+        probe, report = probe_and_report.split("- name: Report provider preflight outcome\n")
+        before_probe = text.split(probe_step)[0]
+        self.assertNotIn("secrets.", before_probe + report)
         self.assertIn("ref: ${{ github.sha }}\n          persist-credentials: false", setup)
         self.assertIn('test "$(git rev-parse HEAD)" = "$GITHUB_SHA"', setup)
         self.assertIn("cargo build --locked --manifest-path workers/ingest/Cargo.toml", setup)
         self.assertIn("--no-default-features --features fixture-provider-preflight", setup)
         self.assertIn('"$WASM_BINDGEN_BIN" --target nodejs', setup)
         match, settings = probe.split("          PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256:", 1)
-        self.assertEqual(" ".join(match.split()), "env: PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH: >- "
+        self.assertEqual(" ".join(match.split()), "id: provider_probe env: PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH: >- "
                          "${{ vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT != '' && "
                          "vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT == secrets.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT && "
                          "vars.PRIVATE_PLAYBACK_STAGING_S3_REGION != '' && "
@@ -360,8 +363,14 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         ])
         self.assertIn("PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: ${{ inputs.scope_sha256 }}", probe)
         self.assertIn('--provider-dispatch "$RUNNER_TEMP/trial-provider-preflight/nntune_ingest.js" 2>/dev/null', probe)
-        self.assertNotRegex(probe, r"(?m)^      - ")
-        self.assertNotRegex(text, r"upload-artifact|continue-on-error|\b(?:wrangler|psql)\b")
+        self.assertEqual(report.split("        run: |\n", 1)[0],
+                         "        if: ${{ always() }}\n"
+                         "        continue-on-error: true\n"
+                         "        env:\n"
+                         "          PROBE_OUTCOME: ${{ steps.provider_probe.outcome }}\n")
+        self.assertNotRegex(probe + report, r"(?m)^      - ")
+        self.assertNotIn("continue-on-error", before_probe + probe)
+        self.assertNotRegex(text, r"upload-artifact|\b(?:wrangler|psql)\b")
 
     def test_codeql_reports_on_every_pull_request(self):
         # The code_scanning ruleset waits for CodeQL on every PR; a path filter

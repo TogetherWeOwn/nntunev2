@@ -167,6 +167,52 @@ test('Retry after a first-load 503 reads the current invited Library', async ({ 
 	expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentTimeOrigin);
 });
 
+test('Selected only survives a failed invited Library refresh and successful Retry', async ({ page, origin }) => {
+	const updatedSelected = { ...selected, title: 'Updated selected track' };
+	const updatedFirst = { ...first, title: 'Updated unselected track' };
+	let listing: Listing = [first, selected];
+	const fixture = await mockCatalogue(page, origin, () => listing);
+	await fixture.signIn();
+
+	const main = page.getByRole('main');
+	const show = main.getByRole('combobox', { name: 'Show', exact: true });
+	const count = main.getByRole('status').and(main.getByTestId('library-find-count'));
+	const stale = main.getByTestId('library-stale-badge');
+	const refresh = main.getByRole('button', { name: library.refresh, exact: true });
+	const retry = main.getByRole('button', { name: 'Retry', exact: true });
+	const checkbox = (track: Track) => row(page, track).getByRole('checkbox', { name: `Select ${track.title}`, exact: true });
+	const expectFiltered = async (track: Track) => {
+		await expect(show).toHaveValue('selected');
+		await expect(count).toHaveText(/^Showing 1 of 2 tracks?$/);
+		await expectCatalogue(page, [track]);
+		await expect(checkbox(track)).toBeChecked();
+	};
+
+	await page.goto(origin + library.path);
+	await expectCatalogue(page, listing);
+	await checkbox(selected).check();
+	await show.selectOption({ label: 'Selected only' });
+	await expectFiltered(selected);
+
+	listing = 503;
+	const [failed] = await Promise.all([page.waitForResponse(origin + library.api), refresh.click()]);
+	expect(failed.status()).toBe(503);
+	await expect(stale).toBeVisible();
+	await expectFiltered(selected);
+
+	listing = [updatedFirst, updatedSelected];
+	const [retried] = await Promise.all([page.waitForResponse(origin + library.api), retry.click()]);
+	expect(retried.status()).toBe(200);
+	await expectFiltered(updatedSelected);
+	await expect(stale).toBeHidden();
+	await expect(refresh).toBeVisible();
+
+	await show.selectOption({ label: 'All tracks' });
+	await expectCatalogue(page, listing);
+	await expect(checkbox(updatedFirst)).not.toBeChecked();
+	expect(fixture.listingAccounts).toEqual([listener.account, listener.account, listener.account]);
+});
+
 test('returning to Library shows the new track and keeps the current selection', async ({ page, origin }) => {
 	let catalogue = [first, selected];
 	const fixture = await mockCatalogue(page, origin, () => catalogue);

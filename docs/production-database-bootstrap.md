@@ -139,7 +139,8 @@ this deployment approval.
 3. The setup process consumes the exact bytes returned by admission.
    Keep the invoker and approver separate from SQL custody. Scope the writer
    to the setup step and the separate aggregate reader to the baseline path.
-   The release task owns live role validation. Use no workflow inputs or
+   Carry the [SQL issuer authority evidence](#sql-issuer-authority-evidence)
+   into release review for each plan. Use no workflow inputs or
    public outputs for the plan, target, credentials or SQL results. Refuse
    debug mode. Check the debug controls at organization, repository and
    Environment scope before releasing secrets. Use a fixed command with
@@ -414,6 +415,8 @@ grants and writes through the read.
 One TLS-verified read-only snapshot checks primary status, identity and rights.
 It scans up to 256 user relations and large objects, and refuses incomplete coverage.
 Ledger and reference rows count as data. Record the job URL, attempt and verdict.
+Link the [SQL issuer authority evidence](#sql-issuer-authority-evidence) in
+the baseline review alongside the verified setup readback and reader issuance OID.
 
 When reviewing the first-launch baseline, reconcile the saved catalog inventory
 and required reader privilege result with the accepted baseline plan. Use the
@@ -441,11 +444,18 @@ the same read-only catalog snapshot. Hash that inventory using the same
 representation as the reviewed and saved inventories. If this readback is
 unavailable, omit `reader_privileges` so the evidence stays pending.
 
-Keep the baseline evidence pending if the check exits nonzero with `pending`,
-including when the catalog matches but the privilege result belongs to a
-different reader. `consistent` confirms the supplied evidence agrees. The
-protected run's `empty` verdict, provenance and retirement evidence are still
-required. Keep credentials and raw SQL results out of the normalized record.
+Both pending messages leave baseline evidence pending. A plain `pending`
+covers absent or unusable readback and other evidence failures, including
+a privilege result for a different reader. Recover any missing private
+readback for the same attempt. `pending (inventory-mismatch)` means a
+complete inventory record identifies the reviewed branch and database OID
+and has a different digest. Use the separately authorized read-only catalog
+check to compare the expected and observed objects on that database. A
+digest difference establishes disagreement, and the catalog comparison
+identifies any omitted objects. Keep migration closed pending reconciliation.
+`consistent` confirms the supplied evidence agrees. The protected run's
+`empty` verdict, provenance and retirement evidence are still required.
+Keep credentials and raw SQL results out of the normalized record.
 
 ### Carry verified staging evidence into database approval
 
@@ -631,6 +641,75 @@ terminate and read back its sessions.
 [PlanetScale roles](https://planetscale.com/docs/postgres/connecting/roles)
 · [Managed Roles API](https://planetscale.com/docs/api/reference/create_role)
 · [PostgreSQL CREATE ROLE](https://www.postgresql.org/docs/current/sql-createrole.html)
+
+### SQL issuer authority evidence
+
+Before each release review, the Operator adds the applicable issuer evidence
+to the existing private release record. Bind each entry to its protected
+workflow, candidate SHA and SHA-256 of that workflow's exact plan bytes
+(`BOOTSTRAP_PLAN_DIGEST` or `BASELINE_PLAN_DIGEST`).
+Keep the staging qualification and Environment protection references in
+the same release record. The [Environment checker](#environment-protection-readback)
+checks saved GitHub policy. SQL authority requires its own observed evidence.
+
+For each SQL issuer operation, record the expected issuer and selected database
+alongside the observation. Include the provider branch and verified direct
+primary TLS route, the bare issuer role and its catalog OID, `session_user`,
+`current_user`, `current_database()`, and the database OID where it exists.
+Record when the evidence was observed and link the private readback showing
+effective authority for the named roles and database. Match both session
+identities to the expected issuer and match the observed route and database
+to the plan and operation. Keep credentials, connection strings, SCRAM
+verifiers and raw diagnostics in their existing custody outside this record.
+
+| Release review | Selected database and role scope to verify | Where the evidence goes |
+| --- | --- | --- |
+| Bootstrap setup | On maintenance, verify the setup issuer's `CREATEROLE` and `CREATEDB`, authority to grant the named owner with SET-only membership to the temporary setup role, and authority to fence, drain and drop that role. Record the planned launch name and its verified absence. The reader issuer also uses maintenance to prepare the named passwordless reader and must be able to fence, drain and retire an unactivated reader there. Verify its non-superuser `CREATEROLE` and authority scoped to that reader. | Cite the issuer evidence in the bootstrap plan's review. Keep the issued setup and pending reader OIDs in separate private issuance readbacks once those operations are authorized and completed. |
+| Protected baseline | Use the setup readback's launch database and OID for reader activation and launch grant cleanup. Verify that the pinned reader issuer has authority to administer the issued reader and grant and revoke launch CONNECT, schema USAGE and direct SELECT over the intended physical relations. Verify it can fence from maintenance, terminate the issued reader's sessions and retire that role. Match the private reader issuance OID and the setup route to the baseline plan. | Cite the launch/database and reader OID readbacks and the reader issuer evidence in the baseline plan's review. |
+
+Use the existing release sequence for role changes. Preparing this record
+uses observed evidence and performs no role issuance, activation or dispatch.
+The issuer identities and authority readbacks stay in the private release
+record. The setup and baseline callers still take their respective version 2
+plans through protected admission.
+Any missing, mismatched or unresolved issuer evidence keeps that preparation
+pending. Record the specific gap and link the observation that shows it.
+
+#### Offline issuer evidence rehearsal
+
+Use one synthetic candidate SHA and the separate SHA-256 digests of its
+synthetic setup and baseline plans. In the bootstrap entry select `postgres`
+(OID `5`) on branch `fixture001` at `db.fixture.invalid` on port `5432`. Record a
+matching primary TLS observation. Pin `fixture_issuer` (OID `41001`) for
+`fixture_creator` and `fixture_owner`, and `fixture_reader_issuer` (OID
+`41002`) for `Fixture-Protected-Reader`. Both session identities match the
+respective issuer. The intended target `launch_fixture` is absent. In the
+later baseline entry use the same branch and endpoint, select `launch_fixture`
+with setup readback OID `41003` and link the reader issuance OID `41004`.
+Use a synthetic timestamp and a private readback reference for each
+observation. The positive control records every scoped capability in the
+table above as verified for its issuer and operation.
+
+For each workflow, use `sha256sum` on its version 2 plan file. Compare the
+computed digest with the digest in that workflow's issuer entry. A mismatch
+keeps the entry pending. Record the digest comparison and the Operator's
+disposition for the bootstrap and baseline entries.
+
+| Synthetic evidence reviewed | Preparation outcome to record |
+| --- | --- |
+| Both bootstrap issuers match their expected identities and maintenance route. The setup issuer's authority to delegate `fixture_owner` is unresolved. | `Pending — SQL issuer authority incomplete` for bootstrap. Leave baseline pending through setup and its readback. |
+| Bootstrap evidence also verifies delegation of the named owner and the remaining scoped issue, fence, drain and retirement capabilities. | The bootstrap issuer evidence is complete. With the rest of the bootstrap prerequisites supplied, mark the preparation `Eligible for independent release review`. |
+| The later baseline record has matching launch and reader OIDs, but the reader issuer's direct SELECT grant option is unresolved, or the observation came from maintenance. | `Pending — SQL issuer authority incomplete` for baseline. |
+| A complete baseline issuer entry carries the bootstrap plan digest. | `Pending — SQL issuer authority incomplete` for baseline. Record the plan-digest mismatch. |
+| The baseline record carries the baseline plan digest and verifies the pinned issuer on the selected launch database, the launch grant and cleanup scope, and the maintenance fence. | With the rest of the baseline prerequisites supplied, mark the preparation `Eligible for independent release review`. |
+
+These are Operator entries. Keep release approval pending until the reviewer
+decides. The [hosted disposable fixture](../.github/scripts/test_database_bootstrap_isolation.py)
+exercises the underlying custody behavior with synthetic SQL issuers. It
+refuses setup without owner delegation, reader preparation under another
+issuer, and reader activation on the wrong database or with a missing grant
+option. The complete controls exercise the intended role operations on the
+disposable instance.
 
 ### Snapshot and metering
 
