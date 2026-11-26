@@ -1256,7 +1256,7 @@ class SourceBindingTests(Base):
         return self.git(*args).decode().strip()
 
     def run_main(self, candidate_files=None, trusted_files=None, current_files=None, private=False,
-                 mode="bootstrap-maintenance", world_factory=None, live_error=None):
+                 mode="bootstrap-maintenance", world_factory=None, live_error=None, cli_refusal=None):
         candidate = self.commit(candidate_files or self.files)
         trusted = self.commit(trusted_files or self.files, candidate)
         current = self.commit(current_files or trusted_files or self.files, trusted)
@@ -1284,6 +1284,15 @@ class SourceBindingTests(Base):
                 patch.object(sa, "Actions", return_value=actions), \
                 patch.object(sa, "current_identity", side_effect=live_error) as live, \
                 patch("sys.stdout", new=io.StringIO()) as output:
+            if cli_refusal is not None:
+                with patch("sys.stderr", new=io.StringIO()) as error, self.assertRaises(SystemExit) as stopped:
+                    sa.cli()
+                self.assertEqual(stopped.exception.code, 1)
+                self.assertEqual(error.getvalue(), f"::error::Candidate admission refused: {cli_refusal}\n")
+                self.assertEqual(output.getvalue(), "")
+                self.assertNotIn(f"runs/{RUN_ID}/artifacts?per_page=100&page=1", actions.calls)
+                live.assert_not_called()
+                return
             with patch.object(sa, "git", wraps=sa.git) as source_git:
                 try:
                     sa.main()
@@ -1408,6 +1417,48 @@ class SourceBindingTests(Base):
 
         self.refused("^artifact content digest mismatch$", self.run_main, private=True, mode="promote",
                      world_factory=different_download)
+
+    def test_private_main_distinguishes_pending_and_failed_required_jobs(self):
+        self.install_private_contract()
+        _, lines = self.run_main(private=True, mode="promote")
+        self.assertEqual(json.loads(lines[0])["verified_private_music_staging"]["run_attempt"], "1")
+
+        def pending():
+            world = PrivateWorld()
+            world.run.update(status="in_progress", conclusion=None)
+            world.jobs[-1].update(status="queued", conclusion=None, started_at=None, completed_at=None)
+            return world
+
+        def failed():
+            world = pending()
+            world.jobs[2].update(conclusion="failure")
+            return world
+
+        def completed_failure():
+            world = failed()
+            world.run.update(status="completed", conclusion="failure")
+            world.jobs[-1].update(status="completed", conclusion="skipped", completed_at=iso(5))
+            return world
+
+        def incomplete_jobs():
+            world = PrivateWorld()
+            world.jobs.pop()
+            return world
+
+        def mismatched_jobs():
+            world = pending()
+            world.jobs[-1].update(run_attempt=2)
+            return world
+
+        wait = (f"post-deploy private music journey in staging run {RUN_ID}, attempt 1 is pending. "
+                "Wait for the attempt to finish, then recheck the evidence.")
+        investigate = (f"staging-stream in staging run {RUN_ID}, attempt 1 did not succeed. "
+                       "Inspect the job and return to candidate qualification.")
+        generic = "missing, unapproved, stale or incoherent evidence"
+        for factory, refusal in ((pending, wait), (failed, investigate), (completed_failure, investigate),
+                                 (incomplete_jobs, generic), (mismatched_jobs, generic)):
+            with self.subTest(fixture=factory.__name__):
+                self.run_main(private=True, mode="promote", world_factory=factory, cli_refusal=refusal)
 
     def test_private_producer_cli_binds_candidate_audio(self):
         fixture = self.install_private_contract()
