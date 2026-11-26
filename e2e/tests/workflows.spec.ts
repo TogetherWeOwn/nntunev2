@@ -109,12 +109,18 @@ test.describe('ci-ok aggregate', () => {
     test(`e2e-lint ${result} ${result === 'success' ? 'passes' : 'fails'} the aggregate`, () => {
       expect(aggregate).toBeDefined();
       const needs = JSON.stringify({
-        placeholder: { result: 'success' },
+        'ci-commits': { result: 'success' },
+        early: { result: 'success' },
         'public-pr-security': { result: 'success' },
         'e2e-lint': { result },
       }, null, 2);
       const script = aggregate!.replace(/^ {10}/gm, '');
-      const actual = runShell(script, { NEEDS_JSON: needs, CI_EVENT_NAME: 'pull_request' });
+      const actual = runShell(script, {
+        NEEDS_JSON: needs,
+        CI_EVENT_NAME: 'pull_request',
+        CI_COVERAGE_COMPLETE: 'true',
+        CI_SKIP: '[]',
+      });
       expect(actual.status).toBe(result === 'success' ? 0 : 1);
     });
   }
