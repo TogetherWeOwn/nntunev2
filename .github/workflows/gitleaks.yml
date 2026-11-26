@@ -1,3 +1,4 @@
+# guards: release:staging promotion gitleaks
 name: gitleaks
 
 # Full-history secret scan; `gitleaks` is a required check on main. Uses the

@@ -108,8 +108,13 @@ numeric `?pr=` suffix copied from the PR Checks tab.
 Before merging, open the linked runs, verify the current head and base, and
 confirm the required checks and the reviewers' decisions at their sources.
 GitHub reports body edits and base retargets as the same `edited` activity.
-Posting evidence as a comment avoids starting another `migrations-staging` run.
-Edit the PR body when its description or Attestation needs a substantive correction.
+After retargeting, push an updated PR head to run the gates against the new
+base. Verify the new head and the migration snapshot's base ref before merge.
+For substantive title, description or Attestation corrections at the same
+head, close and reopen the PR to re-run the title, PR standards and migration
+checks with the current metadata. For same-head graph evidence, reopening also
+refreshes the graph controls in the required `migrations-gate` job. Post ordinary
+evidence updates as comments.
 
 ### Changed-lines mutation gate
 

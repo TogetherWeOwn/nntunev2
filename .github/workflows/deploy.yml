@@ -1,3 +1,4 @@
+# guards: release:staging deploy and post-deploy E2E
 name: deploy
 
 # Staging deploys (apps/web only).

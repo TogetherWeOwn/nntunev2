@@ -784,19 +784,19 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(set(pages[0][0]) - {"patch"}, set(projected[0][0]))
         self.assertNotIn("body", json.loads(history.read_input(self.workflow_api / "pr-metadata.json")))
 
-    def test_workflow_dependabot_opened_and_body_edited_both_verify_the_same_head(self):
+    def test_workflow_opened_and_reopened_verify_the_same_head(self):
         pages, metadata = self.workflow_inputs()
         opened = self.event(metadata)
         opened.update(action="opened", sender={"login": "dependabot[bot]", "type": "Bot"})
         opened["pull_request"]["body"] = "Initial update description"
-        edited = copy.deepcopy(opened)
-        edited.update(action="edited", changes={"body": {"from": opened["pull_request"]["body"]}})
-        edited["pull_request"]["body"] = "Update description with evidence"
+        reopened = copy.deepcopy(opened)
+        reopened.update(action="reopened", sender={"login": "maintainer", "type": "User"})
+        reopened["pull_request"]["body"] = "Correct the description and attestation"
         expected = []
-        for event in (opened, edited):
+        for event in (opened, reopened):
             with self.subTest(action=event["action"]):
                 result = self.run_workflow(pages, metadata, event=event,
-                                           samples=[opened["pull_request"], edited["pull_request"]])
+                                           samples=[opened["pull_request"], reopened["pull_request"]])
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 snapshot = json.loads((self.workflow_api / "pr-metadata.json").read_text())
                 self.assertEqual(snapshot["attempt"], 1)
@@ -809,7 +809,7 @@ class GitFixture(unittest.TestCase):
 
         invalid = copy.deepcopy(pages)
         invalid[0][1] = {"filename": "docs/substitute.md", "status": "added"}
-        result = self.run_workflow(invalid, metadata, event=edited)
+        result = self.run_workflow(invalid, metadata, event=reopened)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("API migration coverage differs", result.stderr)
 
@@ -818,15 +818,20 @@ class GitFixture(unittest.TestCase):
         original = self.full_metadata(metadata)
         retargeted = copy.deepcopy(original)
         retargeted["base"]["ref"] = "release"
+        self.git("commit", "--allow-empty", "-qm", "refresh checks after retarget")
+        retargeted["head"]["sha"] = self.git("rev-parse", "HEAD")
         event = self.event(retargeted)
-        event.update(action="edited", changes={"base": {"ref": {"from": "main"}}})
+        event.update(action="synchronize", before=original["head"]["sha"],
+                     after=retargeted["head"]["sha"])
 
         result = self.run_workflow(pages, retargeted, event=event)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         snapshot = json.loads((self.workflow_api / "pr-metadata.json").read_text())
         self.assertEqual(snapshot["before"]["base"]["ref"], "release")
 
-        result = self.run_workflow(pages, retargeted, event=event, samples=[retargeted, original])
+        stale_base = copy.deepcopy(retargeted)
+        stale_base["base"]["ref"] = "main"
+        result = self.run_workflow(pages, retargeted, event=event, samples=[retargeted, stale_base])
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("API base repository/ref retargeted", result.stderr)
 

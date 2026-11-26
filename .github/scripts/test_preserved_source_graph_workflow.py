@@ -20,10 +20,14 @@ class TestPreservedSourceGraphWorkflow(unittest.TestCase):
         text = (ROOT / ".github/workflows/preserved-source-graph.yml").read_text()
         self.assertIn(
             "  pull_request:\n"
-            "    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]\n",
+            "    types: [opened, synchronize, reopened]\n"
+            "    paths:\n",
             text,
         )
         self.assertNotIn("pull_request_target:", text)
+        for path in ("migrations/**", ".github/scripts/*migration*.py",
+                     ".github/scripts/*graph*.py", ".github/workflows/preserved-source-graph.yml"):
+            self.assertIn(f"      - {path}\n", text)
         self.assertIn("permissions:\n  contents: read\n", text)
         jobs = split_jobs(text)
         self.assertEqual({"synthetic-graph"}, set(jobs))

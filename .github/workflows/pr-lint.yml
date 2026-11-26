@@ -1,3 +1,4 @@
+# guards: release:staging promotion pr-lint
 name: pr-lint
 
 # PR-title conventional-commit lint; `pr-lint` is a required check on main.
@@ -9,7 +10,7 @@ name: pr-lint
 
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened]
+    types: [opened, synchronize, reopened]
   # Merge queue validation: `pr-lint` is a required check, so it
   # must report on merge_group. The queue run has no PR title and no
   # commits array, so it takes the explicit merge_group branch in the run
@@ -30,23 +31,28 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
-  # Never cancel: Dependabot fires two pull_request events ~1s apart at PR
-  # creation (opened, then edited) for the same head SHA, and cancelling the
-  # first leaves a permanent CANCELLED required check in the rollup next to
-  # its successful twin, which reads as a stuck PR. The job takes seconds,
-  # so queue the duplicate instead — `queue: max` so a third rapid event
-  # cannot cancel a still-pending run either (the default queue keeps only
-  # the newest pending run). Pinned by
-  # .github/scripts/test_ci_required_check_concurrency.py.
+  # Keep every pending and in-flight required verdict for this PR.
   cancel-in-progress: false
   queue: max
 
 jobs:
   pr-lint:
     name: pr-lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check workflow demand policy
+        run: |
+          python3.12 -m venv "$RUNNER_TEMP/workflow-guard"
+          python="$RUNNER_TEMP/workflow-guard/bin/python"
+          "$python" -m pip --isolated install --no-deps --only-binary=:all: --require-hashes \
+            -r /dev/stdin <<<'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc'
+          "$python" -I ci/ci_workflow_guard.py .
+          "$python" -m unittest discover -s ci -p test_ci_workflow_guard.py
       - name: Check PR title convention
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
