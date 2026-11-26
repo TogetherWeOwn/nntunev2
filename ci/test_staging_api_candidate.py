@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import io
 from pathlib import Path
 import stat
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -101,6 +102,10 @@ class ApiCandidateTests(unittest.TestCase):
                 "RUNNER_TEMP": temp, "GITHUB_OUTPUT": str(step_outputs),
             }
             with patch("staging_api_candidate.subprocess.check_output", return_value=SHA + "\n"):
+                with self.assertRaisesRegex(Refused, "unexpected CI attempt"):
+                    prepare_ci(root, env | {"GITHUB_RUN_ATTEMPT": "2"})
+                self.assertFalse(step_outputs.exists())
+                self.assertFalse((root / "staging-api-candidate").exists())
                 prepare_ci(root, env)
             outputs = dict(line.split("=", 1) for line in step_outputs.read_text().splitlines())
             payload = Path(outputs["path"])
@@ -165,6 +170,19 @@ class ApiCandidateTests(unittest.TestCase):
                 actions.set_archive(make_archive(files))
                 with self.assertRaisesRegex(Refused, "build archive"):
                     verify(actions)
+
+    def test_refuses_corrupt_deflate_with_matching_artifact_digest(self):
+        actions = ActionsFixture()
+        archive = bytearray(actions.archive)
+        # The first local ZIP header is 30 bytes, followed by the name and extra fields.
+        name_size, extra_size = struct.unpack_from("<HH", archive, 26)
+        start = 30 + name_size + extra_size
+        # Use the reserved DEFLATE block type so reading the member fails in zlib.
+        archive[start] |= 0b110
+        actions.set_archive(bytes(archive))
+        with self.assertRaisesRegex(Refused, "unreadable build archive"):
+            verify(actions)
+        self.assertEqual(actions.downloads, 1)
 
 
 if __name__ == "__main__":
