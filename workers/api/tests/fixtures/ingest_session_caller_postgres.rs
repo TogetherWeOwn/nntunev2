@@ -16,7 +16,7 @@ use nntune_ingest::multipart::{
     initiation::InitiatedUpload,
     readback_inventory::{BucketReadbackResponse, CompletedReadbackInventory},
     resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
-    session_completion::{CompletionRequest, CompletionResponse, SessionCompletion},
+    session_completion::{CompletionResponse, SessionCompletion},
     session_upload::handoff,
     sidecar::{SidecarPut, SidecarPutReply},
     Plan, UploadTarget, PART_BYTES,
@@ -572,107 +572,84 @@ async fn prove_attempt(
     } else {
         BUCKET
     };
-    let plan = Plan::new(
-        UploadTarget {
-            bucket: inventory_bucket,
-            ..target
-        },
-        header,
-        length,
-    )
-    .unwrap();
-    let mut partition = plan.partition();
-    let mut upload_parts = Vec::new();
-    for (index, chunk) in sealed.iter().enumerate() {
-        upload_parts.extend(
-            partition
+    let (opened, mut resumed_writer, completed, ciphertext) = if let Some(fail_later_page) =
+        inventory_case
+    {
+        Box::pin(inventory_pages::complete(
+            observer,
+            opened,
+            &key,
+            header,
+            &sealed,
+            fail_later_page,
+        ))
+        .await
+    } else {
+        let plan = Plan::new(
+            UploadTarget {
+                bucket: inventory_bucket,
+                ..target
+            },
+            header,
+            length,
+        )
+        .unwrap();
+        let mut partition = plan.partition();
+        for (index, chunk) in sealed.iter().enumerate() {
+            let part = partition
                 .push(&SealedChunk {
                     digest: Sha256::digest(&chunk.bytes).into(),
                     bytes: chunk.bytes.clone(),
                     final_chunk: index + 1 == sealed.len(),
                 })
-                .unwrap(),
-        );
-    }
-    upload_parts.extend(partition.finish().unwrap());
-    assert_eq!(
-        upload_parts.len(),
-        if inventory_case.is_some() { 2 } else { 1 }
-    );
-    let binding = ResumeBinding {
-        plan,
-        configuration,
-        environment: &env,
-        library: &lib,
-        session: &sid,
-        object: &obj,
-        generation: &generation,
-        envelope_scheme: 2,
-    };
-    let mut ciphertext = Vec::new();
-    let (receipts, parts): (Vec<_>, Vec<_>) = upload_parts
-        .iter()
-        .map(|part| {
-            let (_, number, bytes, _) = part.request();
-            ciphertext.extend_from_slice(bytes);
-            let etag = if number == 1 {
-                "\"synthetic\""
-            } else {
-                "\"synthetic-tail\""
-            };
-            let digest: [u8; 32] = Sha256::digest(bytes).into();
-            (
-                part.verify_reply(etag.into(), &STANDARD.encode(digest))
-                    .unwrap(),
-                CheckpointPart {
-                    number,
-                    len: bytes.len(),
-                    etag,
-                    digest,
-                },
-            )
-        })
-        .unzip();
-    assert_ne!(ciphertext, input);
-    let checkpoint = ResumeCheckpoint {
-        binding,
-        parts: &parts,
-    };
-    let send = async |sent: CompletionRequest<'_>| {
-        assert_eq!(sent.target.upload_id, UPLOAD);
-        let mut composite = Sha256::new();
-        for part in &parts {
-            composite.update(part.digest);
+                .unwrap();
+            assert!(part.is_none());
         }
-        let composite = STANDARD.encode(composite.finalize());
-        let count = parts.len();
-        Ok(CompletionResponse {
+        let part = partition.finish().unwrap().unwrap();
+        let (_, number, ciphertext, checksum) = part.request();
+        assert_ne!(ciphertext, input);
+        let ciphertext = ciphertext.to_vec();
+        let part_digest: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let receipt = part.verify_reply("\"synthetic\"".into(), checksum).unwrap();
+        let binding = ResumeBinding {
+            plan,
             configuration,
-            status: 200,
-            version: Some(MEDIA.into()),
-            body: format!(
-                "<CompleteMultipartUploadResult><Bucket>{inventory_bucket}</Bucket><Key>{key}</Key>
-                <ChecksumSHA256>{composite}-{count}</ChecksumSHA256></CompleteMultipartUploadResult>"
-            )
-            .into_bytes(),
-        })
-    };
-    let completed = if let Some(fail_later_page) = inventory_case {
-        Box::pin(inventory_pages::complete(
-            observer,
-            &opened,
-            &checkpoint,
-            receipts,
-            fail_later_page,
-            send,
-        ))
-        .await
-    } else {
-        SessionCompletion::prepare(binding, &context, receipts, &checkpoint)
-            .unwrap()
-            .dispatch(send)
-            .await
-            .unwrap()
+            environment: &env,
+            library: &lib,
+            session: &sid,
+            object: &obj,
+            generation: &generation,
+            envelope_scheme: 2,
+        };
+        let parts = [CheckpointPart {
+            number,
+            len: ciphertext.len(),
+            etag: "\"synthetic\"",
+            digest: part_digest,
+        }];
+        let checkpoint = ResumeCheckpoint {
+            binding,
+            parts: &parts,
+        };
+        let completed = SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint)
+                .unwrap()
+                .dispatch(async |sent| {
+                    assert_eq!(sent.target.upload_id, UPLOAD);
+                    let composite = STANDARD.encode(Sha256::digest(part_digest));
+                    Ok(CompletionResponse {
+                        configuration,
+                        status: 200,
+                        version: Some(MEDIA.into()),
+                        body: format!(
+                            "<CompleteMultipartUploadResult><Bucket>{inventory_bucket}</Bucket><Key>{key}</Key>
+                            <ChecksumSHA256>{composite}-1</ChecksumSHA256></CompleteMultipartUploadResult>"
+                        )
+                        .into_bytes(),
+                    })
+                })
+                .await
+                .unwrap();
+        (opened, None, completed, ciphertext)
     };
     let put = SidecarPut::new(inventory_bucket, &context, &origin, map, 0, page).unwrap();
     let page_key = put.request().0.key.clone();
@@ -764,6 +741,7 @@ async fn prove_attempt(
         verified
     };
     if inventory_case.is_some() {
+        let writer = resumed_writer.as_mut().unwrap_or(writer);
         let committed = Box::pin(opened.commit_flac(
             writer,
             auth,
@@ -779,6 +757,23 @@ async fn prove_attempt(
         assert_eq!(outcome.object.replace('-', ""), obj);
         assert_eq!(outcome.media_version, MEDIA);
         assert_eq!(outcome.page_versions, [PAGE]);
+        let replayed = read(writer, auth, prepared, reload).await.unwrap().unwrap();
+        assert_eq!(replayed.map, outcome.map);
+        assert_eq!(replayed.object, outcome.object);
+        assert_eq!(replayed.media_version, outcome.media_version);
+        assert_eq!(replayed.page_versions, outcome.page_versions);
+        observer
+            .query_one(
+                "SELECT 1
+             FROM public.ingest_session_reservations s
+             JOIN public.storage_digest_inventory_intents i ON i.map_id = s.completed_map_id
+             WHERE s.id = $1::text::uuid AND s.terminal_reason = 'completed'
+               AND s.write_lease_id IS NULL AND s.multipart_upload_id = $2
+               AND i.map_id = $3::text::uuid AND i.media_version = $4 AND i.page_versions = $5",
+                &[&sid, &UPLOAD, &map_text, &MEDIA, &&[PAGE][..]],
+            )
+            .await
+            .expect("the completed upload must store the exact media and page versions");
         return;
     }
     if matches!(fault, Some(Fault::LostCompletionResponse)) {
