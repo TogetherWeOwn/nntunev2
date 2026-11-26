@@ -264,17 +264,13 @@ test('the protected summary records an interrupted read and a successful fresh d
   };
 
   const interrupted = probe(scopeFor(generation));
-  const checkedInterruption = assert.rejects(interrupted, (error) => {
-    // GNU timeout can propagate SIGTERM or return the shell status 128 + 15.
-    const termination = error.signal ?? error.code;
-    assert.ok(['SIGTERM', 143].includes(termination), `unexpected probe termination: ${termination}`);
-    assert.equal(error.stdout, '');
-    assert.equal(error.stderr, '');
-    return true;
-  });
-  const [firstRead] = await once(reads, 'head', { signal: AbortSignal.timeout(5000) });
-  assert.ok(interrupted.child.kill('SIGTERM'));
-  await checkedInterruption;
+  const checkedInterruption = assert.rejects(interrupted, { stdout: '', stderr: '' });
+  const [firstRead, interruptedSocket] = await once(reads, 'head', { signal: AbortSignal.timeout(5000) });
+  interruptedSocket.once('close', () => reads.emit('interrupted-close'));
+  const connectionClosed = once(reads, 'interrupted-close', { signal: AbortSignal.timeout(5000) });
+  const signalDelivered = interrupted.child.kill('SIGTERM');
+  await Promise.all([checkedInterruption, connectionClosed]);
+  assert.ok(signalDelivered, 'expected to signal the running probe');
   assert.equal(firstRead, `HEAD ${path}?${queryFor(version)} HTTP/1.1`);
   for (const outcome of ['failure', 'cancelled', 'skipped']) {
     assert.equal(await summary(outcome), 'Private staging fixture provider preflight: incomplete.\n');
