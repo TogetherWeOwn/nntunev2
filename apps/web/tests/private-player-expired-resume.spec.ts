@@ -1,9 +1,9 @@
-import { expect } from '@playwright/test';
+import { expect, type BrowserContext, type Page } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { privateStagingAudio } from '../../../e2e/helpers/private-staging-fixture.js';
 import { fixtureCookie, hasFixtureSession, serveFlac, test } from './helpers/private-music-fixture.js';
 
-test('private Play resumes the same listen after its grant expires during Pause', async ({ page, context, origin }) => {
+async function startPrivatePlayback({ page, context, origin }: { page: Page; context: BrowserContext; origin: string }) {
 	const { library, player } = PRIVATE_MUSIC;
 	const tracks = ['Paused tone', 'First upcoming tone', 'Second upcoming tone'].map((title, index) => ({
 		id: `00000000-0000-4000-8000-00000000011${index}`, title, duration_ms: 14_000
@@ -82,6 +82,22 @@ test('private Play resumes the same listen after its grant expires during Pause'
 		const response = await fetch(src, { cache: 'no-store', headers: { range: 'bytes=0-3' } });
 		return { status: response.status, bytes: await response.text() };
 	}, mediaPath());
+	const expireGrant = async () => {
+		now += grantLifetime;
+		await page.clock.setFixedTime(now - clockSkew);
+	};
+	const holdRenewal = () => {
+		const renewal = Promise.withResolvers<void>();
+		allowRenewal = renewal.promise;
+		return renewal.resolve;
+	};
+	return { audio, play, pause, expectQueue, initial, continuation, plays, listenEvents, readRange,
+		expireGrant, holdRenewal, playsUrl, mediaUrl: origin + mediaPath() };
+}
+
+test('private Play resumes the same listen after its grant expires during Pause', async ({ page, context, origin }) => {
+	const { audio, play, pause, expectQueue, initial, continuation, plays, listenEvents, readRange,
+		expireGrant, holdRenewal, mediaUrl } = await startPrivatePlayback({ page, context, origin });
 	const expectedPlays = [initial];
 	for (let attempt = 0; attempt < 2; attempt++) {
 		await pause.click();
@@ -94,13 +110,11 @@ test('private Play resumes the same listen after its grant expires during Pause'
 			}
 			return observation;
 		});
-		now += grantLifetime;
-		await page.clock.setFixedTime(now - clockSkew);
+		await expireGrant();
 		expect(await readRange()).toEqual({ status: 404, bytes: '' });
 		await expectQueue();
 		expect(plays).toEqual(expectedPlays);
-		const renewal = Promise.withResolvers<void>();
-		allowRenewal = renewal.promise;
+		const releaseRenewal = holdRenewal();
 		expectedPlays.push(continuation);
 		try {
 			await play.click();
@@ -108,7 +122,7 @@ test('private Play resumes the same listen after its grant expires during Pause'
 			await expect(audio).toHaveJSProperty('paused', true);
 			expect(await resume.evaluate(({ starts }) => starts)).toEqual([]);
 		} finally {
-			renewal.resolve();
+			releaseRenewal();
 		}
 		await expect.poll(() => resume.evaluate(({ node, pausedAt }) => !node.paused && !node.error && node.currentTime > pausedAt + 0.2)).toBe(true);
 		const { pausedAt, starts, discontinuities } = await resume.evaluate(({ pausedAt, starts, discontinuities }) =>
@@ -117,11 +131,108 @@ test('private Play resumes the same listen after its grant expires during Pause'
 		// The queued play event can run after the native decoder has advanced.
 		expect(starts[0]).toBeGreaterThanOrEqual(pausedAt - 0.05);
 		expect(discontinuities).toEqual([]);
-		await expect(audio).toHaveJSProperty('currentSrc', origin + mediaPath());
+		await expect(audio).toHaveJSProperty('currentSrc', mediaUrl);
 		expect(await readRange()).toEqual({ status: 206, bytes: 'fLaC' });
 		await expectQueue();
 		await resume.dispose();
 	}
 	expect(plays).toEqual(expectedPlays);
 	expect(listenEvents).toEqual([]);
+});
+
+declare global {
+	interface Window {
+		__privateRenewalActions?: Partial<Record<'play' | 'pause', MediaSessionActionHandler>>;
+	}
+}
+
+test('Media Session Pause holds after private grant renewal until explicit Play', async ({ page, context, origin }) => {
+	await page.addInitScript(() => {
+		const session = navigator.mediaSession;
+		const register = session.setActionHandler.bind(session);
+		const actions: NonNullable<Window['__privateRenewalActions']> = {};
+		window.__privateRenewalActions = actions;
+		session.setActionHandler = (action, handler) => {
+			register(action, handler);
+			if (action === 'play' || action === 'pause') actions[action] = handler ?? undefined;
+		};
+	});
+	const mediaAction = (action: 'play' | 'pause') => page.evaluate((action) => {
+		const handler = window.__privateRenewalActions?.[action];
+		if (!handler) throw new Error(`Missing Media Session ${action} handler`);
+		handler({ action });
+	}, action);
+	const { audio, play, pause, expectQueue, initial, continuation, plays, listenEvents, readRange,
+		expireGrant, holdRenewal, playsUrl, mediaUrl } = await startPrivatePlayback({ page, context, origin });
+	const probe = await audio.evaluateHandle((node: HTMLAudioElement) => {
+		const starts: number[] = [], discontinuities: string[] = [];
+		const nativePlay = node.play.bind(node);
+		node.play = () => {
+			starts.push(node.currentTime);
+			return nativePlay();
+		};
+		for (const event of ['seeking', 'emptied', 'loadstart']) {
+			node.addEventListener(event, () => discontinuities.push(event));
+		}
+		return { node, starts, discontinuities, pausedAtGesture: false };
+	});
+
+	// A matching Play action on an already-playing decoder does not renew or restart it.
+	await expireGrant();
+	const activeAt = await probe.evaluate(({ node }) => node.currentTime);
+	await mediaAction('play');
+	await expect(pause).toBeVisible();
+	await expect.poll(() => probe.evaluate(({ node }) => node.currentTime)).toBeGreaterThan(activeAt + 0.2);
+	expect(await readRange()).toEqual({ status: 404, bytes: '' });
+	expect(plays).toEqual([initial]);
+	expect(await probe.evaluate(({ starts }) => starts)).toEqual([]);
+
+	await pause.click();
+	await expect(audio).toHaveJSProperty('paused', true);
+	const saved = await probe.evaluate(({ node }) => node.currentTime);
+	expect(saved).toBeGreaterThan(1);
+
+	const releaseRenewal = holdRenewal();
+	const renewed = page.waitForResponse(playsUrl);
+	try {
+		await play.click();
+		await expect.poll(() => plays).toEqual([initial, continuation]);
+		// The compact transport shows Play while the native decoder is paused.
+		await mediaAction('pause');
+		await expect(audio).toHaveJSProperty('paused', true);
+		expect(await probe.evaluate(({ starts }) => starts)).toEqual([]);
+	} finally {
+		releaseRenewal();
+	}
+	const response = await renewed;
+	expect(response.status()).toBe(200);
+	expect(await response.finished()).toBeNull();
+	expect(await readRange()).toEqual({ status: 206, bytes: 'fLaC' });
+	await expectQueue();
+	await expect(audio).toHaveJSProperty('currentSrc', mediaUrl);
+	await expect(audio).toHaveJSProperty('currentTime', saved);
+	await expect(audio).toHaveJSProperty('paused', true);
+	expect(plays).toEqual([initial, continuation]);
+
+	// Capture the state at the explicit gesture as well as after the receipt arrives.
+	await play.evaluate((button, observation) => {
+		button.addEventListener('click', (event) => {
+			observation.pausedAtGesture = event.isTrusted && observation.node.paused && observation.starts.length === 0;
+		}, { capture: true, once: true });
+	}, probe);
+	await play.click();
+	await expect.poll(() => audio.evaluate((node: HTMLAudioElement, { original, saved }) =>
+		node === original.node && !node.paused && !node.error && node.currentTime > saved + 0.2,
+	{ original: probe, saved })).toBe(true);
+	const { starts, discontinuities, pausedAtGesture } = await probe.evaluate(({ starts, discontinuities, pausedAtGesture }) =>
+		({ starts, discontinuities, pausedAtGesture }));
+	expect(pausedAtGesture).toBe(true);
+	expect(starts).toEqual([saved]);
+	expect(discontinuities).toEqual([]);
+	await expect(audio).toHaveJSProperty('currentSrc', mediaUrl);
+	await expectQueue();
+	// The superseded renewal is not published to the client. Explicit Play reuses the same receipt.
+	expect(plays).toEqual([initial, continuation, continuation]);
+	expect(listenEvents).toEqual([]);
+	await probe.dispose();
 });
