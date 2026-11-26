@@ -16,13 +16,19 @@ use nntune_ingest::multipart::{
     initiation::InitiatedUpload,
     readback_inventory::{BucketReadbackResponse, CompletedReadbackInventory},
     resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
-    session_completion::{CompletionResponse, SessionCompletion},
+    session_completion::{
+        CompletionReadResponse, CompletionRequest, CompletionResponse, SessionCompletion,
+    },
     session_upload::handoff,
     sidecar::{SidecarPut, SidecarPutReply},
     Plan, UploadTarget,
 };
 use sha2::{Digest, Sha256};
-use std::{io, net::Ipv4Addr};
+use std::{
+    cell::{Cell, OnceCell},
+    io,
+    net::Ipv4Addr,
+};
 use tokio_postgres::{Config, NoTls};
 
 #[path = "../support/blocker_observer.rs"]
@@ -177,7 +183,8 @@ async fn prove_scoped_writer() {
         Some(Fault::ForeignTarget),
         Some(Fault::CommittedSidecarVersion),
         Some(Fault::Quarantined),
-        Some(Fault::LostCompletionResponse),
+        Some(Fault::LostCallerCompletionResponse),
+        Some(Fault::LostProviderCompletionResponse),
     ]
     .into_iter()
     .enumerate()
@@ -194,7 +201,7 @@ async fn prove_scoped_writer() {
     }
     // Reuse tests tombstone their winner. Publication needs its own live winner
     // and creates a reference that must block deletion in the reuse scenario.
-    prove_attempt(&observer, &authority, &mut writer, 0xc0, None, true).await;
+    prove_attempt(&observer, &authority, &mut writer, 0xd0, None, true).await;
 }
 
 #[derive(Clone, Copy)]
@@ -209,7 +216,8 @@ enum Fault {
     ForeignTarget,
     CommittedSidecarVersion,
     Quarantined,
-    LostCompletionResponse,
+    LostCallerCompletionResponse,
+    LostProviderCompletionResponse,
 }
 
 async fn prove_attempt(
@@ -474,6 +482,7 @@ async fn prove_attempt(
         .await,
         Err(UploadError::Refused)
     ));
+    let provider_marker = OnceCell::new();
     let UploadAttempt::Opened(opened) =
         open_or_reuse(
             &mut writer,
@@ -490,7 +499,8 @@ async fn prove_attempt(
                     &context,
                     (BUCKET, &key),
                     deadline,
-                    async |_| {
+                    async |_, marker: &str| {
+                        provider_marker.set(marker.to_owned()).unwrap();
                         let claimed = observer.query_one(
                 "SELECT multipart_object_id IS NOT NULL AND multipart_upload_id IS NULL
                  FROM public.ingest_session_reservations WHERE id = $1::text::uuid", &[&sid],
@@ -589,24 +599,70 @@ async fn prove_attempt(
         binding,
         parts: &parts,
     };
-    let completed = SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint)
-        .unwrap()
-        .dispatch(async |sent| {
-            assert_eq!(sent.target.upload_id, UPLOAD);
-            let composite = STANDARD.encode(Sha256::digest(part_digest));
-            Ok(CompletionResponse {
-                configuration,
-                status: 200,
-                version: Some(MEDIA.into()),
-                body: format!(
-                    "<CompleteMultipartUploadResult><Bucket>{inventory_bucket}</Bucket><Key>{key}</Key>
-                    <ChecksumSHA256>{composite}-1</ChecksumSHA256></CompleteMultipartUploadResult>"
-                )
-                .into_bytes(),
-            })
+    let completion =
+        SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint).unwrap();
+    let provider_version = Cell::new(None);
+    let lost_provider_response = matches!(fault, Some(Fault::LostProviderCompletionResponse));
+    let composite = format!("{}-1", STANDARD.encode(Sha256::digest(part_digest)));
+    let send = async |sent: CompletionRequest<'_>| {
+        assert_eq!(sent.target.upload_id, UPLOAD);
+        assert!(
+            provider_version.replace(Some(MEDIA)).is_none(),
+            "duplicate provider commit"
+        );
+        if lost_provider_response {
+            return Err(());
+        }
+        Ok(CompletionResponse {
+            configuration,
+            status: 200,
+            version: Some(MEDIA.into()),
+            body: format!(
+                "<CompleteMultipartUploadResult><Bucket>{inventory_bucket}</Bucket><Key>{key}</Key>
+                <ChecksumSHA256>{composite}</ChecksumSHA256></CompleteMultipartUploadResult>"
+            )
+            .into_bytes(),
         })
-        .await
-        .unwrap();
+    };
+    let completed = if lost_provider_response {
+        completion
+            .dispatch_durable(
+                opened.durable_target(),
+                async |sent, deadline| {
+                    assert_eq!(deadline, opened.durable_target().usable_until());
+                    send(sent).await
+                },
+                async |sent, deadline| {
+                    assert_eq!(deadline, opened.durable_target().usable_until());
+                    assert_eq!(
+                        (sent.configuration, sent.bucket, sent.key),
+                        (configuration, BUCKET, key.as_str())
+                    );
+                    let pending: bool = observer
+                        .query_one(
+                            "SELECT terminal_reason IS NULL AND completed_map_id IS NULL
+                        AND write_lease_id IS NOT NULL AND multipart_upload_id = $2
+                     FROM public.ingest_session_reservations WHERE id = $1::text::uuid",
+                            &[&sid, &UPLOAD],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    assert!(pending);
+                    Ok(CompletionReadResponse {
+                        configuration,
+                        content_length: Some(ciphertext.len() as u64),
+                        composite_sha256: Some(composite.clone()),
+                        marker: provider_marker.get().cloned(),
+                        version: Some(provider_version.get().unwrap().into()),
+                    })
+                },
+            )
+            .await
+    } else {
+        completion.dispatch(send).await
+    }
+    .unwrap();
     let put = SidecarPut::new(inventory_bucket, &context, &origin, map, 0, page).unwrap();
     let page_key = put.request().0.key.clone();
     let sidecars = [put
@@ -696,7 +752,7 @@ async fn prove_attempt(
         }
         verified
     };
-    if matches!(fault, Some(Fault::LostCompletionResponse)) {
+    if matches!(fault, Some(Fault::LostCallerCompletionResponse)) {
         // Model the already charged admission using the real ingest job writer.
         let accepted_at = now as i64;
         assert_eq!(
@@ -867,7 +923,12 @@ async fn prove_attempt(
         ));
         return;
     }
-    if let Some(fault) = fault.filter(|fault| !matches!(fault, Fault::GrantRevokedWhileWaiting)) {
+    if let Some(fault) = fault.filter(|fault| {
+        !matches!(
+            fault,
+            Fault::GrantRevokedWhileWaiting | Fault::LostProviderCompletionResponse
+        )
+    }) {
         let (auth, retain, expected) = match fault {
             Fault::Digest | Fault::MissingSeek | Fault::ForeignTarget => {
                 (auth, now as i64 + 600, UploadError::Refused)
@@ -887,7 +948,8 @@ async fn prove_attempt(
             Fault::Quarantined
             | Fault::GrantRevokedWhileWaiting
             | Fault::CommittedSidecarVersion
-            | Fault::LostCompletionResponse => unreachable!(),
+            | Fault::LostCallerCompletionResponse
+            | Fault::LostProviderCompletionResponse => unreachable!(),
         };
         assert!(
             matches!(opened.commit_flac(writer, auth, &inventory, retain, reload, verify).await,
@@ -992,6 +1054,9 @@ async fn prove_attempt(
         assert_eq!(outcome.root_version.replace('-', ""), root_text);
         assert_eq!(outcome.media_version, MEDIA);
         assert_eq!(outcome.page_versions, [PAGE]);
+    }
+    if lost_provider_response {
+        return;
     }
     assert!(matches!(
         read(writer, auth, prepared, async |_, _| Err(StoreError)).await,

@@ -24,7 +24,7 @@ async fn connect() -> Client {
     client
 }
 
-async fn no_initiation<'a>(_: SystemTime) -> Result<InitiatedUpload<'a>, ()> {
+async fn no_initiation<'a>(_: SystemTime, _: &str) -> Result<InitiatedUpload<'a>, ()> {
     panic!("a second initiation was attempted")
 }
 
@@ -163,7 +163,7 @@ async fn postgres_fences_the_provider_id_handoff() {
         &context,
         (BUCKET, &key),
         until,
-        async |deadline| {
+        async |deadline, _| {
             assert_eq!(deadline, until);
             assert_claim(&observer, session, &object, None).await;
             let competing = handoff(
@@ -367,7 +367,7 @@ async fn postgres_fences_the_provider_id_handoff() {
         &context,
         (BUCKET, &key),
         until,
-        async |_| {
+        async |_, _| {
             assert_claim(&observer, interrupted, &object, None).await;
             Ok(synthetic_receipt(&context, &key, "uncommitted"))
         },

@@ -189,11 +189,21 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
             &key
         };
         let upload = sender
-            .initiate(&context, bucket, requested_key, until)
+            .initiate(
+                &context,
+                bucket,
+                requested_key,
+                &super::session_upload::completion_marker("fixture-lease"),
+                until,
+            )
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
         assert_eq!(upload.configuration(), configuration);
-        if mode != "init-upload-completion-head" && !readback {
+        if !matches!(
+            mode,
+            "init-upload-completion-head" | "init-completion-response-lost"
+        ) && !readback
+        {
             return Ok(upload.target().upload_id.into());
         }
         Some(upload)
@@ -316,10 +326,13 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
     };
     let completion =
         SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint).unwrap();
-    let completed = sender
-        .complete(completion, until)
-        .await
-        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let completed = if initiated.is_some() {
+        let durable = DurableUpload::new(target, &context, binding.session, until);
+        sender.complete(&durable, completion).await
+    } else {
+        sender.complete_fixture(completion, until).await
+    }
+    .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     if mode == "head-context" {
         context.identities[1] = id(8);
     }
@@ -430,8 +443,8 @@ async fn resume_multipart<'a>(
     // handoff. The sealed bytes and verified receipts survive across attempts.
     assert!(matches_checkpoint(binding, &receipts, &checkpoint));
     let resumed_etag;
+    let upload = DurableUpload::new(target, context, binding.session, until);
     if saved.len() == 1 {
-        let upload = DurableUpload::new(target, context, binding.session, until);
         let receipt = sender
             .put_part(binding, context, second, &upload, until)
             .await
@@ -447,7 +460,7 @@ async fn resume_multipart<'a>(
     let completion = SessionCompletion::prepare(binding, context, receipts, &completed_checkpoint)
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     let completed = sender
-        .complete(completion, until)
+        .complete(&upload, completion)
         .await
         .map_err(dispatch_error)?;
     let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {
