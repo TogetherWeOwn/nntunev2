@@ -456,8 +456,11 @@ reviewed reader and database covers a different inventory. Use the separately
 authorized read-only catalog check on the reviewed database to compare expected
 and observed object identities and definitions. Once the catalog agrees with the
 review, obtain a matched inventory and scoped privilege result from one
-authorized read-only catalog snapshot and rerun the offline check. Keep migration
-closed pending reconciliation.
+authorized read-only catalog snapshot and rerun the offline check. If the reader
+has been retired and no matched readback is available, start a fresh protected
+baseline with fresh approval and a newly issued reader. Use that attempt's
+approved reader identity and readbacks for the comparison. Keep migration closed
+pending reconciliation.
 `consistent` confirms the supplied evidence agrees. The protected run's
 `empty` verdict, provenance and retirement evidence are still required.
 Keep credentials and raw SQL results out of the normalized record.
