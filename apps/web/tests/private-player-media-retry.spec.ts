@@ -197,16 +197,20 @@ async function checkRelayRetry(page: Page, origin: string, {
 			await expect(seek).toBeDisabled();
 			const position = await audio.evaluate((node: HTMLAudioElement) => node.currentTime);
 			const feedback = player.getByTestId('player-seek-feedback');
+			const refusal = 'Cannot jump: this track cannot seek yet.';
 			const attemptJump = async (name: string) => {
 				await player.getByRole('button', { name, exact: true }).click();
-				await expect(feedback).toHaveText('Cannot jump: this track cannot seek yet.');
 				await expect(audio).toHaveJSProperty('currentTime', position);
 			};
 			await attemptJump('Back 10 seconds');
-			const backAnnouncement = await feedback.locator('span').elementHandle();
+			await expect(feedback).toHaveText(refusal);
+			const backAnnouncement = await feedback.evaluateHandle((region, message) =>
+				Array.from(region.childNodes).find((node) => node.textContent === message), refusal);
+			expect(await backAnnouncement.evaluate((node) => node?.isConnected)).toBe(true);
 			await attemptJump('Forward 10 seconds');
 			// Identical refusals replace the live-region child for each activation.
-			await expect.poll(() => backAnnouncement.evaluate((node) => node.isConnected)).toBe(false);
+			await expect.poll(() => backAnnouncement.evaluate((node) => node?.isConnected)).toBe(false);
+			await expect(feedback).toHaveText(refusal);
 			await backAnnouncement.dispose();
 		}
 		// Hold the receipt response and check that Retry has not reloaded the decoder.
