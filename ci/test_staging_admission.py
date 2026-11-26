@@ -1701,6 +1701,7 @@ class SourceBindingTests(Base):
             world = PrivateWorld()
             # Keep the published artifact metadata and repackage the same receipt.
             world.archive = make_zip([("staging-admission.json", json.dumps(world.receipt, indent=2))])
+            world.artifact["size_in_bytes"] = len(world.archive)
             return world
 
         self.refused("^artifact content digest mismatch$", self.run_main, private=True, mode="promote",

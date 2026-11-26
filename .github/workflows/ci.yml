@@ -401,8 +401,6 @@ jobs:
         run: python3 .github/scripts/test_ci_fixture_secrets.py
       - name: Test workflow and offline account-export boundaries
         run: python3 .github/scripts/test_workflow_policy_hardening.py && python3 .github/scripts/test_staging_apply.py && python3 scripts/test_account_export.py
-      - name: Test offline private-trial setup recovery decisions
-        run: python3 -I .github/scripts/test_private_trial_setup_recovery.py
       - name: Test the offline staging observer and private trial capacity readback
         run: python3 -I .github/scripts/test_subsonic_staging_observer.py && python3 -I scripts/test_staging_trial_c0_readback.py
       - name: Test Subsonic staging off-and-drained verifier and adapter offline
@@ -818,6 +816,8 @@ jobs:
         run: test "$BOOTSTRAP_VERDICT" = passed
       - name: Compare inherited SELECT grant paths and offline Reader receipts
         run: exec python3 -B .github/scripts/test_database_bootstrap_inherited_select.py
+      - name: Test offline private-trial setup recovery decisions
+        run: python3 -I .github/scripts/test_private_trial_setup_recovery.py
 
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,
   # to an empty throwaway database (twice, to prove idempotency) and runs
