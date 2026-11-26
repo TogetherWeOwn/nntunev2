@@ -123,6 +123,77 @@ async fn open_ended_range_delivers_plaintext_through_eof() {
 }
 
 #[tokio::test]
+async fn empty_media_read_does_not_credit_or_advance_seek() {
+    let source = Source::browser();
+    source.expected_media_start.set(65_600);
+    let request = PlayRouteRequest {
+        track_id: "track".into(),
+        token: Some(BROWSER_TOKEN.into()),
+        range: Some("bytes=65536-65536".into()),
+        trace_id: None,
+    };
+    let attempt = async || {
+        let output = RefCell::new(Vec::new());
+        let aborted = Cell::new(false);
+        let mut started = false;
+        let mut reports = Vec::new();
+        let result = serve(
+            &request,
+            b"test only, not a deployed secret",
+            Some(&source),
+            || source.time(),
+            |head| {
+                started = true;
+                assert_eq!(head.status, 206);
+                assert_eq!(head.len, 1);
+                assert_eq!(
+                    head.content_range.as_deref(),
+                    Some("bytes 65536-65536/65537")
+                );
+                Ok(Some(Writer {
+                    output: &output,
+                    fault: Fault::None,
+                    aborted: &aborted,
+                    revoke_on_write: None,
+                }))
+            },
+            |interval| reports.push(interval),
+        )
+        .await;
+        (result, started, output.into_inner(), aborted.get(), reports)
+    };
+
+    source.empty_media_once.set(true);
+    let (result, started, output, _, reports) = attempt().await;
+    let error = result.unwrap_err();
+    assert_eq!(error.status, 502);
+    assert_eq!(error.code, "upstream_unavailable");
+    // The pinned digest page is fetched only after the storage metadata is accepted.
+    assert_eq!(source.page_reads.get(), 1);
+    assert!(!started);
+    assert!(output.is_empty());
+    assert!(reports.is_empty());
+
+    let (result, started, output, aborted, reports) = attempt().await;
+    result.unwrap();
+    assert_eq!(source.page_reads.get(), 2);
+    assert!(started);
+    assert!(!aborted);
+    assert_eq!(output, b"Z");
+    assert_eq!(
+        reports,
+        [nntune_stream::delivered::DeliveredInterval {
+            user_id: "member".into(),
+            play_id: "private_browser_AAAAAAAAAAAAAAAAAAAAAA".into(),
+            track_id: "track".into(),
+            start: 65_536,
+            end: LEN,
+            file_bytes: Some(LEN),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn short_media_read_reports_only_written_bytes_and_retry_is_contiguous() {
     let source = Source::browser();
     let attempt = async |start: u64| {
