@@ -315,6 +315,47 @@ class TrialConnectionReadbackTests(unittest.TestCase):
                 self.assertEqual(preflight.read_binding_identities(
                     build_sha=build, version_id=version, database_oid=40200, role_pins=pins, query=query), expected)
 
+    def test_timed_out_binding_preserves_sibling_evidence_and_keeps_preflight_pending(self):
+        build, version = "a" * 40, "12345678-0000-4000-8000-000000000001"
+        database_oid = 40200
+        pins = {binding: (role, role_oid) for role_oid, (binding, role) in
+                enumerate(BINDING_ROLES.items(), database_oid + 1)}
+        auth = "PRIVATE_TRIAL_AUTH_DB"
+        expected_calls = [(build, version, binding, preflight.BINDING_IDENTITY_SQL)
+                          for binding in BINDING_ROLES]
+        complete_tls = dict.fromkeys(BINDING_ROLES, True)
+
+        for timed_out, overall in ((None, "qualified"), (auth, "pending")):
+            with self.subTest(timed_out=timed_out):
+                calls = []
+
+                def query(build_sha, version_id, binding, sql):
+                    calls.append((build_sha, version_id, binding, sql))
+                    if binding == timed_out:
+                        raise subprocess.TimeoutExpired(
+                            ["synthetic-reader", "synthetic-connection-details"], 1,
+                            output=b"synthetic-partial-row", stderr=b"synthetic-reader-diagnostics")
+                    pin = pins[binding]
+                    row = (preflight.DATABASE, database_oid, *pin, *pin)
+                    return preflight.BindingReadback(build, version, binding, (row,))
+
+                with redirect_stdout(StringIO()) as stdout, redirect_stderr(StringIO()) as stderr:
+                    evidence = preflight.read_binding_identities(
+                        build_sha=build, version_id=version, database_oid=database_oid,
+                        role_pins=pins, query=query)
+
+                self.assertEqual(calls, expected_calls)
+                self.assertEqual(evidence, {
+                    binding: {"role": role, "database": preflight.DATABASE,
+                              "verdict": "pending" if binding == timed_out else "pass"}
+                    for binding, role in BINDING_ROLES.items()
+                })
+                self.assertEqual((stdout.getvalue(), stderr.getvalue()), ("", ""))
+                # The connection check expects the underlying identity verdict vocabulary.
+                identities = {binding: "matched" if result["verdict"] == "pass" else "pending"
+                              for binding, result in evidence.items()}
+                self.assertEqual(preflight.binding_connection_verdict(identities, complete_tls), overall)
+
     def test_matching_identity_requires_origin_tls_for_every_binding(self):
         bindings = ("PRIVATE_TRIAL_UPLOAD_DB", "PRIVATE_TRIAL_AUTH_DB",
                     "PRIVATE_TRIAL_PUBLISH_DB", "PRIVATE_TRIAL_ENROLL_DB")
