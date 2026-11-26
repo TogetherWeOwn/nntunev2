@@ -16,10 +16,10 @@ use nntune_ingest::multipart::{
     initiation::InitiatedUpload,
     readback_inventory::{BucketReadbackResponse, CompletedReadbackInventory},
     resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
-    session_completion::{CompletionResponse, SessionCompletion},
+    session_completion::{CompletionRequest, CompletionResponse, SessionCompletion},
     session_upload::handoff,
     sidecar::{SidecarPut, SidecarPutReply},
-    Plan, UploadTarget,
+    Plan, UploadTarget, PART_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::{io, net::Ipv4Addr};
@@ -31,6 +31,9 @@ use blocker_observer::observe_blocked;
 
 #[path = "ingest_session_reuse_postgres.rs"]
 mod reuse_cases;
+
+#[path = "ingest_session_inventory_pages.rs"]
+mod inventory_pages;
 
 const DB: &str = "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_upload_caller_ci";
 const WRITER: &str =
@@ -195,6 +198,17 @@ async fn prove_scoped_writer() {
     // Reuse tests tombstone their winner. Publication needs its own live winner
     // and creates a reference that must block deletion in the reuse scenario.
     prove_attempt(&observer, &authority, &mut writer, 0xc0, None, true).await;
+    for (seed, fail_later_page) in [(0xd0, false), (0xf0, true)] {
+        Box::pin(prove_attempt(
+            &observer,
+            &authority,
+            &mut writer,
+            seed,
+            Some(Fault::InventoryRead { fail_later_page }),
+            false,
+        ))
+        .await;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -210,6 +224,7 @@ enum Fault {
     CommittedSidecarVersion,
     Quarantined,
     LostCompletionResponse,
+    InventoryRead { fail_later_page: bool },
 }
 
 async fn prove_attempt(
@@ -232,8 +247,22 @@ async fn prove_attempt(
     let map_text = uuid_text(map);
     let root_text = uuid_text(root_id);
     let key = format!("media/{obj}/{generation}");
+    let inventory_case = match fault {
+        Some(Fault::InventoryRead { fail_later_page }) => Some(fail_later_page),
+        _ => None,
+    };
+    let padded;
     let input = if publish_fixture {
         include_bytes!("../../../../fixtures/synthetic-flac/private-staging/tone-a.flac").as_slice()
+    } else if inventory_case.is_some() {
+        // Retain the audio frames and add FLAC padding to cross a part boundary.
+        let padding = PART_BYTES - FLAC.len() - 4;
+        let mut input = [&FLAC[..42], &[0x81], &(padding as u32).to_be_bytes()[1..]].concat();
+        input[4] = 0;
+        input.resize(input.len() + padding, 0);
+        input.extend_from_slice(&FLAC[42..]);
+        padded = input;
+        &padded
     } else {
         FLAC
     };
@@ -553,22 +582,23 @@ async fn prove_attempt(
     )
     .unwrap();
     let mut partition = plan.partition();
+    let mut upload_parts = Vec::new();
     for (index, chunk) in sealed.iter().enumerate() {
-        let part = partition
-            .push(&SealedChunk {
-                digest: Sha256::digest(&chunk.bytes).into(),
-                bytes: chunk.bytes.clone(),
-                final_chunk: index + 1 == sealed.len(),
-            })
-            .unwrap();
-        assert!(part.is_none());
+        upload_parts.extend(
+            partition
+                .push(&SealedChunk {
+                    digest: Sha256::digest(&chunk.bytes).into(),
+                    bytes: chunk.bytes.clone(),
+                    final_chunk: index + 1 == sealed.len(),
+                })
+                .unwrap(),
+        );
     }
-    let part = partition.finish().unwrap().unwrap();
-    let (_, number, ciphertext, checksum) = part.request();
-    assert_ne!(ciphertext, input);
-    let ciphertext = ciphertext.to_vec();
-    let part_digest: [u8; 32] = Sha256::digest(&ciphertext).into();
-    let receipt = part.verify_reply("\"synthetic\"".into(), checksum).unwrap();
+    upload_parts.extend(partition.finish().unwrap());
+    assert_eq!(
+        upload_parts.len(),
+        if inventory_case.is_some() { 2 } else { 1 }
+    );
     let binding = ResumeBinding {
         plan,
         configuration,
@@ -579,34 +609,71 @@ async fn prove_attempt(
         generation: &generation,
         envelope_scheme: 2,
     };
-    let parts = [CheckpointPart {
-        number,
-        len: ciphertext.len(),
-        etag: "\"synthetic\"",
-        digest: part_digest,
-    }];
+    let mut ciphertext = Vec::new();
+    let (receipts, parts): (Vec<_>, Vec<_>) = upload_parts
+        .iter()
+        .map(|part| {
+            let (_, number, bytes, _) = part.request();
+            ciphertext.extend_from_slice(bytes);
+            let etag = if number == 1 {
+                "\"synthetic\""
+            } else {
+                "\"synthetic-tail\""
+            };
+            let digest: [u8; 32] = Sha256::digest(bytes).into();
+            (
+                part.verify_reply(etag.into(), &STANDARD.encode(digest))
+                    .unwrap(),
+                CheckpointPart {
+                    number,
+                    len: bytes.len(),
+                    etag,
+                    digest,
+                },
+            )
+        })
+        .unzip();
+    assert_ne!(ciphertext, input);
     let checkpoint = ResumeCheckpoint {
         binding,
         parts: &parts,
     };
-    let completed = SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint)
-        .unwrap()
-        .dispatch(async |sent| {
-            assert_eq!(sent.target.upload_id, UPLOAD);
-            let composite = STANDARD.encode(Sha256::digest(part_digest));
-            Ok(CompletionResponse {
-                configuration,
-                status: 200,
-                version: Some(MEDIA.into()),
-                body: format!(
-                    "<CompleteMultipartUploadResult><Bucket>{inventory_bucket}</Bucket><Key>{key}</Key>
-                    <ChecksumSHA256>{composite}-1</ChecksumSHA256></CompleteMultipartUploadResult>"
-                )
-                .into_bytes(),
-            })
+    let send = async |sent: CompletionRequest<'_>| {
+        assert_eq!(sent.target.upload_id, UPLOAD);
+        let mut composite = Sha256::new();
+        for part in &parts {
+            composite.update(part.digest);
+        }
+        let composite = STANDARD.encode(composite.finalize());
+        let count = parts.len();
+        Ok(CompletionResponse {
+            configuration,
+            status: 200,
+            version: Some(MEDIA.into()),
+            body: format!(
+                "<CompleteMultipartUploadResult><Bucket>{inventory_bucket}</Bucket><Key>{key}</Key>
+                <ChecksumSHA256>{composite}-{count}</ChecksumSHA256></CompleteMultipartUploadResult>"
+            )
+            .into_bytes(),
         })
+    };
+    let completed = if let Some(fail_later_page) = inventory_case {
+        Box::pin(inventory_pages::complete(
+            observer,
+            &opened,
+            &checkpoint,
+            receipts,
+            fail_later_page,
+            send,
+        ))
         .await
-        .unwrap();
+    } else {
+        SessionCompletion::prepare(binding, &context, receipts, &checkpoint)
+            .unwrap()
+            .dispatch(send)
+            .await
+            .unwrap()
+    };
     let put = SidecarPut::new(inventory_bucket, &context, &origin, map, 0, page).unwrap();
     let page_key = put.request().0.key.clone();
     let sidecars = [put
@@ -696,6 +763,24 @@ async fn prove_attempt(
         }
         verified
     };
+    if inventory_case.is_some() {
+        let committed = Box::pin(opened.commit_flac(
+            writer,
+            auth,
+            &inventory,
+            now as i64 + 600,
+            reload,
+            verify,
+        ))
+        .await
+        .unwrap();
+        let outcome = committed.outcome();
+        assert_eq!(outcome.map.replace('-', ""), map_text);
+        assert_eq!(outcome.object.replace('-', ""), obj);
+        assert_eq!(outcome.media_version, MEDIA);
+        assert_eq!(outcome.page_versions, [PAGE]);
+        return;
+    }
     if matches!(fault, Some(Fault::LostCompletionResponse)) {
         // Model the already charged admission using the real ingest job writer.
         let accepted_at = now as i64;
@@ -887,7 +972,8 @@ async fn prove_attempt(
             Fault::Quarantined
             | Fault::GrantRevokedWhileWaiting
             | Fault::CommittedSidecarVersion
-            | Fault::LostCompletionResponse => unreachable!(),
+            | Fault::LostCompletionResponse
+            | Fault::InventoryRead { .. } => unreachable!(),
         };
         assert!(
             matches!(opened.commit_flac(writer, auth, &inventory, retain, reload, verify).await,
