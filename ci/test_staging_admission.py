@@ -939,6 +939,66 @@ class VerifyTests(Base):
                 self.assertNotIn(selected_jobs, actions.calls)
                 self.assertEqual(other_jobs in actions.calls, api_conclusion is not None)
 
+    def test_offline_pending_push_distinguishes_job_creation_from_runner_assignment(self):
+        # Shapes from Actions run and attempt-jobs captures. All IDs, SHAs,
+        # runner names and times are synthetic.
+        world = World()
+        repository = {"id": REPO_ID, "full_name": "TogetherWeOwn/nntunev2"}
+        run = dict(world.run, repository=repository, head_repository=repository)
+        uncreated = {"run": dict(run, status="pending", conclusion=None), "jobs": page("jobs", [])}
+        for job_id, job in enumerate(world.jobs, start=200):
+            job.update(id=job_id, runner_id=300, runner_name="synthetic-runner")
+        assigned = world.jobs[-1]
+        unassigned = dict(assigned, status="queued", conclusion=None, completed_at=None,
+                          runner_id=0, runner_name="", steps=[])
+        queued_run = dict(run, status="queued", conclusion=None)
+        queued_jobs = [*world.jobs[:-1], unassigned]
+        queued = {"run": queued_run, "jobs": page("jobs", queued_jobs)}
+        success = {"run": run, "jobs": page("jobs", world.jobs)}
+        receipt = world.verify()
+        self.assertEqual((receipt["sha"], receipt["run_id"], receipt["run_attempt"], receipt["result"]),
+                         (SHA, str(RUN_ID), "1", "satisfied"))
+        rejected = {
+            "run": dict(run, conclusion="failure"), "jobs": page("jobs", []),
+            "annotations": [{"annotation_level": "failure",
+                             "message": "Queue is full for concurrency group 'deploy-staging-main'"}],
+        }
+        failed_journey = dict(assigned, conclusion="failure", steps=[world.step("Run full journey", 1, "failure")])
+        failed = {"run": dict(run, conclusion="failure"), "jobs": page("jobs", [*world.jobs[:-1], failed_journey])}
+        generic = "::error::Candidate admission refused: missing, unapproved, stale or incoherent evidence\n"
+        target = f"Staging run {RUN_ID}, attempt 1"
+        api = "/repos/TogetherWeOwn/nntunev2/actions"
+        cases = [
+            ("no jobs", uncreated, f"{target} was accepted and has no jobs yet. "
+             f"Next read: GET {api}/runs/{RUN_ID}/attempts/1/jobs?per_page=100&page=1\n"),
+            ("unassigned journey", queued, f"{target} has a queued full-journey job {assigned['id']} "
+             f"with no runner assigned. Next read: GET {api}/jobs/{assigned['id']}\n"),
+            ("completed success", success, generic),
+            ("rejected admission", rejected, generic),
+            ("failed journey", failed, generic),
+            ("incomplete page", dict(queued, jobs=page("jobs", queued_jobs, total=len(queued_jobs) + 1)), generic),
+            ("missing journey", dict(queued, jobs=page("jobs", world.jobs[:-1])), generic),
+            ("ambiguous journey", dict(queued, jobs=page("jobs", [*queued_jobs, dict(unassigned, id=203)])), generic),
+            ("different run source", dict(uncreated, run=dict(uncreated["run"], head_sha=OTHER_SHA)), generic),
+            ("foreign repository", dict(uncreated, run=dict(uncreated["run"], head_repository=world.run["repository"])),
+             generic),
+        ]
+        for field, value in (("run_attempt", 2), ("run_id", RUN_ID + 1), ("head_sha", OTHER_SHA),
+                             ("runner_id", 300), ("runner_id", False), ("runner_name", "synthetic-runner"),
+                             ("steps", [{"status": "in_progress"}]), ("status", "in_progress"),
+                             ("completed_at", iso(0)), ("id", "private\ntext")):
+            changed = [*world.jobs[:-1], dict(unassigned, **{field: value})]
+            cases.append((field, dict(queued, jobs=page("jobs", changed)), generic))
+        for case, evidence, expected in cases:
+            with self.subTest(case=case):
+                result = subprocess.run(
+                    [sys.executable, "-I", str(HERE / "staging_admission.py"), "diagnose-pending-push", SHA],
+                    input=json.dumps(evidence), capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, expected)
+                self.assertEqual(result.returncode, 1)
+
     def test_hash_source_and_manifest_mismatch(self):
         w = World()
         self.assertWorldRefused(w, "manifest mismatch", manifest_hash=sa.digest(b"other"))
