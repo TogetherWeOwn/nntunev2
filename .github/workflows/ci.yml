@@ -125,7 +125,7 @@ jobs:
       actions: read # Nested OSV reads same-run comparison artifacts.
       contents: read
       security-events: write # Nested OSV uploads comparison SARIF.
-    uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@c05610872587137c3c492b7025f02585a1b8ba7d # v0.11.0
+    uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@bfdaf1532e1605281d366186e4ed9e8cfa0113fc # v0.13.0
 
   rust-test:
     needs: early
