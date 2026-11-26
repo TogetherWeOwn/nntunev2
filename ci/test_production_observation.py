@@ -140,6 +140,33 @@ class ProductionObservationTests(unittest.TestCase):
         with self.assertRaises(Refused):
             validate_observation(pins, watch)
 
+    def test_cli_refuses_mid_window_recovery_handoff(self):
+        script = Path(__file__).with_name("production_observation.py")
+        accepted = (0, "Production observation evidence satisfied\n", "")
+        refused = (1, "", "Production observation refused: "
+                          "watch assignment or recovery access does not cover the window\n")
+        midpoint = "2026-10-01T12:15:00Z"
+        cases = (
+            ("both cover the window", None, None, accepted),
+            ("intervals touch", midpoint, midpoint, refused),
+            ("one-second gap", midpoint, "2026-10-01T12:15:01Z", refused),
+            ("backup starts late", None, midpoint, refused),
+        )
+        with TemporaryDirectory(prefix="nntune-observation-") as directory:
+            pin_file = Path(directory) / "pins.json"
+            watch_file = Path(directory) / "watch.json"
+            for label, watcher_end, backup_start, verdict in cases:
+                with self.subTest(case=label):
+                    pins, watch = fixture()
+                    watch["watcher"]["through"] = watcher_end or watch["closed_at"]
+                    watch["backup"]["from"] = backup_start or watch["backup"]["from"]
+                    watch["backup"]["through"] = watch["closed_at"]
+                    pin_file.write_text(json.dumps(pins))
+                    watch_file.write_text(json.dumps(watch))
+                    result = subprocess.run([sys.executable, "-B", script, pin_file, watch_file],
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), verdict)
+
     def test_identity_and_every_readback_can_fail_at_start_during_and_close(self):
         for index in (0, 3, 6):
             for field, value in (("web_sha", "c" * 40), ("api_sha", "c" * 40),
