@@ -634,7 +634,9 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		});
 	}
 
-	async function handleEnded(attachment: MediaAttachment, source: string, matchesOrigin: () => boolean): Promise<void> {
+	async function handleEnded(
+		attachment: MediaAttachment, source: string, matchesOrigin: () => boolean, listeners?: AbortSignal
+	): Promise<void> {
 		if (attachment.audio.ended && matchesOrigin()) {
 			if (pendingGrant === undefined) invalidatePlay();
 			else settlePlay();
@@ -683,8 +685,15 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			const failureMessage = index !== base.currentIndex
 				? 'Could not start the next track. Choose a track to continue.' : undefined;
 			// Keep the ended track selected until the successor has a grant.
-			await preparePlay(track.id, () => evidence.isCurrent() && ownsOrigin(),
+			const handoff = () => preparePlay(track.id, () => evidence.isCurrent() && ownsOrigin(),
 				(grant) => playSelected(result.queue, index, grant, '', grant), { failureMessage });
+			await handoff();
+			// Offline, the same successor and its start position wait for one retry on reconnect.
+			if (failureMessage && listeners && globalThis.navigator?.onLine === false && evidence.isCurrent() && ownsOrigin()) {
+				globalThis.addEventListener?.('online', () => {
+					if (!pendingGrant) void handoff();
+				}, { once: true, signal: listeners });
+			}
 			return;
 		}
 		const streamUrl = streamFor(track);
@@ -837,7 +846,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 							if (audio.error === null) return;
 							break;
 						case 'ratechange': return speed.observe({ audio, matches });
-						case 'ended': return handleEnded(receipt, source, matches);
+						case 'ended': return handleEnded(receipt, source, matches, receipt.listeners.signal);
 						case 'seeked': return;
 						case 'seeking': {
 							const { currentTime, duration } = audio;
