@@ -65,6 +65,7 @@ MAX_JSON = 256 * 1024
 MAX_ARCHIVE = 512 * 1024
 MAX_XML = 2 * 1024 * 1024
 MAX_RUN_PAGE = 4 * 1024 * 1024
+MAX_JOB_PAGE = 4 * 1024 * 1024
 PENDING_RUN_STATES = ("queued", "in_progress", "waiting", "pending", "requested")
 TERMINAL_CONCLUSIONS = ("success", "failure", "cancelled", "skipped", "timed_out",
                         "action_required", "neutral", "stale", "startup_failure")
@@ -477,6 +478,30 @@ class Actions:
                 f"incomplete or exhausted {key} listing")
         return rows
 
+    def attempt_jobs(self, run_id, attempt):
+        route = f"runs/{run_id}/attempts/{attempt}/jobs"
+        page_size, max_pages = 100, 10
+        reason = "incomplete or exhausted jobs listing"
+        jobs, seen, total = [], set(), None
+        # Finish the inventory before checking required names. Later pages can
+        # contain a required job or a second job with the same required name.
+        for number in range(1, max_pages + 1):
+            data = parse_json(self.read(f"{route}?per_page={page_size}&page={number}", MAX_JOB_PAGE), MAX_JOB_PAGE)
+            count, batch = data.get("total_count"), data.get("jobs")
+            require(type(count) is int and 0 <= count <= page_size * max_pages
+                    and (total is None or total == count) and isinstance(batch, list)
+                    and len(batch) == min(page_size, count - len(jobs)), reason)
+            total = count
+            for job in batch:
+                require(isinstance(job, dict) and isinstance(job.get("name"), str), "invalid jobs row")
+                job_id = job.get("id")
+                require(type(job_id) is int and job_id > 0 and job_id not in seen, reason)
+                seen.add(job_id)
+            jobs.extend(batch)
+            if len(jobs) == total:
+                return jobs
+        raise Refused(reason)
+
     def runs(self, route):
         # GitHub search-filtered run listings expose at most 1,000 results.
         # Refuse at that ceiling, on page drift, duplicates or a short page.
@@ -597,7 +622,7 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     run = actions.api(f"runs/{run_id}")
     run_identity(run)
     producer_source_ok(run["head_sha"])
-    jobs = actions.listing(f"runs/{run_id}/attempts/{attempt}/jobs", "jobs")
+    jobs = actions.attempt_jobs(run_id, attempt)
     selected_jobs = {}
     for name in (*deploy_steps, journey_job):
         matches = [j for j in jobs if j.get("name") == name]
