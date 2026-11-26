@@ -419,7 +419,7 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   assert.equal(reports.length, pageReportStart);
   observedPageVersion = 'page+/%?=&';
 
-  await t.test('a shifted Content-Range delivers and counts no media', async (t) => {
+  await t.test('a shifted Content-Range is refused and the same request can be retried', async (t) => {
     const fetchStart = fetches.length;
     const reportStart = reports.length;
     // Keep the status, version, length and authentic ciphertext from the successful seek.
@@ -428,9 +428,21 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     const refused = await request();
     assert.equal(refused.response.status, 502);
     assert.equal(refused.response.headers.get('content-range'), null);
-    assert.equal(JSON.parse(refused.bytes).code, 'upstream_unavailable');
+    const error = JSON.parse(refused.bytes);
+    assert.equal(error.code, 'upstream_unavailable');
+    assert.equal(error.retryable, true);
     assert.deepEqual(fetches.slice(fetchStart), ['media']);
     assert.equal(reports.length, reportStart);
+
+    seekContentRange = span;
+    const retry = await request();
+    assert.equal(retry.response.status, 206);
+    assert.equal(retry.response.headers.get('content-range'), 'bytes 65536-65536/65537');
+    assert.deepEqual(retry.bytes, plaintext.subarray(65_536));
+    assert.deepEqual(fetches.slice(fetchStart), ['media', 'media', 'page']);
+    assert.deepEqual(reports.slice(reportStart), [{
+      user_id: 'member', play_id: play, track_id: 'track', start: 65_536, end: 65_537, file_bytes: 65_537,
+    }]);
   });
 
   fullRange = true;
