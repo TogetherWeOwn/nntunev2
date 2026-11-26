@@ -271,6 +271,7 @@ def check_reader_privilege_binding():
         "column list has an empty name": {"extra_grants": ["UPDATE () ON fixture_catalog.required"]},
         "column grant targets a large object": {"extra_grants": ["UPDATE (id) ON LARGE OBJECT 900001"]},
         "column grant uses a table-only privilege": {"extra_grants": ["DELETE (id) ON fixture_catalog.required"]},
+        "large object grant uses a table-only privilege": {"extra_grants": ["DELETE ON LARGE OBJECT 900001"]},
     }.items():
         check(case, record | {"reader_privileges": over | override})
     check("oversized record", json.dumps(record).encode().ljust(4097))
