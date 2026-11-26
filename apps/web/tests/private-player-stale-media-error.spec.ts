@@ -1,10 +1,10 @@
-import { expect } from '@playwright/test';
+import { expect, type Route } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { privateStagingAudio } from '../../../e2e/helpers/private-staging-fixture.js';
 import { mockInvitedLibraryPlayback } from './fixtures/invited-library-playback.js';
 import { playQueuedTrack, serveFlac, test } from './helpers/private-music-fixture.js';
 
-type ProbedAudio = HTMLAudioElement & { replayCapturedError?: () => boolean };
+type ProbedAudio = HTMLAudioElement & { replayCapturedErrors?: () => { registered: number; delivered: number } };
 
 test('invited playback ignores a retired audio error and retries a current audio error', async ({ page, origin }) => {
 	const { library, player } = PRIVATE_MUSIC;
@@ -17,7 +17,7 @@ test('invited playback ignores a retired audio error and retries a current audio
 	const fixture = await mockInvitedLibraryPlayback(page, origin, {
 		libraryItems: () => [first, second],
 		playableTrackId: (id) => [first.id, second.id].find((trackId) => trackId === id),
-		audio: async (route) => {
+		audio: async (route: Route) => {
 			const isSecond = new URL(route.request().url()).pathname.startsWith(`${player.plays}/media/${second.id}/`);
 			if (isSecond && failSecond) return route.fulfill({ status: 503 });
 			return serveFlac(route, (isSecond ? secondTone : firstTone).body);
@@ -30,19 +30,26 @@ test('invited playback ignores a retired audio error and retries a current audio
 	await page.addInitScript((audioTestId) => {
 		const prototype = HTMLAudioElement.prototype;
 		const add = prototype.addEventListener;
-		prototype.addEventListener = function (this: ProbedAudio, type, listener, options) {
+		const captured = new WeakMap<HTMLAudioElement, EventListener[]>();
+		prototype.addEventListener = function (this: ProbedAudio, type: string,
+			listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) {
 			if (type === 'error' && typeof listener === 'function' && typeof options === 'object' && options.signal
 				&& this.dataset.testid === audioTestId) {
-				// Keep a callable copy that survives normal listener removal. Dispatch on the
-				// retired element so the callback sees its original currentTarget.
-				this.replayCapturedError = () => {
-					let delivered = false;
+				const listeners = captured.get(this) ?? [];
+				listeners.push(listener);
+				captured.set(this, listeners);
+				// The player and Media Session both observe errors. Keep every callback
+				// and replay it with the original currentTarget after normal teardown.
+				this.replayCapturedErrors ??= () => {
+					let delivered = 0;
 					add.call(this, 'error', (event) => {
-						delivered = true;
-						listener.call(this, event);
+						for (const callback of listeners) {
+							callback.call(this, event);
+							delivered += 1;
+						}
 					}, { once: true });
 					this.dispatchEvent(new Event('error'));
-					return delivered;
+					return { registered: listeners.length, delivered };
 				};
 			}
 			add.call(this, type, listener, options);
@@ -86,11 +93,12 @@ test('invited playback ignores a retired audio error and retries a current audio
 	const before = await replacement.evaluate((node: HTMLAudioElement) => node.currentTime);
 	const displayedBefore = Number(await seek.inputValue());
 	expect(displayedBefore).toBeGreaterThan(0);
+	const listenerCount = await page.evaluate(() => navigator.mediaSession ? 2 : 1);
 	expect(await retired.evaluate((node: ProbedAudio) => {
 		if (node.isConnected) throw new Error('The first audio element is still attached');
 		Object.defineProperty(node, 'error', { value: { code: MediaError.MEDIA_ERR_NETWORK } });
-		return node.replayCapturedError?.();
-	})).toBe(true);
+		return node.replayCapturedErrors?.();
+	})).toEqual({ registered: listenerCount, delivered: listenerCount });
 	await advancing(before + 0.2);
 	await expectSecondSelected();
 	await expect(status).toHaveText('Playing');
