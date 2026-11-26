@@ -451,8 +451,8 @@ async fn resume_multipart<'a>(
     // handoff. The sealed bytes and verified receipts survive across attempts.
     assert!(matches_checkpoint(binding, &receipts, &checkpoint));
     let resumed_etag;
+    let upload = DurableUpload::new(target, context, binding.session, until);
     if saved.len() == 1 {
-        let upload = DurableUpload::new(target, context, binding.session, until);
         let receipt = sender
             .put_part(binding, context, second, &upload, until)
             .await
