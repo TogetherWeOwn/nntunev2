@@ -5,7 +5,7 @@ use nntune_core::{
         BodyReadbackError, EnrolledEnvelope, EnrolledReadbackError, ReadbackBody, ReadbackError,
         ReadbackPin, ReadbackResponse,
     },
-    media::PLAIN_CHUNK_SIZE,
+    media::{ciphertext_size, PLAIN_CHUNK_SIZE},
     media_envelope::{wrap_scheme2, EnvelopeContext},
     origin_sealer::SealedChunk,
     s3_locator::{S3Binding, S3Locator},
@@ -20,10 +20,11 @@ use nntune_ingest::{
             BucketReadbackResponse, CompletedReadbackInventory, InventoryError, ReadbackScope,
         },
         resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
-        session_completion::SessionCompletion,
+        session_completion::{PrepareError, SessionCompletion},
         session_outcome::CommittedOutcome,
         sidecar::{CompletedSidecar, SidecarPut, SidecarPutReply},
         CompletedVersionedMedia, MultipartError, Plan, UploadTarget, VersionedCompletionReply,
+        PART_BYTES,
     },
 };
 use sha2::{Digest, Sha256};
@@ -83,13 +84,25 @@ struct ReadbackFixture {
     page_bytes: Vec<Vec<u8>>,
 }
 
+#[derive(Clone, Copy)]
+enum CompletionFault {
+    BadChecksum,
+    MissingMiddlePart,
+}
+
+#[derive(Debug)]
+enum FixtureCompletionError {
+    Prepare(PrepareError),
+    Receipt(MultipartError),
+}
+
 impl ReadbackFixture {
     fn new(plaintext: &[u8]) -> Self {
         Self::in_scope(plaintext, [0, 1, 2, 0xab, 0xcd, 5].map(id), MAP_ID, KEY)
     }
 
     fn in_scope(plaintext: &[u8], identities: [[u8; 16]; 6], map_id: [u8; 16], key: &str) -> Self {
-        Self::complete(plaintext, identities, map_id, key, true).unwrap()
+        Self::complete(plaintext, identities, map_id, key, None).unwrap()
     }
 
     fn complete(
@@ -97,8 +110,8 @@ impl ReadbackFixture {
         identities: [[u8; 16]; 6],
         map_id: [u8; 16],
         key: &str,
-        checksum_matches: bool,
-    ) -> Result<Self, MultipartError> {
+        fault: Option<CompletionFault>,
+    ) -> Result<Self, FixtureCompletionError> {
         let plaintext_len = plaintext.len() as u64;
         let mut enrollment =
             DigestEnrollment::new(plaintext_len, identities[1..].try_into().unwrap(), map_id)
@@ -138,34 +151,43 @@ impl ReadbackFixture {
             );
         }
         parts.extend(partition.finish().unwrap());
+        let reported_length = ciphertext_size(plaintext_len).unwrap();
         let mut media_bytes = Vec::new();
         let mut composite = Sha256::new();
         let mut checkpoint_parts = Vec::new();
-        let uploads = parts
-            .iter()
-            .map(|part| {
-                let (_, number, bytes, checksum) = part.request();
-                media_bytes.extend_from_slice(bytes);
-                let digest = Sha256::digest(bytes).into();
-                composite.update(digest);
-                checkpoint_parts.push(CheckpointPart {
-                    number,
-                    len: bytes.len(),
-                    etag: "synthetic",
-                    digest,
-                });
-                part.verify_reply("synthetic".into(), checksum).unwrap()
-            })
-            .collect();
+        let mut uploads = Vec::new();
+        for part in &parts {
+            let (_, number, bytes, checksum) = part.request();
+            if matches!(fault, Some(CompletionFault::MissingMiddlePart)) && number == 2 {
+                continue;
+            }
+            media_bytes.extend_from_slice(bytes);
+            let digest = Sha256::digest(bytes).into();
+            composite.update(digest);
+            checkpoint_parts.push(CheckpointPart {
+                number,
+                len: bytes.len(),
+                etag: "synthetic",
+                digest,
+            });
+            uploads.push(part.verify_reply("synthetic".into(), checksum).unwrap());
+        }
+        if matches!(fault, Some(CompletionFault::MissingMiddlePart)) {
+            assert_eq!(parts.len(), 3);
+            assert!(checkpoint_parts.iter().map(|part| part.number).eq([1, 3]));
+            assert_eq!(reported_length, (media_bytes.len() + PART_BYTES) as u64);
+        } else {
+            assert_eq!(reported_length, media_bytes.len() as u64);
+        }
         let mut composite = composite.finalize();
-        if !checksum_matches {
+        if matches!(fault, Some(CompletionFault::BadChecksum)) {
             composite[0] ^= 1;
         }
         let composite = STANDARD.encode(composite);
         let body = format!(
             "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{key}</Key>\
              <ChecksumSHA256>{composite}-{}</ChecksumSHA256></CompleteMultipartUploadResult>",
-            parts.len()
+            uploads.len()
         );
         let reply = VersionedCompletionReply {
             configuration: CONFIGURATION,
@@ -188,25 +210,25 @@ impl ReadbackFixture {
             binding,
             parts: &checkpoint_parts,
         };
-        let completion =
-            SessionCompletion::prepare(binding, &context, uploads, &checkpoint).unwrap();
-        let media = completion.verify_completion(reply)?;
         let observed = S3Locator::new(
             BUCKET.into(),
             key.into(),
             S3Binding::VersionId(SHARED_VERSION.into()),
         )
         .unwrap();
-        media
-            .verify_head(
-                &context,
-                Some(HeadReceipt {
-                    configuration: Some(CONFIGURATION),
-                    locator: Some(&observed),
-                    content_length: Some(media_bytes.len() as u64),
-                }),
-            )
-            .unwrap();
+        // The synthetic provider can report all bytes even when the trusted
+        // checkpoint has no confirmation for the middle part.
+        let head = HeadReceipt {
+            configuration: Some(CONFIGURATION),
+            locator: Some(&observed),
+            content_length: Some(reported_length),
+        };
+        let completion = SessionCompletion::prepare(binding, &context, uploads, &checkpoint)
+            .map_err(FixtureCompletionError::Prepare)?;
+        let media = completion
+            .verify_completion(reply)
+            .map_err(FixtureCompletionError::Receipt)?;
+        media.verify_head(&context, Some(head)).unwrap();
         Ok(Self {
             map_id,
             origin: enrollment.finish().unwrap(),
