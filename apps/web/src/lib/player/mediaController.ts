@@ -323,6 +323,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	function retire(): HTMLAudioElement | undefined {
 		pausedTransport?.abort();
 		const previous = current;
+		if (previous?.audio === reconnectHandoffAudio) reconnectHandoffAudio = undefined;
 		current = undefined;
 		// Retire the native receipt without imposing replacement's share-clear policy on remove/clear.
 		attachmentVersion += 1;
@@ -691,16 +692,20 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				(grant) => playSelected(result.queue, index, grant, '', grant), { failureMessage });
 			// Arm before the first grant settles so a reconnect during a stalled request is retained.
 			const armed = playIntent;
-			let onlineSeen = false, retryStarted = false;
-			if (failureMessage && listeners && globalThis.navigator?.onLine === false && evidence.isCurrent() && ownsOrigin()) {
+			let onlineSeen = false, retryStarted = false, listenerArmed = false;
+			const armReconnect = () => {
+				if (listenerArmed || !failureMessage || !listeners || globalThis.navigator?.onLine !== false || !evidence.isCurrent() || !ownsOrigin()) return;
+				listenerArmed = true;
 				reconnectHandoffAudio = audio;
 				globalThis.addEventListener?.('online', () => {
 					onlineSeen = true;
 					reconnectHandoffAudio = undefined;
 					if (!pendingGrant && playIntent === armed) { retryStarted = true; void handoff(); }
 				}, { once: true, signal: listeners });
-			}
+			};
+			armReconnect();
 			await handoff();
+			armReconnect();
 			if (onlineSeen && !retryStarted && !pendingGrant && playIntent === armed) void handoff();
 			return;
 		}
