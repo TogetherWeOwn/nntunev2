@@ -1,5 +1,10 @@
 use super::*;
-use nntune_stream::{enrolled_playback::route::serve, play_route::PlayRouteRequest};
+use nntune_stream::{
+    delivered::DeliveredInterval,
+    enrolled_playback::route::serve,
+    meter_sink::{FlushAck, MeterBook},
+    play_route::PlayRouteRequest,
+};
 use std::cell::{Cell, RefCell};
 
 #[path = "../fixtures/private_enrolled_source.rs"]
@@ -249,6 +254,103 @@ async fn short_media_read_reports_only_written_bytes_and_retry_is_contiguous() {
     assert_eq!(retry.start..retry.end, cursor..cursor + tail.len() as u64);
     assert_eq!(retry.end, LEN);
     assert_eq!(retry.play_id, receipt.play_id);
+}
+
+#[tokio::test]
+async fn final_frame_verification_failure_preserves_acknowledged_delivery() {
+    let source = Source::browser();
+    let play_id = "private_browser_AAAAAAAAAAAAAAAAAAAAAA";
+    let mut meter = MeterBook::new("member");
+    let terminal = FlushAck {
+        accepted: vec![play_id.into()],
+        ..FlushAck::default()
+    }
+    .terminal_play_ids();
+    let receipt = |start, end| DeliveredInterval {
+        user_id: "member".into(),
+        play_id: play_id.into(),
+        track_id: "track".into(),
+        start,
+        end,
+        file_bytes: Some(LEN),
+    };
+    let attempt = async |start: u64, end: u64| {
+        let request = PlayRouteRequest {
+            track_id: "track".into(),
+            token: Some(BROWSER_TOKEN.into()),
+            range: Some(format!("bytes={start}-{end}")),
+            trace_id: None,
+        };
+        let content_range = format!("bytes {start}-{end}/{LEN}");
+        let output = RefCell::new(Vec::new());
+        let aborted = Cell::new(false);
+        let mut reports = Vec::new();
+        let result = serve(
+            &request,
+            b"test only, not a deployed secret",
+            Some(&source),
+            || source.time(),
+            |head| {
+                assert_eq!(head.status, 206);
+                assert_eq!(head.len, end - start + 1);
+                assert_eq!(head.content_range.as_deref(), Some(content_range.as_str()));
+                Ok(Some(Writer {
+                    output: &output,
+                    fault: Fault::None,
+                    aborted: &aborted,
+                    revoke_on_write: None,
+                }))
+            },
+            |interval| reports.push(interval),
+        )
+        .await;
+        (result, output.into_inner(), aborted.get(), reports)
+    };
+
+    source.expected_media_end.set(65_600);
+    let (result, output, aborted, reports) = attempt(65_533, 65_534).await;
+    result.unwrap();
+    assert!(!aborted);
+    assert_eq!(output, b"AA");
+    assert_eq!(reports, [receipt(65_533, 65_535)]);
+    assert!(meter.record(&reports[0], 10));
+    let earlier = meter.pending_windows();
+    assert_eq!(earlier.len(), 1);
+    assert_eq!(earlier[0].union_bytes, 2);
+    meter.mark_flushed(&earlier, &terminal);
+    assert_eq!(meter.plays[play_id].flushed_bytes, 2);
+    assert!(!meter.has_pending());
+
+    source.expected_media_end.set(65_617);
+    source.corrupt_final_frame_once.set(true);
+    let (result, output, aborted, reports) = attempt(65_534, 65_536).await;
+    let error = result.unwrap_err();
+    assert_eq!((error.status, error.code), (502, "upstream_unavailable"));
+    assert!(aborted);
+    assert_eq!(output, b"AY");
+    assert_eq!(reports, [receipt(65_534, 65_536)]);
+    assert!(meter.record(&reports[0], 11));
+    assert_eq!(meter.plays[play_id].flushed_bytes, 2);
+    let prefix = meter.pending_windows();
+    assert_eq!(prefix.len(), 1);
+    assert_eq!(prefix[0].union_bytes, 3); // One byte overlaps the earlier range.
+    meter.mark_flushed(&prefix, &terminal);
+    assert_eq!(meter.plays[play_id].flushed_bytes, 3);
+    assert!(!meter.has_pending());
+
+    source.expected_media_start.set(65_600);
+    let (result, output, aborted, reports) = attempt(65_536, 65_536).await;
+    result.unwrap();
+    assert!(!aborted);
+    assert_eq!(output, b"Z");
+    assert_eq!(reports, [receipt(65_536, LEN)]);
+    assert!(meter.record(&reports[0], 12));
+    let complete = meter.pending_windows();
+    assert_eq!(complete.len(), 1);
+    assert_eq!(complete[0].union_bytes, 4);
+    meter.mark_flushed(&complete, &terminal);
+    assert_eq!(meter.plays[play_id].flushed_bytes, 4);
+    assert!(!meter.has_pending());
 }
 
 #[tokio::test]
