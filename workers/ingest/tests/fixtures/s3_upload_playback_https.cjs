@@ -160,8 +160,14 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
         res.writeHead(206, rangeHeaders).write(bytes.subarray(0, -17));
         return;
       }
-      if (fault === 'short range') rangeHeaders.connection = 'close';
-      res.writeHead(206, rangeHeaders).end(fault === 'short range' ? bytes.subarray(0, -1) : bytes);
+      if (fault === 'short range') {
+        // Keep the truncated body below Node Fetch's backpressure threshold.
+        // The advertised length still requires a complete sealed chunk.
+        rangeHeaders.connection = 'close';
+        res.writeHead(206, rangeHeaders).end(bytes.subarray(0, 16));
+        return;
+      }
+      res.writeHead(206, rangeHeaders).end(bytes);
     } else {
       verify();
       assert.equal(req.headers.range, undefined);
