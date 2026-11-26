@@ -33,7 +33,7 @@ test('a refused end-of-track grant leaves the queue paused and the successor sel
 	const rows = page.getByTestId(player.queueItem);
 	const active = page.locator(player.currentQueueItem);
 	const nowPlaying = transport.getByTestId('library-now-playing');
-	const announcement = page.getByTestId('queue-announcement');
+	const announcement = page.getByRole('status').and(page.getByTestId('queue-announcement'));
 	const order = () => rows.evaluateAll((items, attr) => items.map((item) => item.getAttribute(attr)), player.queueId);
 	const nativeProgress = () => audio.evaluate((node: HTMLAudioElement) =>
 		!node.paused && !node.ended && node.error === null && node.currentTime > 0.2);
