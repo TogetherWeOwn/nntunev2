@@ -1,10 +1,22 @@
+# guards: paths
 name: preserved-source synthetic graph
 
 # This is one qualification control, not an acquisition boundary or approval
 # to consume a preserved source. The fixture creates only local Git objects.
+# To refresh evidence after an attestation change or a base retarget, close
+# and reopen the PR at the same head. Required CI's unfiltered reopened event
+# resolves the new integration commit and runs the same graph controls.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/preserved-source-graph.yml
+      - .github/workflows/ci.yml
+      - .github/scripts/*migration*.py
+      - .github/scripts/*graph*.py
+      - .github/scripts/staging_api_schema_gate.py
+      - .github/scripts/test_ci_pnpm_retry.py
+      - migrations/**
 
 permissions:
   contents: read

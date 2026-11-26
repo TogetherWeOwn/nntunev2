@@ -28,7 +28,10 @@ use worker::{
 use super::{
     head_receipt::{HeadReceipt, HeadReceiptError},
     resume_checkpoint::ResumeBinding,
-    session_completion::{CompletionRequest, CompletionResponse, DispatchError, SessionCompletion},
+    session_completion::{
+        CompletionReadRequest, CompletionReadResponse, CompletionRequest, CompletionResponse,
+        DispatchError, SessionCompletion,
+    },
     session_outcome::CompletionScope,
     session_upload::{self, DurableUpload, HandoffError},
     sidecar::{CompletedSidecar, SidecarError, SidecarPut, SidecarPutReply},
@@ -37,6 +40,8 @@ use super::{
 use crate::pool_deadline::race_against_deadline;
 
 use super::initiation::InitiatedUpload;
+
+const COMPLETION_MARKER: &str = "x-amz-meta-nntune-completion";
 
 #[path = "s3_readback.rs"]
 mod readback;
@@ -122,8 +127,8 @@ impl S3CompletionSender {
             context,
             (&self.bucket, key),
             usable_until,
-            async |deadline| {
-                self.initiate(context, &self.bucket, key, deadline)
+            async |deadline, marker| {
+                self.initiate(context, &self.bucket, key, marker, deadline)
                     .await
                     .map_err(|_| ())
             },
@@ -140,6 +145,7 @@ impl S3CompletionSender {
         context: &EnvelopeContext,
         bucket: &'a str,
         key: &'a str,
+        marker: &str,
         usable_until: SystemTime,
     ) -> Result<InitiatedUpload<'a>, DispatchError> {
         if !(1..=MAX_NEW_PLAINTEXT).contains(&context.plaintext_len)
@@ -160,6 +166,7 @@ impl S3CompletionSender {
                     operation_headers: &[
                         ("x-amz-checksum-algorithm", "SHA256"),
                         ("x-amz-checksum-type", "COMPOSITE"),
+                        (COMPLETION_MARKER, marker),
                     ],
                 },
                 usable_until,
@@ -170,8 +177,8 @@ impl S3CompletionSender {
             .map_err(|error| DispatchError::Unconfirmed(Some(error)))
     }
 
-    /// The caller authorizes the live session and supplies its dispatch deadline.
-    pub async fn complete(
+    #[cfg(feature = "s3-completion-wasm-test")]
+    async fn complete_fixture(
         &self,
         completion: SessionCompletion<'_>,
         usable_until: SystemTime,
@@ -179,6 +186,64 @@ impl S3CompletionSender {
         completion
             .dispatch(async |request| self.send(request, usable_until).await)
             .await
+    }
+
+    /// Complete once under the durable upload lease. Retry only by reading
+    /// back the completed object when the transport loses the response.
+    pub async fn complete(
+        &self,
+        upload: &DurableUpload<'_>,
+        completion: SessionCompletion<'_>,
+    ) -> Result<CompletedVersionedMedia, DispatchError> {
+        completion
+            .dispatch_durable(
+                upload,
+                async |request, until| {
+                    // Leave time for reconciliation without extending the lease.
+                    let remaining = until.duration_since(now()).unwrap_or_default();
+                    self.send(request, until - (remaining / 4).min(Duration::from_secs(5)))
+                        .await
+                },
+                async |request, until| self.read_completion_head(request, until).await,
+            )
+            .await
+    }
+
+    async fn read_completion_head(
+        &self,
+        request: CompletionReadRequest<'_>,
+        until: SystemTime,
+    ) -> Result<CompletionReadResponse, ()> {
+        let reply = self
+            .signed_request(
+                SignedRequest {
+                    configuration: request.configuration,
+                    bucket: request.bucket,
+                    key: request.key,
+                    method: "HEAD",
+                    query: String::new(),
+                    body: &[],
+                    payload_hash: hex::encode(Sha256::digest([])),
+                    operation_headers: &[("x-amz-checksum-mode", "ENABLED")],
+                },
+                until,
+            )
+            .await?;
+        let header = |name| reply.headers.get(name).map_err(|_| ());
+        if reply.status != 200
+            || !reply.body.is_empty()
+            || header("content-range")?.is_some()
+            || header("x-amz-checksum-type")?.as_deref() != Some("COMPOSITE")
+        {
+            return Err(());
+        }
+        Ok(CompletionReadResponse {
+            configuration: self.configuration,
+            content_length: content_length(&reply.headers)?,
+            composite_sha256: header("x-amz-checksum-sha256")?,
+            marker: header(COMPLETION_MARKER)?,
+            version: header("x-amz-version-id")?,
+        })
     }
 
     /// Confirm metadata for the immutable completed version. Publication still

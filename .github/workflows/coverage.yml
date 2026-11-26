@@ -1,14 +1,14 @@
 name: Rust coverage summary
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: '41 4 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Report-only summary: a newer push to main supersedes an in-flight run.
+# Report-only summary: a newer run supersedes an in-flight run on the same ref.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

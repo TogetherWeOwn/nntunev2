@@ -96,6 +96,8 @@ pub(super) struct Source {
     play_id: &'static str,
     fault: Fault,
     checked_lease: Cell<bool>,
+    pub(super) empty_media_once: Cell<bool>,
+    pub(super) page_reads: Cell<usize>,
     pub(super) revoked: Cell<bool>,
     pub(super) short_media_once: Cell<bool>,
     pub(super) expected_media_start: Cell<u64>,
@@ -135,6 +137,8 @@ impl Source {
             play_id,
             fault,
             checked_lease: Cell::new(false),
+            empty_media_once: Cell::new(false),
+            page_reads: Cell::new(0),
             revoked: Cell::new(false),
             short_media_once: Cell::new(false),
             expected_media_start: Cell::new(0),
@@ -202,6 +206,10 @@ impl PrivateSource for Source {
             // Keep the pinned response metadata intact while dropping a body byte.
             bytes.truncate(bytes.len() - 1);
         }
+        if self.empty_media_once.replace(false) {
+            // Return EOF on the first read with the same pinned response metadata.
+            bytes.clear();
+        }
         let version = if self.fault == Fault::MediaVersion {
             "wrong"
         } else {
@@ -243,6 +251,7 @@ impl PrivateSource for Source {
             )
         );
         assert_eq!(length as usize, self.fixture.page.len());
+        self.page_reads.set(self.page_reads.get() + 1);
         let version = if self.fault == Fault::PageVersion {
             "wrong"
         } else {

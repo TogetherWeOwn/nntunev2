@@ -91,3 +91,12 @@ END $$;
 CREATE TABLE public.test_flac_review (view jsonb NOT NULL, retried_revision bigint);
 INSERT INTO public.test_flac_review VALUES
     ('{"job_id":"catalogue-old","revision":1,"status":"needs_review"}', NULL);
+
+CREATE TABLE public.test_operator_review (
+    job_id TEXT PRIMARY KEY REFERENCES public.ingest_jobs (id),
+    view JSONB NOT NULL
+);
+INSERT INTO public.test_operator_review
+SELECT id, jsonb_build_object('job_id', id, 'revision', 2, 'status',
+    CASE WHEN status = 'queued' THEN 'accepted' ELSE 'published' END)
+FROM public.ingest_jobs WHERE id IN ('catalogue-old', 'catalogue-new', 'catalogue-queued');

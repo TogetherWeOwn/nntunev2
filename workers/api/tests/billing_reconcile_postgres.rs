@@ -1156,7 +1156,7 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
         if changed_proof {
             let result = fx.try_put("u1", &incoming).await;
             assert!(
-                matches!(&result, Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "changed terminal read provenance"),
+                matches!(&result, Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "changed equal-end read provenance"),
                 "{case}: {result:?}"
             );
         } else {

@@ -11,7 +11,7 @@ Only the jobs whose tests actually fetch may receive them:
 
 Jobs that never fetch must not receive the secrets (least exposure):
 ``e2e-lint`` runs the cc0 helper's offline unit spec with the config
-env cleared, ``vitest`` has no fixture consumer, and the workspace
+env cleared, ``web-checks`` has no fixture consumer, and the workspace
 crate self-tests clear the config too. Fork PRs receive no secrets at
 all, so every consumer still skips through the fetcher's exit-77 path.
 
@@ -116,12 +116,17 @@ class TestFixtureSecretWiring(unittest.TestCase):
             ("merge_group", "contributor", "", "refs/heads/gh-readonly-queue/main/entry", True),
             ("workflow_dispatch", "contributor", "", "refs/heads/topic", True),
             ("pull_request_target", "contributor", "own/repo", "refs/heads/main", False),
-            ("schedule", "contributor", "", "refs/heads/main", False),
+            ("schedule", "contributor", "", "refs/heads/main", True),
+            ("schedule", "contributor", "", "refs/heads/topic", False),
+            ("schedule", "dependabot[bot]", "", "refs/heads/main", False),
             ("workflow_dispatch", "dependabot[bot]", "", "refs/heads/main", False),
         ]
         for job_id in ("rust-ingest", "web-e2e"):
             job = self.jobs[job_id]
-            self.assertNotRegex(job, r"(?m)^    if:")
+            self.assertIn(
+                "    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), '" + job_id + "') }}",
+                job,
+            )
             guard = re.search(r"^      FIXTURE_SECRETS_ALLOWED: \$\{\{ (.+) \}\}$", job, re.M)
             self.assertIsNotNone(guard, job_id)
             for event, actor, head_repo, ref, expected in cases:
@@ -132,7 +137,7 @@ class TestFixtureSecretWiring(unittest.TestCase):
                         "github.event.pull_request.head.repo.full_name == github.repository": head_repo == "own/repo",
                         "github.ref == 'refs/heads/main'": ref == "refs/heads/main",
                     }
-                    for name in ("pull_request", "push", "merge_group", "workflow_dispatch"):
+                    for name in ("pull_request", "push", "merge_group", "schedule", "workflow_dispatch"):
                         terms[f"github.event_name == '{name}'"] = event == name
                     for term, value in terms.items():
                         expression = expression.replace(term, str(value))
@@ -187,11 +192,11 @@ class TestFixtureSecretWiring(unittest.TestCase):
     def test_non_fetching_jobs_receive_no_fixture_secrets(self):
         """Offline-only jobs stay secret-free.
 
-        e2e-lint's cc0 spec clears the config env itself, vitest has no
+        e2e-lint's cc0 spec clears the config env itself, web-checks has no
         fixture consumer, and rust-test's crate self-tests clear the
         config for the child process — none of them needs R2 access.
         """
-        for job_id in ("e2e-lint", "vitest", "rust-test", "public-text"):
+        for job_id in ("e2e-lint", "web-checks", "rust-test", "public-text"):
             self.assertNotIn("secrets.NNTUNE_FIXTURE_R2_", self.jobs[job_id], job_id)
 
     def test_no_workflow_references_the_retired_nzb_secrets(self):

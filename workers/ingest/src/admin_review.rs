@@ -15,6 +15,7 @@ pub const RETRY_SCOPE: &str = "ingest:review:retry";
 pub const RETRY_BODY_LIMIT: usize = 128;
 
 pub mod completed;
+pub mod source;
 
 /// Synthetic grants use the existing caller-grant format. A future app proxy
 /// must check current admin status and retry step-up before issuing grants.

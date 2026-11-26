@@ -109,12 +109,18 @@ test.describe('ci-ok aggregate', () => {
     test(`e2e-lint ${result} ${result === 'success' ? 'passes' : 'fails'} the aggregate`, () => {
       expect(aggregate).toBeDefined();
       const needs = JSON.stringify({
-        placeholder: { result: 'success' },
+        'ci-commits': { result: 'success' },
+        early: { result: 'success' },
         'public-pr-security': { result: 'success' },
         'e2e-lint': { result },
       }, null, 2);
       const script = aggregate!.replace(/^ {10}/gm, '');
-      const actual = runShell(script, { NEEDS_JSON: needs, CI_EVENT_NAME: 'pull_request' });
+      const actual = runShell(script, {
+        NEEDS_JSON: needs,
+        CI_EVENT_NAME: 'pull_request',
+        CI_COVERAGE_COMPLETE: 'true',
+        CI_SKIP: '[]',
+      });
       expect(actual.status).toBe(result === 'success' ? 0 : 1);
     });
   }
@@ -949,6 +955,22 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     expect(jobIf(stagingWorkflow, 'synthetic')).toBeUndefined();
   });
 
+  test('ordinary staging E2E installs only the default Chromium headless shell', () => {
+    const staging = config.projects?.find((project) => project.name === 'staging');
+    expect(staging).toBeDefined();
+    const use = { ...config.use, ...staging?.use };
+    expect(use.browserName ?? 'chromium').toBe('chromium');
+    expect(use.channel).toBeUndefined();
+    expect(use.headless).not.toBe(false);
+    expect(use.launchOptions?.executablePath).toBeUndefined();
+
+    for (const job of ['synthetic', 'e2e']) {
+      expect(jobSection(stagingWorkflow, job)).toContain(
+        'run: npx playwright install --with-deps --only-shell chromium\n',
+      );
+    }
+  });
+
   test('deploy calls e2e-staging only after successful push staging-web and staging-api (evaluated)', () => {
     // The deploy being sequenced after is itself push-only and gated on
     // the Cloudflare token; when it skips, dependents must skip too.
@@ -1008,39 +1030,63 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     }
   });
 
-  test('main staging deploy, post-deploy E2E and private trial cleanup share a queued workflow lock', () => {
-    const group = "  group: ${{ (github.event_name == 'push' || inputs.private_trial_cleanup_scope_sha256 != '') && 'deploy-staging-main' || format('deploy-staging-{0}', github.run_id) }}\n";
-    const lock = `\nconcurrency:\n${group}  cancel-in-progress: false\n  queue: max\n`;
+  test('staging writers and diagnostic dispatches queue once in their respective groups', () => {
+    // Older pushes already admitted or queued use this workflow-level key.
+    const olderWriterGroup = 'deploy-staging-main';
+    const mainRef = 'refs/heads/main';
     const lanes = ['staging-web', 'staging-api', 'staging-mb', 'staging-ingest', 'staging-stream', 'post-deploy-e2e', 'post-deploy-private-music'];
+    const dispatchFormat = "format('{0}-gate-{1}', github.workflow, github.ref)";
+    const lockPattern = /^concurrency:\n  group: \$\{\{ (.+) \}\}\n  cancel-in-progress: false\n  queue: max$/m;
     const assertDeployLock = (body: string) => {
       const header = body.split('\njobs:\n')[0]!;
       expect(header).toMatch(/^on:\n  push:\n    branches: \[main\]\n  workflow_dispatch:\n    inputs:\n      private_trial_cleanup_scope_sha256:\n        description: [^\n]+\n        type: string\n        default: ''\n\n/m);
-      // E2E holds this run's staging build. Only an explicit cleanup dispatch
-      // shares the push lock, and queued runs cannot replace each other.
-      expect(header).toContain(lock);
+      const lock = header.match(lockPattern);
+      expect(lock, 'queued workflow-level lock').not.toBeNull();
+      expect(lock![1], 'dispatch key must use the workflow and ref').toContain(dispatchFormat);
+      const workflowName = header.match(/^name: ([\w-]+)$/m)?.[1];
+      expect(workflowName).toBe('deploy');
+      const groupFor = (event: string, hasScope: boolean, ref = mainRef): string => {
+        const expression = lock![1]!
+          .replace("github.event_name == 'push'", String(event === 'push'))
+          .replace("inputs.private_trial_cleanup_scope_sha256 != ''", String(hasScope))
+          .replace(dispatchFormat, "'diagnostic'");
+        expect(expression, 'supported staging lock expression').toMatch(
+          /^(?:true|false|'deploy-staging-main'|'diagnostic'|[\s()&|])+$/,
+        );
+        const selected = Function(`"use strict"; return (${expression});`)();
+        return selected === 'diagnostic' ? `${workflowName}-gate-${ref}` : selected;
+      };
+      expect(groupFor('push', false), 'next candidate waits for the older writer').toBe(olderWriterGroup);
+      expect(groupFor('workflow_dispatch', true), 'scoped cleanup waits for writers').toBe(olderWriterGroup);
+      expect(groupFor('workflow_dispatch', false)).toBe('deploy-gate-refs/heads/main');
+      expect(groupFor('workflow_dispatch', false, 'refs/heads/topic')).toBe('deploy-gate-refs/heads/topic');
+
+      expect(jobIf(body, 'gate')).toBe("${{ github.event_name == 'push' || inputs.private_trial_cleanup_scope_sha256 == '' }}");
       for (const lane of lanes) {
         expect(jobIf(body, lane)).toContain("github.event_name == 'push'");
-        expect(jobSection(body, lane), `${lane} must not have its own lock`)
-          .not.toMatch(/^    concurrency:/m);
+      }
+      for (const name of ['gate', ...lanes, PRIVATE_TRIAL_CLEANUP_JOB]) {
+        expect(jobSection(body, name), `${name} must not enter a nested queue`).not.toMatch(/^    concurrency:/m);
       }
       const cleanup = jobSection(body, PRIVATE_TRIAL_CLEANUP_JOB);
-      expect(cleanup).not.toMatch(/^    concurrency:/m);
       expect(cleanup).toContain("github.event_name == 'workflow_dispatch' && github.repository == 'TogetherWeOwn/nntunev2' &&");
       expect(cleanup).toContain("github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha &&");
       expect(cleanup).toContain("github.run_attempt == 1 && inputs.private_trial_cleanup_scope_sha256 != ''");
     };
     assertDeployLock(deployWorkflow);
+    const lock = deployWorkflow.match(lockPattern)![0];
     for (const mutant of [
-      deployWorkflow.replace(lock, '\n'),
-      deployWorkflow.replace(lock, lock.replace('  queue: max\n', '')),
+      deployWorkflow.replace(lock, ''),
+      deployWorkflow.replace(lock, lock.replace('\n  queue: max', '')),
       deployWorkflow.replace(lock, lock.replace('cancel-in-progress: false', 'cancel-in-progress: true')),
-      deployWorkflow.replace(group, '  group: deploy-staging-main\n'),
-      deployWorkflow.replace(group, '  group: deploy-staging-${{ github.run_id }}\n'),
-      deployWorkflow.replace(group, group.replace(" || inputs.private_trial_cleanup_scope_sha256 != ''", '')),
-      ...lanes.map(lane =>
+      deployWorkflow.replace(lock, lock.replace('github.ref)', 'github.run_id)')),
+      deployWorkflow.replace(lock, lock.replace(dispatchFormat, "'diagnostic'")),
+      deployWorkflow.replace(lock, lock.replace("github.event_name == 'push'", 'false')),
+      deployWorkflow.replace(lock, lock.replace(" || inputs.private_trial_cleanup_scope_sha256 != ''", '')),
+      ...['gate', ...lanes, PRIVATE_TRIAL_CLEANUP_JOB].map(name =>
         deployWorkflow.replace(
-          `\n  ${lane}:\n`,
-          `\n  ${lane}:\n    concurrency:\n      group: deploy-staging-main\n`,
+          `\n  ${name}:\n`,
+          `\n  ${name}:\n    concurrency:\n      group: deploy-staging-main\n`,
         ),
       ),
     ]) {

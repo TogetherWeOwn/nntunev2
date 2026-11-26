@@ -64,6 +64,27 @@ class ProductionObservationTests(unittest.TestCase):
                                             capture_output=True, text=True, check=False)
                     self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
 
+    def test_cli_refuses_a_same_build_deployment_change_at_close(self):
+        pins, watch = fixture()
+        closing_sample = watch["samples"][-1]
+        cases = (
+            (pins["candidate"]["deployment_id"], (0, "Production observation evidence satisfied\n", "")),
+            ("12345678-1234-4234-8234-123456789fed",
+             (1, "", "Production observation refused: serving identity drift\n")),
+        )
+        script = Path(__file__).with_name("production_observation.py")
+        with TemporaryDirectory(prefix="nntune-observation-") as directory:
+            pin_file = Path(directory) / "pins.json"
+            watch_file = Path(directory) / "watch.json"
+            pin_file.write_text(json.dumps(pins))
+            for deployment_id, expected in cases:
+                with self.subTest(deployment_id=deployment_id):
+                    closing_sample["deployment_id"] = deployment_id
+                    watch_file.write_text(json.dumps(watch))
+                    result = subprocess.run([sys.executable, "-B", script, pin_file, watch_file],
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
+
     def test_complete_healthy_window_and_later_close_with_coverage(self):
         pins, watch = fixture()
         validate_observation(pins, watch)
@@ -140,6 +161,33 @@ class ProductionObservationTests(unittest.TestCase):
         with self.assertRaises(Refused):
             validate_observation(pins, watch)
 
+    def test_cli_refuses_mid_window_recovery_handoff(self):
+        script = Path(__file__).with_name("production_observation.py")
+        accepted = (0, "Production observation evidence satisfied\n", "")
+        refused = (1, "", "Production observation refused: "
+                          "watch assignment or recovery access does not cover the window\n")
+        midpoint = "2026-10-01T12:15:00Z"
+        cases = (
+            ("both cover the window", None, None, accepted),
+            ("intervals touch", midpoint, midpoint, refused),
+            ("one-second gap", midpoint, "2026-10-01T12:15:01Z", refused),
+            ("backup starts late", None, midpoint, refused),
+        )
+        with TemporaryDirectory(prefix="nntune-observation-") as directory:
+            pin_file = Path(directory) / "pins.json"
+            watch_file = Path(directory) / "watch.json"
+            for label, watcher_end, backup_start, verdict in cases:
+                with self.subTest(case=label):
+                    pins, watch = fixture()
+                    watch["watcher"]["through"] = watcher_end or watch["closed_at"]
+                    watch["backup"]["from"] = backup_start or watch["backup"]["from"]
+                    watch["backup"]["through"] = watch["closed_at"]
+                    pin_file.write_text(json.dumps(pins))
+                    watch_file.write_text(json.dumps(watch))
+                    result = subprocess.run([sys.executable, "-B", script, pin_file, watch_file],
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), verdict)
+
     def test_identity_and_every_readback_can_fail_at_start_during_and_close(self):
         for index in (0, 3, 6):
             for field, value in (("web_sha", "c" * 40), ("api_sha", "c" * 40),
@@ -206,6 +254,34 @@ class ProductionObservationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "Production observation refused: readback failed, missing or unusable\n")
+
+    def test_cli_refuses_unsaved_final_watch_until_evidence_is_saved(self):
+        pins, watch = fixture()
+        script = Path(__file__).with_name("production_observation.py")
+        with TemporaryDirectory(prefix="nntune-observation-") as directory:
+            pin_file = Path(directory) / "pins.json"
+            watch_file = Path(directory) / "evidence" / "watch.json"
+            pin_payload = json.dumps(pins).encode("utf-8")
+            watch_payload = json.dumps(watch).encode("utf-8")
+            pin_file.write_bytes(pin_payload)
+            command = [sys.executable, script, pin_file, watch_file]
+
+            # A missing destination directory prevents the completed watch from being saved.
+            with self.assertRaises(FileNotFoundError):
+                watch_file.write_bytes(watch_payload)
+            refused = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual((refused.returncode, refused.stdout, refused.stderr), (
+                1, "", "Production observation refused: unreadable evidence\n",
+            ))
+            self.assertFalse(watch_file.exists())
+            self.assertEqual(pin_file.read_bytes(), pin_payload)
+
+            watch_file.parent.mkdir()
+            watch_file.write_bytes(watch_payload)
+            verified = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual((verified.returncode, verified.stdout, verified.stderr), (
+                0, "Production observation evidence satisfied\n", "",
+            ))
 
 
 if __name__ == "__main__":

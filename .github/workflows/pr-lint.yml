@@ -1,3 +1,4 @@
+# guards: release:staging promotion pr-lint
 name: pr-lint
 
 # PR-title conventional-commit lint; `pr-lint` is a required check on main.
@@ -9,7 +10,8 @@ name: pr-lint
 
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened]
+    types: [opened, synchronize, reopened]
+    branches: [main]
   # Merge queue validation: `pr-lint` is a required check, so it
   # must report on merge_group. The queue run has no PR title and no
   # commits array, so it takes the explicit merge_group branch in the run
@@ -30,7 +32,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
-  # Never cancel: Dependabot fires two pull_request events ~1s apart at PR
+  # Never cancel: Dependabot used to fire two pull_request events ~1s apart at PR
   # creation (opened, then edited) for the same head SHA, and cancelling the
   # first leaves a permanent CANCELLED required check in the rollup next to
   # its successful twin, which reads as a stuck PR. The job takes seconds,
@@ -44,12 +46,20 @@ concurrency:
 jobs:
   pr-lint:
     name: pr-lint
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.run_attempt == 1
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.actor)
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.triggering_actor)
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.event.pull_request.user.login)
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - name: Check PR title convention
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.event_name == 'workflow_dispatch' && github.token || '' }}
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_TITLE: ${{ github.event.pull_request.title }}
@@ -75,7 +85,7 @@ jobs:
             fail=0
             while IFS= read -r subject; do
               [ -z "$subject" ] && continue
-              if ! printf '%s' "$subject" | python3 -c '
+              if ! printf '%s' "$subject" | python3 -I -c '
           import re, sys
           t = sys.stdin.read()
           sys.exit(0 if re.match(r"^(feat|fix|perf|refactor|test|docs|build|ci|chore|revert|style|security)(\(.+\))?: .*[^.]$", t) and len(t) <= 100 else 1)
@@ -83,12 +93,12 @@ jobs:
                 echo "::error::Non-conventional commit subject on main: $subject"
                 fail=1
               fi
-            done <<< "$(printf '%s' "$EVENT_COMMITS" | python3 -c 'import json,sys; print("\n".join(c["message"].split("\n")[0] for c in (json.loads(sys.stdin.read() or "[]") or [])))')"
+            done <<< "$(printf '%s' "$EVENT_COMMITS" | python3 -I -c 'import json,sys; print("\n".join(c["message"].split("\n")[0] for c in (json.loads(sys.stdin.read() or "[]") or [])))')"
             [ "$fail" = 0 ] && echo "pr-lint: all main-push subjects conventional"
             exit "$fail"
           fi
           echo "PR title: $title"
-          if printf '%s' "$title" | python3 -c '
+          if printf '%s' "$title" | python3 -I -c '
           import re, sys
           t = sys.stdin.read()
           ok = bool(re.match(r"^(feat|fix|perf|refactor|test|docs|build|ci|chore|revert|style|security)(\(.+\))?: .*[^.]$", t)) and len(t) <= 100
@@ -99,3 +109,15 @@ jobs:
             echo "::error::PR title must be 'type(scope): summary' (types: feat fix perf refactor test docs build ci chore revert style security), <=100 chars, no trailing period."
             exit 1
           fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check workflow demand policy
+        run: |
+          python3.12 -I -m venv "$RUNNER_TEMP/workflow-guard"
+          python="$RUNNER_TEMP/workflow-guard/bin/python"
+          "$python" -I -m pip --isolated install --no-deps --only-binary=:all: --require-hashes \
+            -r /dev/stdin <<<'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc'
+          "$python" -I ci/ci_workflow_guard.py .
+          "$python" -I -m unittest discover -s ci -p test_ci_workflow_guard.py

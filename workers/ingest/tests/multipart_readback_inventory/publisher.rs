@@ -1,6 +1,6 @@
 use super::{
-    id, MemoryBody, ReadbackFixture, BUCKET, CONFIGURATION, FINAL_VERSION, FLAC, SCOPE,
-    SHARED_VERSION,
+    id, CompletionFault, FixtureCompletionError, MemoryBody, ReadbackFixture, BUCKET,
+    CONFIGURATION, FINAL_VERSION, FLAC, PART_BYTES, SCOPE, SHARED_VERSION,
 };
 use nntune_ingest::{
     admin_auto_publish::CommittedFlac,
@@ -10,7 +10,9 @@ use nntune_ingest::{
         stage_completed_candidate, CandidateIntent,
         InventoryAppendError::{Identity, MissingOrFenced},
     },
-    multipart::{readback_inventory::ReadbackScope, MultipartError},
+    multipart::{
+        readback_inventory::ReadbackScope, session_completion::PrepareError, MultipartError,
+    },
 };
 use std::time::{Duration, SystemTime};
 use tokio_postgres::{types::Type, Client, NoTls};
@@ -298,10 +300,13 @@ async fn publisher_fixture(with_outcome: bool) {
     assert!(!admitted);
     catalogue::exercise(&observer, &mut writer, &mut contender, &fixture, &intent).await;
 
-    // A padding block provides a second valid FLAC with a distinct digest.
+    // A padding block keeps the audio valid and makes the wire image span
+    // three parts. The completed control below publishes this same FLAC.
+    let padding = 2 * PART_BYTES - FLAC.len() - 4;
     let mut padded = FLAC[..42].to_vec();
     padded[4] = 0;
-    padded.extend_from_slice(&[0x81, 0, 0, 1, 0]);
+    padded.extend_from_slice(&(0x8100_0000 | padding as u32).to_be_bytes());
+    padded.resize(padded.len() + padding, 0);
     padded.extend_from_slice(&FLAC[42..]);
     let identities = [0x70, 0x71, 0x72, 0x82, 0x83, 5].map(id);
     let ids = identities.map(hex::encode);
@@ -310,11 +315,33 @@ async fn publisher_fixture(with_outcome: bool) {
     let map = hex::encode(map_id);
     let key = format!("media/{object}/{generation}");
     let page_key = format!("media-digests/{object}/{generation}/{map}/00000000");
+    const SECOND_MEDIA_VERSION: &str = "Second%2F+==";
+    let complete = |fault| {
+        ReadbackFixture::complete(
+            &padded,
+            identities,
+            map_id,
+            &key,
+            SECOND_MEDIA_VERSION,
+            fault,
+        )
+    };
     assert!(matches!(
-        ReadbackFixture::complete(&padded, identities, map_id, &key, false),
-        Err(MultipartError::Checksum)
+        complete(Some(CompletionFault::MissingMiddlePart)),
+        Err(FixtureCompletionError::Prepare(
+            PrepareError::CheckpointMismatch
+        ))
     ));
-    let second = ReadbackFixture::in_scope(&padded, identities, map_id, &key);
+    assert!(matches!(
+        complete(Some(CompletionFault::BadChecksum)),
+        Err(FixtureCompletionError::Receipt(MultipartError::Checksum))
+    ));
+    assert!(observer
+        .query_opt(INVENTORY, &[&map])
+        .await
+        .unwrap()
+        .is_none());
+    let second = complete(None).unwrap();
     let receipts = [second.sidecar_at(0, &page_key, FINAL_VERSION)];
     let inventory = second.inventory(&receipts);
     let corrupt = inventory
@@ -385,7 +412,7 @@ async fn publisher_fixture(with_outcome: bool) {
     staged.await.unwrap();
     tx.execute(
         "INSERT INTO public.storage_s3_locator_intents VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, NULL)",
-        &[object, root, &BUCKET, &key, &SHARED_VERSION],
+        &[object, root, &BUCKET, &key, &SECOND_MEDIA_VERSION],
     ).await.unwrap();
     tx.commit().await.unwrap();
 

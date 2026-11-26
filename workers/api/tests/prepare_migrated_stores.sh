@@ -87,7 +87,7 @@ port="${BASH_REMATCH[1]}"
 playlist_test=(--locked --manifest-path "$root/workers/api/Cargo.toml" --features postgres-tests --lib)
 playlist_marker="$(psql_run -d nntune_playlist_ci -Atc 'SELECT token FROM private_playlist_rehearsal.marker')"
 # The store rehearsal fences the fixture owner, so read the repeated entries first.
-for test_name in repeated_entries_read postgres_store_rehearsal; do
+for test_name in repeated_entries_read owned_library_playlist_reload postgres_store_rehearsal; do
   NNTUNE_TEST_PRIVATE_PLAYLIST_PORT="$port" \
   NNTUNE_TEST_PRIVATE_PLAYLIST_MARKER="$playlist_marker" \
     cargo test "${playlist_test[@]}" "handlers::tests::private_playlist_postgres::$test_name" \

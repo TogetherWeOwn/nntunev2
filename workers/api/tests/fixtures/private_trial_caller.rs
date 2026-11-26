@@ -3,10 +3,12 @@ use crate::{
     ingest_session_caller::{
         Authorization, CommittedFlacUpload, CurrentAuthorization, PreparedUpload,
     },
+    private_catalogue_read::{lookup_scoped, PublicationScope},
     private_listening::PrivateListening,
     storage_digest_read::uuid_text,
     worker_entry::playback_store_for_postgres_test,
 };
+use nntune_core::s3_locator::S3Binding;
 use nntune_ingest::{
     matching::{
         admin_publish_match::{release_lookup, CompleteReleaseCandidates, FileNumbering},
@@ -19,6 +21,8 @@ use tokio_postgres::{Client, NoTls};
 
 #[path = "../support/blocker_observer.rs"]
 mod blocker_observer;
+#[path = "private_trial_storage_failure.rs"]
+mod storage_failure;
 
 const RECIPIENT: &str = "synthetic-trial-listener";
 const OUTSIDER: &str = "synthetic-trial-outsider";
@@ -248,9 +252,6 @@ pub(crate) async fn verify_publication(
         .await
         .unwrap();
     observer.execute(
-        "INSERT INTO public.ingest_jobs (id,user_id,idempotency_key,accepted_at,status) VALUES ($1,$2,$1,1,'done')", &[&JOB, &owner],
-    ).await.unwrap();
-    observer.execute(
         "INSERT INTO public.invite_codes (id,code_hash,used,created_at,issued_by,email,expires_at,redeemed_by,redeemed_at)
          VALUES (931,'synthetic-trial-code',true,1,$1,'trial-listener@example.test',10,$2,2)", &[&owner,&RECIPIENT],
     ).await.unwrap();
@@ -331,12 +332,59 @@ pub(crate) async fn verify_publication(
     request.body[0] ^= 1;
     assert_eq!(deny(&request, target).await, 400);
     request.body[0] ^= 1;
-    let assert_hidden = async |phase| {
+    let empty = handle(&ctx, &library).await;
+    assert_eq!((empty.status, empty.body.as_str()), (200, "[]"));
+
+    let candidate_object = prepared.intent.identities[2];
+    let candidate_id = uuid_text(candidate_object);
+    observer
+        .batch_execute(include_str!("private_trial_prior_media.sql"))
+        .await
+        .unwrap();
+    let prior_track: String = observer
+        .query_one(
+            "SELECT pg_temp.seed_prior_trial_media($1::text::uuid, $2)",
+            &[&candidate_id, &owner],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    observer.execute(
+        "INSERT INTO public.ingest_jobs (id,user_id,idempotency_key,accepted_at,status) VALUES ($1,$2,$1,1,'done')", &[&JOB, &owner],
+    ).await.unwrap();
+    let scope = PublicationScope {
+        environment: prepared.scope.environment,
+        library: prepared.scope.library,
+        provider_configuration: prepared.intent.identities[4],
+        bucket: "fixture-bucket",
+    };
+    let published_media = async |track: &str| {
+        lookup_scoped(observer, track, scope, None, None)
+            .await
+            .unwrap()
+            .expect("committed media with an exact storage reference")
+            .0
+    };
+    let prior_media = published_media(&prior_track).await;
+    assert_ne!(prior_media.target.object, candidate_object);
+    assert!(matches!(
+        prior_media.locator.binding(),
+        S3Binding::VersionId(version) if version == "prior-fixture-media-version"
+    ));
+    let prior_listing = handle(&ctx, &library).await;
+    assert_eq!(prior_listing.status, 200);
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&prior_listing.body).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["id"], prior_track);
+    let assert_only_prior_visible = async |phase| {
         let response = handle(&ctx, &library).await;
         assert_eq!(response.status, 200, "{phase}");
-        assert_eq!(response.body, "[]", "{phase}");
+        assert_eq!(response.body, prior_listing.body, "{phase}");
+        assert!(
+            published_media(&prior_track).await == prior_media,
+            "{phase}"
+        );
     };
-    assert_hidden("before publication").await;
 
     let lookup = release_lookup(QUERY).unwrap();
     let mut publication = connection().await;
@@ -406,38 +454,71 @@ pub(crate) async fn verify_publication(
     );
     assert_eq!(set_job(JOB).await, 1);
     observer.batch_execute(
-        "CREATE FUNCTION public.fixture_refuse_trial_admission() RETURNS trigger LANGUAGE plpgsql
-         AS $$ BEGIN RETURN NULL; END $$;
+        "CREATE SEQUENCE public.fixture_refused_trial_admissions;
+         CREATE FUNCTION public.fixture_refuse_trial_admission() RETURNS trigger
+         LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+         BEGIN
+             IF NEW.invite_id = 931 AND EXISTS (
+                 SELECT FROM public.catalogue_s3_sources s
+                 JOIN public.ingest_session_reservations r
+                   ON (r.idempotency_key, r.multipart_object_id) = (s.source_job_id, s.object_id)
+                 WHERE (s.track_id, s.accepted_seq, s.object_id) = (NEW.track_id, NEW.accepted_seq, NEW.object_id)
+                   AND r.terminal_reason = 'completed'
+             ) THEN
+                 -- Sequence changes survive rollback and witness the admission attempt.
+                 PERFORM nextval('public.fixture_refused_trial_admissions');
+                 RETURN NULL;
+             END IF;
+             RETURN NEW;
+         END $$;
          CREATE TRIGGER fixture_refusal BEFORE INSERT ON public.private_library_admissions
          FOR EACH ROW EXECUTE FUNCTION public.fixture_refuse_trial_admission();",
     ).await.unwrap();
-    assert_eq!(
-        publish(&mut publication, upload_writer, Some("fixture-bucket"))
-            .await
-            .status,
-        503
-    );
-    assert_eq!(
-        publish(&mut publication, upload_writer, None).await.status,
-        404
-    );
+    let refused = publish(&mut publication, upload_writer, None).await;
+    assert_eq!((refused.status, refused.body), (404, not_found().body));
     publication.simple_query("SELECT 1").await.unwrap();
     assert!(observer
         .query_one(
-            "SELECT NOT EXISTS (SELECT FROM public.catalogue_s3_sources)
-              AND NOT EXISTS (SELECT FROM public.storage_s3_locator_intents)
-              AND NOT EXISTS (SELECT FROM public.tracks WHERE release_id = $1::text::uuid)",
-            &[&RELEASE]
+            "SELECT is_called AND last_value = 1 FROM public.fixture_refused_trial_admissions",
+            &[],
         )
         .await
         .unwrap()
         .get::<_, bool>(0));
+    assert!(observer.query_one(
+        "SELECT NOT EXISTS (SELECT FROM public.catalogue_s3_sources WHERE source_job_id = $1 OR object_id = $2::text::uuid)
+            AND NOT EXISTS (SELECT FROM public.storage_s3_locator_intents WHERE object_id = $2::text::uuid)
+            AND NOT EXISTS (SELECT FROM public.private_library_admissions WHERE object_id = $2::text::uuid)
+            AND NOT EXISTS (SELECT FROM public.storage_validated_digest_references WHERE object_id = $2::text::uuid)
+            AND NOT EXISTS (SELECT FROM public.tracks WHERE release_id = $3::text::uuid)
+            AND EXISTS (SELECT FROM public.ingest_session_reservations r
+                JOIN public.storage_digest_inventory_intents i ON i.map_id = r.completed_map_id
+                JOIN public.storage_validated_digest_winners w ON w.object_id = r.multipart_object_id
+                WHERE r.id = $4::text::uuid AND r.terminal_reason = 'completed'
+                  AND w.object_id = $2::text::uuid AND i.map_id = $5::text::uuid
+                  AND i.media_version = $6 AND i.page_versions = $7)",
+        &[&JOB, &candidate_id, &RELEASE, &prepared.scope.session,
+          &committed.outcome().map, &committed.outcome().media_version, &committed.outcome().page_versions],
+    ).await.unwrap().get::<_, bool>(0));
+    assert_only_prior_visible("after refused admission").await;
     observer
-        .batch_execute("DROP TRIGGER fixture_refusal ON public.private_library_admissions")
+        .batch_execute(
+            "DROP TRIGGER fixture_refusal ON public.private_library_admissions;
+             DROP FUNCTION public.fixture_refuse_trial_admission();
+             DROP SEQUENCE public.fixture_refused_trial_admissions;",
+        )
         .await
         .unwrap();
-    assert_hidden("after refused publication").await;
 
+    // The registered-upload retry can reconcile only a committed publication.
+    let unconfirmed = publish(&mut publication, upload_writer, Some(scope.bucket)).await;
+    assert_eq!(
+        (unconfirmed.status, unconfirmed.body),
+        (503, unavailable().body)
+    );
+    assert_only_prior_visible("after the registered-upload retry").await;
+
+    // Re-enter publication with the original authenticated completion proof.
     // Hold the real commit after the admission is staged. PostgreSQL must
     // report the publisher blocked here before the separate Library read.
     observer
@@ -471,7 +552,7 @@ pub(crate) async fn verify_publication(
         blocker_observer::observe_blocked(observer, gate_pid, publication_pid, pending.as_mut())
             .await
             .unwrap();
-        assert_hidden("while the publication commit is blocked").await;
+        assert_only_prior_visible("while the publication commit is blocked").await;
         gate.commit().await.unwrap();
         pending.await
     };
@@ -485,9 +566,17 @@ pub(crate) async fn verify_publication(
     let listing = handle(&ctx, &library).await;
     assert_eq!(listing.status, 200);
     let entries: Vec<serde_json::Value> = serde_json::from_str(&listing.body).unwrap();
-    assert_eq!(entries.len(), 1);
+    assert_eq!(entries.len(), 2);
     assert_eq!(entries[0]["id"], track);
     assert_eq!(entries[0]["duration_ms"], 14_000);
+    assert_eq!(entries[1]["id"], prior_track);
+    assert!(published_media(&prior_track).await == prior_media);
+    let published = published_media(track).await;
+    assert_eq!(published.target.object, candidate_object);
+    assert!(matches!(
+        published.locator.binding(),
+        S3Binding::VersionId(version) if version == &committed.outcome().media_version
+    ));
     observer
         .batch_execute(
             "DROP TRIGGER fixture_hold_trial_publication ON public.private_library_admissions;
@@ -501,10 +590,10 @@ pub(crate) async fn verify_publication(
             "SELECT count(*) = 1 AND bool_and((environment_id, library_id, reference_id, object_id)
                    = ($1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid))
              FROM public.storage_validated_digest_references
-             WHERE (environment_id, library_id) = ($1::text::uuid, $2::text::uuid)
+             WHERE ((environment_id, library_id) = ($1::text::uuid, $2::text::uuid) AND reference_id <> $5::text::uuid)
                 OR reference_id = $3::text::uuid OR object_id = $4::text::uuid",
             &[&uuid_text(prepared.scope.environment), &uuid_text(prepared.scope.library),
-              &track, &uuid_text(prepared.intent.identities[2])],
+              &track, &candidate_id, &prior_track],
         ).await.unwrap().get::<_, bool>(0)
     };
     assert!(exact_reference().await);
@@ -622,6 +711,31 @@ pub(crate) async fn verify_publication(
         assert_eq!(duration, stored);
     }
     assert_eq!(set_duration(Some(14_000)).await, 1);
+
+    assert!(
+        published_media(track).await == published,
+        "before failed replacement"
+    );
+    let replacement = Some(Target {
+        invite_id: 931,
+        job_id: storage_failure::JOB,
+    });
+    let unconfirmed = Box::pin(upload(&ctx, &request, replacement, async |permit, body| {
+        permit.preflight(&mut publication).await?;
+        storage_failure::attempt(observer, upload_writer, body, auth, prepared).await
+    }))
+    .await;
+    assert_eq!(
+        (unconfirmed.status, unconfirmed.body),
+        (503, crate::handlers::unavailable().body)
+    );
+    assert!(
+        published_media(track).await == published,
+        "after failed replacement"
+    );
+    assert!(exact_reference().await);
+    let after = handle(&ctx, &library).await;
+    assert_eq!((after.status, after.body), (200, listing.body));
 
     observer
         .execute(

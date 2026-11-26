@@ -10,6 +10,7 @@ const binding = 'A'.repeat(43);
 const playId = `private_browser_${'a'.repeat(22)}`;
 const tabId = /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/;
 const cookie = { name: 'private_retry_fixture_session', value: 'synthetic-listener' };
+const initialSpeed = '1.5';
 const listener = async (route: Route) => (await route.request().headerValue('cookie'))
 	?.split('; ').includes(`${cookie.name}=${cookie.value}`);
 
@@ -50,7 +51,9 @@ const test = base.extend<{ origin: string }>({
 
 test.use({ serviceWorkers: 'block' });
 
-async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinuation = false } = {}) {
+async function checkRelayRetry(page: Page, origin: string, {
+	refuseFirstContinuation = false, resumedSpeed = initialSpeed
+} = {}) {
 	const context = page.context();
 	const { library, player: contract } = PRIVATE_MUSIC;
 	const tone = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
@@ -115,6 +118,7 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 	const audio = player.getByTestId(contract.audio);
 	const status = player.getByRole('status');
 	const retry = player.getByRole('button', { name: 'Retry playback', exact: true });
+	const speed = page.getByRole('combobox', { name: 'Playback speed', exact: true });
 	const playbackFailure = 'This audio could not be loaded or played. Retry playback or choose another track.';
 	const audioFailed = () => audio.evaluate((node: HTMLAudioElement) => node.paused && node.error !== null);
 	const expectNoPlaybackRequest = () => expect(page.waitForRequest(
@@ -154,9 +158,19 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 	const mediaUrl = origin + mediaPath;
 	expect(mediaRequests).toEqual([mediaUrl]);
 	await expect(audio).toHaveAttribute('src', mediaPath);
+	await speed.selectOption(initialSpeed);
+	await expect(speed).toHaveValue(initialSpeed);
+	await expect(audio).toHaveJSProperty('playbackRate', Number(initialSpeed));
 
 	const continuation = { ...start, play_id: playId };
 	const expectedPlays = refuseFirstContinuation ? [start, continuation, continuation] : [start, continuation];
+	const firstPlaying = await audio.evaluateHandle((node: HTMLAudioElement) => {
+		const observation = { rate: null as number | null };
+		node.addEventListener('playing', (event) => {
+			if (event.isTrusted) observation.rate ??= node.playbackRate;
+		});
+		return observation;
+	});
 	try {
 		if (refuseFirstContinuation) {
 			const refused = page.waitForResponse(playsUrl);
@@ -175,8 +189,12 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 
 		await retry.press('Enter');
 		await expect.poll(() => plays).toEqual(expectedPlays);
+		if (resumedSpeed !== initialSpeed) await speed.selectOption(resumedSpeed);
+		await expect(speed).toHaveValue(resumedSpeed);
+		await expect(audio).toHaveJSProperty('playbackRate', Number(resumedSpeed));
 		// Hold the receipt response and check that Retry has not reloaded the decoder.
 		await expectNoPlaybackRequest();
+		expect(continuationConfirmed).toBe(false);
 		expect(mediaRequests).toEqual([mediaUrl]);
 		expect(await audioFailed()).toBe(true);
 	} finally {
@@ -185,6 +203,10 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 	await expect(status).toHaveText('Playing');
 	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) =>
 		!node.paused && node.error === null && node.currentTime > 0.2)).toBe(true);
+	await expect.poll(() => firstPlaying.jsonValue()).toEqual({ rate: Number(resumedSpeed) });
+	await firstPlaying.dispose();
+	await expect(audio).toHaveJSProperty('playbackRate', Number(resumedSpeed));
+	await expect(speed).toHaveValue(resumedSpeed);
 	await expect(retry).toHaveCount(0);
 	await expect(audio).toHaveAttribute('src', mediaPath);
 	await assertSelection();
@@ -196,6 +218,10 @@ async function checkRelayRetry(page: Page, origin: string, { refuseFirstContinua
 
 test('invited Library playback retries a failed relay using the original receipt', async ({ page, origin }) => {
 	await checkRelayRetry(page, origin);
+});
+
+test('invited Library Retry resumes at the speed chosen while its receipt was pending', async ({ page, origin }) => {
+	await checkRelayRetry(page, origin, { resumedSpeed: '1.75' });
 });
 
 test('invited Library playback waits for another Retry after a temporary receipt failure', async ({ page, origin }) => {

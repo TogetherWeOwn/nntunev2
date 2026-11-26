@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { s3_completion_test: complete, s3_fixture_retirement_test: retire } = require('./ingest_wasm.cjs');
 const {
-  authorization, bucket, checksum, completionReceipt, initiatedId, initiatedQuery,
+  authorization, bucket, checksum, completionMarker, completionReceipt, initiatedId, initiatedQuery,
   initiationHeaders, initiationReceipt, mapId, mediaKey, sha256, sidecarKey, uploadQuery,
 } = require('./s3_fixture_protocol.cjs');
 
@@ -85,6 +85,86 @@ test('signs the exact multipart POST once and collects its version and body', as
   assert.equal(await complete('success'), version);
   assert.equal(fetch.mock.callCount(), 1);
 });
+
+for (const [scenario, overriddenHeaders, failure] of [
+  ['matching HEAD', {}, null],
+  ['stalled response body', {}, null],
+  ['completion still in flight', {}, transportFailure],
+  ['foreign initiation', { [completionMarker]: 'different-attempt' }, transportFailure],
+  ['different checksum', { 'x-amz-checksum-sha256': 'different-checksum' }, transportFailure],
+  ['wrong length', { 'content-length': String(ciphertextLength + 1) }, transportFailure],
+  ['null version', { 'x-amz-version-id': 'null' }, 'Unconfirmed(Some(CompletionVersion))'],
+]) {
+  test(`recovers a lost completion response with ${scenario}`, async (t) => {
+    const stillCommitting = scenario === 'completion still in flight';
+    const stalled = stillCommitting || scenario === 'stalled response body';
+    const operations = [];
+    let marker;
+    let partChecksum;
+    let committed;
+    let stalledSignal;
+    let recoveryResponse;
+    t.mock.method(globalThis, 'fetch', async (request) => {
+      const query = new URL(request.url).search.slice(1);
+      operations.push(`${request.method} ${query}`);
+      if (request.method === 'POST' && query === 'uploads=') {
+        await verifySignedRequest(request, 'POST', 'uploads=', initiationHeaders);
+        marker = request.headers.get(completionMarker);
+        return new Response(initiationReceipt());
+      }
+      if (request.method === 'PUT') {
+        const body = await verifySignedRequest(request, 'PUT', `partNumber=1&${initiatedQuery}`);
+        partChecksum = checksum(body);
+        return new Response(null, {
+          headers: { etag: '"fixture-part"', 'x-amz-checksum-sha256': partChecksum },
+        });
+      }
+      if (request.method === 'POST') {
+        assert.equal(committed, undefined, 'completion was sent twice');
+        const manifest = (await verifySignedRequest(request, 'POST', initiatedQuery)).toString();
+        const receipt = completionReceipt(manifest, 'fixture-part');
+        assert.ok(manifest.includes(`<ChecksumSHA256>${partChecksum}</ChecksumSHA256>`));
+        if (!stillCommitting) {
+          committed = {
+            ...headHeaders,
+            [completionMarker]: marker,
+            'x-amz-checksum-type': 'COMPOSITE',
+            'x-amz-checksum-sha256': /<ChecksumSHA256>([^<]+)/.exec(receipt)[1],
+          };
+        }
+        if (stalled) {
+          stalledSignal = request.signal;
+          return new Response(new ReadableStream(), {
+            headers: committed ? { 'x-amz-version-id': version } : {},
+          });
+        }
+        throw new Error('completion response lost after storing the version');
+      }
+      if (query === '') {
+        if (stalled) assert.equal(stalledSignal?.aborted, true);
+        await verifySignedRequest(request, 'HEAD', '', { 'x-amz-checksum-mode': 'ENABLED' });
+        recoveryResponse = stillCommitting
+          ? new Response(null, { status: 404 })
+          : new Response(null, { headers: { ...committed, ...overriddenHeaders } });
+        return recoveryResponse;
+      }
+      await verifySignedRequest(request, 'HEAD', versionQuery, {});
+      return new Response(null, { headers: committed });
+    });
+    const result = complete('init-completion-response-lost');
+    if (failure) {
+      await assert.rejects(result, rejectedWith(failure));
+    } else {
+      assert.equal(await result, version);
+    }
+    assert.equal(Boolean(committed), !stillCommitting);
+    assert.equal(recoveryResponse?.status, stillCommitting ? 404 : 200);
+    assert.deepEqual(operations, [
+      'POST uploads=', `PUT partNumber=1&${initiatedQuery}`, `POST ${initiatedQuery}`, 'HEAD ',
+      ...(failure ? [] : [`HEAD ${versionQuery}`]),
+    ]);
+  });
+}
 
 test('signs the ciphertext part and accepts only its matching checksum and ETag', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
@@ -171,6 +251,24 @@ test('uses the initialized upload ID, signed part receipt and completed version 
   ]);
 });
 
+function multipartManifest(parts) {
+  const entries = [...parts].map(([number, receipt]) =>
+    `<Part><PartNumber>${number}</PartNumber><ETag>&quot;${receipt.etag.slice(1, -1)}&quot;</ETag>`
+    + `<ChecksumSHA256>${receipt['x-amz-checksum-sha256']}</ChecksumSHA256></Part>`);
+  return '<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    + entries.join('') + '</CompleteMultipartUpload>';
+}
+
+function multipartCompletionReceipt(parts) {
+  const composite = checksum(Buffer.concat([...parts.values()].map(
+    (receipt) => Buffer.from(receipt['x-amz-checksum-sha256'], 'base64'))));
+  return new Response(
+    `<CompleteMultipartUploadResult><Bucket>${bucket}</Bucket><Key>${mediaKey}</Key>`
+    + `<ChecksumSHA256>${composite}-${parts.size}</ChecksumSHA256></CompleteMultipartUploadResult>`,
+    { headers: { 'x-amz-version-id': version } },
+  );
+}
+
 test('resumes multipart upload with only the missing part and preserves the confirmed receipt', async (t) => {
   const partBytes = 5_244_160;
   const tailBytes = wireHeaderLength + Math.ceil(partBytes / 65_536) * 16;
@@ -201,18 +299,8 @@ test('resumes multipart upload with only the missing part and preserves the conf
     }
     const manifest = (await verifySignedRequest(request, 'POST', uploadQuery)).toString();
     assert.deepEqual([...stored.keys()], [1, 2]);
-    const entries = [...stored].map(([number, receipt]) =>
-      `<Part><PartNumber>${number}</PartNumber><ETag>&quot;${receipt.etag.slice(1, -1)}&quot;</ETag>`
-      + `<ChecksumSHA256>${receipt['x-amz-checksum-sha256']}</ChecksumSHA256></Part>`);
-    assert.equal(manifest, '<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
-      + entries.join('') + '</CompleteMultipartUpload>');
-    const composite = checksum(Buffer.concat([...stored.values()].map(
-      (receipt) => Buffer.from(receipt['x-amz-checksum-sha256'], 'base64'))));
-    return new Response(
-      `<CompleteMultipartUploadResult><Bucket>${bucket}</Bucket><Key>${mediaKey}</Key>`
-      + `<ChecksumSHA256>${composite}-2</ChecksumSHA256></CompleteMultipartUploadResult>`,
-      { headers: { 'x-amz-version-id': version } },
-    );
+    assert.equal(manifest, multipartManifest(stored));
+    return multipartCompletionReceipt(stored);
   });
   assert.equal(await complete('multipart-resume'), version);
   assert.deepEqual(requests, [
@@ -220,6 +308,65 @@ test('resumes multipart upload with only the missing part and preserves the conf
     `PUT partNumber=2&${uploadQuery}`, `POST ${uploadQuery}`,
   ]);
 });
+
+for (const [name, error] of [
+  ['completes a matching full multipart inventory', null],
+  ['keeps completion pending when the provider refuses part 2', 'CompletionStatus'],
+  ['keeps completion pending when the returned composite disagrees with part 2', 'Checksum'],
+]) {
+  test(name, async (t) => {
+    const requests = [];
+    const confirmed = new Map();
+    const stored = new Map();
+    let secondPart;
+    t.mock.method(globalThis, 'fetch', async (request) => {
+      const url = new URL(request.url);
+      requests.push(`${request.method} ${url.search.slice(1)}`);
+      if (request.method === 'PUT') {
+        const number = confirmed.size + 1;
+        assert.ok(number <= 2);
+        const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
+        const receipt = { etag: `"fixture-part-${number}"`, 'x-amz-checksum-sha256': checksum(body) };
+        confirmed.set(number, receipt);
+        stored.set(number, receipt);
+        if (number === 2) {
+          secondPart = body;
+        }
+        return new Response(null, { headers: receipt });
+      }
+
+      const manifest = (await verifySignedRequest(request, 'POST', uploadQuery)).toString();
+      assert.deepEqual([...confirmed.keys()], [1, 2]);
+      assert.equal(manifest, multipartManifest(confirmed));
+      if (error) {
+        // Replace part 2 after confirmation with different bytes of the same length.
+        secondPart[0] ^= 1;
+        stored.set(2, { etag: '"replacement-part-2"', 'x-amz-checksum-sha256': checksum(secondPart) });
+      }
+      assert.deepEqual([...stored.keys()], [1, 2]);
+      assert.deepEqual(stored.get(1), confirmed.get(1));
+      if (error) {
+        assert.notEqual(stored.get(2).etag, confirmed.get(2).etag);
+        assert.notEqual(stored.get(2)['x-amz-checksum-sha256'], confirmed.get(2)['x-amz-checksum-sha256']);
+        if (error === 'CompletionStatus') {
+          return new Response('<Error><Code>InvalidPart</Code></Error>', { status: 400 });
+        }
+      } else {
+        assert.equal(manifest, multipartManifest(stored));
+      }
+      return multipartCompletionReceipt(stored);
+    });
+
+    if (error) {
+      await assert.rejects(complete('multipart-resume-full'), rejectedWith(`Unconfirmed(Some(${error}))`));
+    } else {
+      assert.equal(await complete('multipart-resume-full'), version);
+    }
+    assert.deepEqual(requests, [
+      `PUT partNumber=1&${uploadQuery}`, `PUT partNumber=2&${uploadQuery}`, `POST ${uploadQuery}`,
+    ]);
+  });
+}
 
 const readbackPageVersion = 'page+%2F/=';
 const readbackPageQuery = 'versionId=page%2B%252F%2F%3D';

@@ -1,3 +1,4 @@
+# guards: release:staging promotion gitleaks
 name: gitleaks
 
 # Full-history secret scan; `gitleaks` is a required check on main. Uses the
@@ -27,7 +28,15 @@ concurrency:
 jobs:
   gitleaks:
     name: gitleaks
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.run_attempt == 1
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.actor)
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.triggering_actor)
+      && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.event.pull_request.user.login)
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 10
     env:
       # Include text patches regardless of attributes, and merge-resolution
