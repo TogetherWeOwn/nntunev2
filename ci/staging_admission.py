@@ -4,6 +4,7 @@
 The production CLI reads only reviewed policy from its main workflow checkout,
 Git objects and authenticated Actions metadata. Offline fixtures call the pure
 functions; there is deliberately no production policy/API/local-receipt override.
+The offline terminal-push diagnostic cannot produce a receipt or verified pins.
 """
 
 import argparse
@@ -537,6 +538,44 @@ class Actions:
         return list(found.values())
 
 
+def diagnose_terminal_push(sha, evidence):
+    run = evidence.get("run")
+    require(isinstance(run, dict) and SHA.fullmatch(sha) and run.get("head_sha") == sha
+            and run.get("path") == WORKFLOW and run.get("head_branch") == "main"
+            and run.get("event") == "push" and run.get("status") == "completed"
+            and run.get("conclusion") == "failure" and decimal(run.get("run_attempt")) == "1",
+            "expected a failed automatic staging push for the selected build")
+    run_id = decimal(run.get("id"))
+    job_page, annotations = evidence.get("jobs"), evidence.get("annotations")
+    require(isinstance(job_page, dict) and isinstance(annotations, list), "incomplete evidence")
+    jobs, count = job_page.get("jobs"), job_page.get("total_count")
+    require(isinstance(jobs, list) and type(count) is int and count == len(jobs) <= 100
+            and all(isinstance(row, dict) for row in (*jobs, *annotations)), "incomplete evidence")
+
+    target = f"Staging run {run_id}, attempt 1"
+    if not jobs:
+        require(any(note.get("annotation_level") == "failure"
+                    and note.get("message") == "Queue is full for concurrency group deploy-staging-main"
+                    for note in annotations), "missing workflow queue rejection annotation")
+        return (f"{target} was rejected before jobs by the deploy-staging-main queue. "
+                "Exact-build qualification is pending. The next eligible automatic staging admission can "
+                "provide evidence for the build it runs.")
+
+    journeys = [job for job in jobs if job.get("name") == JOURNEY]
+    require(len(journeys) == 1, "missing or ambiguous full journey job")
+    job = journeys[0]
+    require(decimal(job.get("run_id")) == run_id and decimal(job.get("run_attempt")) == "1"
+            and job.get("head_sha") == sha and job.get("status") == "completed"
+            and job.get("conclusion") == "failure", "missing matching failed full journey job")
+    steps = job.get("steps")
+    require(isinstance(steps, list) and all(isinstance(step, dict) for step in steps), "invalid journey steps")
+    journey_steps = [step for step in steps if step.get("name") == "Run full journey"]
+    require(len(journey_steps) == 1 and journey_steps[0].get("status") == "completed"
+            and journey_steps[0].get("conclusion") == "failure", "missing failed full journey step")
+    return (f"{target} was admitted, and the full E2E journey failed. "
+            "Inspect the journey job and return to candidate qualification.")
+
+
 def unchanged_by_job(job, opening, source, producer_source_ok, deploy_step):
     reason = "known intervening staging deployment; fresh journey required"
     require(job.get("status") == "completed" and job.get("conclusion") in TERMINAL_CONCLUSIONS, reason)
@@ -678,8 +717,17 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("produce", "produce-private", "verify"))
+    parser.add_argument("mode", choices=("produce", "produce-private", "verify", "diagnose-terminal-push"))
+    parser.add_argument("candidate_sha", nargs="?", help="pinned source SHA for diagnose-terminal-push")
     args = parser.parse_args()
+    if args.mode == "diagnose-terminal-push":
+        if args.candidate_sha is None:
+            parser.error("diagnose-terminal-push requires the pinned candidate SHA")
+        print(diagnose_terminal_push(args.candidate_sha, parse_json(sys.stdin.buffer.read(MAX_JSON + 1))),
+              file=sys.stderr)
+        sys.exit(1)
+    if args.candidate_sha is not None:
+        parser.error("candidate_sha is only for diagnose-terminal-push")
     env = os.environ
     policy = parse_json((ROOT / POLICY).read_bytes())
     contract_bytes = (ROOT / CONTRACT).read_bytes() if (ROOT / CONTRACT).is_file() else b""
