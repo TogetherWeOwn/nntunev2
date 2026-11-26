@@ -570,20 +570,7 @@ async fn prove_attempt(
         length,
     )
     .unwrap();
-    let mut partition = plan.partition();
-    let mut upload_parts = Vec::new();
-    for (index, chunk) in sealed.iter().enumerate() {
-        upload_parts.extend(
-            partition
-                .push(&SealedChunk {
-                    digest: Sha256::digest(&chunk.bytes).into(),
-                    bytes: chunk.bytes.clone(),
-                    final_chunk: index + 1 == sealed.len(),
-                })
-                .unwrap(),
-        );
-    }
-    upload_parts.extend(partition.finish().unwrap());
+    let upload_parts = pending_part::partition(plan, &sealed);
     assert_eq!(upload_parts.len(), if pending_confirmation { 3 } else { 1 });
     let ciphertext: Vec<_> = upload_parts
         .iter()
@@ -601,45 +588,50 @@ async fn prove_attempt(
         envelope_scheme: 2,
     };
     let (receipts, parts) = if pending_confirmation {
-        Box::pin(pending_part::resume(&upload_parts, binding, async || {
-            let before = pending_part::reservation(observer, &sid).await;
-            let mut reconnect = connect(WRITER).await;
-            assert!(matches!(
-                read(&mut reconnect, auth, prepared, reload).await,
-                Err(UploadError::Refused)
-            ));
-            assert!(matches!(
-                open_or_reuse(
+        Box::pin(pending_part::resume(
+            &upload_parts,
+            &sealed,
+            binding,
+            async || {
+                let before = pending_part::reservation(observer, &sid).await;
+                let mut reconnect = connect(WRITER).await;
+                assert!(matches!(
+                    read(&mut reconnect, auth, prepared, reload).await,
+                    Err(UploadError::Refused)
+                ));
+                assert!(matches!(
+                    open_or_reuse(
+                        &mut reconnect,
+                        auth,
+                        prepared,
+                        until,
+                        reload,
+                        async |_, _, _, _| panic!(
+                            "pending confirmation opened another provider upload"
+                        ),
+                    )
+                    .await,
+                    Err(UploadError::Refused)
+                ));
+                let recovered = handoff(
                     &mut reconnect,
-                    auth,
-                    prepared,
+                    &prepared.scope,
+                    &opened.lease,
+                    &context,
+                    (BUCKET, &key),
                     until,
-                    reload,
-                    async |_, _, _, _| panic!(
-                        "pending confirmation opened another provider upload"
-                    ),
+                    async |_| panic!("recovery initiated another provider upload"),
                 )
-                .await,
-                Err(UploadError::Refused)
-            ));
-            let recovered = handoff(
-                &mut reconnect,
-                &prepared.scope,
-                &opened.lease,
-                &context,
-                (BUCKET, &key),
-                until,
-                async |_| panic!("recovery initiated another provider upload"),
-            )
-            .await
-            .unwrap();
-            assert!(recovered.target() == target);
-            assert_eq!(
-                recovered.usable_until(),
-                opened.durable_target().usable_until()
-            );
-            assert_eq!(pending_part::reservation(observer, &sid).await, before);
-        }))
+                .await
+                .unwrap();
+                assert!(recovered.target() == target);
+                assert_eq!(
+                    recovered.usable_until(),
+                    opened.durable_target().usable_until()
+                );
+                assert_eq!(pending_part::reservation(observer, &sid).await, before);
+            },
+        ))
         .await
     } else {
         let (receipt, checkpoint_part) =

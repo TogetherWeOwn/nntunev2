@@ -1,4 +1,5 @@
 use super::*;
+use nntune_core::digest_enrollment::EnrollmentOutput;
 use nntune_ingest::multipart::{
     resume_checkpoint::matches_checkpoint, UploadPart, UploadedPart, PART_BYTES,
 };
@@ -13,6 +14,24 @@ pub(super) fn padded_flac() -> Vec<u8> {
     input.resize(input.len() + padding, 0);
     input.extend_from_slice(&FLAC[42..]);
     input
+}
+
+pub(super) fn partition<'a>(plan: Plan<'a>, sealed: &[EnrollmentOutput]) -> Vec<UploadPart<'a>> {
+    let mut partition = plan.partition();
+    let mut parts = Vec::new();
+    for (index, chunk) in sealed.iter().enumerate() {
+        parts.extend(
+            partition
+                .push(&SealedChunk {
+                    digest: Sha256::digest(&chunk.bytes).into(),
+                    bytes: chunk.bytes.clone(),
+                    final_chunk: index + 1 == sealed.len(),
+                })
+                .unwrap(),
+        );
+    }
+    parts.extend(partition.finish().unwrap());
+    parts
 }
 
 pub(super) fn acknowledge<'a>(
@@ -37,6 +56,7 @@ pub(super) fn acknowledge<'a>(
 
 pub(super) async fn resume<'a>(
     upload_parts: &[UploadPart<'a>],
+    sealed: &[EnrollmentOutput],
     binding: ResumeBinding<'a>,
     reconnect: impl AsyncFnOnce(),
 ) -> (Vec<UploadedPart<'a>>, Vec<CheckpointPart<'static>>) {
@@ -51,8 +71,7 @@ pub(super) async fn resume<'a>(
     ]
     .into_iter()
     .unzip();
-    let committed_prefix = saved.clone();
-    let (late_ack, _) = acknowledge(last, "\"fixture-last\"");
+    let (late_ack, provider_confirmation) = acknowledge(last, "\"fixture-last\"");
     receipts.push(late_ack);
 
     reconnect().await;
@@ -64,7 +83,27 @@ pub(super) async fn resume<'a>(
     assert!(!matches_checkpoint(binding, &receipts, &checkpoint));
     let late_ack = receipts.pop().unwrap();
     assert!(matches_checkpoint(binding, &receipts, &checkpoint));
-    let [missing] = &upload_parts[checkpoint.parts.len()..] else {
+
+    let wrong_prefix = [
+        saved[0],
+        CheckpointPart {
+            etag: "\"different-middle\"",
+            ..saved[1]
+        },
+    ];
+    assert!(!matches_checkpoint(
+        binding,
+        &receipts,
+        &ResumeCheckpoint {
+            binding,
+            parts: &wrong_prefix
+        },
+    ));
+
+    // Rebuild requests from retained sealed chunks after reconnect. The fixture
+    // uses the verified checkpoint prefix to select the provider retry.
+    let rebuilt = partition(binding.plan, sealed);
+    let [missing] = &rebuilt[checkpoint.parts.len()..] else {
         panic!("resume must only send the uncommitted part");
     };
     let (target, number, bytes, checksum) = missing.request();
@@ -74,19 +113,37 @@ pub(super) async fn resume<'a>(
         (number, bytes, checksum),
         (3, original_bytes, original_checksum)
     );
-    let (_, confirmed) = acknowledge(missing, "\"fixture-last\"");
-    saved.push(confirmed);
-    assert!(saved.starts_with(&committed_prefix));
+    // The mock provider returns its recorded confirmation for the exact replay.
+    let provider_checksum = STANDARD.encode(provider_confirmation.digest);
+    let retry_ack = missing
+        .verify_reply(provider_confirmation.etag.into(), &provider_checksum)
+        .unwrap();
+    saved.push(CheckpointPart {
+        number,
+        len: bytes.len(),
+        etag: provider_confirmation.etag,
+        digest: Sha256::digest(bytes).into(),
+    });
 
-    // The late original acknowledgement agrees with the now-confirmed retry.
-    // Use it for the exact manifest that will be dispatched once by the caller.
+    // The late original acknowledgement can stand in for the retry response
+    // only when it matches the now-confirmed checkpoint.
+    let checkpoint = ResumeCheckpoint {
+        binding,
+        parts: &saved,
+    };
+    receipts.push(retry_ack);
+    assert!(matches_checkpoint(binding, &receipts, &checkpoint));
+    let mut conflicting = saved.clone();
+    conflicting[2].etag = "\"different-last\"";
+    receipts.pop().unwrap();
     receipts.push(late_ack);
-    assert!(matches_checkpoint(
+    assert!(matches_checkpoint(binding, &receipts, &checkpoint,));
+    assert!(!matches_checkpoint(
         binding,
         &receipts,
         &ResumeCheckpoint {
             binding,
-            parts: &saved
+            parts: &conflicting
         },
     ));
     (receipts, saved)
