@@ -114,8 +114,8 @@ Use these synthetic snapshots of one attempt to rehearse the callback.
 
 | Saved evidence | What to inspect on the next callback |
 | --- | --- |
-| The run is `pending` with a null conclusion and a complete zero-job listing. | Read the same attempt's jobs listing for the first job. For a terminal zero-job failure, inspect that run's check suite annotation for `Queue is full` on `deploy-staging-main` before recording a queue rejection. |
-| The first job (`gate`) exists and is `queued` with runner ID `0`, an empty runner name and no steps. | Read `GET /repos/TogetherWeOwn/nntunev2/actions/jobs/<job-id>` for that job and check for runner assignment or execution. Actions can populate `started_at` while the job is still queued. |
+| The run is `pending` with a null conclusion and a complete zero-job listing. | Read the same attempt's jobs listing for `gate`. For a terminal zero-job failure on attempt `1`, check `/actions/runs/<run-id>/attempts/1` for the `Queue is full` annotation on `deploy-staging-main` before recording a queue rejection. |
+| The job named `gate` is `queued` with runner ID `0`, an empty runner name and no steps. | Read `GET /repos/TogetherWeOwn/nntunev2/actions/jobs/<job-id>` for `gate` and check for runner assignment or execution. Actions can populate `started_at` while the job is still queued. |
 | `Deploy to staging` and `Deploy api to staging` succeeded, and the full journey is queued, running or lacks a successful result. | Read the attempt's post-deploy smoke and full-journey job details. If they share a job, check `Run synthetic smoke` before `Run full journey`. Inspect the journey step, evidence gate and receipt record and upload steps. A failed smoke with a skipped journey is a smoke failure. |
 
 In all three snapshots, record qualification as pending. Report the pinned
