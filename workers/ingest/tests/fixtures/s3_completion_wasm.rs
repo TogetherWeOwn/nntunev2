@@ -2,10 +2,10 @@ use super::{now, Duration, FixtureVersionRemover, S3CompletionSender};
 use crate::multipart::{
     readback_inventory::CompletedReadbackInventory,
     resume_checkpoint::{matches_checkpoint, CheckpointPart, ResumeBinding, ResumeCheckpoint},
-    session_completion::{DispatchError, SessionCompletion},
+    session_completion::{DispatchError, PrepareError, SessionCompletion},
     session_upload::DurableUpload,
     sidecar::SidecarPut,
-    Plan, UploadPart, UploadTarget, UploadedPart, PART_BYTES,
+    MultipartError, Plan, UploadPart, UploadTarget, UploadedPart, PART_BYTES,
 };
 use nntune_core::{
     digest_enrollment::DigestEnrollment,
@@ -415,6 +415,25 @@ async fn resume_multipart<'a>(
     };
     let dispatch_error = |error| JsValue::from_str(&format!("{error:?}"));
     let (target, _, _, _) = first.request();
+    let inventory = if let Some(read_page) = read_page {
+        let empty = ResumeCheckpoint {
+            binding,
+            parts: &[],
+        };
+        let (coherent, status) = read_inventory_status(&read_page, target, &empty)?;
+        if !coherent {
+            return Err(JsValue::from_str(
+                "initial inventory disagrees with checkpoint",
+            ));
+        }
+        assert!(matches!(
+            SessionCompletion::prepare(binding, context, Vec::new(), &empty),
+            Err(PrepareError::Parts(MultipartError::Geometry))
+        ));
+        Some((read_page, status))
+    } else {
+        None
+    };
     let mut receipts = {
         let upload = DurableUpload::new(target, context, binding.session, until);
         let first = sender
@@ -424,9 +443,16 @@ async fn resume_multipart<'a>(
         let second = sender
             .put_part(binding, context, second, &upload, until)
             .await;
-        if let Some(read_page) = read_page {
+        if let Some((read_page, initial_status)) = inventory {
             let receipts = [first, second.map_err(dispatch_error)?];
-            return resume_from_inventory(&read_page, target, binding, context, receipts);
+            return resume_from_inventory(
+                &read_page,
+                target,
+                binding,
+                context,
+                receipts,
+                initial_status,
+            );
         }
         if interrupt_second {
             assert!(matches!(second, Err(DispatchError::Unconfirmed(None))));
@@ -499,6 +525,7 @@ fn resume_from_inventory<'a>(
     binding: ResumeBinding<'a>,
     context: &'a EnvelopeContext,
     receipts: [UploadedPart<'a>; 2],
+    initial_status: serde_json::Value,
 ) -> Result<String, JsValue> {
     let [first_etag, second_etag] = receipts.each_ref().map(|part| part.etag().to_owned());
     let saved = [
@@ -509,21 +536,10 @@ fn resume_from_inventory<'a>(
         binding,
         parts: &saved,
     };
-    let mut statuses = Vec::new();
+    let mut statuses = vec![initial_status];
     for _ in 0..2 {
-        let (first, last) = inventory_pages(read_page, target)?;
-        let observed = first
-            .parts
-            .iter()
-            .chain(&last.parts)
-            .map(|part| CheckpointPart {
-                number: part.number,
-                len: part.len,
-                etag: &part.etag,
-                digest: part.digest,
-            });
-        let coherent = checkpoint.matches_parts(observed);
-        statuses.push(inventory_status(coherent, target, &checkpoint));
+        let (coherent, status) = read_inventory_status(read_page, target, &checkpoint)?;
+        statuses.push(status);
         if coherent {
             let completion =
                 SessionCompletion::prepare(binding, context, receipts.into(), &checkpoint)
@@ -537,11 +553,13 @@ fn resume_from_inventory<'a>(
     Err(JsValue::from_str("fixture inventory did not recover"))
 }
 
-fn inventory_pages(
+fn read_inventory_status(
     read_page: &Function,
     target: UploadTarget<'_>,
-) -> Result<(InventoryPage, InventoryPage), JsValue> {
-    // The callback models only the fixture's two-page status read for this upload.
+    checkpoint: &ResumeCheckpoint<'_>,
+) -> Result<(bool, serde_json::Value), JsValue> {
+    // The callback models one complete page or a read with one continuation.
+    // A thrown provider error leaves the caller without an inventory verdict.
     let page = |marker: JsValue| -> Result<InventoryPage, JsValue> {
         let reply = read_page.call4(
             &JsValue::UNDEFINED,
@@ -552,13 +570,19 @@ fn inventory_pages(
         )?;
         serde_wasm_bindgen::from_value(reply).map_err(|error| JsValue::from_str(&error.to_string()))
     };
-    let first = page(JsValue::NULL)?;
-    let marker = first
-        .next_marker
-        .ok_or_else(|| JsValue::from_str("missing fixture continuation marker"))?;
-    let last = page(JsValue::from(marker))?;
-    assert!(last.next_marker.is_none());
-    Ok((first, last))
+    let mut first = page(JsValue::NULL)?;
+    if let Some(marker) = first.next_marker {
+        let last = page(JsValue::from(marker))?;
+        assert!(last.next_marker.is_none());
+        first.parts.extend(last.parts);
+    }
+    let coherent = checkpoint.matches_parts(first.parts.iter().map(|part| CheckpointPart {
+        number: part.number,
+        len: part.len,
+        etag: &part.etag,
+        digest: part.digest,
+    }));
+    Ok((coherent, inventory_status(coherent, target, checkpoint)))
 }
 
 fn inventory_status(
