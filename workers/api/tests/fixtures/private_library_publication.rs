@@ -7,7 +7,7 @@ use nntune_ingest::{
     digest_candidate_store::CandidateIntent,
     track_writers::TrackRow,
 };
-use tokio_postgres::Client;
+use tokio_postgres::{Client, Row};
 
 pub(super) struct PublicationFixture {
     intent: CandidateIntent,
@@ -29,9 +29,36 @@ impl PublicationFixture {
             .await
             .unwrap();
         let row = writer
-            .query_one(include_str!("private_library_object.sql"), &[&job])
+            .query_one(
+                concat!(
+                    include_str!("private_library_object.sql"),
+                    "JOIN public.catalogue_s3_sources s USING (object_id)
+                     WHERE s.source_job_id = $1 ORDER BY s.track_id LIMIT 1"
+                ),
+                &[&job],
+            )
             .await
             .unwrap();
+        Self::from_receipt(&row, "new-page-pin")
+    }
+
+    pub(super) async fn load_replacement(writer: &Client) -> Self {
+        // The ingest fixture commits a second FLAC with a padding block.
+        const OBJECT: &str = "82828282-8282-4082-8082-828282828282";
+        let row = writer
+            .query_one(
+                concat!(
+                    include_str!("private_library_object.sql"),
+                    "WHERE w.object_id = $1::text::uuid"
+                ),
+                &[&OBJECT],
+            )
+            .await
+            .unwrap();
+        Self::from_receipt(&row, "Final%2f+==")
+    }
+
+    fn from_receipt(row: &Row, page_pin: &'static str) -> Self {
         let id = |column| row.get::<_, ReadUuid>(column).0;
         let intent = CandidateIntent {
             identities: [
@@ -53,7 +80,7 @@ impl PublicationFixture {
             S3Binding::VersionId(row.get("s3_version_id")),
         )
         .unwrap();
-        let pages = ["new-page-pin"];
+        let pages = [page_pin];
         assert_eq!(row.get::<_, Vec<String>>("page_versions"), pages);
         Self {
             intent,
