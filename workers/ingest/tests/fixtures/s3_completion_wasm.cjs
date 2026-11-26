@@ -868,45 +868,86 @@ test('an ambiguous or mismatched abort response stays unconfirmed', async (t) =>
   }
 });
 
-for (const [kind, repeatedPart] of [
-  ['identical', (part) => ({ ...part })],
-  ['conflicting', (part) => ({ ...part, etag: '"overlapping-part-1"' })],
-]) {
-  test(`keeps the checkpoint across ${kind} multipart page overlap and resumes on a coherent retry`, async (t) => {
-    const confirmed = [];
-    const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
-      const number = confirmed.length + 1;
-      assert.ok(number <= 2, 'status and resume must only read inventory');
-      const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
-      const etag = `"inventory-part-${number}"`;
-      const sha = checksum(body);
-      confirmed.push({ number, len: body.length, etag, digest: [...Buffer.from(sha, 'base64')] });
-      return new Response(null, { headers: { etag, 'x-amz-checksum-sha256': sha } });
-    });
-    const markers = [];
-    const uploadId = new URLSearchParams(uploadQuery).get('uploadId');
-    const readPage = (observedBucket, key, id, marker) => {
-      assert.deepEqual([observedBucket, key, id], [bucket, mediaKey, uploadId]);
-      assert.equal(confirmed.length, 2);
-      markers.push(marker);
-      const [first, second] = confirmed;
-      if (marker === null) return { next_marker: 1, parts: [first] };
+const inventoryUploadId = new URLSearchParams(uploadQuery).get('uploadId');
+const terminalInventory = (parts) => ({ next_marker: null, parts });
+const firstPartPage = ([first]) => ({ next_marker: 1, parts: [first] });
 
-      assert.equal(marker, 1);
-      // The first terminal page repeats part 1 alongside genuine part 2.
-      const parts = markers.length === 2 ? [repeatedPart(first), second] : [second];
-      return { next_marker: null, parts };
-    };
-
-    const result = JSON.parse(await complete('multipart-resume', readPage));
-    assert.deepEqual(markers, [null, 1, null, 1]);
+function mockResumeInventory(t, laterPages) {
+  const confirmed = [];
+  const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+    const number = confirmed.length + 1;
+    assert.ok(number <= 2, 'status and resume must only read inventory');
+    const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
+    const etag = `"inventory-part-${number}"`;
+    const sha = checksum(body);
+    confirmed.push({ number, len: body.length, etag, digest: [...Buffer.from(sha, 'base64')] });
+    return new Response(null, { headers: { etag, 'x-amz-checksum-sha256': sha } });
+  });
+  const pages = [[null, () => terminalInventory([])], ...laterPages];
+  let reads = 0;
+  const readPage = (observedBucket, key, id, marker) => {
+    assert.deepEqual([observedBucket, key, id], [bucket, mediaKey, inventoryUploadId]);
+    assert.equal(confirmed.length, reads === 0 ? 0 : 2);
+    assert.ok(reads < pages.length, 'unexpected inventory read');
+    const [expectedMarker, reply] = pages[reads++];
+    assert.equal(marker, expectedMarker);
+    return reply(confirmed);
+  };
+  const verifyCalls = () => {
+    assert.equal(reads, pages.length);
     assert.equal(fetch.mock.callCount(), 2);
+  };
+  return { confirmed, readPage, verifyCalls };
+}
+
+for (const [kind, firstAttempt] of [
+  ['a complete empty inventory', [[null, () => terminalInventory([])]]],
+  ['identical multipart page overlap', [
+    [null, firstPartPage],
+    [1, ([first, second]) => terminalInventory([{ ...first }, second])],
+  ]],
+  ['conflicting multipart page overlap', [
+    [null, firstPartPage],
+    [1, ([first, second]) => terminalInventory([{ ...first, etag: '"overlapping-part-1"' }, second])],
+  ]],
+]) {
+  test(`keeps the checkpoint across ${kind} and resumes on a coherent retry`, async (t) => {
+    const { confirmed, readPage, verifyCalls } = mockResumeInventory(t, [
+      ...firstAttempt,
+      [null, firstPartPage],
+      [1, ([, second]) => terminalInventory([second])],
+    ]);
+    const result = JSON.parse(await complete('multipart-resume', readPage));
+    verifyCalls();
     assert.deepEqual(result, {
       statuses: [
-        { status: 'pending', upload_id: uploadId, parts: confirmed },
-        { status: 'resumable', upload_id: uploadId, parts: confirmed },
+        { status: 'resumable', upload_id: inventoryUploadId, parts: [] },
+        { status: 'pending', upload_id: inventoryUploadId, parts: confirmed },
+        { status: 'resumable', upload_id: inventoryUploadId, parts: confirmed },
       ],
       manifest: confirmed.map(({ number, etag, digest }) => [number, etag, Buffer.from(digest).toString('base64')]),
     });
+  });
+}
+
+test('stops after the retry if complete multipart inventories stay empty', async (t) => {
+  const emptyPage = [null, () => terminalInventory([])];
+  const { readPage, verifyCalls } = mockResumeInventory(t, [emptyPage, emptyPage]);
+  await assert.rejects(complete('multipart-resume', readPage), rejectedWith('fixture inventory did not recover'));
+  verifyCalls();
+});
+
+for (const [name, code, prefix, marker] of [
+  ['a missing provider upload', 'NoSuchUpload', [], null],
+  ['an unavailable continuation', 'ServiceUnavailable', [[null, firstPartPage]], 1],
+]) {
+  test(`surfaces ${name} as an unavailable inventory`, async (t) => {
+    const unavailable = new Error(code);
+    const { readPage, verifyCalls } = mockResumeInventory(t, [
+      ...prefix,
+      [marker, () => { throw unavailable; }],
+    ]);
+    await assert.rejects(complete('multipart-resume', readPage), (error) => error === unavailable);
+    verifyCalls();
   });
 }
