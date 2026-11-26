@@ -343,8 +343,9 @@ by `e2e/tests/deploy-production.spec.ts`; they cannot bypass the receipt verifie
 For an offline rehearsal, run `python3 -I ci/staging_admission.py
 diagnose-terminal-push <pinned-sha> < evidence.json`. The JSON object has `run`,
 `jobs` (the attempt's `total_count` and `jobs`), and `annotations` (an array of
-workflow annotations from that same attempt). Use the synthetic shapes in
-`VerifyTests.test_offline_terminal_main_push_distinguishes_queue_rejection_and_e2e_failure`.
+workflow annotations). Use the synthetic fixture to pair all three inputs for
+the same attempt. The diagnostic relies on that pairing because the annotation
+rows carry no run or attempt ID.
 
 A failed first-attempt main push with zero jobs and the `deploy-staging-main`
 queue-full annotation leaves exact-build qualification pending. The next eligible

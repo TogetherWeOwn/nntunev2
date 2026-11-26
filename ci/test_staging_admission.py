@@ -762,6 +762,16 @@ class VerifyTests(Base):
         failed = {"run": run, "jobs": page("jobs", jobs), "annotations": []}
 
         generic = "::error::Candidate admission refused: missing, unapproved, stale or incoherent evidence\n"
+
+        def assert_diagnosis(raw, expected):
+            result = subprocess.run(
+                [sys.executable, "-I", str(HERE / "staging_admission.py"), "diagnose-terminal-push", SHA],
+                input=raw, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, expected)
+
         for case, evidence, expected in (
             ("queue rejected", rejected,
              f"Staging run {RUN_ID}, attempt 1 was rejected before jobs by the deploy-staging-main queue. "
@@ -783,14 +793,9 @@ class VerifyTests(Base):
             ("successful run", dict(rejected, run=world.run, jobs=page("jobs", world.jobs)), generic),
         ):
             with self.subTest(case=case):
-                result = subprocess.run(
-                    [sys.executable, "-I", str(HERE / "staging_admission.py"),
-                     "diagnose-terminal-push", SHA], input=json.dumps(evidence),
-                    capture_output=True, text=True, timeout=10,
-                )
-                self.assertEqual(result.returncode, 1)
-                self.assertEqual(result.stdout, "")
-                self.assertEqual(result.stderr, expected)
+                assert_diagnosis(json.dumps(evidence), expected)
+        with self.subTest(case="excessive nesting"):
+            assert_diagnosis('{"nested":' + '[' * 10_000 + '0' + ']' * 10_000 + '}', generic)
 
     def test_positive_ignores_skipped_gate_only_later_run(self):
         w = World()

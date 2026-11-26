@@ -723,8 +723,11 @@ def main():
     if args.mode == "diagnose-terminal-push":
         if args.candidate_sha is None:
             parser.error("diagnose-terminal-push requires the pinned candidate SHA")
-        print(diagnose_terminal_push(args.candidate_sha, parse_json(sys.stdin.buffer.read(MAX_JSON + 1))),
-              file=sys.stderr)
+        try:
+            evidence = parse_json(sys.stdin.buffer.read(MAX_JSON + 1))
+        except RecursionError:
+            raise Refused("terminal evidence is nested too deeply") from None
+        print(diagnose_terminal_push(args.candidate_sha, evidence), file=sys.stderr)
         sys.exit(1)
     if args.candidate_sha is not None:
         parser.error("candidate_sha is only for diagnose-terminal-push")
