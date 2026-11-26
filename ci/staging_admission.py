@@ -625,17 +625,19 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
                 and job.get("head_sha") == sha, "required job did not pass in selected attempt")
         selected_jobs[name] = job
     if private:
-        unsuccessful = [job for job in selected_jobs.values() if job.get("status") == "completed"
-                        and job.get("conclusion") in TERMINAL_CONCLUSIONS and job["conclusion"] != "success"]
+        completed = [job for job in selected_jobs.values() if job.get("status") == "completed"
+                     and job.get("conclusion") in TERMINAL_CONCLUSIONS]
+        waiting = [job for job in selected_jobs.values() if active and job.get("status") in PENDING_RUN_STATES
+                   and job.get("conclusion") is None]
+        require(len(completed) + len(waiting) == len(selected_jobs), "required job did not pass in selected attempt")
+        unsuccessful = [job for job in completed if job["conclusion"] != "success"]
         failed = min(unsuccessful, key=lambda job: job["conclusion"] != "failure", default=None)
-        pending = next((job for job in selected_jobs.values() if job.get("status") in PENDING_RUN_STATES
-                        and job.get("conclusion") is None), None) if active else None
-        if failed or pending:
+        if failed or waiting:
             # A rerun can start while its previous attempt's jobs are being read.
             latest = actions.api(f"runs/{run_id}")
             run_identity(latest)
             require((latest.get("status"), latest.get("conclusion")) == (status, conclusion), wrong_attempt)
-            job = failed or pending
+            job = failed or waiting[0]
             raise PrivateJobRefused(job["name"], run_id, attempt, pending=failed is None)
     require(run_succeeded(run), wrong_attempt)
     require(all(job.get("status") == "completed" and job.get("conclusion") == "success"

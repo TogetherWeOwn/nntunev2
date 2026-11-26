@@ -1256,7 +1256,7 @@ class SourceBindingTests(Base):
         return self.git(*args).decode().strip()
 
     def run_main(self, candidate_files=None, trusted_files=None, current_files=None, private=False,
-                 mode="bootstrap-maintenance", world_factory=None, live_error=None, cli_refusal=None):
+                 mode="bootstrap-maintenance", world_factory=None, live_error=None, cli_refusal=None, actions_hook=None):
         candidate = self.commit(candidate_files or self.files)
         trusted = self.commit(trusted_files or self.files, candidate)
         current = self.commit(current_files or trusted_files or self.files, trusted)
@@ -1276,7 +1276,7 @@ class SourceBindingTests(Base):
                 world = World(policy=self.policy, contract_bytes=self.contract,
                               xml=make_junit(final_sha=candidate).replace(
                                   b'classname="journey"', b'classname="signup.spec.ts"'))
-            actions = FakeActions(world.routes())
+            actions = FakeActions(world.routes(), hook=actions_hook)
         env = make_env(GITHUB_SHA=trusted, DEPLOY_SHA=candidate, GITHUB_EVENT_NAME="workflow_dispatch",
                        GITHUB_REPOSITORY_ID=str(REPO_ID), GITHUB_TOKEN="synthetic-token", DEPLOY_MODE=mode)
         with patch.object(sa, "ROOT", self.root), patch.dict(sa.os.environ, env, clear=True), \
@@ -1450,15 +1450,30 @@ class SourceBindingTests(Base):
             world.jobs[-1].update(run_attempt=2)
             return world
 
+        def incoherent_jobs():
+            world = pending()
+            world.jobs[2]["conclusion"] = None
+            return world
+
         wait = (f"post-deploy private music journey in staging run {RUN_ID}, attempt 1 is pending. "
                 "Wait for the attempt to finish, then recheck the evidence.")
         investigate = (f"staging-stream in staging run {RUN_ID}, attempt 1 did not succeed. "
                        "Inspect the job and return to candidate qualification.")
         generic = "missing, unapproved, stale or incoherent evidence"
         for factory, refusal in ((pending, wait), (failed, investigate), (completed_failure, investigate),
-                                 (incomplete_jobs, generic), (mismatched_jobs, generic)):
+                                 (incomplete_jobs, generic), (mismatched_jobs, generic), (incoherent_jobs, generic)):
             with self.subTest(fixture=factory.__name__):
                 self.run_main(private=True, mode="promote", world_factory=factory, cli_refusal=refusal)
+
+        for update in ({"run_attempt": 2}, {"status": "completed", "conclusion": "success"}):
+            with self.subTest(run_changed_during_jobs_read=update):
+                def change_run(route, routes):
+                    if route == f"runs/{RUN_ID}/attempts/1/jobs?per_page=100&page=1":
+                        run_route = f"runs/{RUN_ID}"
+                        routes[run_route] = dict(routes[run_route], **update)
+
+                self.run_main(private=True, mode="promote", world_factory=pending, cli_refusal=generic,
+                              actions_hook=change_run)
 
     def test_private_producer_cli_binds_candidate_audio(self):
         fixture = self.install_private_contract()
