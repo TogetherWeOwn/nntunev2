@@ -10,6 +10,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -39,6 +40,77 @@ def make_run(run_id=10, attempt=1, workflow="e2e-staging.yml", **over):
 def smoke(conclusion, step="success", started="2026-01-02T00:00:00Z"):
     return {"name": SMOKE, "conclusion": conclusion, "started_at": started,
             "steps": [{"number": 3, "name": "Run synthetic smoke", "conclusion": step}]}
+
+
+class StagingTimingTests(unittest.TestCase):
+    @staticmethod
+    def run_summary(run, jobs, **listing_fields):
+        return subprocess.run(
+            [sys.executable, "-I", os.path.join(CI_DIR, "incident_report.py"), "--staging-timing"],
+            input=json.dumps({"run": run, "jobs": {
+                "total_count": len(jobs), "jobs": jobs, **listing_fields}}),
+            capture_output=True, text=True, env={}, check=False,
+        )
+
+    @staticmethod
+    def candidate(**over):
+        return make_run(workflow="deploy.yml", **{
+            "event": "push", "conclusion": "success", "created_at": "2026-01-02T10:00:00Z",
+            "path": ".github/workflows/deploy.yml@main",
+            "run_started_at": "2026-01-02T10:00:01Z", "updated_at": "2026-01-02T10:49:00Z",
+            **over,
+        })
+
+    @staticmethod
+    def job(job_id, start, end, **over):
+        return {"id": job_id, "run_id": 10, "run_attempt": 1, "head_sha": SHA, "runner_id": 1,
+                "status": "completed", "conclusion": "success", "started_at": start,
+                "completed_at": end, **over}
+
+    def test_staging_timing_distinguishes_wait_and_writer_span(self):
+        gate = self.job(1, "2026-01-02T10:12:00Z", "2026-01-02T10:13:00Z")
+        journey = self.job(2, "2026-01-02T10:20:00Z", "2026-01-02T10:32:00Z")
+        del journey["run_attempt"]  # Optional in the documented attempt jobs response.
+        skipped = self.job(3, "2026-01-02T10:00:00Z", "2026-01-02T10:33:00Z",
+                           conclusion="skipped", runner_id=None)
+        queued = self.job(4, "2026-01-02T10:00:01Z", None, status="queued", conclusion=None)
+        cancelled = self.job(5, "2026-01-02T10:00:01Z", "2026-01-02T10:49:00Z",
+                             conclusion="cancelled", runner_id=None)
+        for run, jobs, wait, writer in (
+            (self.candidate(), [journey, skipped, gate], 720, 1200),
+            (self.candidate(status="in_progress", conclusion=None), [queued, gate], 720, None),
+            (self.candidate(conclusion="cancelled"), [cancelled, gate], 720, 60),
+            (self.candidate(run_id=11, path=".github/workflows/deploy.yml", status="pending",
+                            conclusion=None), [], None, None),
+            (self.candidate(run_id=12, conclusion="failure"), [], None, None),
+        ):
+            with self.subTest(status=run["status"], conclusion=run["conclusion"]):
+                result = self.run_summary(run, jobs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {
+                    "run_id": run["id"], "run_attempt": 1, "head_sha": SHA,
+                    "status": run["status"], "conclusion": run["conclusion"], "job_count": len(jobs),
+                    "wait_before_first_job_seconds": wait, "observed_writer_seconds": writer,
+                })
+
+    def test_staging_timing_refuses_mismatched_or_incomplete_evidence(self):
+        gate = self.job(1, "2026-01-02T10:12:00Z", "2026-01-02T10:13:00Z")
+        run = self.candidate()
+        for candidate, jobs, listing_fields in (
+            (dict(run, run_attempt=2), [], {}),
+            (dict(run, path=".github/workflows/deploy.yml@other"), [], {}),
+            (run, [dict(gate, run_attempt=2)], {}),
+            (run, [dict(gate, run_id=11)], {}),
+            (run, [dict(gate, head_sha="b" * 40)], {}),
+            (run, [gate], {"total_count": 2}),
+            (run, [dict(gate, started_at="2026-01-02T09:59:00Z")], {}),
+            (run, [dict(gate, completed_at=None)], {}),
+        ):
+            with self.subTest(candidate=candidate, jobs=jobs, listing=listing_fields):
+                result = self.run_summary(candidate, jobs, **listing_fields)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "incident reporting failed: Invalid staging timing metadata\n")
 
 
 def issue(number, updated="2026-01-01T00:00:00Z", body=MARKER, source=(9, 1), **extra):

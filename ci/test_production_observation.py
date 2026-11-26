@@ -64,6 +64,27 @@ class ProductionObservationTests(unittest.TestCase):
                                             capture_output=True, text=True, check=False)
                     self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
 
+    def test_cli_refuses_a_same_build_deployment_change_at_close(self):
+        pins, watch = fixture()
+        closing_sample = watch["samples"][-1]
+        cases = (
+            (pins["candidate"]["deployment_id"], (0, "Production observation evidence satisfied\n", "")),
+            ("12345678-1234-4234-8234-123456789fed",
+             (1, "", "Production observation refused: serving identity drift\n")),
+        )
+        script = Path(__file__).with_name("production_observation.py")
+        with TemporaryDirectory(prefix="nntune-observation-") as directory:
+            pin_file = Path(directory) / "pins.json"
+            watch_file = Path(directory) / "watch.json"
+            pin_file.write_text(json.dumps(pins))
+            for deployment_id, expected in cases:
+                with self.subTest(deployment_id=deployment_id):
+                    closing_sample["deployment_id"] = deployment_id
+                    watch_file.write_text(json.dumps(watch))
+                    result = subprocess.run([sys.executable, "-B", script, pin_file, watch_file],
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
+
     def test_complete_healthy_window_and_later_close_with_coverage(self):
         pins, watch = fixture()
         validate_observation(pins, watch)

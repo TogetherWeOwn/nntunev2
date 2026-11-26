@@ -155,6 +155,9 @@ pub(super) async fn publish(
         .unwrap()
         .unwrap();
     assert!(verified.matches_committed_outcome(&committed));
+    let seek = verified
+        .flac_plaintext_range(&object.media, &object.plaintext_sha256, 5020..5021)
+        .expect("the committed tone has a later seek anchor");
 
     // Install the rehearsal storage locator from the committed outcome. The
     // production publication writer owns the track and source projections.
@@ -281,5 +284,10 @@ pub(super) async fn publish(
     };
     tx.commit().await.unwrap();
 
-    track.clone()
+    serde_json::json!({
+        "track": track,
+        "mediaVersion": committed.media_version,
+        "seek": seek,
+    })
+    .to_string()
 }

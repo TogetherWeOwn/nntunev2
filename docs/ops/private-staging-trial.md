@@ -12,7 +12,9 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
 If dedicated PostgreSQL provisioning stops partway through, use the
 [Stage C recovery handoff](private-staging-trial-recovery.md) before retrying.
 
-1. **Prepare the isolated database.** Run the [catalog preflight](#isolated-database-catalog-preflight)
+1. **Prepare the isolated database.** For the dedicated PostgreSQL target,
+   verify the [storage handoff](#storage-closeout-before-stage-c1) before C1
+   provisioning or database writes. Run the [catalog preflight](#isolated-database-catalog-preflight)
    before preparing ACLs or issuing either login. If the isolated branch has
    ambient database grants, qualify the [database ACL preparation](#isolated-database-acl-preparation)
    before issuance. Issue the two dedicated SQL logins through the branch's
@@ -73,6 +75,8 @@ If dedicated PostgreSQL provisioning stops partway through, use the
    [staging binding instructions](../ops.md#private-stream-staging).
    For the dedicated PostgreSQL target, see the
    [Stage C2 Hyperdrive origin connection](#stage-c2-hyperdrive-origin-connection).
+   If the connection IDs match but the Worker still serves a previous
+   version, use the [deployment readback rehearsal](#rehearse-a-stale-trial-deployment).
 5. **Arm and qualify one synthetic journey (77c).** Follow the
    [private music journey](../../e2e/README.md#private-music-journey-preparation)
    for the fresh owner step-up, recipient invite and prepublished tone B
@@ -121,6 +125,55 @@ receipt step must carry those fields into `private_track` in
 `staging-admission.json`. A play receipt for the companion track must fail
 with no report. Use the result as an offline handoff check. Live qualification
 and admission still require the protected run's evidence.
+
+### Rehearse a stale trial deployment
+
+Keep the trial disarmed. Match each saved
+[scoped connection readback](#stage-c2-hyperdrive-origin-connection)
+to the protected C1 database setup record. Use the deployment readback for
+the Worker on the reviewed trial route to check which version receives
+traffic. Rehearse both comparisons offline with these synthetic references.
+
+| Binding | Setup config ID | Saved scoped readback |
+| --- | --- | --- |
+| `UPLOAD` | `hd-upload` | `hd-upload` |
+| `AUTH` | `hd-auth` | `hd-auth` |
+| `PUBLISH` | `hd-publish` | `hd-publish` |
+| `ENROLL` | `hd-enroll` | `hd-enroll` |
+
+Use the same route, reviewed commit, deploy record and four matches for both
+cases. The deploy record names candidate version `version-b`. Evaluate the
+current traffic allocation and version using the comparison in the
+[staging API deployment identity readback](../../.github/scripts/staging_api_identity.py).
+
+| Case | Current deployment at 100% | Deployment readback |
+| --- | --- | --- |
+| Stale | `deployment-a` serves the previous `version-a` | Pending. The comparison returns `deployed-version-mismatch`. |
+| Matching control | `deployment-b` serves `version-b` | Matched when the version reports the reviewed build SHA and the closing deployment read still returns `deployment-b`. |
+
+For the stale case, mark C2 serving evidence pending. In the protected C2
+handoff, cite the deploy record for the expected version and the failed
+probe's run and check for the mismatch reason. Record observed deployment
+and version IDs only from a saved protected allocation readback tied to that
+exact probe observation on the same Worker and route. The unavailable
+receipt carries only the mismatch reason. Leave the observed IDs unconfirmed
+if the tied readback is missing. Any later history read is fresh evidence for
+reconciliation.
+
+The trial operator hands the mismatch to Engineering in **Setup step 4,
+Verify isolated serving and cleanup access**. Engineering reconciles the
+active route and version with the deploy record through the separately
+reviewed isolated serving lane and returns a fresh readback for that route.
+Retain the original setup record and its four IDs. Keep the trial disarmed
+and serving evidence pending while that lane or readback is missing.
+
+The control clears the deployment identity check. The ordinary disarmed API
+deploy omits the four trial bindings. After a version change, C2 needs fresh
+binding readbacks and protected read-only results through all four bindings
+on the exact reviewed trial version. The existing origin, TLS and cache checks
+still apply.
+[Binding renderer](../../.github/scripts/staging_stream_config.py)
+· [Stage C2 Hyperdrive origin connection](#stage-c2-hyperdrive-origin-connection)
 
 ## Retire and recover
 
@@ -388,10 +441,12 @@ gh workflow run staging-trial-provider-preflight.yml --ref main \
 ```
 
 GitHub must resolve the dispatch to that reviewed commit. Open the run and
-record its URL and the fixed verdict from the successful probe step. A skipped
-job or a rerun supplies no qualification evidence. Reconcile any interrupted or
-failed attempt before preparing a fresh pair and dispatch. Withdraw the
-disposable credential and clear the run's Environment secrets after use.
+record its URL and the fixed verdict from the successful probe step. The job
+summary reports an incomplete attempt when the probe did not succeed and the
+runner can still publish the summary. A skipped job or a rerun supplies no
+qualification evidence. Reconcile any interrupted or failed attempt before
+preparing a fresh pair and dispatch. Withdraw the disposable credential and
+clear the run's Environment secrets after use.
 
 For the controlled manual path, build the standalone probe in the protected
 qualification environment from the reviewed commit before loading provider
@@ -506,6 +561,59 @@ handoff on paper.
    staging fixture`. Record the planned cleanup separately from the stopped
    journey. End the exercise before dispatch.
 
+## Storage closeout before Stage C1
+
+The protected storage-only rollout owner provides the closeout receipt. The
+database preparation operator reads it before any C1 provisioning or database
+write. Compare it with the approved storage attempt and record the receipt
+reference and the outcome in the protected C1 record. Keep the trial disarmed
+and the database lane read-only until all three checks pass.
+
+1. **Identify the run.** Match the storage rollout attempt, reviewed merge and
+   dispatch commits, and the disposable scope SHA-256. Match the protected
+   main `staging-trial-provider-preflight` run ID, attempt `1`, job ID and
+   tested SHA to that dispatch. Require the job's executed storage probe and
+   its fixed `qualified` verdict. A local disposable pass or a skipped probe
+   leaves storage qualification pending. Refer any stop to the storage owner
+   for reconciliation before accepting the handoff.
+2. **Verify exact absence.** After the probe and before disposal, require
+   independent provider reads for the selected version's empty `404` and the
+   sibling's matching ETag. At closeout require both pinned versions absent by
+   exact-version HEAD and an empty scoped inventory of versions, delete markers
+   and multipart uploads. Match the storage owner's completed DNS closeout to
+   the exact attempt and require the recorded Caddy, staging Environment and
+   scoped resource disposal readbacks. A delete acknowledgement or a successful
+   Compose `down` alone leaves closeout pending.
+3. **Verify writer release.** Require the timestamped release and successful
+   free readback on the original shared writer lock after verified closeout.
+   A line saying the launcher will release, a retained writer, an unavailable
+   readback or another holder at readback leaves the handoff pending. Use the
+   existing writer coordination before C1 writes. A prior release does not
+   establish that the window is available now.
+
+### Offline storage handoff walkthrough
+
+Use the following synthetic readbacks as one receipt. The labels stand in for
+protected references and full digests. No workflow or provider calls are
+needed to walk through the C1 decision.
+
+| Check | Synthetic evidence |
+| --- | --- |
+| Run | Approved attempt `storage-02` pins merge `M2`, dispatch `D2` and scope digest `S2`. Its protected run `8202`, attempt `1`, job `9202`, tested `D2` with the `S2` dispatch. The probe recorded `qualified` at `10:00 UTC`. |
+| Independent verification | At `10:01 UTC`, admin HEAD for scope `S2` reads selected `v2-selected` as empty `404` and the sibling `v2-sibling` as `200` with its original ETag. By `10:03 UTC`, exact HEAD confirms both absent and inventory shows zero versions, delete markers and uploads. At `10:03 UTC`, the storage owner records completed closeout for `storage-02` with passing DNS, Caddy, Environment and scoped resource disposal readbacks. |
+| Writer | At `10:04 UTC` the storage owner records release and a free readback on the same shared writer lock. |
+
+The database operator accepts the storage prerequisite for `storage-02` at
+`10:05 UTC`. Independently change job `9202` to a job from attempt `storage-01`,
+remove the exact HEAD read for `v2-sibling` while leaving its delete success,
+or replace the free readback with a retained writer. Each change leaves C1
+pending. So does moving the release to `10:02 UTC`, before absence was verified,
+or recording that another holder took the lock before readback. A stop before
+dispatch also leaves C1 pending even if rollback verifies absence and writer
+release. The storage owner resolves missing storage or DNS evidence. The
+database operator still needs the separate database admission, rehearsal and
+connection evidence for their respective stages.
+
 ## Stage C2 Hyperdrive origin connection
 
 **Setup pending.** The dedicated PostgreSQL trial uses four distinct Hyperdrive
@@ -525,7 +633,8 @@ against the Zero Trust plan and that one eligible account-scoped credential
 covers Tunnel, Access and Hyperdrive writes. Cloudflare documents the serving
 features individually. Their use together on this origin still needs hosted
 evidence.
-[Tunnel and Access](https://developers.cloudflare.com/hyperdrive/configuration/connect-to-private-database/)
+[Hyperdrive config list](https://developers.cloudflare.com/api/resources/hyperdrive/subresources/configs/methods/list/)
+· [Tunnel and Access](https://developers.cloudflare.com/hyperdrive/configuration/connect-to-private-database/)
 · [Origin TLS](https://developers.cloudflare.com/hyperdrive/configuration/tls-ssl-certificates-for-hyperdrive/)
 · [Cache settings](https://developers.cloudflare.com/hyperdrive/concepts/query-caching/#disable-caching)
 
@@ -533,8 +642,22 @@ For the dedicated stock PostgreSQL route, use the
 [stock PostgreSQL preflight](stock-postgresql-trial-preflight.md) for the Access
 and Tunnel capacity readback and the separate operator connection.
 
+The [offline C0 reporter](../../scripts/staging_trial_c0_readback.py) reads a
+redacted JSON summary on stdin. Use the fields in the
+[synthetic summary](../../scripts/fixtures/staging_trial_c0/synthetic.json).
+Use `null` for an incomplete inventory, unknown limit or unconfirmed scope or TLS
+support. The report gives each observation its own verdict. Exit 0 means the
+report was printed, including any pending rows.
+
+To rehearse Hyperdrive pagination offline, pass `--hyperdrive-pages <synthetic-json>`
+and the same summary on stdin. The file holds a JSON array of synthetic list
+response bodies in page order. Keep `success`, `errors`, `result_info` and the
+`id` field of each `result` entry. This mode derives the count from those pages
+and leaves it pending when the continuation fails or is unavailable. Use
+synthetic responses only. Keep actual provider responses in protected custody.
+
 C1 provisioning waits for completed C0, a passing disposable rehearsal from
-the merged source and the staging writer handoff after storage qualification.
+the merged source and the [verified storage handoff](#storage-closeout-before-stage-c1).
 C2 verifies the actual serving connections after authorized provisioning.
 Collect both readbacks independently for each of the four bindings, using its
 own `<hyperdrive-config-id>`. Keep each config unchanged across its readback
@@ -622,12 +745,13 @@ result, with columns in query order.
 
 For the offline `binding_identity_verdicts` checker, pass the admitted
 `database_oid`, index the approved `(role_name, role_oid)` tuples into
-`role_pins` by full binding name, and index the observed six-field tuples
-into `rows` by the same labels. Keep OIDs as integers. Expect four `matched`
-identity verdicts for the table. Removing ENROLL's row leaves ENROLL `pending`.
-Swapping AUTH and PUBLISH's observed rows leaves both `pending`. Even with
-four identity matches, an absent or false cache result or missing origin TLS
-evidence keeps the handoff pending. [Offline role checker](../../.github/scripts/staging_trial_role_preflight.py)
+`role_pins` by full binding name, and pass the original results as a list of
+`(binding_name, observed_row)` pairs. Each observed row is a six-field tuple.
+Keep OIDs as integers. Expect four `matched` identity verdicts for the table.
+Replacing ENROLL's result with a copy of UPLOAD's leaves both bindings
+`pending`. Swapping AUTH and PUBLISH's observed rows leaves both `pending`.
+Even with four identity matches, an absent or false cache result or missing
+origin TLS evidence keeps the handoff pending. [Offline role checker](../../.github/scripts/staging_trial_role_preflight.py)
 
 Hosted execution requires a protected, read-only Worker probe using the same
 four dedicated bindings while the trial is disarmed, and a hosted caller

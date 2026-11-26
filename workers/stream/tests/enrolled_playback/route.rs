@@ -1,10 +1,14 @@
 use super::*;
 use nntune_stream::{enrolled_playback::route::serve, play_route::PlayRouteRequest};
-use std::cell::{Cell, RefCell};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    task::Poll,
+};
 
 #[path = "../fixtures/private_enrolled_source.rs"]
 mod fixture;
-use fixture::{Fault, Source, Writer, FLAC};
+use fixture::{Fault, FrameGate, Source, Writer, FLAC};
 
 const TOKEN: &str = include_str!("../../../../fixtures/play-grant/private-enrolled.token");
 // Pre-signed synthetic v4 grant for Fixture::new(), expiring at Unix 12.
@@ -13,6 +17,133 @@ const BROWSER_TOKEN: &str = concat!(
     "GNmMjQ0ZjZkYzYxYWI3ZTU3MTI4MzYwODM2NGZmZGViZTAzZjBiNGZmMGE2MDcyNDE5MDFmOTUzZWE5MDY2ZGE.",
     "5OZv4_yGbRpUk6HYDXTckBYY046ImHeyN71sQOoZ0MA",
 );
+// Synthetic v4 grant for Source::other_track(), also expiring at Unix 12.
+const OTHER_TRACK_TOKEN: &str = concat!(
+    "v4.bWVtYmVyfG90aGVyLXRyYWNrfHByaXZhdGVfYnJvd3Nlcl9CQkJCQkJCQkJCQkJCQkJCQkJCQkJCfDQzfDEy",
+    "fDU3ODZjZjBjNjhlNTBiZjg1MjU3NTk2NTU3ZTJhZjZkN2Q2YWNkZWFiZDRlYTJiYjNlMDkzNjQxNzRjMmIwZTc.",
+    "zgFXxaz9HOuIYHMDUw_YXnXqvSqS-9aEL81H7XiHygY",
+);
+
+#[tokio::test]
+async fn interrupting_one_track_preserves_the_other_tracks_cursor_and_receipt() {
+    use nntune_stream::{delivered::DeliveredInterval, meter_sink::MeterBook};
+
+    let request = |track: &str, token: &str| PlayRouteRequest {
+        track_id: track.into(),
+        token: Some(token.into()),
+        range: Some("bytes=65534-65536".into()),
+        trace_id: None,
+    };
+    let interrupted_request = request("track", BROWSER_TOKEN);
+    let complete_request = request("other-track", OTHER_TRACK_TOKEN);
+    let current_epoch = Rc::new(Cell::new(42));
+    let interrupted_source = Source::browser().with_current_epoch(42, current_epoch.clone());
+    let complete_source = Source::other_track().with_current_epoch(43, current_epoch.clone());
+    let interrupted_gate = Rc::<FrameGate>::default();
+    let complete_gate = Rc::<FrameGate>::default();
+    interrupted_source
+        .pause_final_frame
+        .set(Some(interrupted_gate.clone()));
+    complete_source
+        .pause_final_frame
+        .set(Some(complete_gate.clone()));
+    let interrupted_output = RefCell::new(Vec::new());
+    let complete_output = RefCell::new(Vec::new());
+    let interrupted_aborted = Cell::new(false);
+    let complete_aborted = Cell::new(false);
+    let reports = RefCell::new(Vec::new());
+    let meter = RefCell::new(MeterBook::new("member"));
+    let (report_log, delivery_meter) = (&reports, &meter);
+    let start_read = |req, source, output, aborted| {
+        serve(
+            req,
+            b"test only, not a deployed secret",
+            Some(source),
+            now,
+            move |head| {
+                assert_eq!(head.status, 206);
+                assert_eq!(head.len, 3);
+                assert_eq!(
+                    head.content_range.as_deref(),
+                    Some("bytes 65534-65536/65537")
+                );
+                Ok(Some(Writer {
+                    output,
+                    fault: Fault::None,
+                    aborted,
+                    revoke_on_write: None,
+                }))
+            },
+            move |receipt| {
+                assert!(delivery_meter.borrow_mut().record(&receipt, 10));
+                report_log.borrow_mut().push(receipt);
+            },
+        )
+    };
+    let mut interrupted = Box::pin(start_read(
+        &interrupted_request,
+        &interrupted_source,
+        &interrupted_output,
+        &interrupted_aborted,
+    ));
+    assert!(futures_util::poll!(&mut interrupted).is_pending());
+    assert!(interrupted_gate.waiting.get());
+    assert_eq!(*interrupted_output.borrow(), b"AY");
+
+    // The next track replaces the lease while the old read is still pending.
+    current_epoch.set(43);
+    let mut complete = Box::pin(start_read(
+        &complete_request,
+        &complete_source,
+        &complete_output,
+        &complete_aborted,
+    ));
+    assert!(futures_util::poll!(&mut complete).is_pending());
+    assert!(complete_gate.waiting.get());
+    assert_eq!(*complete_output.borrow(), b"BQ");
+    assert!(reports.borrow().is_empty());
+
+    let receipt = |track: &str, play: &str, end| DeliveredInterval {
+        user_id: "member".into(),
+        track_id: track.into(),
+        play_id: play.into(),
+        start: 65_534,
+        end,
+        file_bytes: Some(LEN),
+    };
+    let interrupted_play = "private_browser_AAAAAAAAAAAAAAAAAAAAAA";
+    let complete_play = "private_browser_BBBBBBBBBBBBBBBBBBBBBB";
+    let interrupted_receipt = receipt("track", interrupted_play, 65_536);
+
+    drop(interrupted);
+    assert!(interrupted_gate.dropped.get());
+    assert!(!complete_gate.dropped.get());
+    assert_eq!(
+        reports.borrow().as_slice(),
+        std::slice::from_ref(&interrupted_receipt)
+    );
+
+    complete_gate.released.set(true);
+    assert!(matches!(
+        futures_util::poll!(&mut complete),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(complete_gate.dropped.get());
+    assert!(!complete_aborted.get());
+    assert_eq!(*interrupted_output.borrow(), b"AY");
+    assert_eq!(*complete_output.borrow(), b"BQR");
+    assert_eq!(
+        *reports.borrow(),
+        [
+            interrupted_receipt,
+            receipt("other-track", complete_play, LEN)
+        ]
+    );
+    let meter = meter.borrow();
+    assert_eq!(meter.plays.len(), 2);
+    assert_eq!(meter.plays[interrupted_play].union.total_bytes(), 2);
+    assert_eq!(meter.plays[complete_play].union.total_bytes(), 3);
+}
 
 #[tokio::test]
 async fn private_route_authenticates_flac_and_accounts_for_writer_prefixes() {
@@ -120,6 +251,77 @@ async fn open_ended_range_delivers_plaintext_through_eof() {
     let receipt = delivered.expect("successful write records delivery");
     assert_eq!(receipt.start..receipt.end, 65_534..LEN);
     assert_eq!(receipt.file_bytes, Some(LEN));
+}
+
+#[tokio::test]
+async fn empty_media_read_does_not_credit_or_advance_seek() {
+    let source = Source::browser();
+    source.expected_media_start.set(65_600);
+    let request = PlayRouteRequest {
+        track_id: "track".into(),
+        token: Some(BROWSER_TOKEN.into()),
+        range: Some("bytes=65536-65536".into()),
+        trace_id: None,
+    };
+    let attempt = async || {
+        let output = RefCell::new(Vec::new());
+        let aborted = Cell::new(false);
+        let mut started = false;
+        let mut reports = Vec::new();
+        let result = serve(
+            &request,
+            b"test only, not a deployed secret",
+            Some(&source),
+            || source.time(),
+            |head| {
+                started = true;
+                assert_eq!(head.status, 206);
+                assert_eq!(head.len, 1);
+                assert_eq!(
+                    head.content_range.as_deref(),
+                    Some("bytes 65536-65536/65537")
+                );
+                Ok(Some(Writer {
+                    output: &output,
+                    fault: Fault::None,
+                    aborted: &aborted,
+                    revoke_on_write: None,
+                }))
+            },
+            |interval| reports.push(interval),
+        )
+        .await;
+        (result, started, output.into_inner(), aborted.get(), reports)
+    };
+
+    source.empty_media_once.set(true);
+    let (result, started, output, _, reports) = attempt().await;
+    let error = result.unwrap_err();
+    assert_eq!(error.status, 502);
+    assert_eq!(error.code, "upstream_unavailable");
+    // The pinned digest page is fetched only after the storage metadata is accepted.
+    assert_eq!(source.page_reads.get(), 1);
+    assert!(!started);
+    assert!(output.is_empty());
+    assert!(reports.is_empty());
+
+    let (result, started, output, aborted, reports) = attempt().await;
+    result.unwrap();
+    assert_eq!(source.page_reads.get(), 2);
+    assert!(started);
+    assert!(!aborted);
+    assert_eq!(output, b"Z");
+    assert_eq!(
+        reports,
+        [nntune_stream::delivered::DeliveredInterval {
+            user_id: "member".into(),
+            play_id: "private_browser_AAAAAAAAAAAAAAAAAAAAAA".into(),
+            track_id: "track".into(),
+            start: 65_536,
+            end: LEN,
+            file_bytes: Some(LEN),
+        }]
+    );
 }
 
 #[tokio::test]
@@ -233,4 +435,85 @@ async fn browser_stream_aborts_at_the_next_chunk_after_lease_revocation() {
     )
     .await;
     assert_eq!(replay.unwrap_err().status, 404);
+}
+
+#[tokio::test]
+async fn successful_seek_reports_all_written_bytes_and_meters_only_new_bytes() {
+    use nntune_stream::{
+        delivered::DeliveredInterval,
+        meter_sink::{MeterBook, WindowReport},
+    };
+
+    let play_id = "private_1234567890abcdefghijkl";
+    let file_bytes = Some(FLAC.len() as u64);
+    // Both seeks write eight bytes. Only the first seek repeats four bytes.
+    for (seek, total) in [(4..12, 12), (8..16, 16)] {
+        let source = Source::new(Fault::None);
+        let mut meter = MeterBook::new("member");
+
+        for (range, observed_at, union_bytes) in [(0..8, 10, 8), (seek, 11, total)] {
+            let last = range.end - 1;
+            let request = PlayRouteRequest {
+                track_id: "track".into(),
+                token: Some(TOKEN.into()),
+                range: Some(format!("bytes={}-{last}", range.start)),
+                trace_id: None,
+            };
+            let content_range = format!("bytes {}-{last}/{}", range.start, FLAC.len());
+            let output = RefCell::new(Vec::new());
+            let aborted = Cell::new(false);
+            let mut reports = Vec::new();
+            serve(
+                &request,
+                b"test only, not a deployed secret",
+                Some(&source),
+                || source.time(),
+                |head| {
+                    assert_eq!(head.status, 206);
+                    assert_eq!(head.len, 8);
+                    assert_eq!(head.content_range.as_deref(), Some(content_range.as_str()));
+                    Ok(Some(Writer {
+                        output: &output,
+                        fault: Fault::None,
+                        aborted: &aborted,
+                        revoke_on_write: None,
+                    }))
+                },
+                |receipt| reports.push(receipt),
+            )
+            .await
+            .unwrap();
+
+            assert!(!aborted.get());
+            let output = output.into_inner();
+            assert_eq!(output, FLAC[range.clone()]);
+            let start = range.start as u64;
+            let cursor = start + output.len() as u64;
+            assert_eq!(
+                reports,
+                [DeliveredInterval {
+                    user_id: "member".into(),
+                    play_id: play_id.into(),
+                    track_id: "track".into(),
+                    start,
+                    end: cursor,
+                    file_bytes,
+                }]
+            );
+            assert!(meter.record(&reports[0], observed_at));
+            assert_eq!(meter.plays.len(), 1);
+            assert_eq!(
+                meter.pending_windows(),
+                [WindowReport {
+                    user_id: "member".into(),
+                    play_id: play_id.into(),
+                    track_id: "track".into(),
+                    union_bytes,
+                    file_bytes,
+                    started_at: 10,
+                }],
+                "after delivering {range:?}"
+            );
+        }
+    }
 }

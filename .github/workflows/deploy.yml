@@ -1,3 +1,4 @@
+# guards: release:staging deploy and post-deploy E2E
 name: deploy
 
 # Staging deploys (apps/web only).
@@ -61,9 +62,10 @@ permissions:
 # Hold the main staging lock until post-deploy E2E finishes checking this
 # run's SHA. Queue pending pushes instead of replacing them during E2E.
 # Cleanup shares the deploy lock so the disabled providers cannot change mid-run.
-# Other non-push runs use separate groups.
+# Empty-scope dispatches only run the gate. Queue those by ref using the
+# existing gate group, including dispatches still using the old job-level lock.
 concurrency:
-  group: ${{ (github.event_name == 'push' || inputs.private_trial_cleanup_scope_sha256 != '') && 'deploy-staging-main' || format('deploy-staging-{0}', github.run_id) }}
+  group: ${{ (github.event_name == 'push' || inputs.private_trial_cleanup_scope_sha256 != '') && 'deploy-staging-main' || format('{0}-gate-{1}', github.workflow, github.ref) }}
   cancel-in-progress: false
   queue: max
 
@@ -153,10 +155,6 @@ jobs:
     environment:
       name: staging
       deployment: false
-    concurrency:
-      group: ${{ github.workflow }}-gate-${{ github.ref }}
-      cancel-in-progress: false
-      queue: max
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:

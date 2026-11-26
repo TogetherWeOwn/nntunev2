@@ -74,19 +74,19 @@ in `<account>`. `AUTH`, `PUBLISH` and `ENROLL` remain unsent in this example.
 Read back the exact config ID in the same account. Match the binding's
 intended origin host, Access client reference, dedicated database and scoped
 SQL identity, CA ID and fingerprint, `verify-full` and disabled caching using
-protected readback evidence. Record the match, skip the verified create and
-resume at the first unsent step. The checkpoint does not constitute a
-serving readback.
+protected readback evidence. Require exactly one scoped match. Record that
+config ID as verified present in the prepared handoff, skip its create and
+resume at the first unsent step. Verify serving separately in Stage C2.
 
-If the result cannot bind the ID to this attempt, a required field differs,
-or the lookup is missing, denied or times out, hold the create and dependent
-writes. Use scoped inventory to narrow the search and recover the protected
-create result or equivalent evidence that binds a config ID to the original
-request. A name match, a new ID in inventory or a negative lookup alone
-leaves a sent create unresolved. Preserve the request reference, bound ID or
-`unknown`, last readback, affected binding and dependency IDs. Hand the
-record to the disposal operator and report the unresolved item to Engineering
-for provider-side reconciliation.
+If the result cannot bind the ID to the original request, a required field
+differs, or the readback is missing, ambiguous, denied or times out, hold the
+create and dependent writes. Use scoped inventory to narrow the search and
+recover the protected create result or equivalent evidence that binds a config
+ID to the original request. A name match, a new ID in inventory or a negative
+lookup alone leaves a sent create unresolved. Preserve the request reference,
+bound ID or `unknown`, last readback, affected binding and dependency IDs.
+Hand the record to the disposal operator and report the unresolved item to
+Engineering for provider-side reconciliation.
 
 ## Retire the attempt by exact ID
 
@@ -169,3 +169,14 @@ After simulated DNS removal with the tunnel deletion still pending,
 recheck the two exact DNS IDs and the connector's absence, then remove only
 the remaining tunnel before touching Access. The tabletop uses synthetic
 provider readbacks and leaves serving qualification to Stage C2.
+
+The [offline binding fixture](../../.github/scripts/test_worker_build_workflow.py)
+rehearses an interruption later in C1, after `UPLOAD`, `AUTH` and `PUBLISH`
+were verified. At the unsent checkpoint the fixture plans an `ENROLL` create.
+The synthetic create succeeds but the executor loses its response. Two
+records have the requested settings, and only one has the config ID tied to
+the original request in the admitted account. The prepared handoff supplies
+that ID as `PRIVATE_TRIAL_ENROLL_DB_STAGING_ID` for the staging binding
+renderer and omits an `ENROLL` create. If the same ID is linked only to a
+different request, preparation remains pending. The fixture uses synthetic
+records and ends at configuration preparation.

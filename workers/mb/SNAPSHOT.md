@@ -137,7 +137,7 @@ CC0 core only, no NC supplementary data or live product API reads.
 
 ## Running
 
-Manual dispatch and the PR label `mb-snapshot-spike` both run only the
+Dispatch `mb-snapshot-spike` manually on the ref to measure. It runs the
 CC0 build and local recall comparison. Results are the run's step summary
 and the `mb-snapshot-spike-results` artifact. The workflow does not bind a
 GitHub Environment, read Cloudflare credentials, or call a deploy helper.

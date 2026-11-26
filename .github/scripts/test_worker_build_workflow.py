@@ -11,7 +11,7 @@ import tempfile
 from textwrap import dedent
 import tomllib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 SPEC = importlib.util.spec_from_file_location("check_worker_upload", Path(__file__).with_name("check_worker_upload.py"))
@@ -252,6 +252,77 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "distinct scoped binding"):
                 STREAM_CONFIG.trial_db_bindings(env | bindings | {"PRIVATE_TRIAL_AUTH_DB_STAGING_ID": invalid})
 
+    def test_lost_trial_connection_create_prepares_original_binding(self):
+        # Offline C1 runbook fixture. These are normalized, synthetic records
+        # from the attempt, provider lookup and protected SQL/transport pins.
+        request_ref = "synthetic-enroll-request"
+        requested = {
+            "account": "synthetic-trial-account",
+            "binding": "PRIVATE_TRIAL_ENROLL_DB",
+            "database": ("nntunev2_staging", 40200),
+            "role": ("fixture_enroll", 40204),
+            "origin": "trial.example.invalid",
+            "access_client_ref": "synthetic-serving-client",
+            "origin_ca_ref": "synthetic-trial-ca",
+            "sslmode": "verify-full",
+            "caching_disabled": True,
+        }
+        config_id = "4" * 32
+        configs, protected_results = [], {}
+
+        def lose_create_response(ref, scope):
+            configs.append(scope | {"id": config_id})
+            protected_results[scope["account"], ref] = config_id
+            raise TimeoutError("synthetic response lost after create")
+
+        create = Mock(side_effect=lose_create_response)
+
+        def plan_handoff(results, readbacks, *, sent):
+            if not sent:
+                return {"next_action": "create", "connection": None}
+            bound_id = results.get((requested["account"], request_ref))
+            expected = requested | {"id": bound_id}
+            matches = [row for row in readbacks if row == expected] if bound_id else []
+            if len(matches) != 1:
+                return {"next_action": "reconcile", "connection": None}
+            return {"next_action": "prepare", "connection": matches[0]}
+
+        def execute_create_step(plan):
+            if plan["next_action"] == "create":
+                create(request_ref, requested)
+
+        with self.assertRaises(TimeoutError):
+            execute_create_step(plan_handoff({}, [], sent=False))
+
+        original = requested | {"id": config_id}
+        unrelated = original | {"id": "9" * 32}
+        handoff = plan_handoff(protected_results, [unrelated, *configs], sent=True)
+        self.assertEqual(handoff, {"next_action": "prepare", "connection": original})
+        execute_create_step(handoff)
+        for case, results, readbacks in (
+            ("missing", protected_results, [unrelated]),
+            ("duplicate", protected_results, configs * 2),
+            ("unbound", {}, configs),
+            ("wrong request", {(requested["account"], "synthetic-other-request"): config_id}, configs),
+            ("wrong account", protected_results, [original | {"account": "other-account"}]),
+            ("wrong role", protected_results, [original | {"role": ("fixture_enroll", 40205)}]),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(plan_handoff(results, readbacks, sent=True),
+                                 {"next_action": "reconcile", "connection": None})
+
+        connection = handoff["connection"]
+        already_verified = {"UPLOAD": "1" * 32, "AUTH": "2" * 32, "PUBLISH": "3" * 32}
+        inputs = {f"PRIVATE_TRIAL_{role}_DB_STAGING_ID": value for role, value in already_verified.items()}
+        inputs[f"{connection['binding']}_STAGING_ID"] = connection["id"]
+        rendered = STREAM_CONFIG.trial_db_bindings(inputs | {"PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED": "true"})
+        bindings = tomllib.loads("\n".join(rendered))["env"]["staging"]["hyperdrive"]
+        self.assertEqual(bindings, [
+            {"binding": f"PRIVATE_TRIAL_{role}_DB", "id": value}
+            for role, value in (already_verified | {"ENROLL": config_id}).items()
+        ])
+        create.assert_called_once_with(request_ref, requested)
+
     def test_stream_config_is_internal_and_uses_the_dedicated_fixture_bucket(self):
         source = tomllib.loads((ROOT / "workers/stream/wrangler.toml").read_text())
         off = tomllib.loads(STREAM_CONFIG.render(source, {}))
@@ -429,6 +500,21 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         self.assertIn('check-build "$RUNNER_TEMP/worker-stream.log" stream', build)
         self.assertIn("git diff --exit-code -- ../../Cargo.lock", build)
         self.assertIn("check_worker_upload.py --wrangler", items[prepare + 2])
+
+    def test_candidate_upload_uses_verified_preparation_outputs(self):
+        ci = job((ROOT / ".github/workflows/ci.yml").read_text(), "worker-release-builds")
+        items = steps(ci)
+        dry_run = next(i for i, s in enumerate(items) if "check_worker_upload.py --wrangler" in s)
+        prepare, upload = items[dry_run + 1:dry_run + 3]
+        self.assertIn("id: api-candidate\n", prepare)
+        self.assertIn("run: python3 -B ci/staging_api_candidate.py\n", prepare)
+        self.assertIn("github.event_name == 'push'", prepare)
+        self.assertIn("github.ref == 'refs/heads/main' && github.ref_protected", prepare)
+        self.assertIn("github.run_attempt == 1", prepare)
+        self.assertIn("if: steps.api-candidate.outcome == 'success'\n", upload)
+        self.assertIn("uses: actions/upload-artifact@", upload)
+        self.assertIn("name: ${{ steps.api-candidate.outputs.name }}\n", upload)
+        self.assertIn("path: ${{ steps.api-candidate.outputs.path }}\n", upload)
 
 
 if __name__ == "__main__":

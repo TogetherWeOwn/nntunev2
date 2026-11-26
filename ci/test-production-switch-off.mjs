@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { open, readFile, writeFile } from 'node:fs/promises';
-import { finalSmokeFixture, recoveryFixture } from './fixtures/production-worker-transport.mjs';
+import { finalSmokeFixture, mainSha, recoveryFixture } from './fixtures/production-worker-transport.mjs';
 import { intentFile, workflow } from './production-maintenance/recovery-evidence.mjs';
 
 const checkedAt = '2026-10-01T12:00:00Z';
@@ -69,6 +69,53 @@ test('rollback retries read-only after the verified summary cannot be written', 
   assert.equal(retry.stderr, '');
   assert.equal(await readFile(summary, 'utf8'), 'Recorded maintenance allocation already verified\n');
   assert.deepEqual(await readCheckpoint(), before);
+});
+
+test('switch-off reports unavailable rollback intent for the pinned successful rollout', async (t) => {
+  // The source SHA must be a main ancestor even when the Actions reads are synthetic.
+  const transport = finalSmokeFixture(t, { ...fixture, sha: mainSha() });
+  await transport.prepare();
+  const { fresh, admitWithFakeGitHub } = recoveryFixture(t, transport, 'success');
+  const allocation = structuredClone(transport.rows);
+  const before = transport.calls.length;
+  const unavailable = /Switch-off pending: pinned rollback intent unavailable/;
+  const cases = [
+    ['expired flag', (listing) => { listing.artifacts[0].expired = true; }, unavailable],
+    ['expired timestamp', (listing) => { listing.artifacts[0].expires_at = '2000-01-01T00:00:00Z'; }, unavailable],
+    ['absent', (listing) => { listing.total_count = 0; listing.artifacts = []; }, unavailable],
+    ['wrong producer', (listing) => {
+      listing.artifacts[0].expired = true;
+      listing.artifacts[0].workflow_run.head_sha = 'e'.repeat(40);
+    }, /Protected rollback check failed/],
+    ['incomplete listing', (listing) => { listing.artifacts = []; }, /Protected rollback check failed/],
+  ];
+  for (const [i, [label, changeListing, expected]] of cases.entries()) {
+    const env = fresh(String(13 + i));
+    const result = admitWithFakeGitHub(env, changeListing);
+    assert.equal(result.status, 1, label);
+    assert.match(result.stderr, expected, label);
+    if (expected === unavailable) {
+      assert.match(result.stderr, /Read the Actions artifact metadata for the original rollout/);
+    } else {
+      assert.doesNotMatch(result.stderr, unavailable, label);
+    }
+    assert.deepEqual(readFileSync(join(env.RUNNER_TEMP, 'actions-reads'), 'utf8').trim().split('\n'), [
+      'workflows/deploy-production.yml', 'runs/12/attempts/1', 'runs/12/attempts/1/jobs?per_page=100&page=1',
+      'runs/12/artifacts?per_page=100&page=1',
+    ], label);
+    assert.equal(existsSync(join(env.RUNNER_TEMP, intentFile)), false, label);
+    assert.equal(existsSync(env.GITHUB_OUTPUT), false, label);
+  }
+  assert.equal(transport.calls.length, before);
+
+  const retained = fresh('18');
+  const result = admitWithFakeGitHub(retained);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(readFileSync(join(retained.RUNNER_TEMP, intentFile)), readFileSync(join(transport.temp, intentFile)));
+  assert.match(readFileSync(retained.GITHUB_OUTPUT, 'utf8'), /^allow-submit=true$/m);
+  await transport.run('prepare-recovery', retained);
+  assert.deepEqual(transport.calls.slice(before), ['GET', 'GET', 'GET', 'GET']);
+  assert.deepEqual(transport.rows, allocation);
 });
 
 test('maintenance remains active when the candidate receipt cannot identify a distinct version', async (t) => {
@@ -195,6 +242,27 @@ test('operator switch-off requires complete readback of the pinned maintenance a
   }
 });
 
+test('operator distinguishes pending empty rollback jobs from missing terminal verification', () => {
+  const attempt = '/repos/example/fixture/actions/runs/102/attempts/1';
+  const listing = { total_count: 0, jobs: [] };
+  const example = readFileSync(new URL('../docs/first-private-music-launch.md', import.meta.url), 'utf8')
+    .split('### Read the recorded rollback attempt before jobs appear\n')[1]?.split('\n## ')[0];
+  assert.ok(example, 'document the readback of the exact attempt before job creation');
+  for (const path of [attempt, `${attempt}/jobs`]) {
+    assert.ok(example.includes(`\`GET ${path}\``), `read the recorded attempt at ${path}`);
+  }
+  assert.ok(example.includes(`\`${JSON.stringify(listing)}\``), 'use a complete empty jobs response');
+  assert.match(example, /Keep switch-off \*\*Pending\*\*, the recorded run and attempt, and the writer\s+freeze in both cases/);
+  assert.match(example, /Do not dispatch another recovery or rerun the workflow/);
+
+  const rows = example.split('\n').filter((line) => line.startsWith('|'));
+  const pending = rows.find((row) => row.startsWith('| `pending` |'));
+  const terminal = rows.find((row) => row.startsWith('| `completed` |'));
+  assert.ok(pending && terminal, 'cover both run statuses with the same empty listing');
+  assert.match(pending, /\*\*Pending\*\*.*Repeat the status and jobs reads for `102\/1`/);
+  assert.match(terminal, /\*\*Missing required verification\*\*.*Reconcile the missing `recover-worker` evidence/);
+});
+
 test('operator switch-off resumes read-only after incomplete deployment history', async (t) => {
   let incompleteHistory = true;
   const transport = finalSmokeFixture(t, {
@@ -232,7 +300,7 @@ test('operator switch-off resumes read-only after incomplete deployment history'
   assert.deepEqual(rows, restoredHistory);
 });
 
-test('operator recovers the existing rollback run after the dispatch response is lost', () => {
+test('operator recovers the existing rollback run after the dispatch response is lost', async (t) => {
   const source = readFileSync(new URL(`../${workflow}`, import.meta.url), 'utf8');
   const job = source.split('\n  preflight:\n')[1]?.split(/\n {2}\S/)[0];
   assert.match(job, /^    name: production-preflight$/m);
@@ -288,9 +356,103 @@ test('operator recovers the existing rollback run after the dispatch response is
   assert.equal(confirmStart(listing, { ...preflight, inputs: { ...inputs, DEPLOY_MODE: 'promote' } }), pending);
   assert.equal(confirmStart(listing, { ...preflight, inputs: { ...inputs, INPUT_SHA: run.head_sha } }), pending);
   assert.equal(confirmStart(listing, { ...preflight, inputs: { ...inputs, RECOVERY_RUN_ID: '100' } }), pending);
-  assert.deepEqual(confirmStart(listing, preflight), {
+  const recorded = confirmStart(listing, preflight);
+  assert.deepEqual(recorded, {
     start: 'confirmed', runId: 102, attempt: 1, switchOff: 'pending',
   });
+
+  const resume = (record, read) => {
+    const path = `/repos/${repository.full_name}/actions/runs/${record.runId}/attempts/${record.attempt}`;
+    const request = { method: 'GET', path };
+    const jobsRequest = { method: 'GET', path: `${path}/jobs` };
+    const { nextRead, nextAction, jobStatus, ...confirmed } = record;
+    let observed = confirmed;
+    if (nextRead?.path !== jobsRequest.path) {
+      const pending = { ...confirmed, status: 'pending', nextRead: request };
+      let reply;
+      try {
+        reply = read(request);
+      } catch {
+        return pending;
+      }
+      if (reply?.id !== record.runId || reply.run_attempt !== record.attempt) return pending;
+      observed = { ...confirmed, status: reply.status, conclusion: reply.conclusion };
+      if (reply.status !== 'waiting' && reply.status !== 'in_progress') return observed;
+    }
+
+    const checkJob = { ...observed, nextRead: jobsRequest };
+    let listing;
+    try {
+      listing = read(jobsRequest);
+    } catch {
+      return checkJob;
+    }
+    if (!Array.isArray(listing?.jobs) || listing.total_count !== listing.jobs.length) return checkJob;
+    const jobs = listing.jobs.filter((job) => job.name === 'recover-worker');
+    const [job] = jobs;
+    if (jobs.length !== 1 || job.run_id !== record.runId || job.run_attempt !== record.attempt) return checkJob;
+    const observedJob = { ...checkJob, jobStatus: job.status };
+    if (job.status === 'waiting') return { ...observedJob, nextAction: 'check-production-environment-protection' };
+    if (job.status === 'in_progress') return { ...observedJob, nextAction: 'read-recovery-job' };
+    return observedJob;
+  };
+
+  const nextRead = { method: 'GET', path: '/repos/example/fixture/actions/runs/102/attempts/1' };
+  await t.test('a temporary status failure retries the recorded attempt read-only', () => {
+    const reads = [];
+    const readRun = (request) => {
+      reads.push(request);
+      if (reads.length === 1) throw new Error('synthetic status read unavailable');
+      return { ...run, status: 'completed', conclusion: 'success' };
+    };
+    const unavailable = resume(recorded, readRun);
+    assert.deepEqual(unavailable, { ...recorded, status: 'pending', nextRead });
+    assert.deepEqual(reads, [nextRead]);
+    assert.equal(dispatches, 1);
+
+    assert.deepEqual(resume(unavailable, readRun), { ...recorded, status: 'completed', conclusion: 'success' });
+    assert.deepEqual(reads, [nextRead, nextRead]);
+  });
+
+  await t.test('the recorded rollback waits for production and resumes verification on the same attempt', () => {
+    const recoveryJob = source.split('\n  recover-worker:\n')[1]?.split(/\n {2}\S/)[0];
+    assert.match(recoveryJob, /^    name: recover-worker$/m);
+    assert.match(recoveryJob, /^    needs: \[preflight, staging-evidence\]$/m);
+    assert.match(recoveryJob, /^    environment: production$/m);
+
+    const reads = [];
+    const nextJobRead = { method: 'GET', path: '/repos/example/fixture/actions/runs/102/attempts/1/jobs' };
+    const jobPin = { run_id: 102, run_attempt: 1 };
+    const prerequisites = [
+      { ...jobPin, id: 104, name: 'production-preflight', status: 'completed', conclusion: 'success' },
+      { ...jobPin, id: 105, name: 'staging-evidence', status: 'completed', conclusion: 'success' },
+    ];
+    let job = { ...jobPin, id: 103, name: 'recover-worker', status: 'waiting', conclusion: null };
+    const read = (request) => {
+      reads.push(request);
+      if (request.path === nextRead.path) return { ...run, status: 'waiting', conclusion: null };
+      assert.deepEqual(request, nextJobRead);
+      return { total_count: 3, jobs: [...prerequisites, job] };
+    };
+
+    const pendingJob = { ...recorded, status: 'waiting', conclusion: null, nextRead: nextJobRead };
+    const waiting = resume(recorded, read);
+    assert.deepEqual(waiting, { ...pendingJob, jobStatus: 'waiting', nextAction: 'check-production-environment-protection' });
+    assert.deepEqual(reads, [nextRead, nextJobRead]);
+
+    job = { ...job, status: 'queued' };
+    const queued = resume(waiting, read);
+    assert.deepEqual(queued, { ...pendingJob, jobStatus: 'queued' });
+
+    job = { ...job, run_attempt: 2, status: 'in_progress' };
+    const unconfirmed = resume(queued, read);
+    assert.deepEqual(unconfirmed, pendingJob);
+
+    job = { ...job, run_attempt: 1 };
+    assert.deepEqual(resume(unconfirmed, read), { ...pendingJob, jobStatus: 'in_progress', nextAction: 'read-recovery-job' });
+    assert.deepEqual(reads, [nextRead, nextJobRead, nextJobRead, nextJobRead, nextJobRead]);
+  });
+
   assert.deepEqual(runs, [run]);
   assert.equal(dispatches, 1);
 });

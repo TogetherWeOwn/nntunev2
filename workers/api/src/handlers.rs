@@ -6969,6 +6969,10 @@ where
     response
         .extra_headers
         .push(("cache-control".into(), "private, no-store".into()));
+    response.extra_headers.push((
+        "x-nntune-playback-ttl".into(),
+        receipt.grant.exp_unix.saturating_sub(ctx.now).to_string(),
+    ));
     response
 }
 
@@ -12034,6 +12038,7 @@ pub(crate) mod tests {
                         predicate_stale: false,
                         other_live_holder: false,
                         equal_end_provenance_changed: false,
+                        matching_proof_cancel_conflict: false,
                     }
                 } else {
                     Target::Absent

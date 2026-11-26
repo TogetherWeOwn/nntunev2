@@ -7,6 +7,7 @@
 # See "PR size gate" in TogetherWeOwn/.github's STANDARD.md.
 
 name: pr-size
+# guards: required:pr-size-gate / gate
 
 on:
   # Applying or withdrawing an exception must re-evaluate the gate.
@@ -42,6 +43,15 @@ jobs:
     uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@649943c1ed8a1af8f8760e075f3923237dd72e50 # v0.14.0
     with:
       pr-number: ${{ inputs.pr_number || '' }}
+      runs-on: >-
+        ${{ toJSON(github.event_name == 'pull_request'
+        && github.run_attempt == 1
+        && github.event.pull_request.head.repo.full_name == github.repository
+        && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.actor)
+        && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.triggering_actor)
+        && contains(fromJSON('["Rick7C2", "togetherweown[bot]"]'), github.event.pull_request.user.login)
+        && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+        && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest') }}
       exclude-extra: ""
       advisory-label: true
 

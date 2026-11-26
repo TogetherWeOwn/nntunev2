@@ -1,8 +1,25 @@
+# guards: paths
 name: review-rules (shadow)
 # ci-policy: non-required -- advisory signals; existing required gates stay unchanged.
 # Repin to TogetherWeOwn/.github's squash-merge SHA after central PR #26 merges.
 on:
   pull_request:
+    paths:
+      - '**.rs'
+      - '**.py'
+      - '**.ts'
+      - '**.tsx'
+      - '**.js'
+      - '**.jsx'
+      - '**.mjs'
+      - '**.cjs'
+      - '**.svelte'
+      - '**.sh'
+      - '**.bash'
+      - '**.toml'
+      - '**.sql'
+      - '**.yml'
+      - '**.yaml'
   merge_group:
 permissions: {}
 concurrency:
