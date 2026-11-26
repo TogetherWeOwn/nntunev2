@@ -638,6 +638,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	async function handleEnded(
 		attachment: MediaAttachment, source: string, matchesOrigin: () => boolean, listeners?: AbortSignal
 	): Promise<void> {
+		listeners ??= current === attachment ? current.listeners.signal : undefined;
 		if (attachment.audio.ended && matchesOrigin()) {
 			if (pendingGrant === undefined) invalidatePlay();
 			else settlePlay();
@@ -859,7 +860,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 							if (audio.error === null) return;
 							break;
 						case 'ratechange': return speed.observe({ audio, matches });
-						case 'ended': return handleEnded(receipt, source, matches, receipt.listeners.signal);
+						case 'ended': return handleEnded(receipt, source, matches);
 						case 'seeked': return;
 						case 'seeking': {
 							const { currentTime, duration } = audio;
