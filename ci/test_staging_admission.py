@@ -775,7 +775,12 @@ class AttemptJobsPaginationTests(Base):
 
     def test_required_journey_on_second_page(self):
         *deploy, journey = self.world.jobs
-        self.routes[self.first] = page("jobs", deploy + self.unrelated, total=101)
+        steps = [dict(self.world.step(f"Build task {number}", number),
+                      started_at=iso(-12), completed_at=iso(-11)) for number in range(1, 25)]
+        first_jobs = deploy + [dict(job, steps=steps) for job in self.unrelated]
+        first_page = json.dumps(page("jobs", first_jobs, total=101)).encode()
+        self.assertGreater(len(first_page), sa.MAX_JSON)
+        self.routes[self.first] = first_page
         self.routes[self.second] = page("jobs", [journey], total=101)
         actions = FakeActions(self.routes)
         self.assertEqual(self.world.verify_with_actions(actions)["result"], "satisfied")
@@ -793,6 +798,7 @@ class AttemptJobsPaginationTests(Base):
             ("overlap", page("jobs", [first_jobs[-1]], total=101), "incomplete or exhausted jobs"),
             ("duplicate required name", page("jobs", [dict(last_job, name=sa.JOURNEY)], total=101),
              "missing or ambiguous required staging job"),
+            ("oversized", b" " * (sa.MAX_JOB_PAGE + 1), "response exceeds bounds"),
         ):
             with self.subTest(case=case):
                 routes = dict(self.routes)
