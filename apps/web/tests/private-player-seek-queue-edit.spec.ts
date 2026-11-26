@@ -93,21 +93,25 @@ for (const paused of [false, true]) {
 		await expect.poll(() => audio.evaluate((node: HTMLAudioElement) =>
 			!node.paused && node.currentTime > 0.2)).toBe(true);
 		await expect(audio).toHaveJSProperty('currentSrc', currentSource);
-		if (paused) {
-			await transport.getByRole('button', { name: 'Pause', exact: true }).click();
-			await expect(status).toHaveText('Paused');
-		}
+		const pausedEvent = { type: 'pause', position: expect.any(Number), paused: true, trusted: true, at: expect.any(Number) };
 		const native = await audio.elementHandle();
 		const events = await native.evaluateHandle((node: HTMLAudioElement) => {
-			const changes: { type: string; position: number; paused: boolean; trusted: boolean }[] = [];
+			const changes: { type: string; position: number; paused: boolean; trusted: boolean; at: number }[] = [];
 			for (const type of ['seeking', 'seeked', 'play', 'pause', 'emptied', 'loadstart', 'ended']) {
 				node.addEventListener(type, (event) => changes.push({ type, position: node.currentTime,
-					paused: node.paused, trusted: event.isTrusted }));
+					paused: node.paused, trusted: event.isTrusted, at: performance.now() }));
 			}
 			return changes;
 		});
+		if (paused) {
+			await transport.getByRole('button', { name: 'Pause', exact: true }).click();
+			await expect(status).toHaveText('Paused');
+			// The native pause event is queued and can trail the visible status.
+			await expect.poll(() => events.jsonValue()).toEqual([pausedEvent]);
+		}
 		const editedOrder = [current.id, successor.id];
 		let target: number;
+		let releasedAt: number;
 		try {
 			expect(seekRead).toBeUndefined();
 			await expect(slider).toBeEnabled();
@@ -134,22 +138,30 @@ for (const paused of [false, true]) {
 			await expect(audio).toHaveJSProperty('currentTime', target);
 			await expect(slider).toHaveAttribute('aria-valuetext', /^Seeking to /);
 			expect(grants).toEqual([initialGrant]);
+			releasedAt = await page.evaluate(() => performance.now());
 		} finally {
 			releaseSeek.resolve();
 		}
 		expect((await seekRead!.response())?.status()).toBe(206);
 		await expect.poll(() => events.jsonValue()).toEqual([
-			{ type: 'seeking', position: expect.closeTo(target, 1), paused, trusted: true },
-			{ type: 'seeked', position: paused ? expect.closeTo(target, 1) : expect.any(Number), paused, trusted: true }
+			...(paused ? [pausedEvent] : []),
+			{ type: 'seeking', position: expect.closeTo(target, 1), paused, trusted: true, at: expect.any(Number) },
+			{ type: 'seeked', position: paused ? expect.closeTo(target, 1) : expect.any(Number), paused, trusted: true,
+				at: expect.any(Number) }
 		]);
-		// The playing clock can advance before the queued seeked event is delivered.
-		const [, completion] = await events.jsonValue();
+		// The playing clock can advance before the queued seeked event is delivered, but
+		// never further than real time since the held read was released.
+		const completion = (await events.jsonValue()).at(-1)!;
+		const maxAdvance = (completion.at - releasedAt!) / 1000 + 0.25;
 		expect(completion.position).toBeGreaterThanOrEqual(target - 0.05);
+		expect(completion.position).toBeLessThanOrEqual(target + (paused ? 0.05 : maxAdvance));
 		await expect(slider).not.toHaveAttribute('aria-valuetext', /^Seeking to /);
 		await expect(status).toHaveText(paused ? 'Paused' : 'Playing');
-		await expect.poll(() => native.evaluate((node: HTMLAudioElement, { target, paused }) =>
+		await expect.poll(() => native.evaluate((node: HTMLAudioElement, { target, paused, releasedAt }) =>
 			node.isConnected && node.paused === paused && !node.seeking && !node.ended && !node.error &&
-			(paused ? Math.abs(node.currentTime - target) < 0.05 : node.currentTime > target + 0.2), { target, paused })).toBe(true);
+			(paused ? Math.abs(node.currentTime - target) < 0.05 : node.currentTime > target + 0.2 &&
+				node.currentTime <= target + (performance.now() - releasedAt) / 1000 + 0.25),
+		{ target, paused, releasedAt: releasedAt! })).toBe(true);
 		await expect(active).toHaveAttribute(player.queueId, current.id);
 		await expect(audio).toHaveJSProperty('currentSrc', currentSource);
 		expect(grants).toEqual([initialGrant]);
