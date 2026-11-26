@@ -14,6 +14,10 @@ on:
       - '**.mjs'
       - '**.cjs'
       - '**.svelte'
+      - '**.sh'
+      - '**.bash'
+      - '**.toml'
+      - '**.sql'
       - '**.yml'
       - '**.yaml'
   merge_group:

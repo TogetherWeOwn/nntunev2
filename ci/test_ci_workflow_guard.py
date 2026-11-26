@@ -24,6 +24,7 @@ class GuardFixtures(unittest.TestCase):
             "# guards: paths\non: {push: {branches: [main], paths: [src/**]}}",
             "# guards: release:exact staging SHA\non: [pull_request, push]",
             "# guards: required:ci-ok\non: {pull_request: {}, push: {branches: [release]}}",
+            "# guards: required:ci-ok\non: {pull_request: {}, push: {branches: ['release/v[0-9]+']}}",
             "# guards: required:ci-ok\non: {pull_request: {}, push: {branches: ['**', '!main']}}",
             "# guards: required:proof\non: {workflow_run: {workflows: [CI], types: [completed]}}",
             "# guards: required:proof\non: {workflow_run: {workflows: [CI], types: completed}}",
@@ -68,10 +69,12 @@ class RequiredLintTests(unittest.TestCase):
         cls.text = (ACTIONS / "pr-lint.yml").read_text()
         cls.doc = yaml.load(cls.text, Loader=WorkflowLoader)
         cls.job = cls.doc["jobs"]["pr-lint"]
-        cls.title_command = cls.job["steps"][2]["run"]
+        cls.title_command = cls.job["steps"][0]["run"]
 
     def test_guard_runs_on_pinned_tree_in_existing_required_job(self):
-        checkout, guard, _ = self.job["steps"]
+        title, checkout, guard = self.job["steps"]
+        self.assertEqual("Check PR title convention", title["name"])
+        self.assertIn("github.event_name == 'workflow_dispatch'", title["env"]["GH_TOKEN"])
         self.assertEqual("pr-lint", self.job["name"])
         self.assertEqual({"contents": "read", "pull-requests": "read"}, self.doc["permissions"])
         self.assertEqual("${{ github.sha }}", checkout["with"]["ref"])
@@ -93,6 +96,8 @@ class RequiredLintTests(unittest.TestCase):
         codeql = workflows((ACTIONS / "codeql.yml").read_text())
         self.assertEqual({"pull_request", "merge_group", "schedule", "workflow_dispatch"}, set(codeql))
         self.assertNotIn("paths", codeql["pull_request"])
+        coverage = workflows((ACTIONS / "coverage.yml").read_text())
+        self.assertEqual({"schedule", "workflow_dispatch"}, set(coverage))
 
     def test_title_event_dispatch_input_push_and_merge_group(self):
         cases = (

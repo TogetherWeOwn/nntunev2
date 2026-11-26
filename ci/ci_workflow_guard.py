@@ -58,7 +58,7 @@ def pushes_main(settings):
     for pattern in settings["branches"]:
         if any(char in pattern for char in "?+\\"):
             # Account conservatively for Actions glob syntax outside fnmatch.
-            if not pattern.startswith("!"):
+            if not pattern.startswith("!") and "/" not in pattern:
                 matches = True
         elif fnmatchcase("main", pattern.lstrip("!")):
             matches = not pattern.startswith("!")
