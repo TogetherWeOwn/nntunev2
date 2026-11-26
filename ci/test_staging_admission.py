@@ -798,7 +798,7 @@ class AttemptJobsPaginationTests(Base):
             ("overlap", page("jobs", [first_jobs[-1]], total=101), "incomplete or exhausted jobs"),
             ("duplicate required name", page("jobs", [dict(last_job, name=sa.JOURNEY)], total=101),
              "missing or ambiguous required staging job"),
-            ("oversized", b" " * (sa.MAX_JOB_PAGE + 1), "response exceeds bounds"),
+            ("oversized", b" " * (4 * 1024 * 1024 + 1), "response exceeds bounds"),
         ):
             with self.subTest(case=case):
                 routes = dict(self.routes)
