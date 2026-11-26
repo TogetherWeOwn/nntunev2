@@ -66,12 +66,13 @@ for (const { name, retainSelection } of [
 		]);
 		expect(response.status()).toBe(200);
 		await expect(rows).toHaveCount(retainSelection ? 2 : 1);
-		await expect(titleButton(peer)).toBeVisible();
+		// In the retained case the row count is unchanged while verification runs.
+		await expect(titleButton(retainSelection ? updated : peer)).toBeVisible();
+		await expect(checkbox(peer)).toBeVisible();
 		await expect(checkbox(peer)).not.toBeChecked();
 		await expect(queue).toHaveCount(0);
 
 		if (retainSelection) {
-			await expect(titleButton(updated)).toBeVisible();
 			await expect(checkbox(updated)).toBeChecked();
 		} else {
 			await expect(row(selected)).toHaveCount(0);
