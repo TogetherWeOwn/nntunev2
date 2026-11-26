@@ -143,6 +143,26 @@ If a fresh protected push changes the SHA, review and pin that build first.
 Keep the original evidence under its own attempt. Record the selected run,
 attempt and artifact digest when the verifier emits matching staging pins.
 
+## Staging rollback rehearsal with launch readback pending
+
+This offline example uses placeholders. The maintenance seed was recorded
+earlier. The application candidate's release decision is `Pending` while the
+operator checks that fallback before dispatch.
+
+| Record | Example entry |
+| --- | --- |
+| Staging rollback rehearsal | **Passed.** Push-triggered staging `deploy.yml` run `<staging-run>` had `staging-web` conclude `success` on `<last-good-staging-sha>`. [**Re-run all jobs**](ops.md#staging-deploy-lock-cutover-and-rollback) produced attempt `<attempt>` with `staging-web` at `success`, passing health and the matching SHA from staging `/api/build`. |
+| Launch maintenance target | The maintenance seed record pins production Worker ID `<worker-id>` (`nntune-web`), `<maintenance-deployment>` and `<maintenance-version>` at 100%. |
+| Launch serving readback | **Missing.** The current launch allocation is unavailable. In the disagreement variant, the latest launch deployment reports 100% on `<other-launch-version>`. |
+| Handoff | In either variant, retain the staging pass, leave verification of the maintenance fallback open and keep the release decision `Pending`. |
+
+The next serving readback is the complete deployment history for the pinned
+Worker ID (`nntune-web`) in the pinned production account. Confirm that the
+current deployment is `<maintenance-deployment>` and serves
+`<maintenance-version>` at 100%, then continue the existing fallback checks.
+[Protected recovery](ops.md#protected-production-worker-recovery) ·
+[Switch-off verification](#switch-off-and-verify)
+
 ## Switch off and verify
 
 Before promotion, name the executor and backup and pin the protected control
