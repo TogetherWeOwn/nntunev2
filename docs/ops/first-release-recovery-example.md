@@ -59,8 +59,9 @@ reviewer follows the usual approval rules on that run.
 
 The next read is the same attempt's job list
 (`GET /repos/example/fixture/actions/runs/102/attempts/1/jobs`). Verify the
-job's run ID and attempt. When that `recover-worker` job is `in_progress`,
-record that it has started and continue reading its job status and steps.
+job's run ID and attempt. If `recover-worker` is queued, keep switch-off
+pending and read that job list again. When the exact job is `in_progress`,
+record the job start and continue reading its status and steps.
 Keep switch-off **Pending** until the recovery job, pinned serving allocation
 and denial readbacks agree. Keep the original run and attempt throughout,
 and continue with reads of that run without redispatching or rerunning it.
