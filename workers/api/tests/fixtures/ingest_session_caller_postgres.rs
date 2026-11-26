@@ -1036,6 +1036,18 @@ async fn prove_attempt(
         .await,
         Err(UploadError::Refused)
     ));
+    if !publish_fixture {
+        Box::pin(prove_completion_read_retry(
+            observer,
+            authority,
+            writer,
+            auth,
+            prepared,
+            until,
+            committed.outcome(),
+        ))
+        .await;
+    }
     let track = if publish_fixture {
         let header = async |scope: &CompletionScope<'_>, map, key: &str| {
             registered_header(writer, scope, identities, map, key).await
@@ -1098,6 +1110,109 @@ async fn prove_attempt(
         .await
         .unwrap();
     reuse_cases::protect_completed(observer, authority, writer, auth, prepared, &committed).await;
+}
+
+async fn prove_completion_read_retry(
+    observer: &Client,
+    authority: &Client,
+    writer: &mut Client,
+    auth: Authorization<'_>,
+    prepared: PreparedUpload<'_>,
+    until: SystemTime,
+    committed: &CommittedOutcome,
+) {
+    let reload =
+        async |id: &str, scope: &CompletionScope<'_>| load_authority(authority, id, scope).await;
+    let session = prepared.scope.session;
+    let library = uuid_text(prepared.scope.library);
+    // Row versions detect replacement even if a second write repeats the same values.
+    let saved = async || {
+        let row = observer.query_one(
+            "SELECT s.xmin::text, p.xmin::text, s.multipart_upload_id,
+                    (SELECT count(*) FROM public.ingest_session_reservations WHERE library_id = s.library_id)
+             FROM public.ingest_session_reservations s
+             JOIN public.storage_digest_inventory_intents p ON p.map_id = s.completed_map_id
+             WHERE s.id = $1::text::uuid AND s.library_id = $2::text::uuid
+               AND s.terminal_reason = 'completed' AND s.write_lease_id IS NULL
+               AND p.map_id = $3::text::uuid",
+            &[&session, &library, &committed.map],
+        ).await.unwrap();
+        (
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+            row.get::<_, i64>(3),
+        )
+    };
+    let original = saved().await;
+    assert_eq!((original.2.as_str(), original.3), (UPLOAD, 1));
+
+    // Only the receipt query needs this table. The scoped session lock and
+    // the independent authority lookup can still succeed.
+    let mut holder = connect(DB).await;
+    let holder_pid = backend_pid(&holder).await;
+    let writer_pid = backend_pid(writer).await;
+    let gate = holder.transaction().await.unwrap();
+    gate.batch_execute(
+        "SET LOCAL lock_timeout = '2s';
+         LOCK TABLE public.storage_digest_inventory_intents IN ACCESS EXCLUSIVE MODE",
+    )
+    .await
+    .unwrap();
+    let reauthorized = std::cell::Cell::new(false);
+    cancel_blocked_receipt_query(
+        observer,
+        holder_pid,
+        writer_pid,
+        read(writer, auth, prepared, async |id, scope| {
+            let state = reload(id, scope).await?;
+            assert!(state.is_some());
+            reauthorized.set(true);
+            Ok(state)
+        }),
+    )
+    .await;
+    assert!(reauthorized.get());
+    cancel_blocked_receipt_query(
+        observer,
+        holder_pid,
+        writer_pid,
+        open_or_reuse(writer, auth, prepared, until, reload, async |_, _, _, _| {
+            panic!("an unreadable completion reached the upload provider")
+        }),
+    )
+    .await;
+    gate.rollback().await.unwrap();
+
+    assert_eq!(saved().await, original);
+    let retried = read(writer, auth, prepared, reload).await.unwrap().unwrap();
+    assert_eq!(retried.map, committed.map);
+    assert_eq!(retried.object, committed.object);
+    assert_eq!(retried.generation, committed.generation);
+    assert_eq!(retried.configuration, committed.configuration);
+    assert_eq!(retried.root_version, committed.root_version);
+    assert_eq!(retried.media_version, committed.media_version);
+    assert_eq!(retried.page_versions, committed.page_versions);
+    assert_eq!(saved().await, original);
+}
+
+async fn cancel_blocked_receipt_query<T>(
+    observer: &Client,
+    holder_pid: i32,
+    writer_pid: i32,
+    pending: impl std::future::Future<Output = Result<T, UploadError>>,
+) {
+    let mut pending = std::pin::pin!(pending);
+    observe_blocked(observer, holder_pid, writer_pid, pending.as_mut())
+        .await
+        .expect("the inventory lock must block the receipt query");
+    let cancelled: bool = observer
+        .query_one("SELECT pg_cancel_backend($1)", &[&writer_pid])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(cancelled);
+    assert!(matches!(pending.await, Err(UploadError::Unconfirmed)));
 }
 
 async fn backend_pid(client: &Client) -> i32 {
