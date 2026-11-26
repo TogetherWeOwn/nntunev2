@@ -168,6 +168,15 @@ def check_reader_privilege_binding():
     check("malformed inventory digest", record | {"inventory": inventory | {"inventory_sha256": "b" * 63}})
     check("inventory for another branch", missing_object | {"inventory": observed | {"branch_id": "fixture002"}})
     check("inventory for another database", missing_object | {"inventory": observed | {"database_oid": 17003}})
+
+    # A complete inventory cannot supply scope that the passing access readback lacks.
+    for field in ("database_oid", "inventory_sha256"):
+        unscoped_privileges = privileges.copy()
+        del unscoped_privileges[field]
+        check(f"passing privileges without {field}", record | {"reader_privileges": unscoped_privileges})
+    check("passing privileges for another database with the same inventory digest",
+          record | {"reader_privileges": privileges | {"database_oid": 17004}})
+
     check("missing privilege evidence", {"review": review, "inventory": inventory})
     check("duplicate privilege object", b'{"reader_privileges": null, ' + json.dumps(record).encode()[1:])
     check("oversized record", json.dumps(record).encode().ljust(4097))
