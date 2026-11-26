@@ -1029,7 +1029,8 @@ def verify_migrated_library_read(cluster):
            AND (SELECT relowner = '{MIGRATOR}'::regrole FROM pg_class WHERE oid = 'public.library'::regclass)
            AND NOT has_table_privilege(current_user, 'public.library', 'SELECT WITH GRANT OPTION')
            AND NOT has_table_privilege(current_user, 'public.library', 'DELETE, TRUNCATE, TRIGGER, MAINTAIN')
-           AND NOT has_any_column_privilege(current_user, 'public.library', 'INSERT, UPDATE, REFERENCES');
+           AND NOT has_any_column_privilege(current_user, 'public.library',
+               'INSERT, UPDATE, REFERENCES, SELECT WITH GRANT OPTION');
         COMMIT;
         """, "fixture-job\nt\n", role=READER, database=LAUNCH)
 
