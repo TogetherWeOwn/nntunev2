@@ -599,6 +599,7 @@ async fn prove_attempt(
     } else {
         BUCKET
     };
+    let provider_version = Cell::new(None);
     let lost_provider_response = matches!(fault, Some(Fault::LostProviderCompletionResponse));
     let (opened, mut resumed_writer, completed, ciphertext) = if let Some(fail_later_page) =
         inventory_case
@@ -817,7 +818,6 @@ async fn prove_attempt(
         };
         let completion =
             SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint).unwrap();
-        let provider_version = Cell::new(None);
         let composite = format!("{}-1", STANDARD.encode(Sha256::digest(part_digest)));
         let send = async |sent: CompletionRequest<'_>| {
             assert_eq!(sent.target.upload_id, UPLOAD);
@@ -969,6 +969,21 @@ async fn prove_attempt(
         }
         verified
     };
+    if pending_confirmation {
+        let committed = Box::pin(opened.commit_flac(
+            writer,
+            auth,
+            &inventory,
+            now as i64 + 600,
+            reload,
+            verify,
+        ))
+        .await
+        .unwrap();
+        pending_part::assert_replay(auth, prepared, until, reload, committed.outcome()).await;
+        assert_eq!(provider_version.get(), Some(MEDIA));
+        return;
+    }
     if let Some(fail_later_page) = inventory_case {
         let writer = if fail_later_page {
             let resumed = resumed_writer
