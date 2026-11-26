@@ -99,6 +99,20 @@ def check_reader_cleanup_binding():
         check(f"receipt valid for its own {key}",
               {"reviewed": reviewed | {key: other}, "receipt": other_receipt}, accept=True)
 
+    for case, changes in {
+        "zero database OID": {"database_oid": 0},
+        "reader OID exceeds PostgreSQL range": {"reader_oid": 4294967296},
+        "reserved database": {"launch": "template1"},
+        "invalid database name": {"launch": "fixture-launch"},
+        "reserved reader prefix": {"reader_role": "pg_reader"},
+        "reserved reader name": {"reader_role": "PUBLIC"},
+        "invalid reader name": {"reader_role": "fixture.reader"},
+        "invalid branch ID": {"branch_id": "fixture01"},
+        "unexpected reviewed field": {"extra": "fixture"},
+    }.items():
+        invalid_pins = reviewed | changes
+        check(case, {"reviewed": invalid_pins, "receipt": invalid_pins | {"status": "absent"}})
+
     check("missing receipt", {"reviewed": reviewed})
     check("absence unconfirmed", record | {"receipt": receipt | {"status": "present"}})
     check("duplicate receipt key", b'{"receipt": null, ' + json.dumps(record).encode()[1:])
