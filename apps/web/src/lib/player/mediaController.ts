@@ -227,7 +227,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		readPlayback(audio, ownsPause, get(playbackStatus));
 	}
 
-	function nextFromQueue(): void {
+	function nextFromQueue(origin: 'button' | 'system' = 'button'): void {
 		if (!selection) return;
 		const base = queue.snapshot;
 		const next = nextTrack(base);
@@ -242,7 +242,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (source) void playSelected(next, next.currentIndex, source);
 			return;
 		}
-		if (queue.snapshot === base) selection.commit(next);
+		if (queue.snapshot !== base) return;
+		// System controls still resolve the destination before a selection-only handoff.
+		if (origin === 'system') navigateQueue(nextTrack);
+		else selection.commit(next);
 	}
 
 	function navigateQueue(step: (state: QueueState) => QueueState): void {
@@ -286,7 +289,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			(grant) => playSelected(previous, previous.currentIndex, grant, '', grant), { retireSuperseded: true });
 	}
 
-	const queueTransport = { playCurrent, pauseCurrent, onNext: () => navigateQueue(nextTrack), onPrevious: previousFromTransport };
+	const queueTransport = { playCurrent, pauseCurrent, onNext: () => nextFromQueue('system'), onPrevious: previousFromTransport };
 
 	function clearJumpFeedback(): void {
 		const feedback = get(seekFeedback);

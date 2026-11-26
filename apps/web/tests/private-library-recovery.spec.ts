@@ -60,6 +60,76 @@ async function expectCatalogue(page: Page, tracks: Track[]) {
 	}
 }
 
+test('first-load Retry keeps keyboard focus on an available Library action', async ({ page, origin }) => {
+	const failedRetry = Promise.withResolvers<Listing>();
+	let listing: Listing | Promise<Listing> = 503;
+	const fixture = await mockCatalogue(page, origin, () => listing);
+	await fixture.signIn();
+	const main = page.getByRole('main');
+	const retry = main.getByRole('button', { name: 'Retry', exact: true });
+	const refresh = main.getByRole('button', { name: library.refresh, exact: true });
+	const loading = main.getByRole('status').filter({ hasText: /^Loading your library…$/ });
+	const alert = main.getByRole('alert');
+	const listingUrl = origin + library.api;
+
+	try {
+		await page.goto(origin + library.path);
+		await expect(alert).toHaveText('Library is not reachable right now.');
+		await expectCatalogue(page, []);
+		await expect(refresh).toHaveCount(0);
+		await main.getByRole('button', { name: 'Artists', exact: true }).focus();
+		await page.keyboard.press('Tab');
+		await expect(retry).toBeFocused();
+
+		listing = failedRetry.promise;
+		await page.keyboard.press('Enter');
+		await expect(loading).toBeVisible();
+		await expect(retry).toHaveCount(0);
+		failedRetry.resolve(503);
+		await expect(alert).toHaveText('Library is not reachable right now.');
+		await expectCatalogue(page, []);
+		await expect(retry).toBeFocused();
+
+		listing = [first];
+		const [response] = await Promise.all([
+			page.waitForResponse(listingUrl),
+			page.keyboard.press('Enter')
+		]);
+		expect(response.status()).toBe(200);
+		await expectCatalogue(page, [first]);
+		await expect(alert).toHaveCount(0);
+		await expect(retry).toHaveCount(0);
+		await expect(refresh).toBeEnabled();
+		await expect(refresh).toBeFocused();
+		expect(fixture.listingAccounts).toEqual([listener.account, listener.account, listener.account]);
+	} finally {
+		failedRetry.resolve(503);
+	}
+});
+
+for (const active of ['body', 'Density'] as const) {
+	test(`ordinary first load preserves focus on ${active}`, async ({ page, origin }) => {
+		const initial = Promise.withResolvers<Track[]>();
+		const fixture = await mockCatalogue(page, origin, () => initial.promise);
+		await fixture.signIn();
+		const loading = page.getByRole('status').filter({ hasText: /^Loading your library…$/ });
+		const focus = active === 'body' ? page.locator('body') : page.getByLabel(active, { exact: true });
+		try {
+			await page.goto(origin + library.path);
+			await expect(loading).toBeVisible();
+			if (active === 'Density') await focus.focus();
+			await expect(focus).toBeFocused();
+			initial.resolve([first]);
+			await expectCatalogue(page, [first]);
+			await expect(loading).toHaveCount(0);
+			await expect(focus).toBeFocused();
+			expect(fixture.listingAccounts).toEqual([listener.account]);
+		} finally {
+			initial.resolve([]);
+		}
+	});
+}
+
 test('Retry after a first-load 503 reads the current invited Library', async ({ page, origin }) => {
 	let firstRead = true;
 	const fixture = await mockCatalogue(page, origin, (invitee) => {
@@ -95,6 +165,52 @@ test('Retry after a first-load 503 reads the current invited Library', async ({ 
 	await expect(retry).toHaveCount(0);
 	expect(fixture.listingAccounts).toEqual([listener.account, nextListener.account]);
 	expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentTimeOrigin);
+});
+
+test('Selected only survives a failed invited Library refresh and successful Retry', async ({ page, origin }) => {
+	const updatedSelected = { ...selected, title: 'Updated selected track' };
+	const updatedFirst = { ...first, title: 'Updated unselected track' };
+	let listing: Listing = [first, selected];
+	const fixture = await mockCatalogue(page, origin, () => listing);
+	await fixture.signIn();
+
+	const main = page.getByRole('main');
+	const show = main.getByRole('combobox', { name: 'Show', exact: true });
+	const count = main.getByRole('status').and(main.getByTestId('library-find-count'));
+	const stale = main.getByTestId('library-stale-badge');
+	const refresh = main.getByRole('button', { name: library.refresh, exact: true });
+	const retry = main.getByRole('button', { name: 'Retry', exact: true });
+	const checkbox = (track: Track) => row(page, track).getByRole('checkbox', { name: `Select ${track.title}`, exact: true });
+	const expectFiltered = async (track: Track) => {
+		await expect(show).toHaveValue('selected');
+		await expect(count).toHaveText(/^Showing 1 of 2 tracks?$/);
+		await expectCatalogue(page, [track]);
+		await expect(checkbox(track)).toBeChecked();
+	};
+
+	await page.goto(origin + library.path);
+	await expectCatalogue(page, listing);
+	await checkbox(selected).check();
+	await show.selectOption({ label: 'Selected only' });
+	await expectFiltered(selected);
+
+	listing = 503;
+	const [failed] = await Promise.all([page.waitForResponse(origin + library.api), refresh.click()]);
+	expect(failed.status()).toBe(503);
+	await expect(stale).toBeVisible();
+	await expectFiltered(selected);
+
+	listing = [updatedFirst, updatedSelected];
+	const [retried] = await Promise.all([page.waitForResponse(origin + library.api), retry.click()]);
+	expect(retried.status()).toBe(200);
+	await expectFiltered(updatedSelected);
+	await expect(stale).toBeHidden();
+	await expect(refresh).toBeVisible();
+
+	await show.selectOption({ label: 'All tracks' });
+	await expectCatalogue(page, listing);
+	await expect(checkbox(updatedFirst)).not.toBeChecked();
+	expect(fixture.listingAccounts).toEqual([listener.account, listener.account, listener.account]);
 });
 
 test('returning to Library shows the new track and keeps the current selection', async ({ page, origin }) => {

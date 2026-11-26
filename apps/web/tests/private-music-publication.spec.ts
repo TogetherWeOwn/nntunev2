@@ -12,26 +12,36 @@ const binding = 'A'.repeat(43);
 const playId = '00000000-0000-4000-8000-000000000003';
 const isListener = (cookie: string | null) => hasFixtureSession(cookie, 'synthetic-listener');
 
-test('fresh private publication reaches the invited Library and plays under its canonical ID', async ({ page, browser, origin }) => {
+test('fresh private publication keeps its Library ID as display metadata arrives', async ({ page, browser, origin }) => {
 	const upload = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
 	const companion = privateStagingAudio().find(({ file }) => file === 'tone-b.flac')!;
 	const rows = page.getByTestId(PRIVATE_MUSIC.library.item);
 	const refresh = page.getByRole('button', { name: PRIVATE_MUSIC.library.refresh, exact: true });
 	const ids = () => rows.evaluateAll((items) => items.map((row) => row.getAttribute('data-id')!));
 	const row = (id: string) => rows.and(page.locator(`[data-id="${id}"]`));
-	const uploadMetadata = { title: 'Synthetic Copper Tone', artist: 'Synthetic Signal Lab', durationMs: 14_000 };
-	const companionTrack = { id: companionId, title: 'Queue companion', artist: 'Synthetic Queue Artist', duration_ms: 9_000 };
+	const readSnapshotItems = () => page.evaluate(({ contextKey, snapshotKey }) => {
+		const context = sessionStorage.getItem(contextKey);
+		const snapshot = context && sessionStorage.getItem(`${snapshotKey}.${context}`);
+		return snapshot ? JSON.parse(snapshot).items : null;
+	}, { contextKey: LIBRARY_AUTH_CONTEXT_KEY, snapshotKey: LIBRARY_SNAPSHOT_KEY });
+	const pendingTrack = {
+		id: uploadedId, title: 'Synthetic Copper Tone', duration_ms: 14_000, artist: null, release: null
+	};
+	const enrichedTrack = { ...pendingTrack, artist: 'Synthetic Signal Lab', release: 'Synthetic Copper Album' };
+	const companionTrack = {
+		id: companionId, title: 'Queue companion', artist: 'Synthetic Queue Artist', release: 'Synthetic Queue Album', duration_ms: 9_000
+	};
 	const grantUrl = origin + PRIVATE_MUSIC.player.plays;
 	const playbackRequests: string[] = [];
 	page.on('request', (request) => {
 		const url = request.url();
 		if (url === grantUrl || url.startsWith(`${grantUrl}/media/`)) playbackRequests.push(new URL(url).pathname);
 	});
-	let publishedTrack: typeof companionTrack | undefined;
+	let libraryItems: (typeof pendingTrack | typeof enrichedTrack)[] = [companionTrack];
 	let revoked = false;
 	const fixture = await mockInvitedLibraryPlayback(page, origin, {
-		libraryItems: () => publishedTrack ? [publishedTrack, companionTrack] : [companionTrack],
-		playableTrackId: () => publishedTrack?.id,
+		libraryItems: () => libraryItems,
+		playableTrackId: () => libraryItems.find(({ id }) => id === uploadedId)?.id,
 		audio: upload.body,
 		isRevoked: () => revoked
 	});
@@ -55,10 +65,8 @@ test('fresh private publication reaches the invited Library and plays under its 
 			if (call.method() !== 'POST' || await call.headerValue('cookie') !== `${fixtureCookie}=synthetic-owner` ||
 				await call.headerValue('origin') !== origin || await call.headerValue('authorization')) return route.fulfill({ status: 404 });
 			if (!call.postDataBuffer()?.equals(upload.body)) return route.fulfill({ status: 400 });
-			// The fixture supplies catalogue enrichment for this upload. The receipt carries only the ID and digest.
-			publishedTrack = {
-				id: uploadedId, title: uploadMetadata.title, artist: uploadMetadata.artist, duration_ms: uploadMetadata.durationMs
-			};
+			// The admitted row is already readable while its optional display fields are absent.
+			libraryItems = [companionTrack, pendingTrack];
 			return route.fulfill({ json: { trackId: uploadedId, sha256: upload.sha256 } });
 		});
 		const ownerPage = await owner.newPage();
@@ -70,18 +78,20 @@ test('fresh private publication reaches the invited Library and plays under its 
 		expect(receipt.status).toBe(200);
 		const fresh = freshTrialPublication(receipt.body, upload.sha256, before);
 		await refresh.click();
+		await expect(row(fresh.trackId).getByRole('button', { name: pendingTrack.title, exact: true })).toBeVisible();
+		await expect.poll(ids).toEqual([companionId, fresh.trackId]);
+		await expect.poll(readSnapshotItems).toEqual([companionTrack, pendingTrack]);
+
+		// Move both rows so a lookup by their previous positions would swap the details.
+		libraryItems = [enrichedTrack, companionTrack];
+		await refresh.click();
 		await expect(row(fresh.trackId).getByRole('button', {
-			name: `${uploadMetadata.title} — ${uploadMetadata.artist}`, exact: true
+			name: `${enrichedTrack.title} — ${enrichedTrack.artist}`, exact: true
 		})).toBeVisible();
-		// The Library stores duration in its accepted snapshot before any playback grant or media load.
-		await expect.poll(() => page.evaluate(({ contextKey, snapshotKey }) => {
-			const context = sessionStorage.getItem(contextKey);
-			const snapshot = context && sessionStorage.getItem(`${snapshotKey}.${context}`);
-			return snapshot ? JSON.parse(snapshot).items : null;
-		}, { contextKey: LIBRARY_AUTH_CONTEXT_KEY, snapshotKey: LIBRARY_SNAPSHOT_KEY })).toMatchObject([
-			{ id: fresh.trackId, title: uploadMetadata.title, artist: uploadMetadata.artist, duration_ms: uploadMetadata.durationMs },
-			companionTrack
-		]);
+		await expect(row(companionId).getByRole('button', {
+			name: `${companionTrack.title} — ${companionTrack.artist}`, exact: true
+		})).toBeVisible();
+		await expect.poll(readSnapshotItems).toEqual([enrichedTrack, companionTrack]);
 		const order = assertCuratedLibrary([upload.sha256, companion.sha256], [fresh, { trackId: companionId, sha256: companion.sha256 }], await ids());
 		expect(order).toEqual([fresh.trackId, companionId]);
 		for (const id of order) await row(id).locator(PRIVATE_MUSIC.library.select).click();
@@ -98,6 +108,10 @@ test('fresh private publication reaches the invited Library and plays under its 
 	await player.getByRole('button', { name: 'Play', exact: true }).click();
 	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => !el.paused && el.currentTime > 0.2)).toBe(true);
 	await expect(audio).toHaveAttribute('src', fixture.mediaPath(uploadedId));
+	await expect.poll(() => page.evaluate(() => {
+		const metadata = navigator.mediaSession?.metadata;
+		return metadata && { title: metadata.title, artist: metadata.artist, album: metadata.album };
+	})).toEqual({ title: enrichedTrack.title, artist: enrichedTrack.artist, album: enrichedTrack.release });
 	await player.getByRole('button', { name: 'Pause', exact: true }).click();
 	await waitForPaused(audio, true, 5_000, 'Player did not pause');
 	await audio.evaluate((el) => el.addEventListener('seeked', () => { el.dataset.seeked = 'yes'; }, { once: true }));

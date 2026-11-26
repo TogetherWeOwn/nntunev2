@@ -162,6 +162,16 @@ class ReaderRoleLifecycle(RoleLifecycle):
     END IF;
 """)
 
+    def _retirement_result(self, receipt):
+        return f"""
+SELECT 'retired' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE oid = {receipt} OR rolname = '{self.name}')
+  AND NOT EXISTS (SELECT FROM pg_stat_activity WHERE usesysid = {receipt});
+"""
+
+    def retirement_readback(self, raw_baseline, oid):
+        """Read the retirement verdict on the bound launch database without changing the role."""
+        return self._run("", self._retirement_result(role_oid(oid)), plan=self._bound_plan(raw_baseline, oid))
+
     def retire(self, raw_baseline, oid):
         receipt = role_oid(oid)
         plan = None if raw_baseline is None else self._bound_plan(raw_baseline, oid)
@@ -186,7 +196,4 @@ class ReaderRoleLifecycle(RoleLifecycle):
         {revoke}
         DROP ROLE {self.role};
     END IF;
-""", f"""
-SELECT 'retired' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE oid = {receipt} OR rolname = '{self.name}')
-  AND NOT EXISTS (SELECT FROM pg_stat_activity WHERE usesysid = {receipt});
-""", plan=plan)
+""", self._retirement_result(receipt), plan=plan)

@@ -213,23 +213,61 @@ Access writers as required by [protected recovery](ops.md#protected-production-w
 See the [synthetic post-recovery handoff](ops/first-release-recovery-example.md)
 for an example of recording the serving build and the pending release decision.
 
+### Read the recorded rollback attempt before jobs appear
+
+In this example the operator has already identified the exact `recover-worker`
+dispatch for the reviewed SHA and original rollout. The recorded rollback is
+run `102`, attempt `1`, in the synthetic repository `example/fixture`. Read both
+`GET /repos/example/fixture/actions/runs/102/attempts/1` and
+`GET /repos/example/fixture/actions/runs/102/attempts/1/jobs`. Confirm the status
+response identifies the recorded run and attempt. Both reads succeeded and the
+complete jobs response is `{"total_count":0,"jobs":[]}`.
+
+| Actions run status | Verification entry | Next action |
+| --- | --- | --- |
+| `pending` | **Pending**. Actions has yet to list any jobs. | Repeat the status and jobs reads for `102/1`. |
+| `completed` | **Missing required verification**. The terminal run has no recovery job evidence. | Reconcile the missing `recover-worker` evidence for `102/1` under the protected recovery procedure above. |
+
+Keep switch-off **Pending**, the recorded run and attempt, and the writer
+freeze in both cases. Do not dispatch another recovery or rerun the workflow
+from this readback. Switch-off requires the recovery job, pinned serving
+allocation and denial evidence in step 3.
+
 ## Watch the first 30 minutes
 
-Start at successful final smoke on the pinned 100% allocation. Assign a named
-watcher and a backup with recovery access through at least 30 minutes. At the
-start, every five minutes and at close, record UTC and confirm the serving Web
-and API identities, health/readiness, authorized private listening, expected
-denials, and Web/API/Stream errors against the pre-recorded baseline and error
+Assign a named watcher and a backup with recovery access before promotion.
+Start the watch at the UTC `completed_at` of the successful **Verify production
+serves the promoted build** step in the pinned run and attempt's
+`deploy-production` job. Use the attempt-scoped Actions jobs readback
+(`actions/runs/{run_id}/attempts/{attempt_number}/jobs`) for that timestamp.
+Pair the smoke result with the successful **Pin the final deployment before
+final smoke** step in the same job. In the opening readback, use the pinned
+production Web Worker's complete deployment history. Match the version tagged
+`<sha>-<run-id>-<attempt>` and take the deployment ID from the current 100%
+allocation, immediately preceded by the matching 5% and 50% rollout stages
+in rollout order. Record the deployment and version IDs, candidate SHA, run ID
+and attempt, and job evidence in the private release record.
+
+Keep the start pending if either the smoke or allocation evidence is missing.
+Exclude time and observations from staging, preflight, gradual promotion and
+earlier release attempts, including attempts of the same SHA. Begin the
+opening readback at successful smoke and record it before the first five-minute
+boundary, then record UTC and results every five minutes and at close. Each
+readback confirms the deployment and version at 100%, the serving Web and API
+identities, health/readiness, authorized private listening, expected denials,
+and Web/API/Stream errors against the pre-recorded baseline and error
 threshold. Keep media probes to the approved synthetic fixture. Record only
-outcomes and safe evidence links. The watcher needs usable error and health
-readbacks even if automatic alerts are unavailable.
+outcomes and safe evidence links. The watcher and backup cover the whole
+window. The watcher needs usable error and health readbacks even if automatic
+alerts are unavailable.
 
 Switch off immediately on build drift, failed health, loss of expected access
 control, broken authorized playback or a breached error threshold. Treat lost
 coverage as a failed watch and invoke the switch-off plan. Record the trigger,
-time, recovery outcome and final allocation. A successful watch ends with all
-readbacks healthy after at least 30 minutes. Record the outcome in the release
-thread and product log. [Observability runbook](runbook-observability.md)
+time, recovery outcome and final allocation. A successful watch has healthy
+readbacks throughout and closes at least 30 minutes after the recorded smoke
+completion. Record the outcome in the release thread and product log.
+[Observability runbook](runbook-observability.md)
 
 ### Rehearse the paired backend readback offline
 
@@ -256,9 +294,9 @@ outcome records. Collect the pins separately from the watch, using the accepted
 release record and the protected rollout evidence. The verifier reads local
 files and returns success only for a complete, healthy watch. The operator
 still confirms that each evidence link resolves and supports the recorded outcome.
-For final smoke, confirm the pinned attempt's `deploy-production` job and the
-successful **Verify production serves the promoted build** step, including its
-completion time. The offline job link check only matches the release run ID.
+Use the [watch start evidence above](#watch-the-first-30-minutes) for
+`final_smoke.completed_at`. The offline job link check only matches the
+release run ID, so confirm the job and step in the pinned attempt.
 
 Both JSON objects use `schema: 1`. Use UTC timestamps with seconds and a `Z` or
 `+00:00` suffix. Private evidence links are same-record anchors of the form
@@ -320,7 +358,7 @@ receipt for release publication.
 | Protected switch-off | Executors and protected controls for Access/invites and API/media, private seed evidence for the verified maintenance Worker/deployment/version/seed SHA/module digest, sealed intent custody reference and original rollout artifact link when published, expected denials and grant expiry boundary |
 | Release review and dispatch | Independent reviewer, decision (initially `Pending`, then `APPROVE` or `BLOCK`), UTC and review reference for the pinned SHA and staging attempt, protected workflow and rollout run/attempt, final deployment/version and smoke result |
 | Dispatch readiness | Pending while an applicable journey case lacks a verdict or safe evidence reference from the pinned staging attempt, unless qualification identifies a blocker. Record Blocked for a blocker such as a failed applicable case or a [required staging receipt that cannot be verified](../ci/staging-admission.md#synthetic-handoff-when-actions-evidence-is-unavailable). Record Ready only after the [existing qualification steps](#qualify-the-candidate) are satisfied and every applicable case has a passing verdict and safe reference. Cite the evidence or blocker. |
-| Health watch and recovery | Watcher, backup, UTC start/end, health and error baseline/threshold, readback schedule and results. Actual disposition pending until the [watch](#watch-the-first-30-minutes) or [switch-off](#switch-off-and-verify) has an outcome. Record the watch result when run and whether recovery was invoked. If used, record the trigger and UTC, recovery attempt and outcome, denial and final allocation readbacks. Link the release thread and product log entries. |
+| Health watch and recovery | Watcher, backup, UTC completion of successful final smoke from the pinned rollout job as the watch start, job evidence, closing readback UTC, health and error baseline/threshold, readback schedule and results. Actual disposition pending until the [watch](#watch-the-first-30-minutes) or [switch-off](#switch-off-and-verify) has an outcome. Record the watch result when run and whether recovery was invoked. If used, record the trigger and UTC, recovery attempt and outcome, denial and final allocation readbacks. Link the release thread and product log entries. |
 
 When a scheduled readback is still pending during the watch, name the check
 and its scheduled UTC time in the private release handoff. For example, “The
