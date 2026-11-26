@@ -993,36 +993,47 @@ class CompetingJobsPaginationTests(Base):
     def setUp(self):
         self.world = World()
         self.world.add_other("skipped")
-        self.world.runs[-1].update(created_at=iso(-40), updated_at=iso(9), run_attempt=2)
-        # The first page already shows both lanes skipped in the latest attempt.
-        filler = [self.world.job(f"unrelated {i}", 8, started=6) for i in range(98)]
-        skipped_lanes = [dict(job, started_at=iso(6), completed_at=iso(6))
-                         for job in self.world.others[101]]
-        self.first_jobs = [dict(job, run_id=101, head_sha=OTHER_SHA, run_attempt=2)
-                           for job in skipped_lanes + filler]
-        self.earlier_api = dict(self.world.job("staging-api", -15, started=-30, steps=[
+        latest_attempt = 15
+        self.world.runs[-1].update(created_at=iso(-40), updated_at=iso(16), run_attempt=latest_attempt)
+        names = ("gate", "staging-web", "staging-api", "staging-mb", "staging-ingest",
+                 "staging-stream", "Retire the selected private staging fixture")
+        # The latest reruns skipped deployment. With newer attempts on page
+        # one, the original attempt's API deployment is only on page two.
+        history = []
+        for attempt in range(latest_attempt, 0, -1):
+            done = attempt if attempt > 1 else -18
+            for name in names:
+                if (attempt, name) != (1, "staging-api"):
+                    history.append(dict(self.world.job(name, done, started=done - 1), run_id=101,
+                                        head_sha=OTHER_SHA, run_attempt=attempt,
+                                        conclusion="success" if name == "gate" else "skipped"))
+        self.earlier_api = dict(self.world.job("staging-api", -15, started=-17, steps=[
             self.world.step("Deploy api to staging", 1),
         ]), run_id=101, head_sha=OTHER_SHA)
+        self.total = len(history) + 1
+        self.first_jobs, self.remaining_jobs = history[:100], history[100:]
         self.routes = self.world.routes()
-        self.routes[self.first] = page("jobs", self.first_jobs, total=101)
+        self.routes[self.first] = page("jobs", self.first_jobs, total=self.total)
 
     def test_decisive_deployment_on_second_page(self):
-        self.routes[self.second] = page("jobs", [self.earlier_api], total=101)
+        self.routes[self.second] = page("jobs", self.remaining_jobs + [self.earlier_api], total=self.total)
         actions = FakeActions(self.routes)
         self.assertEqual(self.world.verify_with_actions(actions), self.world.receipt)
         self.assertEqual([route for route in actions.calls if "jobs?filter=all" in route],
                          [self.first, self.second])
 
         late_api = dict(self.earlier_api, completed_at=iso(-1))
-        self.routes[self.second] = page("jobs", [late_api], total=101)
+        self.routes[self.second] = page("jobs", self.remaining_jobs + [late_api], total=self.total)
         self.assertWorldRefused(self.world, "intervening staging deployment", routes=self.routes)
 
     def test_refuses_missing_or_inconsistent_second_page(self):
         for case, payload, reason in (
             ("missing", None, "unavailable"),
-            ("short", page("jobs", [], total=101), "incomplete or exhausted jobs"),
-            ("count drift", page("jobs", [self.earlier_api], total=102), "incomplete or exhausted jobs"),
-            ("overlap", page("jobs", [self.first_jobs[-1]], total=101), "incomplete or exhausted jobs"),
+            ("short", page("jobs", self.remaining_jobs, total=self.total), "incomplete or exhausted jobs"),
+            ("count drift", page("jobs", self.remaining_jobs + [self.earlier_api], total=self.total + 1),
+             "incomplete or exhausted jobs"),
+            ("overlap", page("jobs", self.remaining_jobs + [self.first_jobs[-1]], total=self.total),
+             "incomplete or exhausted jobs"),
         ):
             with self.subTest(case=case):
                 routes = dict(self.routes)
