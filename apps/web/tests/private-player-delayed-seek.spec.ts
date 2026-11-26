@@ -87,7 +87,12 @@ test('a delayed private seek completion leaves the replacement seek pending', as
 	for (const track of tracks) {
 		await page.getByTestId(library.item).filter({ hasText: track.title }).locator(library.select).click();
 	}
-	await play.click();
+	const [firstGrant] = await Promise.all([
+		page.waitForResponse(origin + player.plays),
+		play.click()
+	]);
+	expect(firstGrant.ok()).toBe(true);
+	expect(firstGrant.request().postDataJSON()).toMatchObject({ track_id: first.id });
 	await pause(first);
 	const retired = await audio.elementHandle();
 	await retired.evaluate((node: DelayedSeekAudio) => node.delaySeeked!());
