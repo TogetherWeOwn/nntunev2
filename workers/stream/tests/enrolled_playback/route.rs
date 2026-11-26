@@ -234,3 +234,84 @@ async fn browser_stream_aborts_at_the_next_chunk_after_lease_revocation() {
     .await;
     assert_eq!(replay.unwrap_err().status, 404);
 }
+
+#[tokio::test]
+async fn successful_seek_reports_all_written_bytes_and_meters_only_new_bytes() {
+    use nntune_stream::{
+        delivered::DeliveredInterval,
+        meter_sink::{MeterBook, WindowReport},
+    };
+
+    let play_id = "private_1234567890abcdefghijkl";
+    let file_bytes = Some(FLAC.len() as u64);
+    // Both seeks write eight bytes. Only the first seek repeats four bytes.
+    for (seek, total) in [(4..12, 12), (8..16, 16)] {
+        let source = Source::new(Fault::None);
+        let mut meter = MeterBook::new("member");
+
+        for (range, observed_at, union_bytes) in [(0..8, 10, 8), (seek, 11, total)] {
+            let last = range.end - 1;
+            let request = PlayRouteRequest {
+                track_id: "track".into(),
+                token: Some(TOKEN.into()),
+                range: Some(format!("bytes={}-{last}", range.start)),
+                trace_id: None,
+            };
+            let content_range = format!("bytes {}-{last}/{}", range.start, FLAC.len());
+            let output = RefCell::new(Vec::new());
+            let aborted = Cell::new(false);
+            let mut reports = Vec::new();
+            serve(
+                &request,
+                b"test only, not a deployed secret",
+                Some(&source),
+                || source.time(),
+                |head| {
+                    assert_eq!(head.status, 206);
+                    assert_eq!(head.len, 8);
+                    assert_eq!(head.content_range.as_deref(), Some(content_range.as_str()));
+                    Ok(Some(Writer {
+                        output: &output,
+                        fault: Fault::None,
+                        aborted: &aborted,
+                        revoke_on_write: None,
+                    }))
+                },
+                |receipt| reports.push(receipt),
+            )
+            .await
+            .unwrap();
+
+            assert!(!aborted.get());
+            let output = output.into_inner();
+            assert_eq!(output, FLAC[range.clone()]);
+            let start = range.start as u64;
+            let cursor = start + output.len() as u64;
+            assert_eq!(
+                reports,
+                [DeliveredInterval {
+                    user_id: "member".into(),
+                    play_id: play_id.into(),
+                    track_id: "track".into(),
+                    start,
+                    end: cursor,
+                    file_bytes,
+                }]
+            );
+            assert!(meter.record(&reports[0], observed_at));
+            assert_eq!(meter.plays.len(), 1);
+            assert_eq!(
+                meter.pending_windows(),
+                [WindowReport {
+                    user_id: "member".into(),
+                    play_id: play_id.into(),
+                    track_id: "track".into(),
+                    union_bytes,
+                    file_bytes,
+                    started_at: 10,
+                }],
+                "after delivering {range:?}"
+            );
+        }
+    }
+}
