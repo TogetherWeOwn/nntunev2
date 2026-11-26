@@ -206,6 +206,7 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   let fullRange = false;
   let fullRangeEnd = 65_616;
   let stallTail;
+  let truncateTail;
   const fetches = [];
   const reports = [];
   const server = createServer({
@@ -222,6 +223,14 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
       'x-amz-version-id': page ? observedPageVersion : (mediaVersionOverride ?? 'version+/%?=&'),
     };
     if (!page) headers['content-range'] = fullRange ? `bytes 0-${fullRangeEnd}/${reportedSealedLength}` : seekContentRange;
+    if (!page && truncateTail) {
+      const truncated = truncateTail;
+      truncateTail = undefined;
+      res.writeHead(206, { ...headers, connection: 'close' });
+      res.write(bytes.subarray(0, -1));
+      truncated(() => res.end());
+      return;
+    }
     res.writeHead(page ? 200 : 206, headers);
     if (!page && stallTail) {
       res.once('close', () => stallTail(res.writableFinished));
@@ -688,10 +697,44 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     // origin must close before sending the final frame and before expiry.
     assert.equal(req.signal.aborted, false);
     assert.equal(await closed, false);
+    stallTail = undefined;
     await settled;
     assert.deepEqual(events(), [started, completed, started, aborted]);
     assert.deepEqual(reports.at(-1), {
       user_id: 'member', play_id: play, track_id: 'track', start: 0, end: 65_536, file_bytes: 65_537,
     });
+  });
+
+  await t.test('a short pinned range aborts and a retry delivers only the missing bytes', { timeout: 5_000 }, async () => {
+    const firstFetch = fetches.length;
+    const firstReport = reports.length;
+    const identity = { user_id: 'member', play_id: play, track_id: 'track', file_bytes: plaintext.length };
+    const prefix = { ...identity, start: 65_534, end: 65_536 };
+    const tail = { ...identity, start: 65_536, end: 65_537 };
+    const providerClose = new Promise(resolve => { truncateTail = resolve; });
+    const { req, response, settled } = await open({}, '/play/track', bearer, { range: 'bytes=65534-65536' });
+    assert.equal(response.status, 206);
+    assert.equal(response.headers.get('content-range'), 'bytes 65534-65536/65537');
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    assert.equal(first.done, false);
+    assert.deepEqual(Buffer.from(first.value), Buffer.from('XY'));
+    // Close the provider connection after playback has consumed the verified prefix.
+    const closeProvider = await providerClose;
+    closeProvider();
+    // Worker aborts the writer without a reason. A close would hit the fixture's length assertion.
+    await assert.rejects(reader.read(), reason => reason === undefined, 'the Worker must abort the response');
+    assert.equal(req.signal.aborted, false);
+    await settled;
+    assert.deepEqual(fetches.slice(firstFetch), ['media', 'page']);
+    assert.deepEqual(reports.slice(firstReport), [prefix]);
+
+    fullRange = false;
+    const retry = await request();
+    assert.equal(retry.response.status, 206);
+    assert.equal(retry.response.headers.get('content-range'), 'bytes 65536-65536/65537');
+    assert.deepEqual(Buffer.concat([Buffer.from(first.value), retry.bytes]), Buffer.from('XYZ'));
+    assert.deepEqual(fetches.slice(firstFetch), ['media', 'page', 'media', 'page']);
+    assert.deepEqual(reports.slice(firstReport), [prefix, tail]);
   });
 });
