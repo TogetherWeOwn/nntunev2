@@ -17,12 +17,13 @@ test('Refresh keeps Find active when its last invited Library match disappears',
 		const request = route.request();
 		const { origin: requestOrigin, pathname, search } = new URL(request.url());
 		if (requestOrigin !== origin || request.method() !== 'GET') return route.abort();
-		if (!search && (pathname === library.api || pathname === verifierPath)) {
+		const listingIndex = pathname === library.api ? listingReads++ : undefined;
+		if (!search && (listingIndex !== undefined || pathname === verifierPath)) {
 			if (!hasFixtureSession(await request.headerValue('cookie'), listener)) {
 				return route.fulfill({ status: 401 });
 			}
-			if (pathname === verifierPath) return route.fulfill({ json: { session_binding: binding } });
-			const listing = snapshots[listingReads++];
+			if (listingIndex === undefined) return route.fulfill({ json: { session_binding: binding } });
+			const listing = snapshots[listingIndex];
 			if (!listing) return route.fulfill({ status: 404 });
 			return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: listing });
 		}
