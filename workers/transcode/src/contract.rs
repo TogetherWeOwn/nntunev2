@@ -595,6 +595,13 @@ mod capped_reply_read_tests {
     }
 
     #[test]
+    fn accepts_empty_chunk_at_cap() {
+        let mut body = vec![7u8; MAX_RESULT_BYTES];
+        assert!(push_chunk_capped(&mut body, &[], MAX_RESULT_BYTES));
+        assert_eq!(body.len(), MAX_RESULT_BYTES);
+    }
+
+    #[test]
     fn rejects_chunk_crossing_cap_by_one_byte_without_retaining_it() {
         let mut body = vec![0u8; MAX_RESULT_BYTES - 3];
         assert!(!push_chunk_capped(
