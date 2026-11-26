@@ -6,7 +6,7 @@ const { readFileSync } = require('node:fs');
 const { createServer } = require('node:https');
 const { test } = require('node:test');
 const { setImmediate } = require('node:timers/promises');
-const { make_s3_fixture, fetch: streamFetch } = require('./s3_stream_wasm.cjs');
+const { make_s3_fixture, fetch: streamFetch, NntpPool } = require('./s3_stream_wasm.cjs');
 
 const path = '/fixture-media/media/00000000000040008000000000000003/00000000000040008000000000000004';
 const query = 'versionId=version%2B%2F%25%3F%3D%26';
@@ -186,9 +186,12 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   const grantKey = 'fixture-only-play-grant-key-material';
   const custodyKey = 'fixture-only-transport-authentication-key';
   const play = 'private_1234567890abcdefghijkl';
-  const payload = Buffer.from(`member|track|${play}|42|${expires}|${hash(plaintext)}`).toString('base64url');
-  const signed = `v4.${payload}`;
-  const bearer = `${signed}.${mac(grantKey, signed).toString('base64url')}`;
+  function grant(track, playId, epoch) {
+    const payload = Buffer.from(`member|${track}|${playId}|${epoch}|${expires}|${hash(plaintext)}`).toString('base64url');
+    const signed = `v4.${payload}`;
+    return `${signed}.${mac(grantKey, signed).toString('base64url')}`;
+  }
+  const bearer = grant('track', play, 42);
   const original = JSON.parse(fixture.custody(bearer, expires));
   const sealedLength = fixture.full_ciphertext().length;
   let reportedSealedLength = sealedLength;
@@ -237,14 +240,20 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
 
   const custody = [];
   class Fetcher {
+    constructor(token = bearer, writeBatch) {
+      this.token = token;
+      this.writeBatch = writeBatch;
+    }
+
     async fetch(req) {
       const { origin, pathname } = new URL(req.url);
       assert.equal(origin, 'https://nntune-api');
       assert.equal(req.method, 'POST');
+      if (pathname === '/internal/v1/play-windows' && this.writeBatch) return this.writeBatch(req);
       assert.equal(req.redirect, 'error');
-      assert.equal(await req.text(), bearer);
+      assert.equal(await req.text(), this.token);
       assert.equal(req.headers.get('authorization'),
-        `PlaybackCustody ${mac(custodyKey, `${pathname}\n${bearer}`).toString('hex')}`);
+        `PlaybackCustody ${mac(custodyKey, `${pathname}\n${this.token}`).toString('hex')}`);
       custody.push(pathname);
       if (pathname.endsWith('/resolve')) {
         if (resolveFault === 'oversize') {
@@ -255,16 +264,18 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
             req.signal.addEventListener('abort', () => reject(req.signal.reason), { once: true });
           });
         }
-        return Response.json(snapshot);
+        return Response.json(this.token === bearer ? snapshot : JSON.parse(fixture.custody(this.token, expires)));
       }
       return new Response(null, { status: ++leaseNo >= revokeAt ? 404 : 204 });
     }
   }
   class DurableObjectNamespace {
+    constructor(deliver) { this.deliver = deliver; }
     idFromName(user) { assert.equal(user, 'member'); return {}; }
     get() {
       return { fetch: async req => {
         assert.equal(req.url, 'https://nntp-pool/delivered');
+        if (this.deliver) return this.deliver(req);
         reports.push(await req.json());
         return new Response(null, { status: 202 });
       } };
@@ -447,6 +458,102 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     assert.deepEqual(reports.slice(firstReport), [{
       user_id: 'member', play_id: play, track_id: 'track', start: 65_534, end: 65_537, file_bytes: 65_537,
     }]);
+  });
+
+  await t.test('a transient usage write retries the batch after valid range reads', { timeout: 5_000 }, async (t) => {
+    const meterKey = 'fixture-only-meter-sink-key-material';
+    // The meter book sorts the windows by play id. The other track's
+    // write will already have landed when the second write fails.
+    const otherPlay = 'private_0000000000abcdefghijkl';
+    const otherBearer = grant('other-track', otherPlay, 41);
+    const ledger = new Map();
+    const writes = [];
+    const batches = [];
+    const deliveryStatuses = [];
+    let failWrite = true;
+    async function writeBatch(req) {
+      assert.equal(req.method, 'POST');
+      assert.equal(req.url, 'https://nntune-api/internal/v1/play-windows');
+      const body = await req.text();
+      const authorization = req.headers.get('authorization');
+      const match = /^MeterSink (\d+)\./.exec(authorization);
+      assert.ok(match, 'usage batch must be signed');
+      const [, timestamp] = match;
+      assert.equal(authorization,
+        `MeterSink ${timestamp}.${mac(meterKey, `${timestamp}.${body}`).toString('hex')}`);
+      const { windows } = JSON.parse(body);
+      batches.push(windows);
+      for (const window of windows) {
+        if (window.play_id === play && failWrite) {
+          failWrite = false;
+          return new Response(null, { status: 500 });
+        }
+        const key = `${window.user_id}/${window.track_id}/${window.play_id}`;
+        if (window.union_bytes > (ledger.get(key) ?? 0)) {
+          ledger.set(key, window.union_bytes);
+          writes.push(key);
+        }
+      }
+      return Response.json({ accepted: windows.map(window => window.play_id), fenced: [], rejected: [] });
+    }
+
+    const stored = new Map();
+    let alarm = null;
+    // Run the real pool's /delivered and alarm handlers with in-memory DO
+    // storage. The synthetic API binding supplies only the ledger boundary.
+    const storage = {
+      async get(key) { return structuredClone(stored.get(key)); },
+      async put(key, value) { stored.set(key, structuredClone(value)); },
+      async getAlarm() { return alarm; },
+      async setAlarm(date) { alarm = +date; },
+    };
+    const pool = new NntpPool({ id: { name: 'member' }, storage }, {
+      API: new Fetcher(bearer, writeBatch), METER_SINK_SECRET: meterKey,
+    });
+    t.after(() => pool.free());
+    const NNTP_POOL = new DurableObjectNamespace(async req => {
+      const reply = await pool.fetch(req);
+      deliveryStatuses.push(reply.status);
+      return reply;
+    });
+    for (const [track, token, range, contentRange, expected] of [
+      ['other-track', otherBearer, 'bytes=65535-65536', 'bytes 65535-65536/65537', 'YZ'],
+      ['track', bearer, boundedSeek.range, 'bytes 65534-65536/65537', 'XYZ'],
+    ]) {
+      const { response, bytes } = await request({ API: new Fetcher(token), NNTP_POOL },
+        `/play/${track}`, token, { range });
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-range'), contentRange);
+      assert.deepEqual(bytes, Buffer.from(expected));
+    }
+    assert.deepEqual(deliveryStatuses, [202, 202]);
+    assert.ok(alarm > Date.now(), 'delivery armed the flush');
+
+    // Model the platform consuming an alarm before invoking its handler.
+    const runAlarm = async () => {
+      assert.notEqual(alarm, null);
+      alarm = null;
+      assert.equal((await pool.alarm()).status, 200);
+    };
+    const otherKey = `member/other-track/${otherPlay}`;
+    const playKey = `member/track/${play}`;
+    await runAlarm();
+    assert.equal(batches.length, 1);
+    assert.deepEqual(batches[0].map(({ started_at, ...window }) => window), [
+      { user_id: 'member', track_id: 'other-track', play_id: otherPlay, union_bytes: 2, file_bytes: 65_537 },
+      { user_id: 'member', track_id: 'track', play_id: play, union_bytes: 3, file_bytes: 65_537 },
+    ]);
+    assert.deepEqual([...ledger], [[otherKey, 2]]);
+    assert.ok(alarm > Date.now(), 'the write error rearmed the flush');
+
+    await runAlarm();
+    assert.deepEqual(batches, [batches[0], batches[0]], 'retry sends the same cumulative windows');
+    assert.deepEqual([...ledger], [[otherKey, 2], [playKey, 3]]);
+    assert.deepEqual(writes, [otherKey, playKey]);
+    const flushed = stored.get('meter_book_v1').plays;
+    assert.equal(flushed.get(otherPlay).flushed_bytes, 2);
+    assert.equal(flushed.get(play).flushed_bytes, 3);
+    assert.equal(alarm, null, 'the accepted batch needs no further retry');
   });
 
   await t.test('a wrong encrypted object length delivers and counts no media', { timeout: 5_000 }, async (t) => {
