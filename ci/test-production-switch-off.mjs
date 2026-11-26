@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { open, readFile, writeFile } from 'node:fs/promises';
 import { finalSmokeFixture, recoveryFixture } from './fixtures/production-worker-transport.mjs';
 import { intentFile } from './production-maintenance/recovery-evidence.mjs';
 
@@ -9,6 +11,65 @@ const checkedAt = '2026-10-01T12:00:00Z';
 const now = () => Date.parse(checkedAt) + 60_000;
 const version = '12345678-1234-1234-1234-123456789abc';
 const fixture = { checkedAt, now, sha: 'a'.repeat(40), workerId: 'b'.repeat(32), version };
+
+test('rollback retries read-only after the verified summary cannot be written', async (t) => {
+  const { calls, custody, env, prepare, request, rows, run, temp } = finalSmokeFixture(t, fixture);
+  await prepare();
+  assert.equal(await run('restore'), 'Recorded maintenance allocation verified');
+  assert.deepEqual(rows[0].versions, [{ version_id: version, percentage: 100 }]);
+  assert.equal(calls.filter((method) => method === 'POST').length, 1);
+
+  const checkpoint = [intentFile, 'production-final-allocation.sealed', 'production-rollback-submitted'];
+  const readCheckpoint = () => Promise.all(checkpoint.map((name) => readFile(join(temp, name))));
+  const before = await readCheckpoint();
+  const prefix = `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/workers`;
+  const worker = `${prefix}/workers/${fixture.workerId}`;
+  const urls = [worker, `${worker}/versions/${version}`,
+    `${prefix}/scripts/nntune-web/deployments?page=1&per_page=100`];
+  const replies = [];
+  for (const url of urls) {
+    const response = await request(url, { method: 'GET', redirect: 'error', headers: { Authorization: 'Bearer fixture-only' } });
+    replies.push([url, await response.json()]);
+  }
+  const preload = `
+    import assert from 'node:assert/strict';
+    const replies = new Map(${JSON.stringify(replies)});
+    globalThis.fetch = async (url, options) => {
+      assert.equal(options.method, 'GET');
+      assert.ok(replies.has(url));
+      const response = Response.json(replies.get(url));
+      replies.delete(url);
+      return response;
+    };
+    process.on('exit', () => assert.equal(replies.size, 0, 'Expected the complete serving readback'));
+  `;
+  const summary = join(temp, 'recovery-summary');
+  await writeFile(summary, '');
+  async function restoreTo(flags) {
+    const output = await open(summary, flags);
+    try {
+      return spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+        'ci/production-maintenance/final-smoke-rollback.mjs', 'restore'], {
+        env: { ...env, ROLLBACK_CUSTODY: JSON.stringify(custody) },
+        stdio: ['ignore', output.fd, 'pipe'], encoding: 'utf8', timeout: 5_000,
+      });
+    } finally {
+      await output.close();
+    }
+  }
+
+  const failed = await restoreTo('r');
+  assert.equal(failed.status, 1, failed.stderr);
+  assert.equal(failed.stderr, '::error::Protected rollback check failed. Reconcile Worker, deployment, routes and provider audit before any retry.\n');
+  assert.equal(await readFile(summary, 'utf8'), '');
+  assert.deepEqual(await readCheckpoint(), before);
+
+  const retry = await restoreTo('w');
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.equal(retry.stderr, '');
+  assert.equal(await readFile(summary, 'utf8'), 'Recorded maintenance allocation already verified\n');
+  assert.deepEqual(await readCheckpoint(), before);
+});
 
 test('maintenance remains active when the candidate receipt cannot identify a distinct version', async (t) => {
   const { calls, rows, versions, temp, run } = finalSmokeFixture(t, fixture);
