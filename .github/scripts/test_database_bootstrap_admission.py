@@ -160,6 +160,10 @@ def check_reader_privilege_binding():
     observed = inventory | {"inventory_sha256": hashlib.sha256(retained).hexdigest()}
     missing_object = record | {"inventory": observed, "reader_privileges": privileges | observed}
     check("complete readback omits a reviewed object", missing_object, "pending (inventory-mismatch)")
+    repeated_identity = inventory | {"inventory_sha256": hashlib.sha256(retained * 2).hexdigest()}
+    check("readback repeats one identity at the expected row count",
+          record | {"inventory": repeated_identity, "reader_privileges": privileges | repeated_identity},
+          "pending (inventory-mismatch)")
     check("complete mismatched readback without privilege evidence",
           {"review": review, "inventory": observed}, "pending (inventory-mismatch)")
     check("absent inventory readback", {"review": review, "reader_privileges": privileges})
