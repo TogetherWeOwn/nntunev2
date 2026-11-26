@@ -740,8 +740,17 @@ async fn prove_attempt(
         }
         verified
     };
-    if inventory_case.is_some() {
-        let writer = resumed_writer.as_mut().unwrap_or(writer);
+    if let Some(fail_later_page) = inventory_case {
+        let writer = if fail_later_page {
+            let resumed = resumed_writer
+                .as_mut()
+                .expect("recovery must return its fresh writer for commit and replay");
+            assert_ne!(backend_pid(writer).await, backend_pid(resumed).await);
+            resumed
+        } else {
+            assert!(resumed_writer.is_none());
+            writer
+        };
         let committed = Box::pin(opened.commit_flac(
             writer,
             auth,
