@@ -1,4 +1,4 @@
-import { expect, type Page } from '@playwright/test';
+import { expect, type Page, type Route } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../../e2e/helpers/private-music-journey.js';
 import { fixtureCookie, hasFixtureSession, serveFlac } from '../helpers/private-music-fixture.js';
 
@@ -11,7 +11,7 @@ type LibraryTrack = { id: string; title: string; duration_ms: number };
 export async function mockInvitedLibraryPlayback(page: Page, origin: string, fixture: {
 	libraryItems: () => LibraryTrack[];
 	playableTrackId: (requestedId: string) => string | undefined;
-	audio: Buffer;
+	audio: Buffer | ((route: Route) => Promise<void>);
 	isRevoked?: () => boolean;
 }) {
 	const context = page.context();
@@ -39,6 +39,10 @@ export async function mockInvitedLibraryPlayback(page: Page, origin: string, fix
 			return route.fulfill({ status: 400 });
 		}
 		expect(input.session_id).toMatch(/^[0-9a-f-]{36}$/);
+		if (input.play_id !== undefined &&
+			(!playback || input.play_id !== playId || trackId !== playback.trackId || input.session_id !== playback.sessionId)) {
+			return route.fulfill({ status: 409 });
+		}
 		playback = { trackId, sessionId: input.session_id };
 		return route.fulfill({ json: { trackId, playbackSessionId: playback.sessionId, sessionBinding: binding, playId, durationMs: 14_000 } });
 	});
@@ -51,7 +55,7 @@ export async function mockInvitedLibraryPlayback(page: Page, origin: string, fix
 		if (!trackId || fixture.playableTrackId(trackId) !== trackId || call.url() !== `${origin}${mediaPath(trackId)}`) {
 			return route.fulfill({ status: 404 });
 		}
-		return serveFlac(route, fixture.audio);
+		return typeof fixture.audio === 'function' ? fixture.audio(route) : serveFlac(route, fixture.audio);
 	});
 
 	return {
