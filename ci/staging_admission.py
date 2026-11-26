@@ -452,6 +452,8 @@ def current_identity(env, sha):
             require(isinstance(observed, str) and SHA.fullmatch(observed), "invalid staging build identity")
             if field == "sha":
                 require(set(data) == {"sha"}, "invalid web identity shape")
+            else:
+                require(set(data) == {"ok", "build_sha"} and data["ok"] is True, "invalid API identity shape")
             if observed != sha:
                 raise CurrentStagingBuildDrift(surface)
         except (urllib.error.URLError, TimeoutError):

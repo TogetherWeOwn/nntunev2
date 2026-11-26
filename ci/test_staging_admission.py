@@ -1830,13 +1830,20 @@ class TransportTests(Base):
             def read(self, limit):
                 return json.dumps(self.data).encode()
         with patch.object(sa.urllib.request, "build_opener") as opener:
-            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"build_sha": SHA})]
+            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"ok": True, "build_sha": SHA})]
             sa.current_identity(env, SHA)
             self.assertEqual(opener.return_value.open.call_count, 2)
-            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"build_sha": OTHER_SHA})]
+            opener.return_value.open.side_effect = [
+                Response({"sha": SHA}), Response({"ok": True, "build_sha": OTHER_SHA})]
             self.refused("current staging identity drift", sa.current_identity, env, SHA)
-            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"build_sha": "unknown"})]
+            opener.return_value.open.side_effect = [
+                Response({"sha": SHA}), Response({"ok": True, "build_sha": "unknown"})]
             self.refused("invalid staging build identity", sa.current_identity, env, SHA)
+            for bad_api in ({"build_sha": OTHER_SHA}, {"ok": False, "build_sha": OTHER_SHA},
+                            {"ok": 1, "build_sha": OTHER_SHA}, {"ok": True, "build_sha": OTHER_SHA, "extra": True}):
+                with self.subTest(api=bad_api):
+                    opener.return_value.open.side_effect = [Response({"sha": SHA}), Response(bad_api)]
+                    self.refused("invalid API identity shape", sa.current_identity, env, SHA)
             opener.return_value.open.side_effect = [Response({"sha": OTHER_SHA, "extra": True})]
             self.refused("invalid web identity shape", sa.current_identity, env, SHA)
         for origin in ("http://staging.example.invalid", "https://user:pass@staging.example.invalid",
