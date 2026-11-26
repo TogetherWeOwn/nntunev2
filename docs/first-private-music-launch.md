@@ -100,17 +100,36 @@ until their evidence is available.
 
 ### Check the baseline manifest offline
 
-Set `candidate_sha` to the full commit under **Candidate** and
-`baseline_manifest_sha256` to the saved manifest digest under **Production
-baseline** in the private release record. From a local clone containing the
-candidate commit and its manifest, compare the exact manifest bytes from that
-commit with the saved digest.
+Verify the protected baseline job's run, attempt, successful conclusion and
+`empty` verdict. The [baseline job](../.github/workflows/deploy-database-baseline.yml)
+checks out the run's source SHA. Set `baseline_source_sha` to that full SHA
+under **Production baseline**. Use a full local clone containing both pinned
+commits and manifest blobs. Define this helper in the Bash shell used for each
+step.
+
+```bash
+manifest_digest() (
+  [[ ${1-} =~ ^[0-9a-f]{40}$ ]] || exit 1
+  set -o pipefail
+  manifest_hash=$(git --no-replace-objects cat-file blob \
+    "${1}:migrations/manifest.toml" | sha256sum) || exit 1
+  printf '%s\n' "${manifest_hash%% *}"
+)
+```
+
+Record the successful output of `manifest_digest "${baseline_source_sha:?}"`
+as the manifest digest under **Production baseline**.
+
+To verify the handoff, set `candidate_sha` to the full commit under **Candidate**
+and `baseline_manifest_sha256` to the saved digest. Verify the saved digest
+against both the protected run's source and the candidate commit.
 
 ```bash
 (
-  set -o pipefail
-  manifest_hash=$(git --no-replace-objects cat-file blob "${candidate_sha:?}:migrations/manifest.toml" | sha256sum) || exit 1
-  test "${manifest_hash%% *}" = "${baseline_manifest_sha256:?}"
+  baseline_digest=$(manifest_digest "${baseline_source_sha:?}") || exit 1
+  candidate_digest=$(manifest_digest "${candidate_sha:?}") || exit 1
+  test "$baseline_digest" = "${baseline_manifest_sha256:?}" &&
+    test "$candidate_digest" = "$baseline_manifest_sha256"
 )
 ```
 
@@ -120,10 +139,10 @@ verdict fixed. Compare two saved handoffs against the same candidate.
 
 | Saved manifest digest | Result and next step |
 | --- | --- |
-| Digest from an earlier manifest revision with the same required catalog objects. | The comparison exits nonzero. Keep baseline evidence pending and migration closed. Read the pinned attempt's job and source SHA and reconcile the saved digest against that attempt's private evidence before accepting any correction. |
-| Digest of the manifest at `candidate_sha`. | The comparison exits zero. With the other baseline evidence verified, carry it forward to snapshot verification. |
+| Digest from an earlier manifest revision with the same required catalog objects. | The comparison exits nonzero. Keep baseline evidence pending and migration closed. Read the pinned attempt's job and source SHA and repeat the offline capture. Correct the saved digest only if the verified attempt's digest matches the candidate and the saved value was recorded in error. |
+| Digest of the manifest at both `baseline_source_sha` and `candidate_sha`. | The comparison exits zero. With the other baseline evidence verified, carry it forward to snapshot verification. |
 
-Keep the handoff pending if the candidate manifest cannot be read. A digest
+Keep the handoff pending if either pinned manifest cannot be read. A digest
 match verifies the manifest pin. The protected run's verdict and provenance,
 catalog coverage and reader retirement still require their existing evidence.
 
