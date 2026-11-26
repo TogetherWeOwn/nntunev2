@@ -1650,6 +1650,56 @@ stay in the old `e2e-staging` group and cannot replace a pending run in
   undoing the rollback. If the queue cannot be drained and kept clear, do
   not start a pre-lock rerun.
 
+### Offline staging writer timing
+
+Use this summary for automatic `main` pushes whose source uses the
+`deploy-staging-main` workflow lock. Select attempt 1. Its run `created_at`
+is the submission time, while a rerun needs a different time origin.
+Save the [Actions run attempt][timing-run] as `run.json` and its complete
+[attempt jobs listing][timing-jobs] as `jobs.json` from the same snapshot.
+Use the attempt-specific jobs endpoint. Its scope is needed when a job
+omits `run_attempt`.
+If the listing is paginated, combine every page under `jobs` and retain
+`total_count`. Compute the summary locally from the saved JSON.
+
+```sh
+jq -n --slurpfile run run.json --slurpfile jobs jobs.json '{run: $run[0], jobs: $jobs[0]}' |
+  python3 -I ci/incident_report.py --staging-timing
+```
+
+- `wait_before_first_job_seconds` is the earliest executing job's
+  `started_at` minus the run's `created_at`. It includes time waiting for
+  admission and for the first runner. The timestamps alone cannot attribute
+  that wait to one cause.
+- `observed_writer_seconds` is the latest executing job's `completed_at`
+  minus that same first start, once the attempt is complete. The span
+  includes idle gaps between jobs and any same-run verification. Overlapping
+  jobs count once. The workflow holds the writer through those gaps, so
+  this is a lower bound on lock occupancy. Actions provides no lock acquire
+  or release timestamp. The summary excludes queued and skipped jobs and
+  cancellations without a runner. It uses neither `run_started_at` nor
+  `updated_at` as a lock boundary.
+
+The JSON retains the run ID, attempt, source SHA, run status and conclusion,
+and job count. A pending attempt with zero jobs has an unknown wait so far
+and no observed writer span. A rejected attempt with zero jobs also has two
+`null` durations. Attribute a terminal zero-job failure to a full queue only
+with the corresponding workflow annotation. Once work starts on an active
+attempt, the first wait can be observed while the finished span remains
+`null`. Treat this as operational evidence only. Qualification still uses the
+[attempt-bound staging admission receipt](../ci/staging-admission.md).
+
+Worked examples with synthetic Actions metadata. All times are UTC.
+
+| Attempt | `status` / `conclusion` | Run `created_at` | Job `started_at` → `completed_at` | Wait before first job | Observed writer span |
+| --- | --- | --- | --- | ---: | ---: |
+| 10/1 ran | `completed` / `success` | 10:00 | Gate 10:12 → 10:13, journey 10:20 → 10:32 | 720 s | 1,200 s |
+| 11/1 still pending | `pending` / `null` | 10:00 | `[]` | `null` | `null` |
+| 12/1 rejected before jobs | `completed` / `failure` | 10:00 | `[]` | `null` | `null` |
+
+[timing-run]: https://docs.github.com/en/rest/actions/workflow-runs#get-a-workflow-run-attempt
+[timing-jobs]: https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt
+
 ### Offline staging Worker submission checks
 
 The [submission comparator](../ci/staging_worker_submission.py) runs only in
