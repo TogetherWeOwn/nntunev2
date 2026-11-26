@@ -55,9 +55,9 @@ test('the invited Library preserves a Like confirmed during an older refresh', a
 				return route.fulfill({ json: { session_binding: binding, items } });
 			}
 			if (pathname === '/v1/me/taste/session') {
-			const items = serverLiked ? [{ ...preference, signal: 'love', until: null }] : [];
-			if (++tasteReads === 2) tasteReadStarted.resolve();
-			return route.fulfill({ json: { session_binding: binding, items } });
+				const items = serverLiked ? [{ ...preference, signal: 'love', until: null }] : [];
+				if (++tasteReads === 2) tasteReadStarted.resolve();
+				return route.fulfill({ json: { session_binding: binding, items } });
 			}
 			return route.fulfill({ status: 404 });
 		}
