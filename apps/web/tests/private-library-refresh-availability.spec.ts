@@ -8,15 +8,17 @@ test('Refresh reveals a newly playable invited Library match without clearing Fi
 	const { library, player } = PRIVATE_MUSIC;
 	const recovered = { id: '00000000-0000-4000-8000-000000000031', title: 'Harbor Dusk', duration_ms: 14_000 };
 	const match = { id: '00000000-0000-4000-8000-000000000032', title: 'Harbor Dawn', duration_ms: 14_000 };
-	const nonmatch = { id: '00000000-0000-4000-8000-000000000033', title: 'Field Dawn', duration_ms: 14_000 };
-	const catalogue = [match, recovered, nonmatch];
+	const artistMatch = {
+		id: '00000000-0000-4000-8000-000000000033', title: 'Field Dawn', artist: 'Harbor Ensemble', duration_ms: 14_000
+	};
+	const catalogue = [match, recovered, artistMatch];
 	const tone = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
 	let sourceReady = false;
 	const playableTrackId = (id: string) => catalogue.some((track) =>
 		track.id === id && (track.id !== recovered.id || sourceReady)
 	) ? id : undefined;
 	const fixture = await mockInvitedLibraryPlayback(page, origin, {
-		// The private Library listing admits only tracks with a usable source.
+		// Model ADR 0012's default hiding in the synthetic listing.
 		libraryItems: () => catalogue.filter(({ id }) => playableTrackId(id)),
 		playableTrackId,
 		audio: tone.body
@@ -45,7 +47,8 @@ test('Refresh reveals a newly playable invited Library match without clearing Fi
 	await page.goto(origin + library.path);
 	await expect(rows).toHaveCount(2);
 	await expect(row(match.id)).toBeVisible();
-	await expect(row(nonmatch.id)).toBeVisible();
+	await expect(row(artistMatch.id)).toBeVisible();
+	await expect(row(artistMatch.id)).toContainText(artistMatch.artist);
 	await expect(row(recovered.id)).toHaveCount(0);
 	await scope.selectOption('title');
 	await find.fill('harbor');
@@ -61,7 +64,7 @@ test('Refresh reveals a newly playable invited Library match without clearing Fi
 	expect(listing.status()).toBe(200);
 	await expect(rows).toHaveCount(2);
 	await expect(row(match.id)).toBeVisible();
-	await expect(row(nonmatch.id)).toHaveCount(0);
+	await expect(row(artistMatch.id)).toHaveCount(0);
 	await expect(find).toHaveValue('harbor');
 	await expect(scope).toHaveValue('title');
 	await expect(refresh).toBeFocused();
