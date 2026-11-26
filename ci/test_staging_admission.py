@@ -156,6 +156,88 @@ class FakeActions(sa.Actions):
         return data
 
 
+class StagingRetirementReadbackTests(unittest.TestCase):
+    def test_skipped_retirement_requires_actual_deploy_and_prior_scope_confirmation(self):
+        repo = {"full_name": "TogetherWeOwn/nntunev2", "id": REPO_ID}
+        scope = sa.digest(b'{"fixture":"disposable-tone-a"}')
+        current, prior = "runs/100/attempts/2", "runs/90/attempts/1"
+        retire = "Retire the selected private staging fixture"
+
+        def run(run_id, attempt, sha, event):
+            return {"id": run_id, "run_attempt": attempt, "workflow_id": WORKFLOW_ID,
+                    "path": f"{sa.WORKFLOW}@refs/heads/main", "head_sha": sha,
+                    "head_branch": "main", "event": event, "status": "completed",
+                    "conclusion": "success", "repository": repo, "head_repository": repo}
+
+        def step(name, number=1, started=-10):
+            return {"name": name, "number": number, "status": "completed",
+                    "conclusion": "success", "started_at": iso(started)}
+
+        def job(run, job_id, name, conclusion, *steps):
+            return {"id": job_id, "name": name, "status": "completed", "conclusion": conclusion,
+                    "run_id": run["id"], "head_sha": run["head_sha"], "steps": list(steps)}
+
+        candidate_run = run(100, 2, SHA, "push")
+        cleanup_run = run(90, 1, OTHER_SHA, "workflow_dispatch")
+        clean = {"actions": {
+            current: candidate_run,
+            f"{current}/jobs": page("jobs", [
+                job(candidate_run, 101, retire, "skipped"),
+                job(candidate_run, 102, "staging-web", "success", step("Deploy to staging")),
+                job(candidate_run, 103, "staging-api", "success", step("Deploy api to staging")),
+            ]),
+            prior: cleanup_run,
+            f"{prior}/jobs": page("jobs", [job(cleanup_run, 400, retire, "success",
+                step("Verify the pinned staging disable deployment", started=-15),
+                step("Retire the selected tone A versions once", 2, started=-14),
+            ) | {"completed_at": iso(-11)}]),
+        }, "retirement": {"run_id": 90, "sha": OTHER_SHA, "job_id": 400,
+                          "scope_sha256": scope, "verdict": "Private staging fixture cleanup: confirmed"}}
+        aborted = copy.deepcopy(clean)
+        aborted["actions"][current]["conclusion"] = "failure"
+        _, web, api = aborted["actions"][f"{current}/jobs"]["jobs"]
+        web.update(conclusion="skipped", steps=[])
+        api.update(conclusion="failure", steps=[
+            step("Install prerequisites") | {"conclusion": "failure"},
+            step("Deploy api to staging", 2) | {"conclusion": "skipped"},
+        ])
+        unconfigured = copy.deepcopy(clean)
+        unconfigured["actions"][f"{current}/jobs"]["jobs"][2]["steps"][0]["conclusion"] = "skipped"
+        wrong_attempt = copy.deepcopy(clean)
+        wrong_attempt["actions"][f"{current}/jobs"]["jobs"][1]["run_attempt"] = 1
+        late = copy.deepcopy(clean)
+        late["actions"][f"{prior}/jobs"]["jobs"][0]["completed_at"] = iso(-9)
+        truncated = copy.deepcopy(clean)
+        truncated["actions"][f"{prior}/jobs"]["total_count"] += 1
+
+        def receipt_changed(**fields):
+            return clean | {"retirement": clean["retirement"] | fields}
+
+        cmd = [sys.executable, "-I", "-B", str(HERE / "staging_retirement_readback.py"),
+               SHA, "100", "2", scope]
+        for label, evidence, expected in (
+            ("already cleared", clean, 0),
+            ("pre-deploy abort", aborted, 1),
+            ("green API job with a skipped deploy step", unconfigured, 1),
+            ("another attempt's deploy job", wrong_attempt, 1),
+            ("cleanup completed after deployment started", late, 1),
+            ("incomplete prior jobs page", truncated, 1),
+            ("missing prior receipt", {"actions": clean["actions"]}, 1),
+            ("different scope bytes", receipt_changed(scope_sha256="c" * 64), 1),
+            ("different job's verdict", receipt_changed(job_id=401), 1),
+            ("missing positive verdict", receipt_changed(verdict=""), 1),
+        ):
+            with self.subTest(label=label):
+                result = subprocess.run(cmd, input=json.dumps(evidence), capture_output=True, text=True,
+                                        timeout=5, env={})
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(result.stderr, "")
+                if expected:
+                    self.assertTrue(result.stdout.startswith("Private staging fixture retirement: pending ("))
+                else:
+                    self.assertEqual(result.stdout, "Private staging fixture retirement: already cleared\n")
+
+
 def page(key, rows, total=None):
     return {"total_count": len(rows) if total is None else total, key: rows}
 

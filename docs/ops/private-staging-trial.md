@@ -184,6 +184,51 @@ If setup evidence is missing before arming, keep the trial disarmed. At
 closeout, retain the original pins and use the existing reconciliation path
 before clearing the cleanup settings or withdrawing cleanup access.
 
+#### Carry forward an already-cleared disposable fixture
+
+In the retirement report for an already selected ordinary `main` push, the
+`Retire the selected private staging fixture` job normally skips. The
+[workflow](../../.github/workflows/deploy.yml) runs it only on the first
+protected `main` dispatch with a cleanup scope input. A push that aborts before
+deployment can show the same skip. Use the selected attempt's `staging-web`
+and `staging-api` job records and require success of the actual deploy steps
+`Deploy to staging` and `Deploy api to staging`. A green job whose deploy step
+skipped does not establish deployment.
+
+For a disposable fixture whose original sign-off passed, reuse the read-only
+Actions run, job and verdict readback above. Match the original publication
+and both exact version pins to the retained scope bytes in protected custody.
+Keep the original sign-off filed under the successful retirement dispatch.
+The offline retirement report uses only the digest of the original scope, the
+separately recorded dispatch input and the fixed verdict line. Keep scope
+bytes, credentials and full logs out of the saved report input.
+
+```sh
+python3 -I ci/staging_retirement_readback.py "$candidate_sha" "$candidate_run_id" \
+  "$candidate_attempt" "$approved_scope_sha256" < retirement-readback.json
+```
+
+The input's `actions` object holds the authenticated GitHub REST response bodies
+from `repos/TogetherWeOwn/nntunev2/actions/`. Use keys
+`runs/<id>/attempts/<attempt>` and `runs/<id>/attempts/<attempt>/jobs` for the
+selected push and the original dispatch's attempt `1`. Save each complete jobs
+page using `per_page=100&page=1`. Use the attempt-specific routes even when a
+job row omits `run_attempt`. Check the workflow revision at each recorded SHA.
+The `retirement` object holds `run_id`, `sha`, `job_id`, `scope_sha256` and
+`verdict` from the verified original retirement record. Use the recorded
+dispatch input for `scope_sha256` and the exact fixed line from that job's
+retirement step for `verdict`. Take `approved_scope_sha256` independently from
+the original approved scope bytes. GitHub's run and jobs responses alone do
+not supply those custody records.
+
+**Already cleared** means both deploy steps succeeded in the selected attempt
+and the prior confirmed cleanup for this scope finished by the time either
+deploy step started. Keep the current job recorded as **Skipped**. If the
+candidate aborted before deploy, either deployment step lacks evidence, or
+any original scope or retirement record is missing or mismatched, record
+**Pending** for the candidate. Preserve any verified historical sign-off.
+The report checks saved evidence and grants no staging or release clearance.
+
 ### Isolated database catalog preflight
 
 The observed isolated app catalog contains provider-managed HypoPG 1.4.3 in
