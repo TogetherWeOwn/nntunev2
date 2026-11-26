@@ -462,8 +462,8 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
 
   await t.test('a transient usage write retries the batch after valid range reads', { timeout: 5_000 }, async (t) => {
     const meterKey = 'fixture-only-meter-sink-key-material';
-    // The meter book sorts the windows by play id. The other track's
-    // write will already have landed when the second write fails.
+    // Deliver this track first and use the lower play id for timestamp ties
+    // so its write lands before the one that fails.
     const otherPlay = 'private_0000000000abcdefghijkl';
     const otherBearer = grant('other-track', otherPlay, 41);
     const ledger = new Map();
