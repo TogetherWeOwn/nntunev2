@@ -693,6 +693,66 @@ def prove_baseline(cluster):
         """, "1\n", database=LAUNCH)
 
 
+def prove_repeat_readback(cluster, forward):
+    def observe():
+        result = cluster.sql(f"""
+            BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+            SELECT d.oid, c.oid, fixture_row.id,
+                   session_user = '{READER}' AND current_user = '{READER}'
+                   AND c.relowner = '{MIGRATOR}'::regrole AND c.relkind = 'r'
+                   AND has_table_privilege(current_user, c.oid, 'SELECT')
+                   AND NOT has_table_privilege(current_user, c.oid,
+                       'DELETE, TRUNCATE, TRIGGER, MAINTAIN, SELECT WITH GRANT OPTION')
+                   AND NOT has_any_column_privilege(current_user, c.oid,
+                       'INSERT, UPDATE, REFERENCES, SELECT WITH GRANT OPTION')
+            FROM baseline_readiness_fixture.required AS fixture_row
+            JOIN pg_catalog.pg_class c
+                ON c.oid = fixture_row.tableoid AND c.oid = 'baseline_readiness_fixture.required'::regclass
+            JOIN pg_catalog.pg_database d ON d.datname = current_database();
+            COMMIT;
+            """, role=READER, database=LAUNCH)
+        checked(result, "read the required table using the scoped Reader")
+        fields = result.stdout.rstrip("\n").split("|")
+        require(len(fields) == 4 and fields[2:] == ["42", "t"],
+                "verify the synthetic row and effective SELECT-only access")
+        database_oid, table_oid = map(int, fields[:2])
+        require(database_oid > 0 and table_oid > 0, "read real database and relation identities")
+        return database_oid, table_oid
+
+    launch = {"role": MIGRATOR, "database": LAUNCH}
+    cluster.ok("seed one synthetic row after the first forward run",
+               "INSERT INTO baseline_readiness_fixture.required VALUES (42);", **launch)
+    first = observe()
+    cluster.ok("run the same fixture forward SQL a second time", forward, **launch)
+    second = observe()
+    require(second == first, "preserve the required relation identity on the second readback")
+
+    def check_binding(migration, inventory, expected, verdict):
+        record = json.dumps({"migration": migration, "inventory": inventory})
+        script = Path(__file__).with_name("database_bootstrap_inventory.py")
+        result = command(sys.executable, "-IB", script, input_text=record, timeout=3)
+        require((result.returncode, result.stdout, result.stderr) == expected, verdict)
+
+    # Run and time metadata are synthetic. Keep the measured database OID
+    # and vary the migration provenance even when both SQL observations agree.
+    pins = {"branch_id": cluster.branch_id, "run_attempt": "1"}
+    prior = pins | {"database_oid": first[0], "run_id": "8101"}
+    current = pins | {"database_oid": second[0], "run_id": "8102"}
+    prior_migration = prior | {"completed_at": 1800000000}
+    prior_readback = prior | {"readback_at": 1800000060}
+    current_migration = current | {"completed_at": 1800000120}
+    current_readback = current | {"readback_at": 1800000180}
+    accepted = (0, "database-bootstrap-inventory: consistent\n", "")
+    refused = (1, "", "database-bootstrap-inventory: refused\n")
+    check_binding(prior_migration, prior_readback, accepted, "accept the original matching readback")
+    check_binding(current_migration, current_readback, accepted, "accept the repeat matching readback")
+    check_binding(current_migration, prior_readback, refused, "refuse the saved prior readback")
+    check_binding(current_migration, prior_readback | {"readback_at": current_readback["readback_at"]},
+                  refused, "refuse a recent observation bound to the prior migration run")
+    cluster.ok("restore the empty required fixture table",
+               "DELETE FROM baseline_readiness_fixture.required WHERE id = 42;", **launch)
+
+
 def prove_missing_baseline_relation(cluster, plan):
     launch = {"database": LAUNCH, "role": MIGRATOR}
     reader = {"database": LAUNCH, "role": READER}
@@ -717,15 +777,17 @@ def prove_missing_baseline_relation(cluster, plan):
         $inventory$;
     """ + sql.removeprefix(begin)
 
+    forward = "CREATE TABLE IF NOT EXISTS baseline_readiness_fixture.required (id integer);"
     cluster.ok("prepare the complete reviewed fixture inventory with no rows", f"""
         CREATE SCHEMA baseline_readiness_fixture;
-        CREATE TABLE baseline_readiness_fixture.required (id integer);
+        {forward}
         CREATE TABLE baseline_readiness_fixture.retained (id integer);
         GRANT USAGE ON SCHEMA baseline_readiness_fixture TO {READER};
         GRANT SELECT ON ALL TABLES IN SCHEMA baseline_readiness_fixture TO {READER};
     """, **launch)
     try:
         cluster.ok("accept the exact reviewed empty control", reconciled_sql, "empty\n", **reader)
+        prove_repeat_readback(cluster, forward)
         cluster.ok("remove the required empty table", "DROP TABLE baseline_readiness_fixture.required;", **launch)
         cluster.ok("confirm the remaining inventory still has no rows", sql, "empty\n", **reader)
         cluster.denied("refuse readiness despite the empty census", reconciled_sql,
@@ -1167,4 +1229,5 @@ if __name__ == "__main__":
         sys.exit(f"database-bootstrap-fixture: failed to {error}")
     except Exception:
         sys.exit("database-bootstrap-fixture: failed")
-    print("database-bootstrap-fixture: routed TLS, setup role lifecycle, baseline, isolation and teardown passed")
+    print("database-bootstrap-fixture: routed TLS, setup role lifecycle, baseline, repeat readback, "
+          "isolation and teardown passed")
