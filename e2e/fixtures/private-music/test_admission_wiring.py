@@ -25,8 +25,10 @@ DEPLOYMENT = "22222222-2222-4222-8222-222222222222"
 REDEPLOYMENT = "33333333-3333-4333-8333-333333333333"
 PRIVATE_DETAIL = "https://private.example.invalid/listen?token=disposable-canary&account=account@example.invalid"
 PRIVATE_MARKERS = (b"private.example.invalid", b"disposable-canary", b"account@example.invalid")
-TRACK_FILE = "fixtures/synthetic-flac/private-staging/tone-a.flac"
-TRACK = b"disposable synthetic track"
+AUDIO_DIR = "fixtures/synthetic-flac/private-staging"
+TRACK_FILE = f"{AUDIO_DIR}/tone-a.flac"
+PUBLISHED_TRACK = "00000000-0000-4000-8000-000000000001"
+COMPANION_TRACK = "00000000-0000-4000-8000-000000000002"
 
 
 def write(root, name, contents):
@@ -37,12 +39,13 @@ def write(root, name, contents):
 
 def setup(root, env):
     for name in ("e2e/package.json", "e2e/playwright.private-staging.config.ts", "e2e/helpers/private-staging-admission-reporter.ts",
+                 "e2e/helpers/private-staging-fixture.ts", "e2e/private-staging/track-evidence.ts",
+                 TRACK_FILE, f"{AUDIO_DIR}/tone-b.flac", f"{AUDIO_DIR}/manifest.json",
                  "ci/staging_admission.py", ".github/scripts/private_staging_evidence.py",
                  ".github/scripts/staging_api_identity.py"):
         write(root, name, (ROOT / name).read_bytes())
     (root / "e2e/node_modules").symlink_to(ROOT / "e2e/node_modules", target_is_directory=True)
     write(root, "migrations/manifest.toml", b"# disposable manifest\n")
-    write(root, TRACK_FILE, TRACK)
     # The production CLI binds the audio to the candidate's Git object.
     def git(*args):
         return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
@@ -65,12 +68,10 @@ def setup(root, env):
         "sha256": sha256(contract).hexdigest(), "spec_revision": "fixture",
         "product_approval": "fixture", "qa_approval": "fixture",
     }]}).encode())
-    proof = {"track_id": VERSION, "sha256": sha256(TRACK).hexdigest(), "build_sha": sha,
-             "run_id": env["GITHUB_RUN_ID"], "run_attempt": env["GITHUB_RUN_ATTEMPT"], "ignored": PRIVATE_DETAIL}
-    names = ["private-publication", "private-library", "private-play", "private-anonymous-refusal",
-             "private-unlisted-refusal", "private-cutoff-refusal"]
     write(root, "e2e/private-staging/fixture.spec.ts", f"""
 import {{ test }} from '@playwright/test';
+import {{ freshTrialPublication, privateStagingAudio }} from '../helpers/private-staging-fixture.js';
+import {{ privateRunIdentity, privateTrackObservation }} from './track-evidence.js';
 const detail = {json.dumps(PRIVATE_DETAIL)};
 test(detail, async ({{}}, info) => {{
   console.log(detail);
@@ -80,6 +81,21 @@ test(detail, async ({{}}, info) => {{
   if (process.env.FIXTURE_OUTCOME === 'retry' && info.retry === 0) throw new Error(detail);
   info.annotations.push({{ type: 'ignored', description: detail }});
   await info.attach(detail, {{ body: detail, contentType: 'text/plain' }});
+  const upload = privateStagingAudio().find(({{ file }}) => file === 'tone-a.flac')!;
+  const publicationReceipt = {{ trackId: '{PUBLISHED_TRACK}', sha256: upload.sha256 }};
+  const publication = freshTrialPublication(JSON.stringify(publicationReceipt), upload.sha256, ['{COMPANION_TRACK}']);
+  const libraryRow = {{ trackId: '{PUBLISHED_TRACK}' }};
+  const playReceipt = {{ trackId: process.env.FIXTURE_OUTCOME === 'other-track' ? '{COMPANION_TRACK}' : '{PUBLISHED_TRACK}' }};
+  const run = privateRunIdentity(process.env.GITHUB_SHA!, process.env.GITHUB_RUN_ID, process.env.GITHUB_RUN_ATTEMPT);
+  const observe = (type: string, observedTrackId: string) => {{
+    const proof = privateTrackObservation(run, publication, observedTrackId);
+    info.annotations.push({{ type, description: JSON.stringify({{ ...proof, ignored: detail }}) }});
+  }};
+  observe('private-publication', publication.trackId);
+  observe('private-library', libraryRow.trackId);
+  observe('private-play', playReceipt.trackId);
+  for (const type of ['private-anonymous-refusal', 'private-unlisted-refusal', 'private-cutoff-refusal'])
+    observe(type, publication.trackId);
   const phases = {json.dumps(admission.IDENTITY_PHASES)};
   for (const [index, phase] of phases.entries()) {{
     await test.step(phase, async () => info.annotations.push({{
@@ -94,8 +110,6 @@ test(detail, async ({{}}, info) => {{
       else await test.step(title, async () => {{}});
     }}
   }}
-  for (const type of {json.dumps(names)})
-    info.annotations.push({{ type, description: JSON.stringify({json.dumps(proof)}) }});
 }});
 """.encode())
 
@@ -319,11 +333,19 @@ def run_fixture(root):
         return run(args, {"FIXTURE_OUTCOME": kind})
 
     report = root / "e2e/private-staging-results/admission.xml"
-    for refusal in ("failure", "skip", "expected", "retry"):
+    for refusal in ("failure", "skip", "expected", "retry", "other-track"):
         assert playwright(refusal).returncode != 0 and not report.exists()
     result = playwright("pass")
     assert result.returncode == 0, (result.stdout, result.stderr)
-    assert {case.attrib["retry"] for case in ET.parse(report).iter("testcase")} == {"0"}
+    cases = ET.parse(report)
+    assert {case.attrib["retry"] for case in cases.iter("testcase")} == {"0"}
+    expected_track = {"track_id": PUBLISHED_TRACK, "sha256": sha256((ROOT / TRACK_FILE).read_bytes()).hexdigest(),
+                      "build_sha": env["GITHUB_SHA"], "run_id": env["GITHUB_RUN_ID"],
+                      "run_attempt": env["GITHUB_RUN_ATTEMPT"]}
+    for case, name in (("upload-to-library", "private-publication"), ("upload-to-library", "private-library"),
+                       ("play", "private-play")):
+        properties = cases.findall(f"./testcase[@name='{case}']/properties/property[@name='{name}']")
+        assert [json.loads(prop.attrib["value"]) for prop in properties] == [expected_track], name
     assert all(marker not in report.read_bytes() for marker in PRIVATE_MARKERS)
     empty_policy = b'{"schema":1,"evaluator":"junit-map-v1","approvals":[]}'
     policy = root / admission.POLICY
@@ -391,7 +413,8 @@ def run_fixture(root):
     assert result.returncode == 0, (result.stdout, result.stderr)
     saved = receipt.read_bytes()
     assert all(marker not in saved for marker in PRIVATE_MARKERS)
-    assert json.loads(saved)["result"] == "satisfied"
+    recorded = json.loads(saved)
+    assert recorded["result"] == "satisfied" and recorded["private_track"] == expected_track
     policy.write_bytes(empty_policy)
     assert run(command).returncode != 0 and json.loads(receipt.read_bytes())["result"] == "incomplete"
 

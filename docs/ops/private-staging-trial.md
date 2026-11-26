@@ -95,6 +95,33 @@ If dedicated PostgreSQL provisioning stops partway through, use the
    publication and versioned storage pins for cleanup. Keep tone B's pins
    separately for its recorded disposition.
 
+### Rehearse the verifier handoff offline
+
+The hosted [`e2e-lint` job](../../.github/workflows/ci.yml) runs the offline
+test **private staging reporter and receipt wiring with disposable evidence**.
+For a [focused reproduction of that test's failure](../../CONTRIBUTING.md#focused-reproduction-only),
+run from the repository root with the pinned `e2e` dependencies installed.
+The hosted job uses Node 26, Python 3.13 and `jq` 1.8.2. The fixture finds
+Bash, Git, `python3` and `jq` on `PATH` in a clean environment. Check that
+`env -i PATH="$PATH" python3 --version` and
+`env -i PATH="$PATH" jq --version` work. If Python needs a private library
+path, use the launcher from the job's **Preserve Python runtime for isolated
+helper subprocesses** step.
+
+```sh
+python3 -B -I e2e/fixtures/private-music/test_admission_wiring.py "$(command -v node)"
+```
+
+The disposable runner checks the original tone A FLAC against its manifest,
+then passes the synthetic publication, Library row and play receipt through
+the staging journey's observation helper. It checks that
+`private-publication`, `private-library` and `private-play` carry the same
+track ID, digest, build, run and attempt in `admission.xml`. The existing
+receipt step must carry those fields into `private_track` in
+`staging-admission.json`. A play receipt for the companion track must fail
+with no report. Use the result as an offline handoff check. Live qualification
+and admission still require the protected run's evidence.
+
 ## Retire and recover
 
 1. **Contain and retire the selected fixture (77c).** Stop new trial activity.
