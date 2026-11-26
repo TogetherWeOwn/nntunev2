@@ -610,3 +610,25 @@ snapshot `fixture-a` and the response names the existing label
 | The response names only the label. | Keep migration closed pending readback. |
 | The same label points to `fixture-b` on the same branch, captured before setup and completed after setup. | Keep migration closed. The readback identifies a different snapshot, and the capture predates setup. |
 | The readback identifies `fixture-a` and confirms a successful capture after setup with the reviewed timing and restore scope. | The offline check accepts the complete evidence. The separate protected release checks still apply. |
+
+## Post-migration schema inventory
+
+Before app cutover, reconcile the current migration manifest and ledger on
+the launch database. Keep the schema inventory readback and its provenance
+in private custody. Run the [offline inventory check](../.github/scripts/database_bootstrap_inventory.py)
+from the repository root with `python3 -IB .github/scripts/database_bootstrap_inventory.py < inventory-binding.json`.
+
+Supply exactly two JSON objects under `migration` and `inventory` in one
+record. Both contain `branch_id`, the integer `database_oid`, and the decimal
+strings `run_id` and `run_attempt`. Take the `migration` fields and integer
+`completed_at` from the current successful protected migration. Take the
+`inventory` fields and integer `readback_at` from the saved readback and its
+recorded provenance. Use UTC Unix seconds. Keep the run and attempt from that
+provenance when preparing the record.
+
+The checker reads up to 4 KiB and returns `consistent` only when the branch,
+database OID, run and attempt match and the readback follows completion. A
+recent readback associated with an earlier migration run still refuses.
+On refusal or missing provenance, keep cutover pending until a readback for
+the current run can be verified. Confirm provenance and schema completeness
+separately during the manifest and ledger reconciliation.
