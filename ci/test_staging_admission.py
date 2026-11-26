@@ -1750,6 +1750,19 @@ class StagingPushReadbackTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stderr, json.loads(result.stdout)),
                          (1, b"", {"status": "pending"}))
 
+    def add_completed_push(self, snapshot, *, run_id, run_number):
+        head = "d" * 40
+        runs = snapshot["runs"]["workflow_runs"]
+        snapshot["runs"] = page("workflow_runs", [*runs, dict(
+            self.world.run, id=run_id, run_number=run_number, head_sha=head,
+        )])
+        snapshot["comparisons"][self.compare_route(head)] = self.comparison(head)
+        jobs = [dict(job, run_id=run_id, head_sha=head, started_at=iso(6), completed_at=iso(7))
+                for job in self.world.jobs]
+        jobs[-1].update(started_at=iso(8), completed_at=iso(10))
+        snapshot["jobs"][f"runs/{run_id}/attempts/1/jobs"] = page("jobs", jobs)
+        return head, jobs
+
     def test_nominates_ordinary_descendant_for_exact_attempt_verification(self):
         snapshot = self.snapshot()
         result = self.readback(snapshot)
@@ -1764,6 +1777,32 @@ class StagingPushReadbackTests(unittest.TestCase):
 
         other_runs = [run for run in snapshot["runs"]["workflow_runs"] if run["id"] != RUN_ID]
         snapshot["runs"] = page("workflow_runs", other_runs)
+        self.assert_pending(snapshot)
+
+    def test_most_recent_completed_journey_wins_even_when_creation_order_differs(self):
+        for run_id, run_number in ((102, 31), (94, 8)):
+            with self.subTest(run_number=run_number):
+                snapshot = self.snapshot()
+                head, jobs = self.add_completed_push(snapshot, run_id=run_id, run_number=run_number)
+                result = self.readback(snapshot)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"status": "nominated", "sha": head,
+                                                             "run_id": str(run_id), "run_attempt": "1"})
+                for job, original in zip(jobs, self.world.jobs):
+                    job.update(started_at=original["started_at"], completed_at=original["completed_at"])
+                self.assert_pending(snapshot)
+
+    def test_completed_skipped_attempt_does_not_mask_qualifying_push(self):
+        snapshot = self.snapshot()
+        _, jobs = self.add_completed_push(snapshot, run_id=95, run_number=9)
+        for job in jobs:
+            job.update(conclusion="skipped", started_at=None, completed_at=None, steps=[])
+        result = self.readback(snapshot)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"status": "nominated", "sha": SHA,
+                                                     "run_id": str(RUN_ID), "run_attempt": "1"})
+
+        jobs[-1]["run_attempt"] = 2
         self.assert_pending(snapshot)
 
     def test_ancestry_must_be_bound_to_the_selected_push_head(self):

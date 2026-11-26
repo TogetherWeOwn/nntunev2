@@ -7,7 +7,7 @@ import sys
 
 from staging_admission import (
     DEPLOY_STEPS, JOURNEY, MAX_RUN_PAGE, PENDING_RUN_STATES, SHA,
-    TERMINAL_CONCLUSIONS, WORKFLOW, Refused, decimal, parse_json, require,
+    TERMINAL_CONCLUSIONS, WORKFLOW, Refused, decimal, parse_json, require, timestamp,
 )
 
 
@@ -78,26 +78,40 @@ def nominate(evidence, *, squash, repo, repository_id):
         seen_numbers.add(number)
         # The existing verifier resolves the highest run ID for a SHA.
         current = latest_by_sha.get(head)
-        if current is None or run_id > current[1]:
-            latest_by_sha[head] = (number, run_id, attempt, status, conclusion)
+        if current is None or run_id > current[0]:
+            latest_by_sha[head] = (run_id, attempt, status, conclusion)
 
-    ordered = sorted(latest_by_sha.items(), key=lambda item: item[1][0])
-    for head, (_, run_id, attempt, status, conclusion) in ordered:
+    candidates = []
+    for head, (run_id, attempt, status, conclusion) in latest_by_sha.items():
         # Only a completed first attempt can be handed to the verifier.
         if (attempt, status, conclusion) != ("1", "completed", "success"):
             continue
         if not contains_squash(comparisons, squash, head):
             continue
         attempt_jobs = complete_page(jobs.get(f"runs/{run_id}/attempts/{attempt}/jobs"), "jobs")
+        required_jobs = {}
         for name in (*DEPLOY_STEPS, JOURNEY):
             matches = [job for job in attempt_jobs if job["name"] == name]
             require(len(matches) == 1, "missing or ambiguous staging job")
             job = matches[0]
             require(decimal(job["run_id"]) == str(run_id) and decimal(job["run_attempt"]) == attempt
                     and job["head_sha"] == head and job["status"] == "completed"
-                    and job["conclusion"] == "success", "unsuccessful or mismatched staging job")
-        return {"status": "nominated", "sha": head, "run_id": str(run_id), "run_attempt": attempt}
-    raise Refused("no eligible staging attempt")
+                    and job["conclusion"] in TERMINAL_CONCLUSIONS, "incoherent staging job")
+            required_jobs[name] = job
+        if any(job["conclusion"] != "success" for job in required_jobs.values()):
+            continue
+        # The ordinary journey follows both deploy jobs in the shared writer
+        # group. Queued runs can complete in a different order from creation.
+        completed = timestamp(required_jobs[JOURNEY]["completed_at"])
+        require(all(timestamp(required_jobs[name]["completed_at"]) <= completed for name in DEPLOY_STEPS),
+                "journey completed before deployment")
+        candidates.append((completed, head, str(run_id), attempt))
+
+    require(candidates, "no eligible staging attempt")
+    candidates.sort(reverse=True)
+    completed, head, run_id, attempt = candidates[0]
+    require(len(candidates) == 1 or completed != candidates[1][0], "ambiguous deployment order")
+    return {"status": "nominated", "sha": head, "run_id": run_id, "run_attempt": attempt}
 
 
 def main():
