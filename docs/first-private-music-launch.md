@@ -252,11 +252,20 @@ Access writers as required by [protected recovery](ops.md#protected-production-w
    On an ambiguous result reconcile allocation, reservation and audit before
    any retry. [Protected recovery](https://github.com/TogetherWeOwn/nntunev2/pull/1783)
 3. Read back the pinned maintenance version at 100%, private Access denials
-   and the maintenance response through an authorized probe. Use the separately
-   approved backend controls to stop new grants and verify direct API and media
-   denial, including across existing sessions and a previously issued media
-   grant. A signed grant can survive cohort revocation until expiry. Keep the
-   service fenced and verify denial before declaring switch-off complete.
+   and the maintenance response through an authorized probe.
+   From the pinned Worker's deployment history, record the ID of the deployment
+   whose recovery marker and preceding rollout history match the selected
+   recovery attempt. See the [allocation readback example](ops/first-release-recovery-example.md#evidence-allocation).
+   Match the serving deployment ID from the provider readback accompanying
+   the probe to that recorded ID.
+   If the IDs differ, keep switch-off **Pending** and the writer freeze
+   in place. Repeat the authorized maintenance readback for the recorded
+   recovery deployment.
+   Use the separately approved backend controls to stop new grants and verify
+   direct API and media denial, including across existing sessions and a
+   previously issued media grant. A signed grant can survive cohort revocation
+   until expiry. Keep the service fenced and verify denial before declaring
+   switch-off complete.
    Preserve the database and snapshot. Record the job, allocation and denial
    readbacks and then retire the temporary release-window controls.
 
