@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Report trusted completed gates using the first-party keyed incident pattern.
 
-Only API job/step conclusions are public evidence here: never logs, artifacts,
-secrets, triggering-run source, or exception response bodies. Stdlib only.
+Use API job/step conclusions for incidents, or summarize staging timing from
+saved Actions metadata. No logs, artifacts, or exception response bodies.
 """
 
 import argparse
@@ -19,6 +19,9 @@ WORKFLOWS = {"deploy.yml": {"push", "workflow_dispatch"},
              "e2e-staging.yml": {"push", "schedule", "workflow_dispatch"},
              "deploy-production.yml": {"workflow_dispatch"}}
 BAD = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
+ACTIVE = {"queued", "in_progress", "waiting", "requested", "pending"}
+OUTCOMES = BAD | {"success", "skipped", "neutral", "stale"}
+MAX_STAGING_TIMING_INPUT = 2 * 1024 * 1024
 # The successful evidence step prevents skipped/unconfigured jobs from closing
 # an incident. Keys are job names from the reviewed default-branch workflows.
 GATES = {
@@ -134,6 +137,81 @@ def trusted(run):
             and run.get("status") == "completed"
             and run.get("event") in WORKFLOWS[workflow]
             and re.fullmatch(r"[0-9a-f]{40}", run.get("head_sha", "")) is not None)
+
+
+def actions_time(value):
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError
+    return parsed
+
+
+def staging_timing(evidence):
+    """Summarize the observed job span of one automatic staging attempt."""
+    try:
+        run, listing = evidence["run"], evidence["jobs"]
+        run_id, attempt, sha = run["id"], run["run_attempt"], run["head_sha"]
+        status, conclusion = run["status"], run["conclusion"]
+        if (type(run_id) is not int or run_id <= 0 or type(attempt) is not int or attempt != 1
+                or not re.fullmatch(r"[0-9a-f]{40}", sha)
+                or run["path"] != ".github/workflows/deploy.yml"
+                or run["event"] != "push" or run["head_branch"] != "main"
+                or run["head_repository"]["full_name"] != REPO
+                or not (status == "completed" and conclusion in OUTCOMES
+                        or status in ACTIVE and conclusion is None)):
+            raise ValueError
+        created = actions_time(run["created_at"])
+        jobs, count = listing["jobs"], listing["total_count"]
+        if not isinstance(jobs, list) or type(count) is not int or count != len(jobs):
+            raise ValueError
+
+        seen, starts, ends = set(), [], []
+        for job in jobs:
+            job_id, job_status, outcome = job["id"], job["status"], job["conclusion"]
+            job_attempt = job.get("run_attempt", attempt)
+            if (type(job_id) is not int or job_id <= 0 or job_id in seen
+                    or type(job["run_id"]) is not int or job["run_id"] != run_id
+                    or type(job_attempt) is not int or job_attempt != attempt or job["head_sha"] != sha
+                    or not (job_status == "completed" and outcome in OUTCOMES
+                            or job_status in ACTIVE and outcome is None and status != "completed")):
+                raise ValueError
+            seen.add(job_id)
+            if job_status not in {"in_progress", "completed"} or outcome == "skipped":
+                continue
+            runner_id = job.get("runner_id")
+            if outcome == "cancelled" and (type(runner_id) is not int or runner_id <= 0):
+                continue
+            start = actions_time(job["started_at"])
+            if start < created:
+                raise ValueError
+            starts.append(start)
+            if job_status == "completed":
+                end = actions_time(job["completed_at"])
+                if end < start:
+                    raise ValueError
+                ends.append(end)
+    except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
+        raise ReportError("Invalid staging timing metadata") from None
+
+    first = min(starts) if starts else None
+    return {
+        "run_id": run_id, "run_attempt": attempt, "head_sha": sha,
+        "status": status, "conclusion": conclusion, "job_count": count,
+        "wait_before_first_job_seconds": (first - created).total_seconds() if first else None,
+        "observed_writer_seconds": (max(ends) - first).total_seconds()
+        if first and status == "completed" else None,
+    }
+
+
+def print_staging_timing():
+    raw = sys.stdin.buffer.read(MAX_STAGING_TIMING_INPUT + 1)
+    if len(raw) > MAX_STAGING_TIMING_INPUT:
+        raise ReportError("Staging timing metadata exceeded bound")
+    try:
+        evidence = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise ReportError("Invalid staging timing JSON") from None
+    print(json.dumps(staging_timing(evidence)))
 
 
 def gate_result(jobs, name, evidence):
@@ -430,8 +508,14 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--run-id", type=int)
     mode.add_argument("--recent", action="store_true")
+    mode.add_argument("--staging-timing", action="store_true", help="read saved Actions JSON from stdin")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.staging_timing:
+        if args.dry_run:
+            parser.error("--staging-timing is already offline")
+        print_staging_timing()
+        return
     if (args.run_id is not None and args.run_id <= 0) or os.environ.get("GITHUB_REPOSITORY") != REPO:
         raise ReportError("Invalid incident reporting context")
     token = os.environ.get("GITHUB_TOKEN")
