@@ -1250,13 +1250,37 @@ class VerifyTests(Base):
         w.others[101][0]["completed_at"] = iso(-30)
         self.assertWorldRefused(w, "intervening staging deployment")
 
-    def test_prior_rerun_mutation_is_not_hidden_by_latest_predeploy_failure(self):
+    def test_older_run_retry_requires_complete_deployment_history(self):
         w = World()
-        w.add_other("failure")
-        w.others[101][0]["steps"] = [w.step("Prerequisite", 1, "failure"),
-                                    w.step("Deploy api to staging", 2, "skipped")]
-        w.others[101].append(dict(w.others[101][0], conclusion="success", steps=[]))
-        self.assertWorldRefused(w, "intervening staging deployment")
+        older_id = RUN_ID - 1
+        w.runs.append(dict(w.run, id=older_id, head_sha=OTHER_SHA, run_attempt=2,
+                           created_at=iso(-60), updated_at=iso(12), conclusion="failure"))
+        # The older push left the queue after the candidate journey finished.
+        # Only Web was retried. The API job remains in attempt 1's history.
+        older_job = {"run_id": older_id, "head_sha": OTHER_SHA, "conclusion": "failure"}
+        api = dict(w.job("staging-api", 7, started=6, steps=[
+            w.step("Verify actual staging migration schema (read-only)", 8, "failure"),
+            w.step("Deploy api to staging", 9, "skipped"),
+        ]), **older_job, id=201)
+        web = dict(w.job("staging-web", 9, started=8, steps=[
+            w.step("Build staging web", 7, "failure"),
+            w.step("Deploy to staging", 8, "skipped"),
+        ]), **older_job, id=202)
+        retry = dict(web, id=203, run_attempt=2, started_at=iso(10), completed_at=iso(11))
+        route = f"runs/{older_id}/jobs?filter=all&per_page=100&page=1"
+        routes = w.routes()
+        routes[route] = page("jobs", [retry, web, api])
+        self.assertEqual(w.verify(routes), w.receipt)
+
+        # A failed job can still have finished writing before its cleanup failed.
+        late_writer = dict(web, steps=[w.step("Build staging web", 7),
+                                       w.step("Deploy to staging", 8),
+                                       w.step("Post job cleanup", 20, "failure")])
+        routes[route] = page("jobs", [retry, late_writer, api])
+        self.assertWorldRefused(w, "intervening staging deployment", routes=routes)
+
+        routes[route] = page("jobs", [retry, api], total=3)
+        self.assertWorldRefused(w, "incomplete or exhausted jobs listing", routes=routes)
 
     def test_pending_rerun_cannot_reuse_historical_lanes(self):
         for status in ("queued", "waiting", "in_progress"):
