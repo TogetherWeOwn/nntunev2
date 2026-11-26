@@ -781,7 +781,7 @@ jobs:
   # service container; its password is a throwaway, not a secret.
   api-migrations:
     name: api-migrations
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     # Allow cold Rust builds to finish before the PostgreSQL test deadline.
     timeout-minutes: 25
     services:
