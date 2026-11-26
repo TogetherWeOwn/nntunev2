@@ -27,10 +27,10 @@ pub struct PublishedSource<'a> {
     pub locator: S3Locator,
 }
 
-/// Use the scoped review loader on a bounded connection. The loader must check
-/// current admin authority and use the supplied read-only snapshot for the
-/// owner, environment, library and job. Reloading the same selection checks
-/// the current publication again before returning a locator.
+/// Use a bounded connection. The review reader must check current admin
+/// authority and use the supplied read-only snapshot for the owner,
+/// environment, library and job. Reloading the same selection checks the
+/// current publication again before returning a locator.
 pub async fn select<'a>(
     auth: &Authorization<'_>,
     client: &mut Client,
