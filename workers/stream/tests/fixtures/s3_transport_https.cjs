@@ -370,11 +370,51 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     assert.equal(reports.length, reportStart);
   });
 
+  await t.test('a surplus byte in a pinned media body delivers and counts no media', async (t) => {
+    const fetchStart = fetches.length;
+    const reportStart = reports.length;
+    const fetch = globalThis.fetch;
+    let appendSurplus = true;
+    t.mock.method(globalThis, 'fetch', async (req) => {
+      const response = await fetch(req);
+      if (!appendSurplus || req.url !== `https://${host}${path}?${query}`) return response;
+      appendSurplus = false;
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-range'), span);
+      assert.equal(response.headers.get('x-amz-version-id'), 'version+/%?=&');
+      assert.equal(response.headers.get('content-length'), '17');
+      // Model the surplus at the Fetch boundary after HTTPS has framed the body.
+      const body = response.body.pipeThrough(new TransformStream({
+        flush(controller) { controller.enqueue(Uint8Array.of(0)); },
+      }));
+      return new Response(body, { status: response.status, headers: response.headers });
+    });
+
+    const refused = await request();
+    assert.equal(refused.response.status, 502);
+    assert.equal(refused.response.headers.get('content-range'), null);
+    const error = JSON.parse(refused.bytes);
+    assert.equal(error.code, 'upstream_unavailable');
+    assert.equal(error.retryable, true);
+    assert.deepEqual(fetches.slice(fetchStart), ['media', 'page']);
+    assert.deepEqual(reports.slice(reportStart), []);
+
+    const control = await request();
+    assert.equal(control.response.status, 206);
+    assert.equal(control.response.headers.get('content-range'), 'bytes 65536-65536/65537');
+    assert.deepEqual(control.bytes, plaintext.subarray(65_536));
+    assert.deepEqual(fetches.slice(fetchStart), ['media', 'page', 'media', 'page']);
+    assert.deepEqual(reports.slice(reportStart), [{
+      user_id: 'member', play_id: play, track_id: 'track', start: 65_536, end: 65_537, file_bytes: 65_537,
+    }]);
+  });
+
   const pageFaultStart = fetches.length;
+  const pageReportStart = reports.length;
   observedPageVersion = 'wrong-version';
   assert.equal(await status(), 502);
   assert.deepEqual(fetches.slice(pageFaultStart), ['media', 'page']);
-  assert.equal(reports.length, 1);
+  assert.equal(reports.length, pageReportStart);
   observedPageVersion = 'page+/%?=&';
 
   await t.test('a shifted Content-Range delivers and counts no media', async (t) => {
