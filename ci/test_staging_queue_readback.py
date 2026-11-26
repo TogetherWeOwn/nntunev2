@@ -131,6 +131,20 @@ class QueueReadbackTests(unittest.TestCase):
         self.assertEqual([row["disposition"] for row in report["runs"]],
                          ["superseded", "keep_approved", "keep_newest_eligible"])
 
+        # A selected run with no job record would otherwise be superseded by
+        # the newer eligible push. Approval must protect that exact run.
+        selected, newer = run(4, head_sha=sha), run(5)
+        selected_candidate = {"run_id": 4, "run_attempt": 1, "head_sha": sha}
+        selected_evidence = snapshot(selected, newer, jobs={4: [], 5: []})
+        selected_evidence["approval_candidate"] = selected_candidate
+        code, report = self.invoke(selected_evidence | {"approval": selected_candidate | {
+            "environment": "staging", "state": "approved"}})
+        self.assertEqual(code, 0)
+        self.assertEqual(report["runs"], [
+            {"run_id": 4, "head_sha": sha, "disposition": "keep_approved"},
+            {"run_id": 5, "head_sha": newer["head_sha"], "disposition": "keep_newest_eligible"},
+        ])
+
         # The earlier approved run has finished and is absent from the active pages.
         earlier_approval = approval | {"run_id": older["id"]}
         after_completion = snapshot(current, successor, jobs={2: [gate], 3: []})
