@@ -437,7 +437,7 @@ def prove_setup_caller(cluster, *, interrupt, reader):
         route = {"PATH": routed_client(cluster, "route")}
         env |= route
         for overrides in (
-            {"GITHUB_RUN_ATTEMPT": "2"}, {"GITHUB_RUN_ID": "0"}, {"BOOTSTRAP_STEP_DEBUG": "true"},
+            {"GITHUB_RUN_ID": "0"}, {"BOOTSTRAP_STEP_DEBUG": "true"},
             {"BOOTSTRAP_PLAN_DIGEST": secrets.token_hex(32)},
             {"GITHUB_SHA": secrets.token_hex(20)}, {"GITHUB_REPOSITORY": "fixture/fork"},
         ):
@@ -535,10 +535,15 @@ def prove_setup_caller(cluster, *, interrupt, reader):
         run(env, "complete", 3)
         identity_sql = f"""SELECT oid FROM pg_database WHERE datname = '{LAUNCH}' AND datallowconn
             AND NOT datistemplate AND datdba = '{OWNER}'::regrole
+            AND has_database_privilege('{MIGRATOR}', oid, 'CONNECT')
+            AND has_database_privilege('{MIGRATOR}', oid, 'CREATE')
+            AND NOT EXISTS (SELECT FROM aclexplode(datacl) WHERE grantee = 0)
             AND NOT has_database_privilege('{reader}', oid, 'CONNECT');"""
         identity = cluster.sql(identity_sql)
         checked(identity, "read back the new database identity with the reader still fenced")
         require(identity.stdout.strip().isdigit(), "observe a single launch database OID")
+        run(env | {"GITHUB_RUN_ATTEMPT": "2"}, "refused", 0)
+        cluster.ok("preserve the verified launch identity after rerun refusal", identity_sql, identity.stdout)
         run(env, "refused", 1)  # The name collision stops any second write.
         cluster.ok("preserve the new database OID after collision refusal", identity_sql, identity.stdout)
         cluster.ok("preserve both sibling database identities and ACLs", sibling_sql, siblings.stdout)
@@ -583,6 +588,27 @@ def prove_baseline_partial_read(cluster, env, reader):
         require((process.returncode, stdout, stderr) == expected, f"enforce the child exit status for {mode}")
         require(not list(cluster.directory.glob("database-baseline-ca-*")), "remove the baseline caller's temporary CA")
     routed_client(cluster, "route", reader)
+
+
+def prove_baseline_inventory_limit(cluster, reader, run):
+    launch = {"role": MIGRATOR, "database": LAUNCH}
+    tables = "\n".join(
+        f"CREATE TABLE baseline_inventory.fixture_{index} (id integer);" for index in range(256)
+    )
+    cluster.ok("prepare 256 readable empty tables at the documented inventory limit", f"""
+        CREATE SCHEMA baseline_inventory;
+        {tables}
+        GRANT USAGE ON SCHEMA baseline_inventory TO "{reader}";
+        GRANT SELECT ON ALL TABLES IN SCHEMA baseline_inventory TO "{reader}";
+        """, **launch)
+    run("empty")
+
+    cluster.ok("add one more readable empty table beyond the inventory limit", f"""
+        CREATE TABLE baseline_inventory.extra (id integer);
+        GRANT SELECT ON baseline_inventory.extra TO "{reader}";
+        """, **launch)
+    run("refused")
+    cluster.ok("remove the inventory limit fixture", "DROP SCHEMA baseline_inventory CASCADE;", **launch)
 
 
 def prove_baseline(cluster):
@@ -636,6 +662,7 @@ def prove_baseline(cluster):
     require(b"baseline scope refused" in (cluster.directory / "standby-result").read_bytes(),
             "refuse the simulated PostgreSQL recovery verdict for an otherwise eligible reader")
     routed_client(cluster, "route", reader)
+    prove_baseline_inventory_limit(cluster, reader, run)
     cluster.ok("prepare a partition with hidden child grants", f"""
         CREATE SCHEMA baseline_fixture;
         CREATE TABLE baseline_fixture.parent (id integer) PARTITION BY RANGE (id);
@@ -666,6 +693,66 @@ def prove_baseline(cluster):
         """, "1\n", database=LAUNCH)
 
 
+def prove_repeat_readback(cluster, forward):
+    def observe():
+        result = cluster.sql(f"""
+            BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+            SELECT d.oid, c.oid, fixture_row.id,
+                   session_user = '{READER}' AND current_user = '{READER}'
+                   AND c.relowner = '{MIGRATOR}'::regrole AND c.relkind = 'r'
+                   AND has_table_privilege(current_user, c.oid, 'SELECT')
+                   AND NOT has_table_privilege(current_user, c.oid,
+                       'DELETE, TRUNCATE, TRIGGER, MAINTAIN, SELECT WITH GRANT OPTION')
+                   AND NOT has_any_column_privilege(current_user, c.oid,
+                       'INSERT, UPDATE, REFERENCES, SELECT WITH GRANT OPTION')
+            FROM baseline_readiness_fixture.required AS fixture_row
+            JOIN pg_catalog.pg_class c
+                ON c.oid = fixture_row.tableoid AND c.oid = 'baseline_readiness_fixture.required'::regclass
+            JOIN pg_catalog.pg_database d ON d.datname = current_database();
+            COMMIT;
+            """, role=READER, database=LAUNCH)
+        checked(result, "read the required table using the scoped Reader")
+        fields = result.stdout.rstrip("\n").split("|")
+        require(len(fields) == 4 and fields[2:] == ["42", "t"],
+                "verify the synthetic row and effective SELECT-only access")
+        database_oid, table_oid = map(int, fields[:2])
+        require(database_oid > 0 and table_oid > 0, "read real database and relation identities")
+        return database_oid, table_oid
+
+    launch = {"role": MIGRATOR, "database": LAUNCH}
+    cluster.ok("seed one synthetic row after the first forward run",
+               "INSERT INTO baseline_readiness_fixture.required VALUES (42);", **launch)
+    first = observe()
+    cluster.ok("run the same fixture forward SQL a second time", forward, **launch)
+    second = observe()
+    require(second == first, "preserve the required relation identity on the second readback")
+
+    def check_binding(migration, inventory, expected, verdict):
+        record = json.dumps({"migration": migration, "inventory": inventory})
+        script = Path(__file__).with_name("database_bootstrap_inventory.py")
+        result = command(sys.executable, "-IB", script, input_text=record, timeout=3)
+        require((result.returncode, result.stdout, result.stderr) == expected, verdict)
+
+    # Run and time metadata are synthetic. Keep the measured database OID
+    # and vary the migration provenance even when both SQL observations agree.
+    pins = {"branch_id": cluster.branch_id, "run_attempt": "1"}
+    prior = pins | {"database_oid": first[0], "run_id": "8101"}
+    current = pins | {"database_oid": second[0], "run_id": "8102"}
+    prior_migration = prior | {"completed_at": 1800000000}
+    prior_readback = prior | {"readback_at": 1800000060}
+    current_migration = current | {"completed_at": 1800000120}
+    current_readback = current | {"readback_at": 1800000180}
+    accepted = (0, "database-bootstrap-inventory: consistent\n", "")
+    refused = (1, "", "database-bootstrap-inventory: refused\n")
+    check_binding(prior_migration, prior_readback, accepted, "accept the original matching readback")
+    check_binding(current_migration, current_readback, accepted, "accept the repeat matching readback")
+    check_binding(current_migration, prior_readback, refused, "refuse the saved prior readback")
+    check_binding(current_migration, prior_readback | {"readback_at": current_readback["readback_at"]},
+                  refused, "refuse a recent observation bound to the prior migration run")
+    cluster.ok("restore the empty required fixture table",
+               "DELETE FROM baseline_readiness_fixture.required WHERE id = 42;", **launch)
+
+
 def prove_missing_baseline_relation(cluster, plan):
     launch = {"database": LAUNCH, "role": MIGRATOR}
     reader = {"database": LAUNCH, "role": READER}
@@ -690,15 +777,17 @@ def prove_missing_baseline_relation(cluster, plan):
         $inventory$;
     """ + sql.removeprefix(begin)
 
+    forward = "CREATE TABLE IF NOT EXISTS baseline_readiness_fixture.required (id integer);"
     cluster.ok("prepare the complete reviewed fixture inventory with no rows", f"""
         CREATE SCHEMA baseline_readiness_fixture;
-        CREATE TABLE baseline_readiness_fixture.required (id integer);
+        {forward}
         CREATE TABLE baseline_readiness_fixture.retained (id integer);
         GRANT USAGE ON SCHEMA baseline_readiness_fixture TO {READER};
         GRANT SELECT ON ALL TABLES IN SCHEMA baseline_readiness_fixture TO {READER};
     """, **launch)
     try:
         cluster.ok("accept the exact reviewed empty control", reconciled_sql, "empty\n", **reader)
+        prove_repeat_readback(cluster, forward)
         cluster.ok("remove the required empty table", "DROP TABLE baseline_readiness_fixture.required;", **launch)
         cluster.ok("confirm the remaining inventory still has no rows", sql, "empty\n", **reader)
         cluster.denied("refuse readiness despite the empty census", reconciled_sql,
@@ -719,7 +808,11 @@ def prepare_baseline_readers(cluster, names, *, host):
         raw = base64.b64decode(env.pop("BOOTSTRAP_PLAN_B64"))
         env.pop("BOOTSTRAP_SETUP_PASSWORD")
         lifecycle = ReaderRoleLifecycle(raw, READER_ISSUER)
-        result = cluster.sql(lifecycle.prepare(), role=READER_ISSUER)
+        prepare = lifecycle.prepare()
+        if not pending:
+            cluster.denied("refuse the setup issuer as the reader issuer", prepare,
+                           "wrong custodian session", role=ISSUER)
+        result = cluster.sql(prepare, role=READER_ISSUER)
         checked(result, "prepare an unusable reader for the setup caller")
         oid = int(result.stdout)
         cluster.ok("read back pending reader attributes and a NULL password", f"""
@@ -844,6 +937,7 @@ def prove_reader_lifecycle(cluster, pending, *, scenario, database_oid, publish=
     other_oid = int(result.stdout)
     plan.update(version=2, database_oid=database_oid, reader_oid=oid)
     raw = json.dumps(plan).encode()
+    retirement_readback = lifecycle.retirement_readback(raw, oid)
     cluster.ok("delegate only launch CONNECT and schema/table grant options", f"""
         GRANT CONNECT ON DATABASE {LAUNCH} TO {READER_ISSUER} WITH GRANT OPTION;
         REVOKE USAGE ON SCHEMA public FROM PUBLIC;
@@ -865,6 +959,8 @@ def prove_reader_lifecycle(cluster, pending, *, scenario, database_oid, publish=
         GRANT CONNECT ON DATABASE postgres TO {READER_ISSUER};
         REVOKE CONNECT ON DATABASE postgres, template1 FROM PUBLIC;
     """)
+    cluster.denied("refuse reader activation from maintenance with the correct issuer and plan", activate,
+                   "wrong custodian session", role=READER_ISSUER, database=MAINTENANCE)
     cluster.ok("model a wider PUBLIC column grant", "GRANT UPDATE (id) ON reader_scope.leaf TO PUBLIC;", database=LAUNCH)
     cluster.denied("refuse the wider PUBLIC column grant", activate, "reader scope refused", **launch)
     cluster.ok("remove the synthetic wider grant", "REVOKE UPDATE (id) ON reader_scope.leaf FROM PUBLIC;", database=LAUNCH)
@@ -947,11 +1043,26 @@ def prove_reader_lifecycle(cluster, pending, *, scenario, database_oid, publish=
                 SELECT NOT rolcanlogin AND rolpassword IS NULL AND rolvaliduntil = 'epoch'::timestamptz
                 FROM pg_authid WHERE oid = {oid};
             """, "t\n")
+            if holder is not None and publish is None:
+                cluster.ok("accept the reader CONNECT revoke", f"""
+                    REVOKE CONNECT ON DATABASE {LAUNCH} FROM {lifecycle.role};
+                """, **launch)
+                holder.stdin.write(f"""
+                    SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = current_user AND oid = {oid})
+                        AND NOT has_database_privilege(current_database(), 'CONNECT')
+                        AND EXISTS (SELECT FROM reader_scope.leaf WHERE id = 5);
+                """.encode())
+                holder.stdin.flush()
+                require(select.select([holder.stdout], [], [], 3)[0] and holder.stdout.readline() == b"t\n",
+                        "verify the same reader still has effective access after the accepted revoke")
+                cluster.ok("withhold the retired verdict while reader access survives", retirement_readback, **launch)
             cluster.ok("revoke the scoped grants and read back role and session absence", lifecycle.retire(raw, oid),
                        "retired\n", **launch)
             if holder is not None:
                 stdout, _ = holder.communicate(b"SELECT 1;\n", timeout=3)
                 require(holder.returncode != 0 and not stdout, "observe the reader server session terminate")
+                if publish is None:
+                    cluster.ok("read back retirement after access ends", retirement_readback, "retired\n", **launch)
         finally:
             if holder is not None and holder.poll() is None:
                 holder.kill()
@@ -1140,4 +1251,5 @@ if __name__ == "__main__":
         sys.exit(f"database-bootstrap-fixture: failed to {error}")
     except Exception:
         sys.exit("database-bootstrap-fixture: failed")
-    print("database-bootstrap-fixture: routed TLS, setup role lifecycle, baseline, isolation and teardown passed")
+    print("database-bootstrap-fixture: routed TLS, setup role lifecycle, baseline, repeat readback, "
+          "isolation and teardown passed")

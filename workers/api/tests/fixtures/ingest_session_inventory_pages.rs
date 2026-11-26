@@ -258,7 +258,7 @@ pub(super) async fn complete<'a>(
             context,
             (BUCKET, key),
             deadline,
-            async |_| panic!("resume initiated a replacement provider upload"),
+            async |_, _| panic!("resume initiated a replacement provider upload"),
         )
         .await
         .unwrap();

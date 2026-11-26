@@ -106,9 +106,8 @@ pub async fn resolve_uploaded_playback(track: String, grant_key: String) -> Stri
         .await
         .unwrap()
         .expect("issued private playback receipt");
-    // The uploaded fixture contains 19 samples at 44.1 kHz.
     let relay = receipt.relay();
-    assert_eq!(relay.duration_ms.get(), 1);
+    assert_eq!(relay.duration_ms.get(), 14_000);
     let bearer = &relay.grant.token;
     let loaded = service
         .load_for_stream(&db, bearer, scope, now)

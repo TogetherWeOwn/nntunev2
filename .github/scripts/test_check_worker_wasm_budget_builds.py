@@ -10,6 +10,7 @@ temporary directories only.
 
 from __future__ import annotations
 
+import gzip
 import io
 import os
 import subprocess
@@ -276,6 +277,57 @@ class MainExitTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("FAIL", output)
             self.assertIn("api", output)
+
+    def test_failed_budget_publishes_sizes_from_the_same_builds(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary = root / "summary.md"
+            stale = write_fixture(root, "api")
+            unreadable = write_fixture(root, "ingest")
+            expected_gzip = len(gzip.compress(TINY_WASM, compresslevel=9, mtime=0))
+            real_is_file = Path.is_file
+
+            def fake_run(argv, **kwargs):
+                if argv == EXPECTED_API_ARGV:
+                    return fail_proc()
+                if argv == EXPECTED_ALL_ARGV[-1]:
+                    write_fixture(root, "youtube")
+                return ok_proc()
+
+            def fake_is_file(path):
+                if path == unreadable:
+                    raise PermissionError("fixture cannot be inspected")
+                return real_is_file(path)
+
+            out = io.StringIO()
+            with (
+                patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}),
+                patch.object(checker.subprocess, "run", side_effect=fake_run) as cargo,
+                patch.object(Path, "is_file", fake_is_file),
+                redirect_stdout(out),
+            ):
+                code = main(["--root", tmp, "--budget", str(expected_gzip - 1)])
+
+            self.assertEqual(code, 1)
+            self.assertEqual(
+                [call.args[0] for call in cargo.call_args_list], EXPECTED_ALL_ARGV
+            )
+            self.assertTrue(stale.is_file())
+            table = summary.read_text(encoding="utf-8")
+            self.assertEqual(table, out.getvalue())
+            self.assertIn("| `api` | n/a | n/a | n/a | n/a | error: build failed", table)
+            self.assertIn(
+                "| `ingest` | n/a | n/a | n/a | n/a | error: unreadable artifact",
+                table,
+            )
+            self.assertIn("| `mb` | n/a | n/a | n/a | n/a | error: missing artifact", table)
+            self.assertIn(
+                f"| `youtube` | 68 B | {expected_gzip} B | 68 | {expected_gzip} | ok |",
+                table,
+            )
+            self.assertIn(f"youtube: {expected_gzip} compressed bytes exceeds budget", table)
 
     def test_main_returns_0_when_all_six_pass(self):
         import tempfile

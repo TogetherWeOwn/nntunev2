@@ -125,6 +125,42 @@ def exercise(event_path):
     check(False, event=b" " * admission.MAX_EVENT_BYTES + b"{}")
 
 
+def check_reader_privilege_binding():
+    script = Path(__file__).with_name("database_bootstrap_reader_evidence.py")
+    inventory = {"branch_id": "fixture001", "database_oid": 17001, "inventory_sha256": "a" * 64}
+    review = inventory | {"reader_role": "Fixture-Reader", "reader_oid": 17002}
+    privileges = review | {"result": "passed"}
+    record = {"review": review, "inventory": inventory, "reader_privileges": privileges}
+
+    def check(case, evidence, accept=False):
+        raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
+        result = subprocess.run(
+            [sys.executable, "-IB", str(script)], input=raw, env={},
+            capture_output=True, timeout=3, check=False,
+        )
+        expected = ((0, b"database-bootstrap-reader-evidence: consistent\n", b"") if accept else
+                    (1, b"", b"database-bootstrap-reader-evidence: pending\n"))
+        if (result.returncode, result.stdout, result.stderr) != expected:
+            raise RuntimeError(f"reader privilege fixture: {case}")
+
+    for case, override in {
+        "another scoped reader": {"reader_role": "Fixture-Other-Reader", "reader_oid": 17003},
+        "same name reissued": {"reader_oid": 17003},
+        "same OID different role name": {"reader_role": "Fixture-Other-Reader"},
+        "OID encoded as a float": {"reader_oid": 17002.0},
+        "unsuccessful privilege result": {"result": "failed"},
+        "privileges checked against another inventory": {"inventory_sha256": "b" * 64},
+    }.items():
+        check(case, record | {"reader_privileges": privileges | override})
+    check("saved inventory differs from review and privileges", record | {
+        "inventory": inventory | {"inventory_sha256": "b" * 64},
+    })
+    check("missing privilege evidence", {"review": review, "inventory": inventory})
+    check("duplicate privilege object", b'{"reader_privileges": null, ' + json.dumps(record).encode()[1:])
+    check("oversized record", json.dumps(record).encode().ljust(4097))
+    check("privileges match the approved reader and inventory", record, accept=True)
+
+
 def snapshot_record(branch="fixture001"):
     at = 1800000000
     review = {
@@ -137,6 +173,52 @@ def snapshot_record(branch="fixture001"):
         "readback_at": at + 60, "expires_at": at + 3600,
     }
     return {"review": review, "snapshot": snapshot}
+
+
+def check_inventory_run_binding():
+    script = Path(__file__).with_name("database_bootstrap_inventory.py")
+    pins = {"branch_id": "fixture001", "database_oid": 40200, "run_id": "8102", "run_attempt": "1"}
+    migration = pins | {"completed_at": 1800000000}
+    inventory = pins | {"readback_at": 1800000060}
+    record = {"migration": migration, "inventory": inventory}
+
+    def check(case, evidence, *, accept=False):
+        raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
+        result = subprocess.run(
+            [sys.executable, "-IB", str(script)], input=raw,
+            capture_output=True, timeout=3, check=False,
+        )
+        expected = ((0, b"database-bootstrap-inventory: consistent\n", b"") if accept else
+                    (1, b"", b"database-bootstrap-inventory: refused\n"))
+        if (result.returncode, result.stdout, result.stderr) != expected:
+            raise RuntimeError(f"inventory fixture: {case}")
+
+    check("fresh inventory from previous run", record | {"inventory": inventory | {"run_id": "8101"}})
+    check("fresh inventory from current run", record, accept=True)
+    for case, override in {
+        "different attempt": {"run_attempt": "2"},
+        "different database": {"database_oid": 40201},
+        "different branch": {"branch_id": "fixture002"},
+        "readback before completion": {"readback_at": migration["completed_at"] - 1},
+        "readback at completion": {"readback_at": migration["completed_at"]},
+        "non-integer readback time": {"readback_at": str(inventory["readback_at"])},
+    }.items():
+        check(case, record | {"inventory": inventory | override})
+    for case, pin in {
+        "boolean OID": {"database_oid": True},
+        "invalid run ID": {"run_id": "08102"},
+        "invalid attempt": {"run_attempt": "0"},
+        "invalid branch": {"branch_id": "fixture-01"},
+    }.items():
+        check(case, {"migration": migration | pin, "inventory": inventory | pin})
+    check("missing inventory run ID", record | {
+        "inventory": {key: value for key, value in inventory.items() if key != "run_id"},
+    })
+    check("duplicate migration key", b'{"migration": null, ' + json.dumps(record).encode()[1:])
+    check("malformed record", b"{")
+    at_limit = json.dumps(record).encode().ljust(4096)
+    check("record at size limit", at_limit, accept=True)
+    check("record one byte over size limit", at_limit + b" ")
 
 
 def check_snapshot(case, evidence, accept=False, *, args=()):
@@ -246,10 +328,12 @@ if __name__ == "__main__":
     try:
         check_baseline_workflow()
         check_aborted_baseline_run_binding()
+        check_reader_privilege_binding()
         with tempfile.TemporaryDirectory(prefix="bootstrap-admission-") as temp:
             exercise(Path(temp) / "event.json")
         if Path(temp).exists():
             raise RuntimeError
+        check_inventory_run_binding()
         check_snapshot_readback()
         check_snapshot_label_retry()
     except Exception:

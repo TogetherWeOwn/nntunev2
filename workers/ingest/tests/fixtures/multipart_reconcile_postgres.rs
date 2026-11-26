@@ -140,7 +140,7 @@ async fn postgres_reconciles_a_lost_initiation() {
         &context,
         (BUCKET, &key),
         SystemTime::now() + Duration::from_secs(60),
-        async |_| {
+        async |_, _| {
             assert!(!created.replace(true));
             Err(()) // S3 allocated UPLOAD, but the response never arrived.
         },

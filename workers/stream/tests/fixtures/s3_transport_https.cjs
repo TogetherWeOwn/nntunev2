@@ -6,11 +6,12 @@ const { readFileSync } = require('node:fs');
 const { createServer } = require('node:https');
 const { test } = require('node:test');
 const { setImmediate } = require('node:timers/promises');
-const { make_s3_fixture, fetch: streamFetch } = require('./s3_stream_wasm.cjs');
+const { make_s3_fixture, fetch: streamFetch, NntpPool } = require('./s3_stream_wasm.cjs');
 
 const path = '/fixture-media/media/00000000000040008000000000000003/00000000000040008000000000000004';
 const query = 'versionId=version%2B%2F%25%3F%3D%26';
 const span = 'bytes 65600-65616/65617';
+const shiftedSpan = 'bytes 65599-65615/65617';
 const pagePath = path.replace('/media/', '/media-digests/') + '/00000000000040008000000000000006/00000000';
 const pageQuery = 'versionId=page%2B%2F%25%3F%3D%26';
 const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -98,7 +99,7 @@ test('versioned encrypted playback over a disposable HTTPS origin', { timeout: 2
     { headers: { 'x-amz-version-id': 'wrong-version' } },
     { headers: { 'x-amz-version-id': null } },
     { headers: { 'x-amz-version-id': ['version+/%?=&', 'version+/%?=&'] } },
-    { headers: { 'content-range': 'bytes 65599-65615/65617' } },
+    { headers: { 'content-range': shiftedSpan } },
     { headers: { 'content-range': 'bytes 65600-65616/65618' } },
     { headers: { 'content-range': [span, span] } },
     { headers: { 'content-length': [17, 17] } },
@@ -185,17 +186,25 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   const grantKey = 'fixture-only-play-grant-key-material';
   const custodyKey = 'fixture-only-transport-authentication-key';
   const play = 'private_1234567890abcdefghijkl';
-  const payload = Buffer.from(`member|track|${play}|42|${expires}|${hash(plaintext)}`).toString('base64url');
-  const signed = `v4.${payload}`;
-  const bearer = `${signed}.${mac(grantKey, signed).toString('base64url')}`;
+  function grant(track, playId, epoch) {
+    const payload = Buffer.from(`member|${track}|${playId}|${epoch}|${expires}|${hash(plaintext)}`).toString('base64url');
+    const signed = `v4.${payload}`;
+    return `${signed}.${mac(grantKey, signed).toString('base64url')}`;
+  }
+  const bearer = grant('track', play, 42);
   const original = JSON.parse(fixture.custody(bearer, expires));
+  const sealedLength = fixture.full_ciphertext().length;
+  let reportedSealedLength = sealedLength;
   let snapshot = original;
   let resolveFault;
   let leaseNo = 0;
   let revokeAt = Infinity;
   let host;
+  let mediaVersionOverride;
   let observedPageVersion = 'page+/%?=&';
+  let seekContentRange = span;
   let fullRange = false;
+  let fullRangeEnd = 65_616;
   let stallTail;
   const fetches = [];
   const reports = [];
@@ -204,12 +213,15 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     cert: readFileSync(process.env.NODE_EXTRA_CA_CERTS),
   }, (req, res) => {
     const page = req.url.startsWith(pagePath);
-    verifyGet(req, host, page, fullRange ? 'bytes=0-65616' : undefined);
+    verifyGet(req, host, page, fullRange ? `bytes=0-${fullRangeEnd}` : undefined);
     fetches.push(page ? 'page' : 'media');
     const bytes = Buffer.from(page ? fixture.digest_page()
-      : fullRange ? fixture.full_ciphertext() : fixture.ciphertext());
-    const headers = { 'content-length': bytes.length, 'x-amz-version-id': page ? observedPageVersion : 'version+/%?=&' };
-    if (!page) headers['content-range'] = fullRange ? 'bytes 0-65616/65617' : span;
+      : fullRange ? fixture.full_ciphertext().subarray(0, fullRangeEnd + 1) : fixture.ciphertext());
+    const headers = {
+      'content-length': bytes.length,
+      'x-amz-version-id': page ? observedPageVersion : (mediaVersionOverride ?? 'version+/%?=&'),
+    };
+    if (!page) headers['content-range'] = fullRange ? `bytes 0-${fullRangeEnd}/${reportedSealedLength}` : seekContentRange;
     res.writeHead(page ? 200 : 206, headers);
     if (!page && stallTail) {
       res.once('close', () => stallTail(res.writableFinished));
@@ -229,14 +241,20 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
 
   const custody = [];
   class Fetcher {
+    constructor(token = bearer, writeBatch) {
+      this.token = token;
+      this.writeBatch = writeBatch;
+    }
+
     async fetch(req) {
       const { origin, pathname } = new URL(req.url);
       assert.equal(origin, 'https://nntune-api');
       assert.equal(req.method, 'POST');
+      if (pathname === '/internal/v1/play-windows' && this.writeBatch) return this.writeBatch(req);
       assert.equal(req.redirect, 'error');
-      assert.equal(await req.text(), bearer);
+      assert.equal(await req.text(), this.token);
       assert.equal(req.headers.get('authorization'),
-        `PlaybackCustody ${mac(custodyKey, `${pathname}\n${bearer}`).toString('hex')}`);
+        `PlaybackCustody ${mac(custodyKey, `${pathname}\n${this.token}`).toString('hex')}`);
       custody.push(pathname);
       if (pathname.endsWith('/resolve')) {
         if (resolveFault === 'oversize') {
@@ -247,16 +265,18 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
             req.signal.addEventListener('abort', () => reject(req.signal.reason), { once: true });
           });
         }
-        return Response.json(snapshot);
+        return Response.json(this.token === bearer ? snapshot : JSON.parse(fixture.custody(this.token, expires)));
       }
       return new Response(null, { status: ++leaseNo >= revokeAt ? 404 : 204 });
     }
   }
   class DurableObjectNamespace {
+    constructor(deliver) { this.deliver = deliver; }
     idFromName(user) { assert.equal(user, 'member'); return {}; }
     get() {
       return { fetch: async req => {
         assert.equal(req.url, 'https://nntp-pool/delivered');
+        if (this.deliver) return this.deliver(req);
         reports.push(await req.json());
         return new Response(null, { status: 202 });
       } };
@@ -349,18 +369,89 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   assert.equal(await status(), 404);
   assert.equal(fetches.length, 4);
   revokeAt = Infinity;
+
+  await t.test('a mismatched media version delivers and counts no media', async (t) => {
+    const fetchStart = fetches.length;
+    const reportStart = reports.length;
+    // Use the same status, range, length and ciphertext as the successful seek.
+    mediaVersionOverride = 'wrong-version';
+    t.after(() => { mediaVersionOverride = undefined; });
+    const refused = await request();
+    assert.equal(refused.response.status, 502);
+    assert.equal(refused.response.headers.get('content-range'), null);
+    assert.equal(JSON.parse(refused.bytes).code, 'upstream_unavailable');
+    assert.deepEqual(fetches.slice(fetchStart), ['media']);
+    assert.equal(reports.length, reportStart);
+  });
+
+  await t.test('a surplus byte in a pinned media body delivers and counts no media', async (t) => {
+    const fetchStart = fetches.length;
+    const reportStart = reports.length;
+    const fetch = globalThis.fetch;
+    let appendSurplus = true;
+    t.mock.method(globalThis, 'fetch', async (req) => {
+      const response = await fetch(req);
+      if (!appendSurplus || req.url !== `https://${host}${path}?${query}`) return response;
+      appendSurplus = false;
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-range'), span);
+      assert.equal(response.headers.get('x-amz-version-id'), 'version+/%?=&');
+      assert.equal(response.headers.get('content-length'), '17');
+      // Model the surplus at the Fetch boundary after HTTPS has framed the body.
+      const body = response.body.pipeThrough(new TransformStream({
+        flush(controller) { controller.enqueue(Uint8Array.of(0)); },
+      }));
+      return new Response(body, { status: response.status, headers: response.headers });
+    });
+
+    const refused = await request();
+    assert.equal(refused.response.status, 502);
+    assert.equal(refused.response.headers.get('content-range'), null);
+    const error = JSON.parse(refused.bytes);
+    assert.equal(error.code, 'upstream_unavailable');
+    assert.equal(error.retryable, true);
+    assert.deepEqual(fetches.slice(fetchStart), ['media', 'page']);
+    assert.deepEqual(reports.slice(reportStart), []);
+
+    const control = await request();
+    assert.equal(control.response.status, 206);
+    assert.equal(control.response.headers.get('content-range'), 'bytes 65536-65536/65537');
+    assert.deepEqual(control.bytes, plaintext.subarray(65_536));
+    assert.deepEqual(fetches.slice(fetchStart), ['media', 'page', 'media', 'page']);
+    assert.deepEqual(reports.slice(reportStart), [{
+      user_id: 'member', play_id: play, track_id: 'track', start: 65_536, end: 65_537, file_bytes: 65_537,
+    }]);
+  });
+
+  const pageFaultStart = fetches.length;
+  const pageReportStart = reports.length;
   observedPageVersion = 'wrong-version';
   assert.equal(await status(), 502);
-  assert.equal(fetches.length, 6);
-  assert.equal(reports.length, 1);
-
+  assert.deepEqual(fetches.slice(pageFaultStart), ['media', 'page']);
+  assert.equal(reports.length, pageReportStart);
   observedPageVersion = 'page+/%?=&';
+
+  await t.test('a shifted Content-Range delivers and counts no media', async (t) => {
+    const fetchStart = fetches.length;
+    const reportStart = reports.length;
+    // Keep the status, version, length and authentic ciphertext from the successful seek.
+    seekContentRange = shiftedSpan;
+    t.after(() => { seekContentRange = span; });
+    const refused = await request();
+    assert.equal(refused.response.status, 502);
+    assert.equal(refused.response.headers.get('content-range'), null);
+    assert.equal(JSON.parse(refused.bytes).code, 'upstream_unavailable');
+    assert.deepEqual(fetches.slice(fetchStart), ['media']);
+    assert.equal(reports.length, reportStart);
+  });
+
   fullRange = true;
+  const boundedSeek = { range: 'bytes=65534-65540' };
   await t.test('a bounded range crossing the short final chunk ends at media EOF', { timeout: 5_000 }, async () => {
     const firstFetch = fetches.length;
     const firstReport = reports.length;
     // request() drains the body to EOF before returning.
-    const { response, bytes } = await request({}, '/play/track', bearer, { range: 'bytes=65534-65540' });
+    const { response, bytes } = await request({}, '/play/track', bearer, boundedSeek);
     assert.equal(response.status, 206);
     assert.equal(response.headers.get('content-range'), 'bytes 65534-65536/65537');
     assert.deepEqual(bytes, Buffer.from('XYZ'));
@@ -368,6 +459,180 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     assert.deepEqual(reports.slice(firstReport), [{
       user_id: 'member', play_id: play, track_id: 'track', start: 65_534, end: 65_537, file_bytes: 65_537,
     }]);
+  });
+
+  await t.test('a transient usage write retries the batch after valid range reads', { timeout: 5_000 }, async (t) => {
+    const meterKey = 'fixture-only-meter-sink-key-material';
+    // Deliver this track first and use the lower play id for timestamp ties
+    // so its write lands before the one that fails.
+    const otherPlay = 'private_0000000000abcdefghijkl';
+    const otherBearer = grant('other-track', otherPlay, 41);
+    const ledger = new Map();
+    const writes = [];
+    const batches = [];
+    const deliveryStatuses = [];
+    let failWrite = true;
+    async function writeBatch(req) {
+      assert.equal(req.method, 'POST');
+      assert.equal(req.url, 'https://nntune-api/internal/v1/play-windows');
+      const body = await req.text();
+      const authorization = req.headers.get('authorization');
+      const match = /^MeterSink (\d+)\./.exec(authorization);
+      assert.ok(match, 'usage batch must be signed');
+      const [, timestamp] = match;
+      assert.equal(authorization,
+        `MeterSink ${timestamp}.${mac(meterKey, `${timestamp}.${body}`).toString('hex')}`);
+      const { windows } = JSON.parse(body);
+      batches.push(windows);
+      for (const window of windows) {
+        if (window.play_id === play && failWrite) {
+          failWrite = false;
+          return new Response(null, { status: 500 });
+        }
+        const key = `${window.user_id}/${window.track_id}/${window.play_id}`;
+        if (window.union_bytes > (ledger.get(key) ?? 0)) {
+          ledger.set(key, window.union_bytes);
+          writes.push(key);
+        }
+      }
+      return Response.json({ accepted: windows.map(window => window.play_id), fenced: [], rejected: [] });
+    }
+
+    const stored = new Map();
+    let alarm = null;
+    // Run the real pool's /delivered and alarm handlers with in-memory DO
+    // storage. The synthetic API binding supplies only the ledger boundary.
+    const storage = {
+      async get(key) { return structuredClone(stored.get(key)); },
+      async put(key, value) { stored.set(key, structuredClone(value)); },
+      async getAlarm() { return alarm; },
+      async setAlarm(date) { alarm = +date; },
+    };
+    const pool = new NntpPool({ id: { name: 'member' }, storage }, {
+      API: new Fetcher(bearer, writeBatch), METER_SINK_SECRET: meterKey,
+    });
+    t.after(() => pool.free());
+    const NNTP_POOL = new DurableObjectNamespace(async req => {
+      const reply = await pool.fetch(req);
+      deliveryStatuses.push(reply.status);
+      return reply;
+    });
+    for (const [track, token, range, contentRange, expected] of [
+      ['other-track', otherBearer, 'bytes=65535-65536', 'bytes 65535-65536/65537', 'YZ'],
+      ['track', bearer, boundedSeek.range, 'bytes 65534-65536/65537', 'XYZ'],
+    ]) {
+      const { response, bytes } = await request({ API: new Fetcher(token), NNTP_POOL },
+        `/play/${track}`, token, { range });
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-range'), contentRange);
+      assert.deepEqual(bytes, Buffer.from(expected));
+    }
+    assert.deepEqual(deliveryStatuses, [202, 202]);
+    assert.ok(alarm > Date.now(), 'delivery armed the flush');
+
+    // Model the platform consuming an alarm before invoking its handler.
+    const runAlarm = async () => {
+      assert.notEqual(alarm, null);
+      alarm = null;
+      assert.equal((await pool.alarm()).status, 200);
+    };
+    const otherKey = `member/other-track/${otherPlay}`;
+    const playKey = `member/track/${play}`;
+    await runAlarm();
+    assert.equal(batches.length, 1);
+    assert.deepEqual(batches[0].map(({ started_at, ...window }) => window), [
+      { user_id: 'member', track_id: 'other-track', play_id: otherPlay, union_bytes: 2, file_bytes: 65_537 },
+      { user_id: 'member', track_id: 'track', play_id: play, union_bytes: 3, file_bytes: 65_537 },
+    ]);
+    assert.deepEqual([...ledger], [[otherKey, 2]]);
+    assert.ok(alarm > Date.now(), 'the write error rearmed the flush');
+
+    await runAlarm();
+    assert.deepEqual(batches, [batches[0], batches[0]], 'retry sends the same cumulative windows');
+    assert.deepEqual([...ledger], [[otherKey, 2], [playKey, 3]]);
+    assert.deepEqual(writes, [otherKey, playKey]);
+    const flushed = stored.get('meter_book_v1').plays;
+    assert.equal(flushed.get(otherPlay).flushed_bytes, 2);
+    assert.equal(flushed.get(play).flushed_bytes, 3);
+    assert.equal(alarm, null, 'the accepted batch needs no further retry');
+  });
+
+  await t.test('a wrong encrypted object length delivers and counts no media', { timeout: 5_000 }, async (t) => {
+    const firstFetch = fetches.length;
+    const firstReport = reports.length;
+    reportedSealedLength = sealedLength + 1;
+    t.after(() => { reportedSealedLength = sealedLength; });
+
+    const { response, bytes } = await request({}, '/play/track', bearer, boundedSeek);
+    assert.equal(response.status, 502);
+    assert.equal(response.headers.get('content-range'), null);
+    assert.equal(JSON.parse(bytes).code, 'upstream_unavailable');
+    assert.deepEqual(fetches.slice(firstFetch), ['media']);
+    assert.equal(reports.length, firstReport);
+  });
+
+  await t.test('re-reading an earlier pinned range delivers bytes without new credit', { timeout: 5_000 }, async (t) => {
+    const { NntpPool } = require('./s3_stream_wasm.cjs');
+    const stored = new Map();
+    let alarm = null;
+    const storage = {
+      async get(key) { return structuredClone(stored.get(key)); },
+      async put(key, value) { stored.set(key, structuredClone(value)); },
+      async getAlarm() { return alarm; },
+      async setAlarm(date) { alarm = +date; },
+    };
+    const windows = [];
+    const sink = new class Fetcher {
+      async fetch(req) {
+        assert.equal(req.url, 'https://nntune-api/internal/v1/play-windows');
+        const batch = (await req.json()).windows;
+        windows.push(...batch);
+        return Response.json({ accepted: batch.map(window => window.play_id) });
+      }
+    }();
+    const pool = new NntpPool({ id: { name: 'member' }, storage }, {
+      API: sink, METER_SINK_SECRET: 'fixture-only-meter-sink-key-material',
+    });
+    t.after(() => {
+      pool.free();
+      fullRange = true;
+      fullRangeEnd = 65_616;
+    });
+    // Give this sequence a fresh meter while retaining the original signed grant and pins.
+    const NNTP_POOL = new DurableObjectNamespace();
+    NNTP_POOL.get = () => ({ fetch: async req => {
+      reports.push(await req.clone().json());
+      const reply = await pool.fetch(req);
+      assert.equal(reply.status, 202);
+      return reply;
+    } });
+    for (const [start, end, expected, credited] of [
+      [65_533, 65_535, 'AX', [2]],
+      [65_536, 65_537, 'Z', [2, 3]],
+      [65_533, 65_535, 'AX', [2, 3]],
+    ]) {
+      // Leave byte 65535 unread so a seek position cannot stand in for the union.
+      fullRange = end < plaintext.length;
+      fullRangeEnd = 65_599;
+      const firstFetch = fetches.length;
+      const firstReport = reports.length;
+      const { response, bytes } = await request({ NNTP_POOL }, '/play/track', bearer,
+        { range: `bytes=${start}-${end - 1}` });
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-range'), `bytes ${start}-${end - 1}/${plaintext.length}`);
+      assert.deepEqual(bytes, Buffer.from(expected));
+      assert.deepEqual(fetches.slice(firstFetch), ['media', 'page']);
+      assert.deepEqual(reports.slice(firstReport), [{
+        user_id: 'member', play_id: play, track_id: 'track', start, end, file_bytes: plaintext.length,
+      }]);
+
+      assert.notEqual(alarm, null);
+      alarm = null; // The platform consumes the alarm before invoking its handler.
+      assert.equal((await pool.alarm()).status, 200);
+      assert.deepEqual(windows.map(window => window.union_bytes), credited);
+      assert.equal(stored.get('meter_book_v1').plays.get(play).flushed_bytes, credited.at(-1));
+      assert.equal(alarm, null);
+    }
   });
 
   await t.test('canceling a v4 response stops a pending read at the HTTPS origin', { timeout: 5_000 }, async (t) => {

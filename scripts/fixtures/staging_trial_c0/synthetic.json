@@ -1,0 +1,9 @@
+{
+  "hyperdrive_used": 21,
+  "access_apps_used": 8,
+  "access_apps_limit": 10,
+  "tunnels_used": 4,
+  "tunnels_limit": 5,
+  "token_write_scope": null,
+  "tunnel_verify_full": null
+}

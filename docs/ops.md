@@ -1480,6 +1480,20 @@ Recovery verifies the intent and rollout before reservation. The plan expires
 after two minutes. Reconcile an expired or ambiguous reservation against audit.
 Verify restored build health and identity or the private maintenance behavior.
 
+If the recovery job reports **Switch-off pending: pinned rollback intent
+unavailable**, read the Actions artifact metadata on the original rollout run
+and record whether `production-rollback-intent-<original-rollout-run-id>-1`
+is absent from the complete listing or expired. Keep the original recovery
+run, accepted SHA, hostname and rollout run and attempt in the private release
+record. Keep the custody and key in the protected Environment and leave the
+writer freeze in place. Use the pinned Worker's complete deployment history
+and provider audit to read back the recorded fallback at 100%, using the
+pinned maintenance version for a first release. Keep switch-off pending and
+continue the existing denial readbacks. Record those results and the missing
+or expired artifact in the private release handoff. Keep reconciliation
+read-only while the original sealed intent is unavailable. An incomplete
+listing or mismatched producer uses the general protected rollback refusal.
+
 ### First private release handoff
 
 Use the [first private music launch instructions and pinned candidate template](first-private-music-launch.md).
@@ -1635,6 +1649,56 @@ stay in the old `e2e-staging` group and cannot replace a pending run in
   Draining first also keeps an already queued push from immediately
   undoing the rollback. If the queue cannot be drained and kept clear, do
   not start a pre-lock rerun.
+
+### Offline staging writer timing
+
+Use this summary for automatic `main` pushes whose source uses the
+`deploy-staging-main` workflow lock. Select attempt 1. Its run `created_at`
+is the submission time, while a rerun needs a different time origin.
+Save the [Actions run attempt][timing-run] as `run.json` and its complete
+[attempt jobs listing][timing-jobs] as `jobs.json` from the same snapshot.
+Use the attempt-specific jobs endpoint. Its scope is needed when a job
+omits `run_attempt`.
+If the listing is paginated, combine every page under `jobs` and retain
+`total_count`. Compute the summary locally from the saved JSON.
+
+```sh
+jq -n --slurpfile run run.json --slurpfile jobs jobs.json '{run: $run[0], jobs: $jobs[0]}' |
+  python3 -I ci/incident_report.py --staging-timing
+```
+
+- `wait_before_first_job_seconds` is the earliest executing job's
+  `started_at` minus the run's `created_at`. It includes time waiting for
+  admission and for the first runner. The timestamps alone cannot attribute
+  that wait to one cause.
+- `observed_writer_seconds` is the latest executing job's `completed_at`
+  minus that same first start, once the attempt is complete. The span
+  includes idle gaps between jobs and any same-run verification. Overlapping
+  jobs count once. The workflow holds the writer through those gaps, so
+  this is a lower bound on lock occupancy. Actions provides no lock acquire
+  or release timestamp. The summary excludes queued and skipped jobs and
+  cancellations without a runner. It uses neither `run_started_at` nor
+  `updated_at` as a lock boundary.
+
+The JSON retains the run ID, attempt, source SHA, run status and conclusion,
+and job count. A pending attempt with zero jobs has an unknown wait so far
+and no observed writer span. A rejected attempt with zero jobs also has two
+`null` durations. Attribute a terminal zero-job failure to a full queue only
+with the corresponding workflow annotation. Once work starts on an active
+attempt, the first wait can be observed while the finished span remains
+`null`. Treat this as operational evidence only. Qualification still uses the
+[attempt-bound staging admission receipt](../ci/staging-admission.md).
+
+Worked examples with synthetic Actions metadata. All times are UTC.
+
+| Attempt | `status` / `conclusion` | Run `created_at` | Job `started_at` → `completed_at` | Wait before first job | Observed writer span |
+| --- | --- | --- | --- | ---: | ---: |
+| 10/1 ran | `completed` / `success` | 10:00 | Gate 10:12 → 10:13, journey 10:20 → 10:32 | 720 s | 1,200 s |
+| 11/1 still pending | `pending` / `null` | 10:00 | `[]` | `null` | `null` |
+| 12/1 rejected before jobs | `completed` / `failure` | 10:00 | `[]` | `null` | `null` |
+
+[timing-run]: https://docs.github.com/en/rest/actions/workflow-runs#get-a-workflow-run-attempt
+[timing-jobs]: https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt
 
 ### Offline staging Worker submission checks
 
