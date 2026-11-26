@@ -17,8 +17,9 @@ use nntune_core::{
     s3_locator::S3Binding,
 };
 use sha2::{Digest, Sha256};
+use wasm_bindgen_futures::JsFuture;
 use worker::{
-    js_sys::Function,
+    js_sys::{Function, Promise},
     wasm_bindgen::{self, prelude::*},
 };
 
@@ -49,7 +50,33 @@ pub async fn s3_completion_test(
         "path" => "https://fixture.test:8443/api",
         _ => "https://fixture.test:8443",
     };
-    run(&mode, endpoint, read_page, None).await
+    run(&mode, endpoint, read_page, None, None, false).await
+}
+
+#[wasm_bindgen]
+pub async fn s3_multipart_delayed_status_test(observe: Function) -> Result<String, JsValue> {
+    run(
+        "multipart-resume-full",
+        "https://fixture.test:8443",
+        None,
+        None,
+        Some(&observe),
+        false,
+    )
+    .await
+}
+
+#[wasm_bindgen]
+pub async fn s3_multipart_conflicting_status_test(observe: Function) -> Result<String, JsValue> {
+    run(
+        "multipart-resume-full",
+        "https://fixture.test:8443",
+        None,
+        None,
+        Some(&observe),
+        true,
+    )
+    .await
 }
 
 #[wasm_bindgen]
@@ -83,7 +110,7 @@ pub async fn upload_for_playback(
     } else {
         "readback-playback"
     };
-    run(mode, &endpoint, None, reconcile_completion).await
+    run(mode, &endpoint, None, reconcile_completion, None, false).await
 }
 
 async fn run(
@@ -91,6 +118,8 @@ async fn run(
     endpoint: &str,
     read_page: Option<Function>,
     reconcile_completion: Option<Function>,
+    observe: Option<&Function>,
+    conflicting_status: bool,
 ) -> Result<String, JsValue> {
     let configuration = id(7);
     let bucket = "fixture-bucket";
@@ -307,6 +336,8 @@ async fn run(
             staged_inventory,
             mode == "multipart-resume",
             read_page,
+            observe,
+            conflicting_status,
         )
         .await;
     }
@@ -464,6 +495,8 @@ async fn resume_multipart<'a>(
     staged_inventory: Option<Function>,
     interrupt_second: bool,
     read_page: Option<Function>,
+    observe: Option<&Function>,
+    conflicting_status: bool,
 ) -> Result<String, JsValue> {
     let [first, second] = parts else {
         panic!("expected two fixture parts");
@@ -489,64 +522,125 @@ async fn resume_multipart<'a>(
     } else {
         None
     };
-    let mut receipts = {
-        let upload = DurableUpload::new(target, context, binding.session, until);
-        let first = sender
-            .put_part(binding, context, first, &upload, until)
-            .await
-            .map_err(dispatch_error)?;
+    let upload = DurableUpload::new(target, context, binding.session, until);
+    let first = sender
+        .put_part(binding, context, first, &upload, until)
+        .await
+        .map_err(dispatch_error)?;
+    if let Some((read_page, initial_status)) = inventory {
         let second = sender
             .put_part(binding, context, second, &upload, until)
+            .await
+            .map_err(dispatch_error)?;
+        return resume_from_inventory(
+            &read_page,
+            target,
+            binding,
+            context,
+            [first, second],
+            initial_status,
+        );
+    }
+    let mut receipts = vec![first];
+    if let Some(observe) = observe {
+        let report = |stage, part_count: usize| {
+            observe
+                .call2(
+                    &JsValue::NULL,
+                    &JsValue::from_str(stage),
+                    &part_count.into(),
+                )
+                .map(Some)
+        };
+        let first_etag = receipts[0].etag().to_owned();
+        let early_parts = [checkpoint_part(&receipts[0], &first_etag)];
+        let conflicting_etag = "\"conflicting-part\"";
+        let status_parts = [CheckpointPart {
+            etag: if conflicting_status {
+                conflicting_etag
+            } else {
+                first_etag.as_str()
+            },
+            ..early_parts[0]
+        }];
+        let delayed = report("status", status_parts.len())?;
+        let second_result = sender
+            .put_part(binding, context, second, &upload, until)
             .await;
-        if let Some((read_page, initial_status)) = inventory {
-            let receipts = [first, second.map_err(dispatch_error)?];
-            return resume_from_inventory(
-                &read_page,
-                target,
-                binding,
-                context,
-                receipts,
-                initial_status,
-            );
-        }
         if interrupt_second {
-            assert!(matches!(second, Err(DispatchError::Unconfirmed(None))));
-            vec![first]
+            assert!(matches!(
+                second_result,
+                Err(DispatchError::Unconfirmed(None))
+            ));
         } else {
-            vec![first, second.map_err(dispatch_error)?]
+            receipts.push(second_result.map_err(dispatch_error)?);
         }
-    };
-    let etags: Vec<_> = receipts
+        report("confirmed", receipts.len())?;
+        let current_parts;
+        let status_parts = if let Some(reply) = delayed {
+            JsFuture::from(Promise::resolve(&reply)).await?;
+            status_parts.as_slice()
+        } else {
+            current_parts = checkpoint_parts(&receipts);
+            current_parts.as_slice()
+        };
+        let status = ResumeCheckpoint {
+            binding,
+            parts: status_parts,
+        };
+        if !receipts
+            .get(..status.parts.len())
+            .is_some_and(|prefix| matches_checkpoint(binding, prefix, &status))
+        {
+            return Err(JsValue::from_str("conflicting multipart status"));
+        }
+        report("resumed", receipts.len())?;
+    } else {
+        let second_result = sender
+            .put_part(binding, context, second, &upload, until)
+            .await;
+        if interrupt_second {
+            assert!(matches!(
+                second_result,
+                Err(DispatchError::Unconfirmed(None))
+            ));
+        } else {
+            receipts.push(second_result.map_err(dispatch_error)?);
+        }
+    }
+    let initial_etags: Vec<_> = receipts
         .iter()
         .map(|receipt| receipt.etag().to_owned())
         .collect();
-    let mut saved: Vec<_> = receipts
+    let initial_saved: Vec<_> = receipts
         .iter()
-        .zip(&etags)
+        .zip(&initial_etags)
         .map(|(receipt, etag)| checkpoint_part(receipt, etag))
         .collect();
-
     let checkpoint = ResumeCheckpoint {
         binding,
-        parts: &saved,
+        parts: &initial_saved,
     };
-    // The fixture stands in for the caller's checkpoint store and scoped
-    // handoff. The sealed bytes and verified receipts survive across attempts.
     assert!(matches_checkpoint(binding, &receipts, &checkpoint));
-    let resumed_etag;
-    let upload = DurableUpload::new(target, context, binding.session, until);
-    if saved.len() == 1 {
+    if initial_saved.len() == 1 {
         let receipt = match staged_inventory {
-            Some(read_page) => recover_staged_part(&read_page, saved[0], second)?,
+            Some(read_page) => recover_staged_part(&read_page, initial_saved[0], second)?,
             None => sender
                 .put_part(binding, context, second, &upload, until)
                 .await
                 .map_err(dispatch_error)?,
         };
-        resumed_etag = receipt.etag().to_owned();
-        saved.push(checkpoint_part(&receipt, &resumed_etag));
         receipts.push(receipt);
     }
+    let etags: Vec<_> = receipts
+        .iter()
+        .map(|receipt| receipt.etag().to_owned())
+        .collect();
+    let saved: Vec<_> = receipts
+        .iter()
+        .zip(&etags)
+        .map(|(receipt, etag)| checkpoint_part(receipt, etag))
+        .collect();
     let completed_checkpoint = ResumeCheckpoint {
         binding,
         parts: &saved,
@@ -662,6 +756,13 @@ fn inventory_status(
         .collect();
     let status = if coherent { "resumable" } else { "pending" };
     serde_json::json!({ "status": status, "upload_id": target.upload_id, "parts": saved })
+}
+
+fn checkpoint_parts<'a>(receipts: &'a [UploadedPart<'_>]) -> Vec<CheckpointPart<'a>> {
+    receipts
+        .iter()
+        .map(|receipt| checkpoint_part(receipt, receipt.etag()))
+        .collect()
 }
 
 fn checkpoint_part<'a>(receipt: &UploadedPart<'_>, etag: &'a str) -> CheckpointPart<'a> {

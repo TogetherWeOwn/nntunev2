@@ -2,7 +2,11 @@
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { s3_completion_test: complete, s3_fixture_retirement_test: retire } = require('./ingest_wasm.cjs');
+const {
+  s3_completion_test: complete, s3_fixture_retirement_test: retire,
+  s3_multipart_delayed_status_test: completeWithDelayedStatus,
+  s3_multipart_conflicting_status_test: completeWithConflictingStatus,
+} = require('./ingest_wasm.cjs');
 const {
   authorization, bucket, checksum, completionMarker, completionReceipt, initiatedId, initiatedQuery,
   initiationHeaders, initiationReceipt, mapId, mediaKey, sha256, sidecarKey, uploadQuery,
@@ -306,6 +310,80 @@ test('resumes multipart upload with only the missing part and preserves the conf
   assert.deepEqual(requests, [
     `PUT partNumber=1&${uploadQuery}`, `PUT partNumber=2&${uploadQuery}`,
     `PUT partNumber=2&${uploadQuery}`, `POST ${uploadQuery}`,
+  ]);
+});
+
+test('preserves confirmed progress when a pre-finalization multipart status reply arrives late', { timeout: 10_000 }, async (t) => {
+  const requests = [];
+  const stored = new Map();
+  const observations = [];
+  const statusReply = Promise.withResolvers();
+  const expectedPuts = [`PUT partNumber=1&${uploadQuery}`, `PUT partNumber=2&${uploadQuery}`];
+  t.mock.method(globalThis, 'fetch', async (request) => {
+    const url = new URL(request.url);
+    requests.push(`${request.method} ${url.search.slice(1)}`);
+    if (request.method === 'PUT') {
+      const number = Number(url.searchParams.get('partNumber'));
+      assert.equal(stored.has(number), false, 'a confirmed part must never be sent again');
+      assert.equal(number, stored.size + 1);
+      const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
+      const receipt = { etag: `"fixture-part-${number}"`, 'x-amz-checksum-sha256': checksum(body) };
+      stored.set(number, receipt);
+      return new Response(null, { headers: receipt });
+    }
+    const manifest = (await verifySignedRequest(request, 'POST', uploadQuery)).toString();
+    assert.deepEqual([...stored.keys()], [1, 2]);
+    assert.equal(manifest, multipartManifest(stored));
+    return multipartCompletionReceipt(stored);
+  });
+
+  assert.equal(await completeWithDelayedStatus((stage, count) => {
+    observations.push([stage, count]);
+    if (stage === 'status') {
+      assert.deepEqual(requests, expectedPuts.slice(0, 1));
+      return statusReply.promise;
+    }
+    assert.deepEqual(requests, expectedPuts);
+    if (stage === 'confirmed') {
+      assert.equal(count, 2);
+      statusReply.resolve();
+    }
+  }), version);
+  assert.deepEqual(observations, [['status', 1], ['confirmed', 2], ['resumed', 2]]);
+  assert.deepEqual(requests, [...expectedPuts, `POST ${uploadQuery}`]);
+});
+
+test('rejects a conflicting pre-finalization multipart status reply', { timeout: 10_000 }, async (t) => {
+  const requests = [];
+  const stored = new Map();
+  const statusReply = Promise.withResolvers();
+  t.mock.method(globalThis, 'fetch', async (request) => {
+    const url = new URL(request.url);
+    requests.push(`${request.method} ${url.search.slice(1)}`);
+    if (request.method === 'PUT') {
+      const number = Number(url.searchParams.get('partNumber'));
+      const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
+      const receipt = { etag: `"fixture-part-${number}"`, 'x-amz-checksum-sha256': checksum(body) };
+      stored.set(number, receipt);
+      return new Response(null, { headers: receipt });
+    }
+    assert.fail('conflicting status must be rejected before completion');
+  });
+  await assert.rejects(
+    completeWithConflictingStatus((stage, count) => {
+      if (stage === 'status') {
+        assert.equal(count, 1);
+        assert.deepEqual(requests, [`PUT partNumber=1&${uploadQuery}`]);
+        return statusReply.promise;
+      }
+      assert.equal(stage, 'confirmed');
+      assert.equal(count, 2);
+      statusReply.resolve();
+    }),
+    rejectedWith('conflicting multipart status'),
+  );
+  assert.deepEqual(requests, [
+    `PUT partNumber=1&${uploadQuery}`, `PUT partNumber=2&${uploadQuery}`,
   ]);
 });
 
