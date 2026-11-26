@@ -96,3 +96,25 @@ The authorized probe read `503`, `Cache-Control: no-store` and
 `X-Robots-Tag: noindex` from the maintenance response. Private Access and
 direct API and media denials passed, including the existing-session and
 previously issued media-grant checks. The database and snapshot were preserved.
+
+## Record a cancelled health proof after the rollback write
+
+Both cases below use the same selected recovery run `102`, attempt `1`, and
+the successful `recover-worker` job `103` for rollout `101/1`. The recovery
+marker and provider readback confirm that the attempt wrote deployment
+`33333333-3333-4333-8333-333333333333`, serving the pinned maintenance version
+`22222222-2222-4222-8222-222222222222` at 100%. Keep those observations in the
+record. The private Access, API and media denials agree in both cases.
+
+The synthetic probe job below represents the operator's authorized maintenance
+readback. Match its evidence to the selected recovery and the serving
+deployment above.
+
+| Maintenance probe job | Switch-off verdict | Next action |
+| --- | --- | --- |
+| `cancelled` before a result was recorded | **Pending.** Maintenance health proof is missing. | Keep the writer freeze and reconcile the recorded recovery evidence. Repeat the authorized maintenance readback for serving deployment `33333333-3333-4333-8333-333333333333` before closing switch-off. |
+| `success` with `503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex` | **Complete.** The recorded recovery job, serving allocation and denial evidence agree. | Record the completed switch-off and retire the temporary release-window controls. |
+
+Keep run `102/1` and the observed write when the probe is cancelled. Do not
+dispatch another recovery or rerun the workflow from this evidence. Follow the
+[existing switch-off verification](../first-private-music-launch.md#switch-off-and-verify).
