@@ -52,7 +52,7 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   let fault;
   let uploads = 0;
   let failCompletion = false;
-  let onInterruptedClose;
+  let interruptRange;
 
   function store(versions, version, body) {
     assert.equal(versions.has(version), false);
@@ -152,12 +152,11 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
         'content-range': `bytes ${start}-${last}/${sealedLength}`,
         'content-length': end - start,
       };
-      if (onInterruptedClose) {
-        assert.equal(start, 0);
-        const closed = onInterruptedClose;
-        onInterruptedClose = undefined;
-        res.once('close', () => closed(res.writableFinished));
-        res.writeHead(206, rangeHeaders).write(bytes.subarray(0, -17));
+      if (interruptRange) {
+        const interrupt = interruptRange;
+        interruptRange = undefined;
+        res.writeHead(206, rangeHeaders);
+        interrupt(res, bytes);
         return;
       }
       if (fault === 'short range') {
@@ -208,7 +207,7 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   host = `127.0.0.1:${server.address().port}`;
   const endpoint = `https://${host}`;
 
-  const { track, mediaVersion, seek: indexedSeek } = JSON.parse(await upload_for_playback(endpoint, true));
+  const { track, mediaVersion, seek: indexedSeek, retrySeek } = JSON.parse(await upload_for_playback(endpoint, true));
   assert.equal(mediaVersion, original);
   const upload = ['POST media', 'PUT media', 'POST media', 'HEAD media', 'PUT page', 'GET media', 'GET page'];
   assert.deepEqual(operations.splice(0), upload);
@@ -332,7 +331,10 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
     { timeout: 4000 }, async () => {
       expectedRange = boundaryRange;
       const { promise: closed, resolve } = Promise.withResolvers();
-      onInterruptedClose = resolve;
+      interruptRange = (res, bytes) => {
+        res.once('close', () => resolve(res.writableFinished));
+        res.write(bytes.subarray(0, -17));
+      };
       const interrupted = await open('bytes=65535-65536');
       assert.equal(interrupted.response.status, 206);
       assert.equal(interrupted.response.headers.get('content-range'), 'bytes 65535-65536/177175');
@@ -443,6 +445,49 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   assert.deepEqual(reports.splice(0), [{ ...interval, start: 68_861, end: 129_212 }]);
   assert.deepEqual(meterWindows, [{ ...interval, union_bytes: 60_351, started_at: 60 }]);
 
+  await t.test('an interrupted seek across the final FLAC index point retries from the delivered cursor',
+    { timeout: 4000 }, async () => {
+      // The 10,030–10,032 ms request straddles the anchor at sample 442,368.
+      // The whole-frame window is samples [221,184, 617,400), from the previous anchor to EOF.
+      assert.deepEqual(retrySeek, { start: 68_861, end: 177_175 });
+      const { start, end } = retrySeek;
+      expectedRange = 'bytes=65600-177270';
+      let closeOrigin;
+      interruptRange = (res, bytes) => {
+        // Write one complete sealed chunk of the two planned, then wait for the client.
+        res.write(bytes.subarray(0, 65_552));
+        closeOrigin = () => res.destroy();
+      };
+      const interrupted = await open(`bytes=${start}-${end - 1}`);
+      assert.equal(interrupted.response.status, 206);
+      assert.equal(interrupted.response.headers.get('content-range'), 'bytes 68861-177174/177175');
+      const client = interrupted.response.body.getReader();
+      const first = await client.read();
+      assert.equal(first.done, false);
+      const prefix = Buffer.from(first.value);
+      const cursor = start + prefix.length;
+      assert.equal(cursor, 131_072);
+      assert.deepEqual(prefix, tone.subarray(start, cursor));
+      await setImmediate();
+      closeOrigin();
+      await assert.rejects(client.read());
+      await interrupted.settled;
+      assert.deepEqual(operations.splice(0), ['GET range', 'GET page']);
+      assert.deepEqual(custody.splice(0), ['resolve', 'lease', 'lease']);
+      const deliveredPrefix = { ...interval, start, end: cursor };
+      assert.deepEqual(reports, [deliveredPrefix]);
+
+      expectedRange = suffixRange;
+      const resumed = await request(`bytes=${cursor}-${end - 1}`);
+      assert.equal(resumed.response.status, 206);
+      assert.equal(resumed.response.headers.get('content-range'), 'bytes 131072-177174/177175');
+      assert.deepEqual(Buffer.concat([prefix, resumed.bytes]), tone.subarray(68_861, 177_175));
+      assert.deepEqual(operations.splice(0), ['GET range', 'GET page']);
+      assert.deepEqual(custody.splice(0), ['resolve', 'lease', 'lease']);
+      assert.deepEqual(reports.splice(0), [deliveredPrefix, { ...interval, start: cursor, end }]);
+    });
+
+  expectedRange = secondRange;
   for (fault of ['wrong version', 'changed bytes', 'short range']) {
     const refused = await request(seek);
     assert.equal(refused.response.status, 502, fault);

@@ -245,6 +245,7 @@
 	let extendSelection = false;
 	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
+	let libraryList: HTMLDivElement | null = $state(null);
 	const showRefresh = $derived(showingTracks || (!loading && (showRecovery || !!accountTrackLikes?.feedback)));
 	$effect.pre(() => {
 		// Likes can finish after listing Refresh has already restored focus.
@@ -372,6 +373,11 @@
 			trackMenu = null;
 			endTrackDrag();
 			if (!isCurrent()) return;
+			// A listener can tab into the old listing while Refresh is pending.
+			const active = authoritative && !authBoundary && !state.loadError && !state.libraryUnavailable &&
+				libraryList ? document.activeElement : null;
+			const focusedTrackControl = active && libraryList?.contains(active) && active instanceof HTMLElement
+				? active : null;
 			draggedLibraryItem = null;
 			if (authoritative && !authBoundary && !state.loadError && !state.libraryUnavailable) {
 				preserveTrackFocus(isCurrent);
@@ -462,6 +468,16 @@
 				applyShareLink(restoredQueue);
 			} else if (!state.loading) currentFavoriteEdit++; // Retire feedback without invalidating pending writes.
 			if (!isCurrent()) return;
+			if (focusedTrackControl) {
+				// Moving a keyed row can blur its existing control. Restore that same
+				// node after rendering if it survived and focus fell back to the page.
+				void tick().then(() => {
+					if (isCurrent() && showingTracks && libraryList?.contains(focusedTrackControl) &&
+						(document.activeElement === null || document.activeElement === document.body)) {
+						focusedTrackControl.focus();
+					}
+				});
+			}
 			// Same-account refresh completion: the panel may have remounted
 			// (branch swap), so hand focus back to the filter input the user
 			// was typing in. Background refreshes keep the panel mounted, so
@@ -2074,7 +2090,7 @@
 				</button>
 			{:else}
 			<!-- svelte-ignore a11y_no_static_element_interactions: list-scoped shortcuts preserve all native controls and do not add a tab stop. -->
-			<div data-testid="library-list" onkeydown={libraryListKey}>
+			<div data-testid="library-list" bind:this={libraryList} onkeydown={libraryListKey}>
 				{#if groupByArtist}
 					{#each artistGroups as group (group.key)}
 						<div class="nt-artist-group">

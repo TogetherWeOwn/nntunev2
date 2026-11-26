@@ -721,7 +721,10 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     # Per-lane locks are not a reservation. Discover recent/rerunnable runs
     # and every unresolved run, not the workflow's entire lifetime history.
     for other in actions.conflicts(workflow_id, opening):
-        if (decimal(other.get("id")) == run_id if private else other.get("head_sha") == sha):
+        other_id = decimal(other.get("id"))
+        # Independent runs can redeploy the same commit. The selected run's
+        # attempt is checked again below after reading the other writers.
+        if other_id == run_id:
             continue
         require(other.get("status") in (*PENDING_RUN_STATES, "completed"),
                 "unclassified conflicting staging run")
@@ -732,7 +735,6 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
             # pre-opening run cannot conceal a later job in that snapshot.
             if timestamp(other.get("updated_at")) <= opening:
                 continue
-        other_id = decimal(other.get("id"))
         # Include ALL attempts: a failed latest rerun must not hide a mutation
         # from an earlier attempt after the candidate journey started.
         other_jobs = actions.listing(f"runs/{other_id}/jobs?filter=all", "jobs")

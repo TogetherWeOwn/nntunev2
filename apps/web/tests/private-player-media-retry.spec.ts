@@ -52,7 +52,7 @@ const test = base.extend<{ origin: string }>({
 test.use({ serviceWorkers: 'block' });
 
 async function checkRelayRetry(page: Page, origin: string, {
-	refuseFirstContinuation = false, resumedSpeed = initialSpeed, expireWhilePlaying = false
+	refuseFirstContinuation = false, resumedSpeed = initialSpeed, expireWhilePlaying = false, muteWhilePending = false
 } = {}) {
 	const context = page.context();
 	const { library, player: contract } = PRIVATE_MUSIC;
@@ -124,6 +124,7 @@ async function checkRelayRetry(page: Page, origin: string, {
 	const retry = player.getByRole('button', { name: 'Retry playback', exact: true });
 	const speed = page.getByRole('combobox', { name: 'Playback speed', exact: true });
 	const seek = player.getByRole('slider', { name: 'Seek', exact: true });
+	const mute = player.getByRole('button', { name: 'Mute', exact: true });
 	const playbackFailure = 'This audio could not be loaded or played. Retry playback or choose another track.';
 	const audioFailed = () => audio.evaluate((node: HTMLAudioElement) => node.paused && node.error !== null);
 	const expectNoPlaybackRequest = () => expect(page.waitForRequest(
@@ -233,6 +234,14 @@ async function checkRelayRetry(page: Page, origin: string, {
 		expect(continuationConfirmed).toBe(false);
 		expect(mediaRequests).toEqual(failedMediaRequests);
 		expect(await audioFailed()).toBe(true);
+		if (muteWhilePending) {
+			await expect(audio).toHaveJSProperty('muted', false);
+			await expect(mute).toHaveAttribute('aria-pressed', 'false');
+			await mute.click();
+			await expect(audio).toHaveJSProperty('muted', true);
+			await expect(mute).toHaveAttribute('aria-pressed', 'true');
+			expect(continuationConfirmed).toBe(false);
+		}
 	} finally {
 		releaseContinuation.resolve();
 	}
@@ -250,6 +259,10 @@ async function checkRelayRetry(page: Page, origin: string, {
 	await expect(retry).toHaveCount(0);
 	await expect(audio).toHaveAttribute('src', mediaPath);
 	await assertSelection();
+	if (muteWhilePending) {
+		await expect(audio).toHaveJSProperty('muted', true);
+		await expect(mute).toHaveAttribute('aria-pressed', 'true');
+	}
 	expect(plays).toEqual(expectedPlays);
 	// A single resumed FLAC load may legitimately make several byte-range requests.
 	expect(mediaRequests.length).toBeGreaterThan(failedMediaRequests.length);
@@ -270,4 +283,8 @@ test('invited Library playback waits for another Retry after a temporary receipt
 
 test('invited Library playback resumes from its last position after an expired renewal returns 503', async ({ page, origin }) => {
 	await checkRelayRetry(page, origin, { expireWhilePlaying: true, refuseFirstContinuation: true });
+});
+
+test('invited Library Retry resumes with mute chosen while its receipt was pending', async ({ page, origin }) => {
+	await checkRelayRetry(page, origin, { muteWhilePending: true });
 });

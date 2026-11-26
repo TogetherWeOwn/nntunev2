@@ -118,6 +118,23 @@ test('switch-off reports unavailable rollback intent for the pinned successful r
   assert.deepEqual(transport.rows, allocation);
 });
 
+test('operator keeps the recorded rollback write when its maintenance probe is cancelled', () => {
+  const report = readFileSync(new URL('../docs/ops/first-release-recovery-example.md', import.meta.url), 'utf8');
+  const example = report.split('## Record a cancelled health proof after the rollback write\n')[1]?.split('\n## ')[0];
+  assert.ok(example, 'include a cancelled health proof in the operator handoff');
+  assert.match(example, /same selected recovery run `102`, attempt `1`, and\s+the successful `recover-worker` job `103` for rollout `101\/1`/);
+  assert.match(example, /wrote deployment\s+`33333333-3333-4333-8333-333333333333`, serving the pinned maintenance version\s+`22222222-2222-4222-8222-222222222222` at 100%/);
+  assert.match(example, /Match its evidence to the selected recovery and the serving\s+deployment above\./);
+
+  const rows = example.split('\n');
+  const cancelled = rows.find((line) => line.startsWith('| `cancelled`'));
+  const verified = rows.find((line) => line.startsWith('| `success`'));
+  assert.match(cancelled, /\| \*\*Pending\.\*\* Maintenance health proof is missing\. \|/);
+  assert.match(cancelled, /Keep the writer freeze and reconcile the recorded recovery evidence\. Repeat the authorized maintenance readback for serving deployment `33333333-3333-4333-8333-333333333333`/);
+  assert.match(verified, /`503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex` \| \*\*Complete\.\*\*/);
+  assert.match(example, /Keep run `102\/1` and the observed write when the probe is cancelled\. Do not\s+dispatch another recovery or rerun the workflow/);
+});
+
 test('maintenance remains active when the candidate receipt cannot identify a distinct version', async (t) => {
   const { calls, rows, versions, temp, run } = finalSmokeFixture(t, fixture);
   await run('check-seed');

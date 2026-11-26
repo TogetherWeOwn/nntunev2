@@ -78,6 +78,56 @@ it('orders the current grant’s events and refuses the retired grant’s late t
 	expect(writes()).toEqual([retiredStart, currentStart, { ...currentStart, event: 'skip' }]);
 });
 
+it('keeps the listen on pause and posts one skip for abandonment or media error', async () => {
+	const fetchFn = vi.fn<typeof fetch>(async (path) => path === contextPath ? Response.json({ context }) : ack());
+	const writes = () => fetchFn.mock.calls.filter(([path]) => path === eventsPath)
+		.map(([, init]) => JSON.parse(String(init?.body)));
+	const { sender, currentPlayId, open } = listenTransport(fetchFn);
+	const audio = new EventTarget() as HTMLAudioElement;
+	const history = createPlayerListenHistory(sender, new EventTarget() as Window);
+	onTestFinished(() => history.resetAtAuthBoundary());
+	history.attach(audio, trackId, currentPlayId);
+	await sender.ready;
+
+	const fire = (event: string) => audio.dispatchEvent(new Event(event));
+	const first = { playback_id: '00000000-0000-0000-0000-000000000000', track_id: trackId, event: 'start', context };
+	const replay = { ...first, playback_id: '00000000-0000-0000-0000-000000000001' };
+	expect(await open('A'.repeat(22))).toBe(true);
+	fire('playing');
+	await vi.advanceTimersByTimeAsync(0);
+	expect(writes()).toEqual([first]);
+
+	fire('pause');
+	await vi.advanceTimersByTimeAsync(0);
+	expect(writes()).toEqual([first]);
+	fire('playing');
+	await vi.advanceTimersByTimeAsync(0);
+	expect(writes()).toEqual([first]);
+
+	history.finish(audio);
+	const abandoned = [first, { ...first, event: 'skip' }];
+	await vi.advanceTimersByTimeAsync(0);
+	expect(writes()).toEqual(abandoned);
+	fire('playing');
+	await vi.advanceTimersByTimeAsync(0);
+	expect(writes()).toEqual(abandoned);
+
+	expect(await open('A'.repeat(21) + 'Q')).toBe(true);
+	fire('playing');
+	await vi.advanceTimersByTimeAsync(0);
+	expect(writes()).toEqual([...abandoned, replay]);
+
+	const failed = [...abandoned, replay, { ...replay, event: 'skip' }];
+	fire('error');
+	await vi.advanceTimersByTimeAsync(0);
+	expect(writes()).toEqual(failed);
+	fire('error');
+	fire('emptied');
+	fire('playing');
+	await vi.advanceTimersByTimeAsync(0);
+	expect(writes()).toEqual(failed);
+});
+
 it('reuses the listen context on page restore and stays closed after an auth transition', async () => {
 	const fetchFn = vi.fn<typeof fetch>(async (path) => path === contextPath ? Response.json({ context }) : ack());
 	const { sender, currentPlayId, open } = listenTransport(fetchFn);
