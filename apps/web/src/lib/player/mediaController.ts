@@ -689,9 +689,11 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				(grant) => playSelected(result.queue, index, grant, '', grant), { failureMessage });
 			await handoff();
 			// Offline, the same successor and its start position wait for one retry on reconnect.
+			// Play or Pause on the ended track supersedes that retry.
+			const armed = playIntent;
 			if (failureMessage && listeners && globalThis.navigator?.onLine === false && evidence.isCurrent() && ownsOrigin()) {
 				globalThis.addEventListener?.('online', () => {
-					if (!pendingGrant) void handoff();
+					if (!pendingGrant && playIntent === armed) void handoff();
 				}, { once: true, signal: listeners });
 			}
 			return;

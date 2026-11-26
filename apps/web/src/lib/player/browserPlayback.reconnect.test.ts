@@ -46,3 +46,25 @@ test('a private handoff that loses the network keeps its successor and retries t
 		network.cleanup();
 	}
 });
+
+test('replaying the ended track before reconnect cancels the pending successor retry', async () => {
+	const network = simulateConnectivity();
+	try {
+		const { player, media, queue, fetchFn, src, attach, toggleDuringFirstPlay, requests } = setup();
+		await toggleDuringFirstPlay();
+		const first = src();
+		const ended = attach(false);
+		network.drop();
+		fetchFn.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+		ended.finish();
+		await vi.waitFor(() => expect(player.queueAnnouncement.text).toBe('Could not start the next track. Choose a track to continue.'));
+		await media.playCurrent();
+		expect(ended.play).toHaveBeenCalledOnce();
+
+		network.restore();
+		await Promise.resolve();
+		expect([requests().length, queue.snapshot.currentIndex, src(), media.audio]).toEqual([3, 0, first, ended]);
+	} finally {
+		network.cleanup();
+	}
+});
