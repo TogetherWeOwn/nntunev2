@@ -201,6 +201,7 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   let observedPageVersion = 'page+/%?=&';
   let seekContentRange = span;
   let fullRange = false;
+  let fullRangeEnd = 65_616;
   let stallTail;
   const fetches = [];
   const reports = [];
@@ -209,15 +210,15 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     cert: readFileSync(process.env.NODE_EXTRA_CA_CERTS),
   }, (req, res) => {
     const page = req.url.startsWith(pagePath);
-    verifyGet(req, host, page, fullRange ? 'bytes=0-65616' : undefined);
+    verifyGet(req, host, page, fullRange ? `bytes=0-${fullRangeEnd}` : undefined);
     fetches.push(page ? 'page' : 'media');
     const bytes = Buffer.from(page ? fixture.digest_page()
-      : fullRange ? fixture.full_ciphertext() : fixture.ciphertext());
+      : fullRange ? fixture.full_ciphertext().subarray(0, fullRangeEnd + 1) : fixture.ciphertext());
     const headers = {
       'content-length': bytes.length,
       'x-amz-version-id': page ? observedPageVersion : (mediaVersionOverride ?? 'version+/%?=&'),
     };
-    if (!page) headers['content-range'] = fullRange ? `bytes 0-65616/${reportedSealedLength}` : seekContentRange;
+    if (!page) headers['content-range'] = fullRange ? `bytes 0-${fullRangeEnd}/${reportedSealedLength}` : seekContentRange;
     res.writeHead(page ? 200 : 206, headers);
     if (!page && stallTail) {
       res.once('close', () => stallTail(res.writableFinished));
@@ -461,6 +462,70 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     assert.equal(JSON.parse(bytes).code, 'upstream_unavailable');
     assert.deepEqual(fetches.slice(firstFetch), ['media']);
     assert.equal(reports.length, firstReport);
+  });
+
+  await t.test('re-reading an earlier pinned range delivers bytes without new credit', { timeout: 5_000 }, async (t) => {
+    const { NntpPool } = require('./s3_stream_wasm.cjs');
+    const stored = new Map();
+    let alarm = null;
+    const storage = {
+      async get(key) { return structuredClone(stored.get(key)); },
+      async put(key, value) { stored.set(key, structuredClone(value)); },
+      async getAlarm() { return alarm; },
+      async setAlarm(date) { alarm = +date; },
+    };
+    const windows = [];
+    const sink = new class Fetcher {
+      async fetch(req) {
+        assert.equal(req.url, 'https://nntune-api/internal/v1/play-windows');
+        const batch = (await req.json()).windows;
+        windows.push(...batch);
+        return Response.json({ accepted: batch.map(window => window.play_id) });
+      }
+    }();
+    const pool = new NntpPool({ id: { name: 'member' }, storage }, {
+      API: sink, METER_SINK_SECRET: 'fixture-only-meter-sink-key-material',
+    });
+    t.after(() => {
+      pool.free();
+      fullRange = true;
+      fullRangeEnd = 65_616;
+    });
+    // Give this sequence a fresh meter while retaining the original signed grant and pins.
+    const NNTP_POOL = new DurableObjectNamespace();
+    NNTP_POOL.get = () => ({ fetch: async req => {
+      reports.push(await req.clone().json());
+      const reply = await pool.fetch(req);
+      assert.equal(reply.status, 202);
+      return reply;
+    } });
+    for (const [start, end, expected, credited] of [
+      [65_533, 65_535, 'AX', [2]],
+      [65_536, 65_537, 'Z', [2, 3]],
+      [65_533, 65_535, 'AX', [2, 3]],
+    ]) {
+      // Leave byte 65535 unread so a seek position cannot stand in for the union.
+      fullRange = end < plaintext.length;
+      fullRangeEnd = 65_599;
+      const firstFetch = fetches.length;
+      const firstReport = reports.length;
+      const { response, bytes } = await request({ NNTP_POOL }, '/play/track', bearer,
+        { range: `bytes=${start}-${end - 1}` });
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-range'), `bytes ${start}-${end - 1}/${plaintext.length}`);
+      assert.deepEqual(bytes, Buffer.from(expected));
+      assert.deepEqual(fetches.slice(firstFetch), ['media', 'page']);
+      assert.deepEqual(reports.slice(firstReport), [{
+        user_id: 'member', play_id: play, track_id: 'track', start, end, file_bytes: plaintext.length,
+      }]);
+
+      assert.notEqual(alarm, null);
+      alarm = null; // The platform consumes the alarm before invoking its handler.
+      assert.equal((await pool.alarm()).status, 200);
+      assert.deepEqual(windows.map(window => window.union_bytes), credited);
+      assert.equal(stored.get('meter_book_v1').plays.get(play).flushed_bytes, credited.at(-1));
+      assert.equal(alarm, null);
+    }
   });
 
   await t.test('canceling a v4 response stops a pending read at the HTTPS origin', { timeout: 5_000 }, async (t) => {
