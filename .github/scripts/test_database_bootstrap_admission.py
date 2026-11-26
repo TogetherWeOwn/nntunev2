@@ -70,6 +70,46 @@ def check_aborted_baseline_run_binding():
             raise RuntimeError(f"baseline admission fixture: {case}")
 
 
+def check_reader_cleanup_binding():
+    script = Path(__file__).with_name("database_bootstrap_reader_cleanup.py")
+    reviewed = {
+        "branch_id": "fixture001", "launch": "fixture_launch", "database_oid": 41001,
+        "reader_role": "fixture_reader", "reader_oid": 42001,
+    }
+    receipt = reviewed | {"status": "absent"}
+    record = {"reviewed": reviewed, "receipt": receipt}
+
+    def check(case, evidence, *, accept=False):
+        raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
+        result = subprocess.run(
+            [sys.executable, "-EsB", str(script)], input=raw,
+            capture_output=True, timeout=3, check=False,
+        )
+        expected = ((0, b"database-bootstrap-reader-cleanup: consistent\n", b"") if accept else
+                    (1, b"", b"database-bootstrap-reader-cleanup: pending\n"))
+        if (result.returncode, result.stdout, result.stderr) != expected:
+            raise RuntimeError(f"reader cleanup fixture: {case}")
+
+    for key, other in {
+        "branch_id": "fixture002", "launch": "fixture_other", "database_oid": 41002,
+        "reader_role": "fixture_other_reader", "reader_oid": 42002,
+    }.items():
+        other_receipt = receipt | {key: other}
+        check(f"receipt mismatches {key}", record | {"receipt": other_receipt})
+        check(f"receipt valid for its own {key}",
+              {"reviewed": reviewed | {key: other}, "receipt": other_receipt}, accept=True)
+
+    check("missing receipt", {"reviewed": reviewed})
+    check("absence unconfirmed", record | {"receipt": receipt | {"status": "present"}})
+    check("duplicate receipt key", b'{"receipt": null, ' + json.dumps(record).encode()[1:])
+    check("oversized record", json.dumps(record).encode().ljust(4097))
+    check("boolean OID", {
+        "reviewed": reviewed | {"reader_oid": 1}, "receipt": receipt | {"reader_oid": True},
+    })
+    check("floating-point OID", record | {"receipt": receipt | {"database_oid": 41001.0}})
+    check("exact cleanup receipt", record, accept=True)
+
+
 def exercise(event_path):
     plan = secrets.token_bytes(64)
     sha, run = secrets.token_hex(20), str(secrets.randbelow(10**10) + 1)
@@ -336,6 +376,7 @@ if __name__ == "__main__":
         check_inventory_run_binding()
         check_snapshot_readback()
         check_snapshot_label_retry()
+        check_reader_cleanup_binding()
     except Exception:
         sys.exit("database-bootstrap-admission-fixture: failed")
     print("database-bootstrap-admission-fixture: run binding, snapshot readback, refusals and teardown passed")
