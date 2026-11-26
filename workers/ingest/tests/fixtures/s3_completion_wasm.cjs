@@ -89,12 +89,14 @@ test('signs the exact multipart POST once and collects its version and body', as
 for (const [scenario, overriddenHeaders, failure] of [
   ['matching HEAD', {}, null],
   ['stalled response body', {}, null],
+  ['completion still in flight', {}, transportFailure],
   ['foreign initiation', { [completionMarker]: 'different-attempt' }, transportFailure],
   ['different checksum', { 'x-amz-checksum-sha256': 'different-checksum' }, transportFailure],
   ['wrong length', { 'content-length': String(ciphertextLength + 1) }, transportFailure],
   ['null version', { 'x-amz-version-id': 'null' }, 'Unconfirmed(Some(CompletionVersion))'],
 ]) {
   test(`recovers a lost completion response with ${scenario}`, async (t) => {
+    const stillCommitting = scenario === 'completion still in flight';
     const operations = [];
     let marker;
     let partChecksum;
@@ -120,22 +122,25 @@ for (const [scenario, overriddenHeaders, failure] of [
         const manifest = (await verifySignedRequest(request, 'POST', initiatedQuery)).toString();
         const receipt = completionReceipt(manifest, 'fixture-part');
         assert.ok(manifest.includes(`<ChecksumSHA256>${partChecksum}</ChecksumSHA256>`));
-        committed = {
-          ...headHeaders,
-          [completionMarker]: marker,
-          'x-amz-checksum-type': 'COMPOSITE',
-          'x-amz-checksum-sha256': /<ChecksumSHA256>([^<]+)/.exec(receipt)[1],
-        };
-        if (scenario === 'stalled response body') {
+        if (!stillCommitting) {
+          committed = {
+            ...headHeaders,
+            [completionMarker]: marker,
+            'x-amz-checksum-type': 'COMPOSITE',
+            'x-amz-checksum-sha256': /<ChecksumSHA256>([^<]+)/.exec(receipt)[1],
+          };
+        }
+        if (stillCommitting || scenario === 'stalled response body') {
           stalledSignal = request.signal;
           return new Response(new ReadableStream(), { headers: { 'x-amz-version-id': version } });
         }
         throw new Error('completion response lost after storing the version');
       }
-      assert.ok(committed);
       if (query === '') {
         if (stalledSignal) assert.equal(stalledSignal.aborted, true);
         await verifySignedRequest(request, 'HEAD', '', { 'x-amz-checksum-mode': 'ENABLED' });
+        if (stillCommitting) return new Response(null, { status: 404 });
+        assert.ok(committed);
         return new Response(null, { headers: { ...committed, ...overriddenHeaders } });
       }
       await verifySignedRequest(request, 'HEAD', versionQuery, {});
@@ -147,7 +152,7 @@ for (const [scenario, overriddenHeaders, failure] of [
     } else {
       assert.equal(await result, version);
     }
-    assert.ok(committed, 'provider never committed the upload');
+    assert.equal(Boolean(committed), !stillCommitting);
     assert.deepEqual(operations, [
       'POST uploads=', `PUT partNumber=1&${initiatedQuery}`, `POST ${initiatedQuery}`, 'HEAD ',
       ...(failure ? [] : [`HEAD ${versionQuery}`]),
