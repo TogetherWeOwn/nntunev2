@@ -331,15 +331,28 @@ test('operator switch-off keeps a successful probe for an earlier maintenance de
   });
   await transport.run('record');
   const [precedingMaintenance] = transport.rows;
-  transport.shift();
   const { enter, fresh } = recoveryFixture(t, transport, 'success');
   const selected = fresh('13');
+
+  const url = `https://api.cloudflare.com/client/v4/accounts/${selected.CLOUDFLARE_ACCOUNT_ID}/workers/scripts/nntune-web/deployments?page=1&per_page=100`;
+  async function readDeploymentHistory() {
+    const response = await transport.request(url, { method: 'GET', redirect: 'error',
+      headers: { Authorization: `Bearer ${selected.CLOUDFLARE_API_TOKEN}` } });
+    assert.equal(response.ok, true);
+    const { success, result } = await response.json();
+    assert.equal(success, true);
+    return result.deployments;
+  }
+
+  transport.shift();
+  const rollout = await readDeploymentHistory();
   assert.equal(await enter(selected), 'Recorded maintenance allocation verified');
-  const [restoredDeployment] = transport.rows;
+  const [restoredDeployment, ...precedingRollout] = await readDeploymentHistory();
+  assert.match(restoredDeployment.annotations['workers/message'], /^First-release maintenance recovery [a-f0-9]{32}$/);
+  assert.deepEqual(precedingRollout, rollout);
   assert.notEqual(precedingMaintenance.id, restoredDeployment.id);
   assert.deepEqual(precedingMaintenance.versions, restoredDeployment.versions);
 
-  const url = `https://api.cloudflare.com/client/v4/accounts/${selected.CLOUDFLARE_ACCOUNT_ID}/workers/scripts/nntune-web/deployments?page=1&per_page=100`;
   // The probe reports status and headers. Its deployment ID comes from the
   // accompanying provider readback, using the same field as the recovery job.
   async function verifyProbe() {
@@ -347,12 +360,7 @@ test('operator switch-off keeps a successful probe for an earlier maintenance de
     assert.equal(health.status, 503);
     assert.equal(health.headers.get('cache-control'), 'no-store');
     assert.equal(health.headers.get('x-robots-tag'), 'noindex');
-    const response = await transport.request(url, { method: 'GET', redirect: 'error',
-      headers: { Authorization: `Bearer ${selected.CLOUDFLARE_API_TOKEN}` } });
-    assert.equal(response.ok, true);
-    const { success, result } = await response.json();
-    assert.equal(success, true);
-    const [serving] = result.deployments;
+    const [serving] = await readDeploymentHistory();
     assert.deepEqual(serving.versions, restoredDeployment.versions);
     return serving.id === restoredDeployment.id ? 'complete' : 'pending';
   }
@@ -368,7 +376,8 @@ test('operator switch-off keeps a successful probe for an earlier maintenance de
 
   const guide = readFileSync(new URL('../docs/first-private-music-launch.md', import.meta.url), 'utf8');
   const verification = guide.split('\n## Switch off and verify\n')[1]?.split('\n## ')[0];
-  assert.match(verification, /Match the serving deployment ID from the provider readback accompanying\s+the probe to the deployment verified for the selected recovery attempt\./);
+  assert.match(verification, /From the pinned Worker's deployment history, record the ID of the deployment\s+whose recovery marker and preceding rollout history match the selected\s+recovery attempt\./);
+  assert.match(verification, /Match the serving deployment ID from the provider readback accompanying\s+the probe to that recorded ID\./);
   assert.match(verification, /If the IDs differ, keep switch-off \*\*Pending\*\* and the writer freeze\s+in place\. Repeat the authorized maintenance readback for the recorded\s+recovery deployment\./);
 });
 

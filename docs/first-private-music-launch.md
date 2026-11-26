@@ -203,8 +203,11 @@ Access writers as required by [protected recovery](ops.md#protected-production-w
    any retry. [Protected recovery](https://github.com/TogetherWeOwn/nntunev2/pull/1783)
 3. Read back the pinned maintenance version at 100%, private Access denials
    and the maintenance response through an authorized probe.
+   From the pinned Worker's deployment history, record the ID of the deployment
+   whose recovery marker and preceding rollout history match the selected
+   recovery attempt. See the [allocation readback example](ops/first-release-recovery-example.md#evidence-allocation).
    Match the serving deployment ID from the provider readback accompanying
-   the probe to the deployment verified for the selected recovery attempt.
+   the probe to that recorded ID.
    If the IDs differ, keep switch-off **Pending** and the writer freeze
    in place. Repeat the authorized maintenance readback for the recorded
    recovery deployment.
