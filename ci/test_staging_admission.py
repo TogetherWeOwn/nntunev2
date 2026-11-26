@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Offline fixtures for ci/staging_admission.py (pure evaluator and fake Actions)."""
 
+import base64
 import copy
 import importlib.util
 import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1327,6 +1329,68 @@ class SourceBindingTests(Base):
             "observed_at": {phase: world.receipt["identities"][phase]["observed_at"]
                             for phase in sa.IDENTITY_PHASES},
         }})
+
+    def test_private_staging_receipt_handoff_to_database_admission(self):
+        self.install_private_contract()
+        world, lines = self.run_main(private=True, mode="promote")
+        staging = json.loads(lines[0])["verified_private_music_staging"]
+        sha = staging["sha"]
+        self.assertEqual((staging["run_id"], staging["run_attempt"]), ("100", "1"))
+        self.assertEqual(staging["artifact_name"], world.artifact["name"])
+        self.assertEqual(staging["artifact_name"], f"staging-admission-{sha}-100-1-private-music")
+
+        scripts = HERE.parent / ".github/scripts"
+        with patch.object(sys, "path", [str(scripts), *sys.path]):
+            import database_bootstrap_admission as admission
+            import database_bootstrap_baseline as baseline
+            import database_bootstrap_setup as setup
+
+        shared = {"version": 2, "host": "fixture.example", "port": 5432, "ca_pem": "synthetic CA",
+                  "branch_id": "fixture001", "launch": "launch_fixture", "reader_role": "fixture_reader"}
+        setup_bytes = json.dumps(shared | {
+            "maintenance": "postgres", "setup_login": "fixture_setup.fixture001", "setup_role": "fixture_setup",
+            "owner_role": "fixture_owner", "migrator_role": "fixture_migrator",
+        }).encode()
+        # These OIDs represent separate setup and reader issuance readbacks.
+        baseline_bytes = json.dumps(shared | {"database_oid": 16384, "reader_oid": 16385}).encode()
+        with patch.object(setup, "validate_ca"), patch.object(baseline, "validate_ca"):
+            self.assertEqual(setup.setup_plan(setup_bytes).launch, "launch_fixture")
+            accepted = baseline.baseline_plan(baseline_bytes)
+            self.assertEqual((accepted.database_oid, accepted.reader_oid), (16384, 16385))
+            with self.assertRaises(ValueError):
+                setup.setup_plan(baseline_bytes)
+            with self.assertRaises(ValueError):
+                baseline.baseline_plan(setup_bytes)
+
+        event = {"inputs": {}}
+        now = 1800000000
+        for workflow, run_id, plan, other_run, other_plan in (
+            (admission.WORKFLOW, "200", setup_bytes, "201", baseline_bytes),
+            (baseline.WORKFLOW, "201", baseline_bytes, "200", setup_bytes),
+        ):
+            with self.subTest(workflow=workflow):
+                env = {
+                    "GITHUB_REPOSITORY": admission.REPOSITORY,
+                    "GITHUB_WORKFLOW_REF": f"{admission.REPOSITORY}/{workflow}@{admission.MAIN}",
+                    "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": admission.MAIN,
+                    "GITHUB_SHA": sha, "GITHUB_WORKFLOW_SHA": sha, "BOOTSTRAP_SHA": sha,
+                    "GITHUB_RUN_ID": run_id, "BOOTSTRAP_RUN_ID": run_id, "GITHUB_RUN_ATTEMPT": "1",
+                    "BOOTSTRAP_EXPIRY": str(now + 60), "BOOTSTRAP_PLAN_DIGEST": sa.digest(plan),
+                    "BOOTSTRAP_PLAN_B64": base64.b64encode(plan).decode("ascii"),
+                }
+                self.assertEqual(admission.authorized_plan(env, event, now, workflow=workflow), plan)
+                other_workflow = baseline.WORKFLOW if workflow == admission.WORKFLOW else admission.WORKFLOW
+                self.assertIsNone(admission.authorized_plan(env, event, now, workflow=other_workflow))
+                for overrides in (
+                    {"BOOTSTRAP_SHA": "0" * 40},
+                    {"GITHUB_RUN_ATTEMPT": "2"},
+                    {"BOOTSTRAP_RUN_ID": staging["run_id"]},
+                    {"BOOTSTRAP_RUN_ID": other_run},
+                    {"BOOTSTRAP_PLAN_DIGEST": sa.digest(other_plan)},
+                ):
+                    self.assertIsNone(admission.authorized_plan(env | overrides, event, now, workflow=workflow))
+                artifact_input = {"inputs": {"staging_receipt": staging["artifact_name"]}}
+                self.assertIsNone(admission.authorized_plan(env, artifact_input, now, workflow=workflow))
 
     def test_private_main_prints_no_pins_on_live_identity_refusal(self):
         self.install_private_contract()
