@@ -68,3 +68,26 @@ test('replaying the ended track before reconnect cancels the pending successor r
 		network.cleanup();
 	}
 });
+
+test('native replay before reconnect cancels the pending successor retry', async () => {
+	const network = simulateConnectivity();
+	try {
+		const { player, queue, fetchFn, src, attach, toggleDuringFirstPlay, requests } = setup();
+		await toggleDuringFirstPlay();
+		const first = src();
+		const ended = attach(false) as EventTarget & { ended: boolean; paused: boolean };
+		network.drop();
+		fetchFn.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+		ended.finish();
+		await vi.waitFor(() => expect(player.queueAnnouncement.text).toBe('Could not start the next track. Choose a track to continue.'));
+		ended.ended = false;
+		ended.paused = false;
+		ended.dispatchEvent(new Event('play'));
+
+		network.restore();
+		await Promise.resolve();
+		expect([requests().length, queue.snapshot.currentIndex, src()]).toEqual([3, 0, first]);
+	} finally {
+		network.cleanup();
+	}
+});

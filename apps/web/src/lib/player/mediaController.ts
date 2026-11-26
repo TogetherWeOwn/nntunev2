@@ -88,6 +88,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	let applyingShare: { revision: number; retry: boolean } | undefined;
 	let positioning = false;
 	let nextPosition: (() => void) | undefined;
+	let reconnectHandoffAudio: HTMLAudioElement | undefined;
 
 	function pause(audio: HTMLAudioElement | undefined): void {
 		if (audio && !audio.paused) audio.pause();
@@ -692,7 +693,9 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			// Play or Pause on the ended track supersedes that retry.
 			const armed = playIntent;
 			if (failureMessage && listeners && globalThis.navigator?.onLine === false && evidence.isCurrent() && ownsOrigin()) {
+				reconnectHandoffAudio = audio;
 				globalThis.addEventListener?.('online', () => {
+					reconnectHandoffAudio = undefined;
 					if (!pendingGrant && playIntent === armed) void handoff();
 				}, { once: true, signal: listeners });
 			}
@@ -827,6 +830,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					}
 					switch (event.type) {
 						case 'play':
+							if (event.type === 'play' && reconnectHandoffAudio === audio) {
+								reconnectHandoffAudio = undefined;
+								invalidatePlay();
+							}
 						case 'playing':
 							if (!audio.paused && !audio.ended && matches()) {
 								receipt.playing = true;
@@ -842,6 +849,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 							return;
 						case 'pause':
 							// Native completion pauses before `ended`; retain that intent.
+							if (reconnectHandoffAudio === audio && !audio.ended) {
+								reconnectHandoffAudio = undefined;
+								invalidatePlay();
+							}
 							if (!audio.paused || audio.ended) return;
 							break;
 						case 'error':
