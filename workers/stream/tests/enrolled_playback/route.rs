@@ -19,9 +19,9 @@ const BROWSER_TOKEN: &str = concat!(
 );
 // Synthetic v4 grant for Source::other_track(), also expiring at Unix 12.
 const OTHER_TRACK_TOKEN: &str = concat!(
-    "v4.bWVtYmVyfG90aGVyLXRyYWNrfHByaXZhdGVfYnJvd3Nlcl9CQkJCQkJCQkJCQkJCQkJCQkJCQkJCfDQyfDEy",
+    "v4.bWVtYmVyfG90aGVyLXRyYWNrfHByaXZhdGVfYnJvd3Nlcl9CQkJCQkJCQkJCQkJCQkJCQkJCQkJCfDQzfDEy",
     "fDU3ODZjZjBjNjhlNTBiZjg1MjU3NTk2NTU3ZTJhZjZkN2Q2YWNkZWFiZDRlYTJiYjNlMDkzNjQxNzRjMmIwZTc.",
-    "5IZubhMIL7iiCcfEddhINzeSlevOTCFChl9AJskiNuo",
+    "zgFXxaz9HOuIYHMDUw_YXnXqvSqS-9aEL81H7XiHygY",
 );
 
 #[tokio::test]
@@ -36,8 +36,9 @@ async fn interrupting_one_track_preserves_the_other_tracks_cursor_and_receipt() 
     };
     let interrupted_request = request("track", BROWSER_TOKEN);
     let complete_request = request("other-track", OTHER_TRACK_TOKEN);
-    let interrupted_source = Source::browser();
-    let complete_source = Source::other_track();
+    let current_epoch = Rc::new(Cell::new(42));
+    let interrupted_source = Source::browser().with_current_epoch(42, current_epoch.clone());
+    let complete_source = Source::other_track().with_current_epoch(43, current_epoch.clone());
     let interrupted_gate = Rc::<FrameGate>::default();
     let complete_gate = Rc::<FrameGate>::default();
     interrupted_source
@@ -52,13 +53,14 @@ async fn interrupting_one_track_preserves_the_other_tracks_cursor_and_receipt() 
     let complete_aborted = Cell::new(false);
     let reports = RefCell::new(Vec::new());
     let meter = RefCell::new(MeterBook::new("member"));
+    let (report_log, delivery_meter) = (&reports, &meter);
     let start_read = |req, source, output, aborted| {
         serve(
             req,
             b"test only, not a deployed secret",
             Some(source),
             now,
-            |head| {
+            move |head| {
                 assert_eq!(head.status, 206);
                 assert_eq!(head.len, 3);
                 assert_eq!(
@@ -72,9 +74,9 @@ async fn interrupting_one_track_preserves_the_other_tracks_cursor_and_receipt() 
                     revoke_on_write: None,
                 }))
             },
-            |receipt| {
-                assert!(meter.borrow_mut().record(&receipt, 10));
-                reports.borrow_mut().push(receipt);
+            move |receipt| {
+                assert!(delivery_meter.borrow_mut().record(&receipt, 10));
+                report_log.borrow_mut().push(receipt);
             },
         )
     };
@@ -84,17 +86,20 @@ async fn interrupting_one_track_preserves_the_other_tracks_cursor_and_receipt() 
         &interrupted_output,
         &interrupted_aborted,
     ));
+    assert!(futures_util::poll!(&mut interrupted).is_pending());
+    assert!(interrupted_gate.waiting.get());
+    assert_eq!(*interrupted_output.borrow(), b"AY");
+
+    // The next track replaces the lease while the old read is still pending.
+    current_epoch.set(43);
     let mut complete = Box::pin(start_read(
         &complete_request,
         &complete_source,
         &complete_output,
         &complete_aborted,
     ));
-    assert!(futures_util::poll!(&mut interrupted).is_pending());
     assert!(futures_util::poll!(&mut complete).is_pending());
-    assert!(interrupted_gate.waiting.get());
     assert!(complete_gate.waiting.get());
-    assert_eq!(*interrupted_output.borrow(), b"AY");
     assert_eq!(*complete_output.borrow(), b"BQ");
     assert!(reports.borrow().is_empty());
 

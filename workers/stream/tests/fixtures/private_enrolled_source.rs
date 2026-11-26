@@ -97,6 +97,8 @@ pub(super) struct Source {
     sealed: Vec<u8>,
     track_id: &'static str,
     play_id: &'static str,
+    lease_epoch: u64,
+    current_epoch: Rc<Cell<u64>>,
     fault: Fault,
     checked_lease: Cell<bool>,
     pub(super) empty_media_once: Cell<bool>,
@@ -158,6 +160,8 @@ impl Source {
             sealed,
             track_id,
             play_id,
+            lease_epoch: 42,
+            current_epoch: Rc::new(Cell::new(42)),
             fault,
             checked_lease: Cell::new(false),
             empty_media_once: Cell::new(false),
@@ -172,6 +176,16 @@ impl Source {
 
     pub(super) fn time(&self) -> SystemTime {
         self.clock.get()
+    }
+
+    pub(super) fn with_current_epoch(mut self, epoch: u64, current_epoch: Rc<Cell<u64>>) -> Self {
+        self.lease_epoch = epoch;
+        self.current_epoch = current_epoch;
+        self
+    }
+
+    fn is_current(&self) -> bool {
+        self.current_epoch.get() == self.lease_epoch
     }
 }
 
@@ -223,9 +237,9 @@ impl PrivateSource for Source {
     async fn resolve(&self, grant: &Grant) -> Option<CatalogueMedia<'_>> {
         assert_eq!(grant.user_id, "member");
         assert_eq!(grant.play_id.as_deref(), Some(self.play_id));
-        assert_eq!(grant.lease_epoch, Some(42));
+        assert_eq!(grant.lease_epoch, Some(self.lease_epoch));
         assert_eq!(grant.track_id, self.track_id);
-        (self.fault != Fault::Denied).then(|| {
+        (self.is_current() && self.fault != Fault::Denied).then(|| {
             let reference = if self.fault == Fault::WrongReference {
                 id(8)
             } else {
@@ -248,7 +262,8 @@ impl PrivateSource for Source {
         if checked && self.fault == Fault::ExpiredAtWrite {
             self.clock.set(self.fixture.pins().usable_until);
         }
-        !self.revoked.get()
+        self.is_current()
+            && !self.revoked.get()
             && self.fault != Fault::LeaseLost
             && !(checked && self.fault == Fault::Displaced)
     }
