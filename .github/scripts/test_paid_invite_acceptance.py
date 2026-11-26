@@ -185,6 +185,22 @@ class AcceptanceTest(unittest.TestCase):
         self.run_case("accepted")
         self.assertIn(f"/v1/checkout/sessions/{SESSION}", [path for path, _ in self.requests])
 
+    def test_finish_requires_meter_evidence_even_with_paid_playback(self):
+        # Model successful synthetic playback on the same paid test session.
+        # The operator can attest playback_and_meter only after observing usage.
+        checks = self.evidence["checks"]
+        del checks["playback_and_meter"]
+        self.run_case("missing_evidence")
+        checks["playback_and_meter"] = None
+        self.run_case("wrong_build")
+        self.assertEqual(self.connected, [])
+        self.assertEqual(self.requests, [])
+
+        checks["playback_and_meter"] = SHA
+        self.run_case("accepted")
+        self.assertEqual([path for path, _ in self.requests],
+                         list(self.routes) + ["/api/build", "/healthz"])
+
     def test_redirect_and_denied_access_stop_without_following(self):
         for status in (302, 401, 403):
             with self.subTest(status=status):
