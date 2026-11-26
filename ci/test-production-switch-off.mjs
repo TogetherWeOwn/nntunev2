@@ -124,6 +124,7 @@ test('operator keeps the recorded rollback write when its maintenance probe is c
   assert.ok(example, 'include a cancelled health proof in the operator handoff');
   assert.match(example, /same selected recovery run `102`, attempt `1`, and\s+the successful `recover-worker` job `103` for rollout `101\/1`/);
   assert.match(example, /wrote deployment\s+`33333333-3333-4333-8333-333333333333`, serving the pinned maintenance version\s+`22222222-2222-4222-8222-222222222222` at 100%/);
+  assert.match(example, /Match its evidence to the selected recovery and the serving\s+deployment above\./);
 
   const rows = example.split('\n');
   const cancelled = rows.find((line) => line.startsWith('| `cancelled`'));
