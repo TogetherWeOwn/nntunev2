@@ -20,6 +20,7 @@ def run(rid, **overrides):
 
 def job(rid, jid=1, **overrides):
     return {"id": jid, "run_id": rid, "run_attempt": 1, "head_sha": f"{rid:040x}",
+            "run_url": f"https://api.github.com/repos/TogetherWeOwn/nntunev2/actions/runs/{rid}",
             "status": "queued", "started_at": None, "completed_at": None,
             "conclusion": None, "runner_id": 0, "steps": []} | overrides
 
@@ -33,7 +34,7 @@ def snapshot(*runs, jobs=None):
     return {"workflow": {"path": PATH, "id": 11, "state": "active"},
             "runs": {state: pages("workflow_runs", [row for row in runs if row["status"] == state])
                      for state in STATES},
-            "jobs": {str(rid): pages("jobs", rows) for rid, rows in (jobs or {}).items()}}
+            "jobs": {f"runs/{rid}/attempts/1/jobs": pages("jobs", rows) for rid, rows in (jobs or {}).items()}}
 
 
 class QueueReadbackTests(unittest.TestCase):
@@ -80,6 +81,20 @@ class QueueReadbackTests(unittest.TestCase):
                 self.assertEqual(report["newest_eligible_run_id"], 1)
                 self.assertEqual(report["runs"][1]["disposition"], "keep_job_activity")
 
+    def test_github_ref_qualified_paths_and_optional_job_attempt(self):
+        queued_job = job(1)
+        del queued_job["run_attempt"]
+        evidence = snapshot(run(1, path=f"{PATH}@main"), run(2), run(3, path=f"{PATH}@other"),
+                            jobs={1: [queued_job], 2: []})
+        code, report = self.invoke(evidence)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["newest_eligible_run_id"], 2)
+        self.assertEqual([row["disposition"] for row in report["runs"]],
+                         ["superseded", "keep_newest_eligible", "keep_outside_selection"])
+        self.assert_indeterminate(snapshot(run(1, path=".github/workflows/other.yml@main"), jobs={1: []}))
+        evidence["jobs"]["runs/1/attempts/2/jobs"] = evidence["jobs"].pop("runs/1/attempts/1/jobs")
+        self.assert_indeterminate(evidence)
+
     def test_same_run_or_rerun_cannot_supersede_itself(self):
         for row in (run(1), run(1, run_attempt=2)):
             with self.subTest(attempt=row["run_attempt"]):
@@ -100,7 +115,7 @@ class QueueReadbackTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(report["newest_eligible_run_id"], 101)
         self.assertEqual(report["runs"][0]["disposition"], "keep_job_activity")
-        for inventory in (evidence["runs"]["pending"], evidence["jobs"]["1"]):
+        for inventory in (evidence["runs"]["pending"], evidence["jobs"]["runs/1/attempts/1/jobs"]):
             page = inventory.pop()
             self.assert_indeterminate(evidence)
             inventory.append(page | {"total_count": 102})
@@ -112,6 +127,7 @@ class QueueReadbackTests(unittest.TestCase):
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [job(1, run_attempt=2)], 2: []}))
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [job(2)], 2: []}))
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [job(1, head_sha="b" * 40)], 2: []}))
+        self.assert_indeterminate(snapshot(run(1), jobs={1: [job(1, run_url=job(2)["run_url"])]}))
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [job(1), job(1)], 2: []}))
         self.assert_indeterminate(snapshot(run(1), jobs={1: []}), "--pin-run", "bad")
         self.assert_indeterminate('{"runs": {}, "runs": {}}')

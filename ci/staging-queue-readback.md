@@ -19,7 +19,10 @@ Use fresh read-only responses from `repos/TogetherWeOwn/nntunev2/actions/`.
 | --- | --- |
 | `workflow` | `workflows/deploy.yml`, as a single object |
 | `runs` | An object with `queued`, `pending`, `requested`, `waiting` and `in_progress` keys. For each, save all pages of `workflows/deploy.yml/runs?status=<key>&per_page=100` without filtering by branch or event. |
-| `jobs` | An object keyed by decimal run ID. For each first-attempt automatic `main` push with `queued` or `pending` status, save all pages of `runs/<id>/attempts/1/jobs?per_page=100`. Other runs already stay outside selection. |
+| `jobs` | An object keyed by the attempt-specific route, such as `runs/1234/attempts/1/jobs`. For each first-attempt automatic `main` push with `queued` or `pending` status, save all pages from that route with `?per_page=100`. Other runs already stay outside selection. |
+
+Keep the route key even if a job row omits `run_attempt`. A supplied attempt
+must match the route. Job rows must also match the listed run ID, URL and SHA.
 
 A complete report gives the newest eligible run ID and one disposition per
 listed run. The selector compares GitHub workflow run numbers. The eligible

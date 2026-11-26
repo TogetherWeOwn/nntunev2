@@ -9,6 +9,7 @@ import sys
 
 REPO = "TogetherWeOwn/nntunev2"
 WORKFLOW = ".github/workflows/deploy.yml"
+RUN_PATH = re.compile(rf"{re.escape(WORKFLOW)}(?:@(?P<ref>[^\s\x00-\x1f\x7f]+))?")
 RUN_STATES = ("queued", "pending", "requested", "waiting", "in_progress")
 UNSTARTED_JOBS = ("queued", "pending", "requested")
 PAGE_SIZE = 100
@@ -66,16 +67,24 @@ def staging_repository(repo):
 
 
 def no_jobs_started(run, inventory):
-    jobs = pages(inventory, "jobs")
+    run_route = f"runs/{run['id']}"
+    attempt = run["run_attempt"]
+    # GitHub may omit run_attempt on an attempt-specific jobs response.
+    jobs = pages(inventory.get(f"{run_route}/attempts/{attempt}/jobs"), "jobs")
+    run_url = f"https://api.github.com/repos/{REPO}/actions/{run_route}".lower()
     for job in jobs.values():
+        job_attempt = job.get("run_attempt", attempt)
+        job_run_url = job.get("run_url")
         require(type(job.get("run_id")) is int and job["run_id"] == run["id"]
-                and type(job.get("run_attempt")) is int and job["run_attempt"] == run["run_attempt"]
+                and type(job_attempt) is int and job_attempt == attempt
+                and isinstance(job_run_url, str) and job_run_url.lower() == run_url
                 and job.get("head_sha") == run["head_sha"], "job evidence belongs to a different run attempt")
-        require({"status", "started_at", "completed_at", "conclusion"} <= job.keys(),
+        require({"status", "started_at", "completed_at", "conclusion", "runner_id"} <= job.keys(),
                 "missing job state evidence")
     return all(job["status"] in UNSTARTED_JOBS and job["started_at"] is None
                and job["completed_at"] is None and job["conclusion"] is None
-               and job.get("runner_id") in (None, 0) and job.get("steps", []) == []
+               and (job["runner_id"] is None or type(job["runner_id"]) is int and job["runner_id"] == 0)
+               and job.get("steps", []) == []
                for job in jobs.values())
 
 
@@ -92,10 +101,11 @@ def select(evidence, pinned_runs, pinned_shas):
     for state in RUN_STATES:
         for rid, run in pages(inventory[state], "workflow_runs").items():
             number, sha = run.get("run_number"), run.get("head_sha")
-            repo = run.get("repository")
+            repo, path = run.get("repository"), run.get("path")
+            run_path = RUN_PATH.fullmatch(path) if isinstance(path, str) else None
             require(rid not in runs and positive_id(number) and number not in numbers
                     and positive_id(run.get("run_attempt")) and run.get("status") == state
-                    and run.get("path") == WORKFLOW and type(run.get("workflow_id")) is int
+                    and run_path and type(run.get("workflow_id")) is int
                     and run["workflow_id"] == workflow["id"] and staging_repository(repo)
                     and isinstance(sha, str) and SHA.fullmatch(sha)
                     and isinstance(run.get("event"), str) and isinstance(run.get("head_branch"), str),
@@ -103,9 +113,11 @@ def select(evidence, pinned_runs, pinned_shas):
             runs[rid] = sha
             numbers.add(number)
             head_repo = run.get("head_repository")
-            if not automatic_pending(run) or not staging_repository(head_repo) or head_repo["id"] != repo["id"]:
+            from_main = run_path["ref"] in (None, "main", "refs/heads/main", sha)
+            if (not from_main or not automatic_pending(run)
+                    or not staging_repository(head_repo) or head_repo["id"] != repo["id"]):
                 kept[rid] = "keep_outside_selection"
-            elif no_jobs_started(run, jobs.get(str(rid))):
+            elif no_jobs_started(run, jobs):
                 eligible[rid] = number
             else:
                 kept[rid] = "keep_job_activity"
