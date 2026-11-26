@@ -372,6 +372,9 @@
 			endTrackDrag();
 			if (!isCurrent()) return;
 			draggedLibraryItem = null;
+			if (authoritative && !authBoundary && !state.loadError && !state.libraryUnavailable) {
+				preserveTrackFocus(isCurrent);
+			}
 			items = state.items;
 			staleAt = state.staleAt;
 			loading = state.loading;
@@ -1136,6 +1139,18 @@
 		if (typeof document === 'undefined') return null;
 		const holder = document.activeElement?.closest?.('[data-testid="library-item"]');
 		return holder?.getAttribute('data-id') ?? null;
+	}
+
+	function preserveTrackFocus(isCurrent: () => boolean): void {
+		if (typeof document === 'undefined') return;
+		const control = document.activeElement;
+		if (!control?.closest?.('[data-testid="library-item"]') || !(control instanceof HTMLElement)) return;
+		// Moving a keyed row can drop focus even when its control survives.
+		void tick().then(() => {
+			if (isCurrent() && control.isConnected && document.activeElement === document.body) {
+				control.focus({ preventScroll: true });
+			}
+		});
 	}
 
 	function focusLibraryRecovery(): void {
