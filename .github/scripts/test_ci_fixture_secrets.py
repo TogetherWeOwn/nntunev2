@@ -116,12 +116,17 @@ class TestFixtureSecretWiring(unittest.TestCase):
             ("merge_group", "contributor", "", "refs/heads/gh-readonly-queue/main/entry", True),
             ("workflow_dispatch", "contributor", "", "refs/heads/topic", True),
             ("pull_request_target", "contributor", "own/repo", "refs/heads/main", False),
-            ("schedule", "contributor", "", "refs/heads/main", False),
+            ("schedule", "contributor", "", "refs/heads/main", True),
+            ("schedule", "contributor", "", "refs/heads/topic", False),
+            ("schedule", "dependabot[bot]", "", "refs/heads/main", False),
             ("workflow_dispatch", "dependabot[bot]", "", "refs/heads/main", False),
         ]
         for job_id in ("rust-ingest", "web-e2e"):
             job = self.jobs[job_id]
-            self.assertNotRegex(job, r"(?m)^    if:")
+            self.assertIn(
+                "    if: ${{ !contains(fromJSON(needs.early.outputs.skip || '[]'), '" + job_id + "') }}",
+                job,
+            )
             guard = re.search(r"^      FIXTURE_SECRETS_ALLOWED: \$\{\{ (.+) \}\}$", job, re.M)
             self.assertIsNotNone(guard, job_id)
             for event, actor, head_repo, ref, expected in cases:
@@ -132,7 +137,7 @@ class TestFixtureSecretWiring(unittest.TestCase):
                         "github.event.pull_request.head.repo.full_name == github.repository": head_repo == "own/repo",
                         "github.ref == 'refs/heads/main'": ref == "refs/heads/main",
                     }
-                    for name in ("pull_request", "push", "merge_group", "workflow_dispatch"):
+                    for name in ("pull_request", "push", "merge_group", "schedule", "workflow_dispatch"):
                         terms[f"github.event_name == '{name}'"] = event == name
                     for term, value in terms.items():
                         expression = expression.replace(term, str(value))

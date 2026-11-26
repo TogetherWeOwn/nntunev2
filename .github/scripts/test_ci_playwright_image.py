@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import unittest
 
-from test_ci_pnpm_retry import split_jobs, split_steps, step_field
+from test_ci_pnpm_retry import job_level_field, split_jobs, split_steps, step_field
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
@@ -73,7 +73,7 @@ class TestPlaywrightImage(unittest.TestCase):
         aggregate = split_jobs(self.workflow)["ci-ok"]
         self.assertIn("e2e-lint", step_field(aggregate, "needs"))
         self.assertEqual(step_field(aggregate, "if"), "${{ always() }}")
-        self.assertIn('all(.[]; .result == "success")', aggregate)
+        self.assertIsNone(job_level_field(self.job, "if"))
         self.assertIn("python3 .github/scripts/test_ci_playwright_image.py", self.workflow)
 
     def run_preflight(self, source=None):
