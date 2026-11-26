@@ -12,6 +12,7 @@ for (const [retainSelection, title] of [
 	const verifierPath = '/v1/me/likes/session';
 	const selected = { id: '00000000-0000-4000-8000-000000000001', title: 'Harbor Dawn' };
 	const neighbor = { id: '00000000-0000-4000-8000-000000000002', title: 'Field Dusk' };
+	const initial = retainSelection ? [selected] : [selected, neighbor];
 	const refreshReply = Promise.withResolvers<void>();
 	const playbackRequests: string[] = [];
 	let listingReads = 0;
@@ -31,7 +32,7 @@ for (const [retainSelection, title] of [
 			listingReads += 1;
 			if (listingReads > 2) return route.fulfill({ status: 500 });
 			if (listingReads === 2) await refreshReply.promise;
-			const tracks = listingReads === 1 || retainSelection ? [selected, neighbor] : [neighbor];
+			const tracks = listingReads === 1 || retainSelection ? initial : [neighbor];
 			return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: tracks });
 		}
 		if (path.startsWith('/api/') || path.startsWith('/v1/')) return route.fulfill({ status: 404 });
@@ -62,7 +63,6 @@ for (const [retainSelection, title] of [
 		await expect(feedback).toBeVisible();
 		await expect(queue).toHaveCount(0);
 		await expect(checkbox(selected.id)).toBeChecked();
-		await expect(checkbox(neighbor.id)).not.toBeChecked();
 		await expect(append).toHaveCount(1);
 		await expect(append).toBeEnabled();
 		await expect(append).toBeFocused();
@@ -77,7 +77,10 @@ for (const [retainSelection, title] of [
 	if (retainSelection) {
 		await expect(feedback).toBeVisible();
 		await expect(append).toBeFocused();
-		await page.keyboard.press('Enter');
+		await page.getByRole('button', { name: 'Select all', exact: true }).click();
+		await expect(page.getByTestId('selection-count')).toHaveText('1 selected');
+		await expect(feedback).toBeVisible();
+		await append.press('Enter');
 		await expect(feedback).toHaveText('Added 1 track (0 already queued)');
 		await expect(queue).toHaveCount(1);
 		await expect(queue).toBeVisible();
@@ -87,9 +90,9 @@ for (const [retainSelection, title] of [
 		await expect(checkbox(selected.id)).toHaveCount(0);
 		await expect(append).toBeDisabled();
 		await expect(page.getByTestId('append-result')).toHaveCount(0);
+		await expect(checkbox(neighbor.id)).toBeVisible();
+		await expect(checkbox(neighbor.id)).not.toBeChecked();
 	}
-	await expect(checkbox(neighbor.id)).toBeVisible();
-	await expect(checkbox(neighbor.id)).not.toBeChecked();
 	expect(listingReads).toBe(2);
 	expect(await mediaSources.evaluate((sources) => [...sources].filter(Boolean))).toEqual([]);
 	expect(playbackRequests).toEqual([]);

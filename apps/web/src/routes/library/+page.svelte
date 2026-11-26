@@ -1226,7 +1226,9 @@
 	}
 
 	function selectDisplayedIds(): void {
-		selectedIds = selectAllDisplayed(selectedIds, renderedItems.map((track) => track.id));
+		const next = selectAllDisplayed(selectedIds, renderedItems.map((track) => track.id));
+		if (next.length === selectedIds.length && next.every((id, index) => id === selectedIds[index])) return;
+		selectedIds = next;
 	}
 
 	function clearSelectedIds(): void {
