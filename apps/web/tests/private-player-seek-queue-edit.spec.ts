@@ -140,8 +140,11 @@ for (const paused of [false, true]) {
 		expect((await seekRead!.response())?.status()).toBe(206);
 		await expect.poll(() => events.jsonValue()).toEqual([
 			{ type: 'seeking', position: expect.closeTo(target, 1), paused, trusted: true },
-			{ type: 'seeked', position: expect.closeTo(target, 1), paused, trusted: true }
+			{ type: 'seeked', position: paused ? expect.closeTo(target, 1) : expect.any(Number), paused, trusted: true }
 		]);
+		// The playing clock can advance before the queued seeked event is delivered.
+		const [, completion] = await events.jsonValue();
+		expect(completion.position).toBeGreaterThanOrEqual(target - 0.05);
 		await expect(slider).not.toHaveAttribute('aria-valuetext', /^Seeking to /);
 		await expect(status).toHaveText(paused ? 'Paused' : 'Playing');
 		await expect.poll(() => native.evaluate((node: HTMLAudioElement, { target, paused }) =>
