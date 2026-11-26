@@ -782,6 +782,7 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
             "invalid artifact provenance")
     require(timestamp(artifact.get("expires_at")) > datetime.now(timezone.utc), "expired receipt")
     archive = actions.read(f"artifacts/{decimal(artifact.get('id'))}/zip", MAX_ARCHIVE)
+    require(len(archive) == artifact["size_in_bytes"], "artifact archive size mismatch")
     require("sha256:" + digest(archive) == artifact["digest"], "artifact content digest mismatch")
     receipt = validate_receipt(read_archive(archive), repo=repo, sha=sha, run_id=run_id, attempt=attempt,
                                workflow_sha=sha, manifest_hash=manifest_hash,

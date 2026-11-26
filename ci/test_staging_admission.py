@@ -1424,6 +1424,14 @@ class VerifyTests(Base):
         w.artifact["digest"] = "sha256:" + "0" * 64
         self.assertWorldRefused(w, "content digest mismatch")
 
+    def test_artifact_archive_size_mismatch(self):
+        w = World()
+        self.assertEqual(w.verify()["result"], "satisfied")
+        for difference in (-1, 1):
+            with self.subTest(difference=difference):
+                w.artifact["size_in_bytes"] = len(w.archive) + difference
+                self.assertWorldRefused(w, "artifact archive size mismatch")
+
     def test_incomplete_listings(self):
         w = World()
         self.assertWorldRefused(w, "incomplete or exhausted jobs",
