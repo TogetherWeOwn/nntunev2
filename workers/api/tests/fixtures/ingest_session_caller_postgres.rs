@@ -1228,6 +1228,16 @@ async fn prove_attempt(
             ),
         )
         .await;
+        Box::pin(prove_overlapping_completed_reads(
+            observer,
+            authority,
+            writer,
+            auth,
+            prepared,
+            committed.outcome(),
+            &track,
+        ))
+        .await;
         crate::handlers::tests::private_trial_fixture::verify_registration(
             observer, authority, input, auth,
         )
@@ -1380,4 +1390,106 @@ async fn backend_pid(client: &Client) -> i32 {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+async fn prove_overlapping_completed_reads(
+    observer: &Client,
+    authority: &Client,
+    status_writer: &mut Client,
+    auth: Authorization<'_>,
+    prepared: PreparedUpload<'_>,
+    acknowledged: &CommittedOutcome,
+    track: &str,
+) {
+    // Compare upload and publication row versions to catch even same-value writes.
+    let snapshot = async || {
+        observer
+            .query_one(
+                "SELECT c.track_id::text, ARRAY[s.xmin::text, i.xmin::text, l.xmin::text,
+                                          c.xmin::text, t.xmin::text, a.xmin::text, r.xmin::text]
+             FROM public.ingest_session_reservations s
+             JOIN public.storage_digest_inventory_intents i ON i.map_id = s.completed_map_id
+             JOIN public.storage_s3_locator_intents l ON l.object_id = s.multipart_object_id
+             JOIN public.catalogue_s3_sources c ON c.object_id = l.object_id
+             JOIN public.tracks t ON t.id = c.track_id
+             JOIN public.private_library_admissions a
+                ON a.object_id = c.object_id AND a.track_id = c.track_id
+             JOIN public.storage_validated_digest_references r
+                ON r.object_id = c.object_id AND r.reference_id = c.track_id
+             WHERE s.id = $1::text::uuid AND s.multipart_upload_id = $2
+               AND s.terminal_reason = 'completed' AND s.write_lease_id IS NULL
+               AND i.map_id = $3::text::uuid AND l.s3_version_id = i.media_version",
+                &[&prepared.scope.session, &UPLOAD, &acknowledged.map],
+            )
+            .await
+            .map(|row| (row.get::<_, String>(0), row.get::<_, Vec<String>>(1)))
+            .unwrap()
+    };
+    let before = snapshot().await;
+    assert_eq!(before.0, track);
+
+    let mut resume_writer = connect(WRITER).await;
+    let status_pid = backend_pid(status_writer).await;
+    let resume_pid = backend_pid(&resume_writer).await;
+    let reload =
+        async |id: &str, scope: &CompletionScope<'_>| load_authority(authority, id, scope).await;
+    let (status_locked, entered) = tokio::sync::oneshot::channel();
+    let (release_status, released) = tokio::sync::oneshot::channel();
+    let mut status = Box::pin(read(
+        status_writer,
+        auth,
+        prepared,
+        async move |id, scope| {
+            status_locked.send(()).unwrap();
+            released.await.unwrap();
+            load_authority(authority, id, scope).await
+        },
+    ));
+    // The status authority callback runs under the real scoped session lock.
+    tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(2), entered) => {
+            result.expect("status must reach authorization").unwrap();
+        }
+        _ = &mut status => panic!("status returned before resume could overlap"),
+    }
+    let mut resume = Box::pin(open_or_reuse(
+        &mut resume_writer,
+        auth,
+        prepared,
+        SystemTime::now() + Duration::from_secs(30),
+        reload,
+        async |_, _, _, _| panic!("resume attempted a second upload after completion"),
+    ));
+    observe_blocked(observer, status_pid, resume_pid, resume.as_mut())
+        .await
+        .expect("resume must wait for the completed session held by status");
+    release_status.send(()).unwrap();
+    let (status, resume) = tokio::join!(status, resume);
+    let UploadAttempt::Reused(resume) = resume.expect("resume must return the committed upload")
+    else {
+        panic!("completed session opened a new upload");
+    };
+    for result in [&status.unwrap().unwrap(), resume.outcome()] {
+        assert_eq!(result.map, acknowledged.map);
+        assert_eq!(result.object, acknowledged.object);
+        assert_eq!(result.generation, acknowledged.generation);
+        assert_eq!(result.configuration, acknowledged.configuration);
+        assert_eq!(result.root_version, acknowledged.root_version);
+        assert_eq!(result.media_version, acknowledged.media_version);
+        assert_eq!(result.page_versions, acknowledged.page_versions);
+    }
+    assert_eq!(snapshot().await, before);
+
+    // Let the later cleanup case model elapsed time after this synthetic reuse.
+    assert_eq!(
+        observer
+            .execute(
+                "UPDATE public.storage_validated_digest_winners SET upload_until = '-infinity'
+                 WHERE object_id = $1::text::uuid AND upload_until = $2",
+                &[&acknowledged.object, &resume.usable_until()],
+            )
+            .await
+            .unwrap(),
+        1
+    );
 }

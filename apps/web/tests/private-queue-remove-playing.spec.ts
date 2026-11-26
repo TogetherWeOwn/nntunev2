@@ -254,3 +254,64 @@ test('Next plays the reordered private successor with a fresh grant', async ({ p
 	expect(at).toBeGreaterThan(0);
 	expect(grantStarts[1]).toBeGreaterThanOrEqual(at);
 });
+
+test('keyboard moves to the queue boundary keep focus on the moved track during playback and pause', async ({ page, origin }) => {
+	const { first, upcoming, later, grants, tab, firstSource, queue, active, audio, player, assertQueue } =
+		await openInvitedQueue(page, origin);
+	const move = (track: typeof first, direction: 'up' | 'down' | 'to top' | 'to bottom') => queue
+		.and(page.locator(`[${contract.queueId}="${track.id}"]`))
+		.getByRole('button', { name: `Move ${track.title} ${direction}`, exact: true });
+	const status = page.getByRole('status').and(page.getByTestId('queue-announcement'));
+	const playback = await audio.evaluateHandle((node: HTMLAudioElement) => {
+		const interruptions: string[] = [];
+		for (const type of ['play', 'pause', 'emptied', 'loadstart', 'seeking', 'ended']) {
+			node.addEventListener(type, () => interruptions.push(type));
+		}
+		return { node, position: node.currentTime, interruptions };
+	});
+
+	await move(first, 'down').focus();
+	await page.keyboard.press('Tab');
+	await expect(move(first, 'to bottom')).toBeFocused();
+	await page.keyboard.press('Enter');
+	await assertQueue([upcoming.id, later.id, first.id]);
+	await expect(status).toHaveText(`${first.title} moved to 3 of 3`);
+	await expect(move(first, 'to bottom')).toBeDisabled();
+	await expect(move(first, 'up')).toBeFocused();
+	await expect(active).toHaveAttribute(contract.queueId, first.id);
+	await expect.poll(() => playback.evaluate(({ node, position, interruptions }) => ({
+		connected: node.isConnected,
+		source: node.currentSrc,
+		advancing: !node.paused && !node.ended && !node.error && node.currentTime > position + 0.1,
+		interruptions
+	}))).toEqual({ connected: true, source: origin + firstSource, advancing: true, interruptions: [] });
+
+	await player.getByRole('button', { name: 'Pause', exact: true }).click();
+	await expect.poll(() => playback.evaluate(({ node, interruptions }) =>
+		node.paused && interruptions.length === 1 && interruptions[0] === 'pause')).toBe(true);
+	const pausedAt = await playback.evaluate(({ node }) => node.currentTime);
+	await move(later, 'up').focus();
+	await expect(move(later, 'up')).toBeFocused();
+	await page.keyboard.press('Space');
+	await assertQueue([later.id, upcoming.id, first.id]);
+	await expect(status).toHaveText(`${later.title} moved to 1 of 3`);
+	await expect(move(later, 'up')).toBeDisabled();
+	await expect(move(later, 'down')).toBeFocused();
+
+	await move(first, 'up').focus();
+	await page.keyboard.press('Tab');
+	await expect(move(first, 'to top')).toBeFocused();
+	await page.keyboard.press('Enter');
+	await assertQueue([first.id, later.id, upcoming.id]);
+	await expect(status).toHaveText(`${first.title} moved to 1 of 3`);
+	await expect(move(first, 'to top')).toBeDisabled();
+	await expect(move(first, 'down')).toBeFocused();
+	await expect(active).toHaveAttribute(contract.queueId, first.id);
+	await expect(player.getByTestId('library-now-playing')).toHaveText(first.title);
+	await expect(player.getByRole('button', { name: 'Play', exact: true })).toBeVisible();
+	expect(await playback.evaluate(({ node, interruptions }) => ({
+		connected: node.isConnected, source: node.currentSrc, paused: node.paused,
+		position: node.currentTime, interruptions
+	}))).toEqual({ connected: true, source: origin + firstSource, paused: true, position: pausedAt, interruptions: ['pause'] });
+	expect(grants.map((request) => request.postDataJSON())).toEqual([{ track_id: first.id, session_id: tab }]);
+});
