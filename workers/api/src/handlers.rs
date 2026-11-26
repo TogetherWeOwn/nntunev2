@@ -14692,6 +14692,171 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn paid_invite_checkout_resume_keeps_other_invite_payment_separate() {
+        use serde_json::{json, Value};
+
+        let mut h = stripe_harness();
+        h.config = h.config.with_play_grant_secret(PLAY_SECRET.to_vec());
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        h.store.billing_bindings.replace(test_bindings());
+        h.store.plan_caps_rows.borrow_mut().insert(
+            PLAN_PLUS.into(),
+            crate::plan_limits::caps_from_plan_row(1, 1),
+        );
+
+        let owner = seed_admin(&h, "owner", "owner@example.test");
+        let decode = |response: Response, status| {
+            assert_eq!(response.status, status, "{}", response.body);
+            serde_json::from_str::<Value>(&response.body).unwrap()
+        };
+        let invited_signup = |email, credential: &[u8], seed| {
+            let invite = decode(
+                h.call_full(
+                    "POST",
+                    "/v1/admin/invites",
+                    Some(json!({"email": email}).to_string()),
+                    Some(owner.clone()),
+                    Some(ORIGIN),
+                ),
+                201,
+            );
+            let (signup, user) = signup_with_invite(
+                &h,
+                email,
+                credential,
+                seed,
+                Some(invite["code"].as_str().unwrap()),
+            );
+            assert_eq!(signup.status, 200, "{}", signup.body);
+            (user, cookie_of(&signup))
+        };
+        let checkout = |cookie: &str| {
+            h.call_full(
+                "POST",
+                paid_invite_billing::CHECKOUT,
+                Some(json!({"planId": PLAN_PLUS}).to_string()),
+                Some(cookie.into()),
+                Some(ORIGIN),
+            )
+        };
+        let pending = |user: &str| {
+            block_on(h.store.open_checkout_operation(user))
+                .unwrap()
+                .unwrap()
+        };
+        let subscription = |cookie: &str| {
+            decode(
+                billing_get(&h, "/v1/me/subscription", Some(cookie.into())),
+                200,
+            )
+        };
+        let play = |cookie: &str| {
+            play_call(
+                &h,
+                cookie,
+                json!({"track_id":"track-9", "session_id":"tab-a"}),
+            )
+        };
+
+        let (resuming, resuming_cookie) =
+            invited_signup("resuming@example.test", b"resuming-invite", 41);
+        let initial_checkout = decode(checkout(&resuming_cookie), 200);
+        let resuming_op = pending(&resuming);
+        let resuming_session = resuming_op.session_id.as_deref().unwrap();
+
+        let (other, other_cookie) = invited_signup("other@example.test", b"other-invite", 42);
+        h.stripe
+            .next_customer
+            .replace(Some("cus_test_other".into()));
+        let other_checkout = decode(checkout(&other_cookie), 200);
+        let other_op = pending(&other);
+        let other_session = other_op.session_id.as_deref().unwrap();
+        assert_ne!(resuming, other);
+        assert_ne!(resuming_session, other_session);
+        assert_ne!(initial_checkout["url"], other_checkout["url"]);
+        assert_ne!(
+            h.store.billing_customers.borrow()[&resuming],
+            h.store.billing_customers.borrow()[&other]
+        );
+
+        let complete = |session_id: &str, subscription_id: &str, invoice_id: &str| {
+            let mut sessions = h.stripe.sessions.borrow_mut();
+            let session = sessions.get_mut(session_id).unwrap();
+            let customer = session.customer.as_deref().unwrap();
+            h.stripe.subscriptions.borrow_mut().insert(
+                subscription_id.into(),
+                test_subscription(subscription_id, customer, "active", PRICE_PLUS),
+            );
+            h.stripe.invoices.borrow_mut().insert(
+                invoice_id.into(),
+                test_invoice(
+                    invoice_id,
+                    customer,
+                    subscription_id,
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    BILLING_NOW + BILLING_PERIOD,
+                    BILLING_NOW,
+                ),
+            );
+            session.status = Some("complete".into());
+            session.payment_status = Some("paid".into());
+            session.subscription = Some(subscription_id.into());
+            session.url = None;
+        };
+
+        // A different invitee pays while the first tab is away from billing.
+        complete(other_session, "sub_test_other", "in_test_other");
+        let body = checkout_completed_body("evt_test_other_paid", other_session, false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(subscription(&other_cookie)["state"], "active");
+        assert_eq!(
+            live_for(&h, &other).unwrap().stripe_subscription_id,
+            "sub_test_other"
+        );
+        let history = h.store.invoice_history.borrow().clone();
+        assert_eq!(history.len(), 1);
+
+        // The first tab resumes its own unpaid session and reads its entitlement.
+        assert_eq!(decode(checkout(&resuming_cookie), 200), initial_checkout);
+        assert_eq!(subscription(&resuming_cookie)["state"], "no_subscription");
+        let denied = decode(play(&resuming_cookie), 402);
+        assert_eq!(denied["code"], "subscription_required");
+        assert_eq!(denied["reason"], "never_subscribed");
+        assert_eq!(pending(&resuming), resuming_op);
+        assert!(live_for(&h, &resuming).is_none());
+        assert!(block_on(h.store.playback_lease(&resuming))
+            .unwrap()
+            .is_none());
+        assert_eq!(*h.store.invoice_history.borrow(), history);
+
+        // The same tab now discovers its own verified payment through Checkout
+        // readback. No completion webhook is delivered for this session.
+        complete(resuming_session, "sub_test_resuming", "in_test_resuming");
+        assert_eq!(checkout(&resuming_cookie).status, 409);
+        assert_eq!(subscription(&resuming_cookie)["state"], "active");
+        assert_eq!(
+            live_for(&h, &resuming).unwrap().stripe_subscription_id,
+            "sub_test_resuming"
+        );
+        assert_eq!(
+            h.store.checkout_ops.borrow()[&resuming_op.id].state,
+            "succeeded"
+        );
+        assert!(decode(play(&resuming_cookie), 200)["play_id"].is_string());
+        let invoices = h.store.invoice_history.borrow();
+        assert_eq!(invoices.len(), 2);
+        assert_eq!(invoices["in_test_other"], history["in_test_other"]);
+        assert_eq!(
+            invoices["in_test_resuming"].stripe_subscription_id,
+            "sub_test_resuming"
+        );
+        assert_eq!(*h.stripe.sessions_created.borrow(), 2);
+        assert!(h.stripe.expired.borrow().is_empty());
+    }
+
+    #[test]
     fn billing_webhook_valid_advances_and_records_history() {
         let h = stripe_harness();
         seed_billing_user(&h, "u1");
