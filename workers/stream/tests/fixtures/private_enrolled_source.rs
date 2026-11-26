@@ -108,6 +108,8 @@ pub(super) struct Source {
     pub(super) expected_media_start: Cell<u64>,
     pub(super) pause_final_frame: Cell<Option<Rc<FrameGate>>>,
     clock: Cell<SystemTime>,
+    pub(super) expected_media_end: Cell<u64>,
+    pub(super) corrupt_final_frame_once: Cell<bool>,
 }
 
 impl Source {
@@ -155,6 +157,7 @@ impl Source {
         } else {
             now()
         };
+        let sealed_len = sealed.len() as u64;
         Self {
             fixture,
             sealed,
@@ -171,6 +174,8 @@ impl Source {
             expected_media_start: Cell::new(0),
             pause_final_frame: Cell::new(None),
             clock: Cell::new(start),
+            expected_media_end: Cell::new(sealed_len),
+            corrupt_final_frame_once: Cell::new(false),
         }
     }
 
@@ -272,13 +277,19 @@ impl PrivateSource for Source {
         assert_eq!(get.configuration, id(5));
         assert!(get.locator == self.fixture.media.locator());
         let start = self.expected_media_start.get();
-        let end = self.sealed.len() as u64;
+        let end = self.expected_media_end.get();
+        let sealed_len = self.sealed.len() as u64;
         assert_eq!(get.range, start..end);
-        assert_eq!(get.sealed_len, end);
-        let mut bytes = self.sealed[start as usize..].to_vec();
+        assert_eq!(get.sealed_len, sealed_len);
+        let mut bytes = self.sealed[start as usize..end as usize].to_vec();
         if self.short_media_once.replace(false) {
             // Keep the pinned response metadata intact while dropping a body byte.
             bytes.truncate(bytes.len() - 1);
+        }
+        if self.corrupt_final_frame_once.replace(false) {
+            assert!(!self.fixture.last.is_empty());
+            assert_eq!(end, sealed_len);
+            *bytes.last_mut().unwrap() ^= 1;
         }
         if self.empty_media_once.replace(false) {
             // Return EOF on the first read with the same pinned response metadata.
@@ -292,7 +303,7 @@ impl PrivateSource for Source {
         Ok(S3GetReply {
             status: 206,
             version: Some(version.into()),
-            content_range: Some(format!("bytes {start}-{}/{end}", end - 1)),
+            content_range: Some(format!("bytes {start}-{}/{sealed_len}", end - 1)),
             content_length: Some(end - start),
             has_content_encoding: false,
             body: BodyBytes {
