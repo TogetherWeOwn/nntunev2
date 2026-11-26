@@ -51,7 +51,7 @@ test('ordinary staging shares one configuration preflight', () => {
 
 for (const [index, postDeploy] of ['false', 'true'].entries()) {
   const preflight = preflights[0]!;
-  const script = preflight[2]!.replace(/^ {10}/gm, '');
+  const script = `export POST_DEPLOY=${postDeploy}\n${preflight[2]!.replace(/^ {10}/gm, '')}`;
   test.describe(index === 0 ? 'synthetic preflight' : 'journey preflight', () => {
     test('binds both Access secrets into the preflight environment', () => {
       expect(preflight[1]).toContain('CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}');
@@ -60,7 +60,7 @@ for (const [index, postDeploy] of ['false', 'true'].entries()) {
 
     if (index === 0) {
       test('unconfigured staging skips offline', () => {
-        const result = runShell(script, { POST_DEPLOY: postDeploy });
+        const result = runShell(script);
         expect(result.status).toBe(0);
         expect(result.output).toContain('configured=false');
         expect(result.output).not.toContain('configured=true');
@@ -70,7 +70,7 @@ for (const [index, postDeploy] of ['false', 'true'].entries()) {
       // staging-evidence accepts for promotion: a missing URL must fail, not
       // skip every step and pass.
       test('unconfigured staging fails closed instead of skipping', () => {
-        const result = runShell(script, { POST_DEPLOY: postDeploy, ...dummyPair });
+        const result = runShell(script, dummyPair);
         expect(result.status).not.toBe(0);
         expect(result.output).toContain('STAGING_BASE_URL');
         expect(result.output).not.toContain('configured=');
