@@ -102,13 +102,21 @@ test('a delayed private track end leaves the selected replacement playing until 
 	expect(selection.request().postDataJSON()).toEqual(freshGrant(selected));
 	await expectPlaying(selected);
 	const replacement = await audio.elementHandle();
-	const before = await replacement.evaluate((node: HTMLAudioElement) => node.currentTime);
+	const continuity = await replacement.evaluateHandle((node: HTMLAudioElement) => {
+		const interruptions: string[] = [];
+		for (const type of ['pause', 'seeking', 'emptied']) {
+			node.addEventListener(type, () => interruptions.push(type));
+		}
+		return { before: node.currentTime, interruptions };
+	});
+	const before = await continuity.evaluate((probe) => probe.before);
 	const released = await retired.evaluate((node: DelayedEndAudio) => node.releaseDelayedEnd?.());
 	expect(released).toMatchObject({ retired: true, aborted: true });
 	expect(released?.delivered).toBeGreaterThan(0);
 	await advancing(before + 0.2);
 	await expectPlaying(selected);
 	expect(await audio.evaluate((node, original) => node === original, replacement)).toBe(true);
+	expect(await continuity.evaluate((probe) => probe.interruptions)).toEqual([]);
 	expect(grants).toEqual([freshGrant(first), freshGrant(selected)]);
 
 	const completed = await finish();
