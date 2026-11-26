@@ -72,6 +72,14 @@ configuration change and abort the run on deploy drift.
 | `cancellation_or_lapse` | Period-end cancellation or lapse was applied and observed on the same subscription. |
 | `teardown_verified` | Paid dispatch is off again and synthetic resources are retired as described below. |
 
+Before entering `playback_and_meter`, verify that the play, seek, delivered
+usage and replay observations came from the synthetic account and playback
+sequence in this admitted run. An earlier playback sequence for the same
+account and build cannot supply that attestation. The runner verifies the
+attested build SHA and reads back the selected Checkout Session by ID. The
+operator verifies playback provenance because the receipt carries only a
+build SHA for `playback_and_meter`.
+
 On success or interruption, close paid dispatch in the protected staging
 configuration first. Disable the dedicated test webhook destination, confirm
 Checkout refuses, and restore the pre-trial Access policy and settings.
