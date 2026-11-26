@@ -37,6 +37,20 @@ test('new plays use the acknowledged mode in the same tab and continuations keep
 	expect(requests().map((body) => body.session_id)).toEqual(Array(8).fill(tab));
 });
 
+test('a settled zero position takes precedence over a later failed decoder reading', async () => {
+	const { media, src, play, attach } = setup();
+	await play(0);
+	const original = src();
+	const audio = Object.assign(attach(), { seekable: { length: 0 } });
+	await media.playCurrent();
+	audio.dispatchEvent(new Event('timeupdate'));
+	expect(get(media.absoluteSeek)).toMatchObject({ duration: 120, elapsed: 0 });
+
+	audio.failAt(0.2);
+	await media.retryCurrent();
+	expect([src(), audio.currentTime, audio.load.mock.calls.length]).toEqual([original, 0, 1]);
+});
+
 test.each(['refused', 'superseded', 'account retirement', 'legacy reply', 'extra field', 'newer play'] as const)('%s fences grant publication', async (caseName) => {
 	const { player, media, queue, fetchFn, lifetime, src, play, refresh, attach, delayGrant } = setup();
 	await play(0);
