@@ -540,3 +540,70 @@ required TLS combination is confirmed unavailable or a cache check fails,
 stop and report the affected binding to Engineering. Retain the `verify-full`
 requirement. Use these serving results in the C2 comparison of operator and
 serving database identities.
+
+### Assemble the four-connection handoff
+
+Record the reviewed revision and the Stage B disposable run and job that
+passed the stock PostgreSQL replay, identity and role-isolation checks. Use
+that proof as the rehearsal record. For the hosted handoff, take the database
+OID, cluster and TLS pins from the independently admitted trial target.
+Disposable database and role OIDs apply only to the disposable instance. Match
+the hosted target through the separate operator readback before comparing the
+four Worker results. [Stock target qualification](../../ops/staging-trial-pg/README.md)
+· [Operator preflight](https://github.com/TogetherWeOwn/nntunev2/pull/1942)
+
+Start with the four original, binding-labelled receipts before indexing them
+by name. Require one receipt per binding, four distinct config IDs, and four
+distinct canonical SQL role names and OIDs. Match each ID to the expected
+`<binding>_STAGING_ID` and the binding read back from the same reviewed Worker
+version. Match each approved role name to `<binding>_ROLE` and take its OID
+from the independently reviewed role pins. Keep approval pins and observed
+values separate even when they agree. Record evidence references and verdicts
+in the protected handoff. Keep raw results and credentials in custody.
+
+On each receipt, match the config's account, origin host, selected database,
+serving Access client and origin CA to the reviewed trial scope. Require
+`verify-full` origin TLS established under those settings and an explicit
+`caching.disabled=true` pass for that config. Require exactly one read-only
+identity row from the same binding. Check these against the same attempt and
+unchanged config. A missing result, repeated label or config, wrong Worker
+version, mismatched identity, or missing TLS or cache proof leaves the handoff
+pending. Account capacity and recovery have their own procedures.
+[Origin and cache checks](#stage-c2-hyperdrive-origin-connection)
+· [Interrupted setup recovery](https://github.com/TogetherWeOwn/nntunev2/pull/2043)
+
+In this synthetic example, the selected `nntunev2_staging` database has OID
+`40200`. All four receipts refer to the same reviewed build, Worker version,
+trial target, dedicated serving route and origin CA. Each config reference
+stands for a different scoped ID. The TLS and cache passes refer to separate
+evidence for each config. Values in the observed column come from the Worker
+result, with columns in query order.
+
+| Binding | Config ref | Approved role name and OID | Observed identity row | Origin TLS | `caching.disabled` |
+| --- | --- | --- | --- | --- | --- |
+| `PRIVATE_TRIAL_UPLOAD_DB` | `cfg-upload` | `trial_upload`, `40201` | `nntunev2_staging, 40200, trial_upload, 40201, trial_upload, 40201` | `verify-full` | `true` |
+| `PRIVATE_TRIAL_AUTH_DB` | `cfg-auth` | `trial_auth`, `40202` | `nntunev2_staging, 40200, trial_auth, 40202, trial_auth, 40202` | `verify-full` | `true` |
+| `PRIVATE_TRIAL_PUBLISH_DB` | `cfg-publish` | `trial_publish`, `40203` | `nntunev2_staging, 40200, trial_publish, 40203, trial_publish, 40203` | `verify-full` | `true` |
+| `PRIVATE_TRIAL_ENROLL_DB` | `cfg-enroll` | `trial_enroll`, `40204` | `nntunev2_staging, 40200, trial_enroll, 40204, trial_enroll, 40204` | `verify-full` | `true` |
+
+For the offline `binding_identity_verdicts` checker, pass the admitted
+`database_oid`, index the approved `(role_name, role_oid)` tuples into
+`role_pins` by full binding name, and index the observed six-field tuples
+into `rows` by the same labels. Keep OIDs as integers. Expect four `matched`
+identity verdicts for the table. Removing ENROLL's row leaves ENROLL `pending`.
+Swapping AUTH and PUBLISH's observed rows leaves both `pending`. Even with
+four identity matches, an absent or false cache result or missing origin TLS
+evidence keeps the handoff pending. [Offline role checker](../../.github/scripts/staging_trial_role_preflight.py)
+
+Hosted execution requires a protected, read-only Worker probe using the same
+four dedicated bindings while the trial is disarmed, and a hosted caller
+that verifies the config and deployed-version receipts and supplies the
+rows to the checker. The current deploy renders these bindings only with
+upload armed. The existing hosted role preflight accepts a database OID,
+issuer OID and two pre-grant roles and uses the staging migrator connection.
+The hosted provider preflight accepts an S3 fixture scope for exact-version
+HEAD and DELETE. The example is input to the offline identity checker only.
+Keep hosted qualification pending until the protected caller and its four
+read-only results are available. [Deploy binding configuration](../../.github/scripts/staging_stream_config.py)
+· [Hosted role preflight](../../.github/workflows/staging-trial-role-preflight.yml)
+· [Hosted provider preflight](../../.github/workflows/staging-trial-provider-preflight.yml)
