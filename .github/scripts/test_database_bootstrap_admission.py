@@ -250,6 +250,20 @@ def check_reader_privilege_binding():
     check("oversized record", json.dumps(record).encode().ljust(4097))
     check("privileges match the approved reader and inventory", record, "consistent")
 
+    # Both targets returned migration version 1, the same catalog, and
+    # effective read access for the same reader. Only the database OID differs.
+    catalog = b"1\ngrant_ledger.schema_migrations\ngrant_tracks.tracks\n"
+    catalog_pin = {"inventory_sha256": hashlib.sha256(catalog).hexdigest()}
+    other_target = catalog_pin | {"database_oid": 17004}
+    matching = {
+        "review": review | catalog_pin,
+        "inventory": inventory | catalog_pin,
+        "reader_privileges": privileges | catalog_pin,
+    }
+    check("matching database target", matching, "consistent")
+    check("identical catalog from another database", matching | {"inventory": inventory | other_target})
+    check("effective access on another database", matching | {"reader_privileges": privileges | other_target})
+
 
 def snapshot_record(branch="fixture001"):
     at = 1800000000
