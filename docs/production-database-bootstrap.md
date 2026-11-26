@@ -440,19 +440,24 @@ python3 -IB .github/scripts/database_bootstrap_reader_evidence.py < evidence.jso
 The protected baseline emits a fixed verdict. It does not emit an inventory
 digest. For `reader_privileges`, use a retained private readback that records
 the observed role identity, effective privilege result and covered inventory in
-the same read-only catalog snapshot. Hash that inventory using the same
-representation as the reviewed and saved inventories. If this readback is
-unavailable, omit `reader_privileges` so the evidence stays pending.
+the same read-only catalog snapshot. Use the same deterministic representation
+for all three inventories. Include object identities and their schema definitions
+or versions so a change to a definition changes the digest even when the object
+has the same name. Hash the definitions actually observed for each readback.
+If the privilege readback is unavailable, omit `reader_privileges` so the
+evidence stays pending.
 
 Both pending messages leave baseline evidence pending. A plain `pending`
 covers absent or unusable readback and other evidence failures, including
 a privilege result for a different reader. Recover any missing private
-readback for the same attempt. `pending (inventory-mismatch)` means a
-complete inventory record identifies the reviewed branch and database OID
-and has a different digest. Use the separately authorized read-only catalog
-check to compare the expected and observed objects on that database. A
-digest difference establishes disagreement, and the catalog comparison
-identifies any omitted objects. Keep migration closed pending reconciliation.
+readback for the same attempt. `pending (inventory-mismatch)` means a complete,
+scoped inventory differs from the review, or a passing privilege result for the
+reviewed reader and database covers a different inventory. Use the separately
+authorized read-only catalog check on the reviewed database to compare expected
+and observed object identities and definitions. Once the catalog agrees with the
+review, obtain a matched inventory and scoped privilege result from one
+authorized read-only catalog snapshot and rerun the offline check. Keep migration
+closed pending reconciliation.
 `consistent` confirms the supplied evidence agrees. The protected run's
 `empty` verdict, provenance and retirement evidence are still required.
 Keep credentials and raw SQL results out of the normalized record.

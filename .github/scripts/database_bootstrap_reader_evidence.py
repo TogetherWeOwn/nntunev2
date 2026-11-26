@@ -60,9 +60,15 @@ def reader_evidence_verdict(raw):
         return "pending"
     if observed_digest != digest:
         return "pending (inventory-mismatch)"
-    if not matches_pins(record.get("reader_privileges"), review | {"result": "passed"}):
+
+    privileges = record.get("reader_privileges")
+    covered_digest = privileges.get("inventory_sha256") if isinstance(privileges, dict) else None
+    if not (
+        valid_inventory_digest(covered_digest)
+        and matches_pins(privileges, review | {"inventory_sha256": covered_digest, "result": "passed"})
+    ):
         return "pending"
-    return "consistent"
+    return "consistent" if covered_digest == digest else "pending (inventory-mismatch)"
 
 
 if __name__ == "__main__":
