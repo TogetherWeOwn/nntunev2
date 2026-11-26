@@ -1,5 +1,6 @@
 //! Reconcile the result of an already committed private trial attempt.
 
+use nntune_core::digest_geometry::DigestGeometry;
 use tokio_postgres::{types::Type, Client};
 
 use crate::{
@@ -52,6 +53,12 @@ impl Permit<'_> {
             || committed.generation.replace('-', "") != uuid_text(prepared.intent.identities[3])
             || committed.configuration.replace('-', "") != uuid_text(prepared.intent.identities[4])
         {
+            return Err(Unconfirmed);
+        }
+        // The catalogue lookup reads the same inventory. Check its completeness
+        // against the authenticated upload geometry before comparing the pins.
+        let geometry = DigestGeometry::new(prepared.context.plaintext_len).ok_or(Unconfirmed)?;
+        if committed.page_versions.len() != geometry.pages() as usize {
             return Err(Unconfirmed);
         }
         let row = tx

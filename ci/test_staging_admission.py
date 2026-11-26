@@ -58,6 +58,7 @@ PRIVATE_CONTRACT_BYTES = json.dumps(PRIVATE_CONTRACT).encode()
 PRIVATE_AUDIO = (HERE.parent / "fixtures/synthetic-flac/private-staging/tone-a.flac").read_bytes()
 PRIVATE_AUDIO_SHA = sa.digest(PRIVATE_AUDIO)
 PRIVATE_TRACK_ID = "00000000-0000-4000-8000-000000000001"
+PRIVATE_LISTENER = "00000000-0000-4000-8000-000000000003"
 
 
 def make_policy(contract_bytes=CONTRACT_BYTES):
@@ -105,7 +106,10 @@ def private_report(pins, *, observation_offset=0, **track_overrides):
         if name in proofs:
             props = ET.SubElement(case, "properties")
             for proof in proofs[name]:
-                ET.SubElement(props, "property", name=proof, value=json.dumps(track))
+                value = track
+                if proof == "private-cutoff-refusal":
+                    value = track | {"cutoff_listener": PRIVATE_LISTENER, "refused_listener": PRIVATE_LISTENER}
+                ET.SubElement(props, "property", name=proof, value=json.dumps(value))
     observations = {lane: {k: v for k, v in pin.items() if k not in ("run_id", "run_attempt")}
                     for lane, pin in pins.items()}
     for phase, minutes in (("build-identity", -3), ("build-identity-final", -2)):
@@ -370,6 +374,20 @@ class PrivateAdmissionTests(Base):
                                      private_track_sha256=PRIVATE_AUDIO_SHA)
                 self.assertEqual(receipt["result"], "incomplete")
                 self.assertIn("private track evidence", receipt["reasons"][0])
+
+    def test_green_cutoff_requires_matching_listener_aliases(self):
+        for aliases in ({}, {"cutoff_listener": PRIVATE_LISTENER},
+                        {"cutoff_listener": "bad", "refused_listener": "bad"},
+                        {"cutoff_listener": PRIVATE_LISTENER, "refused_listener": PRIVATE_TRACK_ID}):
+            with self.subTest(aliases=aliases):
+                report = private_report(private_pins())
+                cutoff = report.find(".//property[@name='private-cutoff-refusal']")
+                value = json.loads(cutoff.get("value"))
+                del value["cutoff_listener"], value["refused_listener"]
+                cutoff.set("value", json.dumps(value | aliases))
+                receipt = PrivateWorld(report).receipt
+                self.assertEqual(receipt["result"], "incomplete")
+                self.assertEqual(receipt["reasons"], ["private cutoff refusal does not identify the invited listener"])
 
     def test_green_report_requires_private_play_observation(self):
         report = private_report(private_pins())
@@ -801,10 +819,97 @@ class VerifyTests(Base):
         w = World()
         self.assertEqual(w.verify()["result"], "satisfied")
 
+    def test_offline_terminal_main_push_distinguishes_queue_rejection_and_e2e_failure(self):
+        world = World()
+        receipt = world.verify()
+        self.assertEqual((receipt["sha"], receipt["run_id"], receipt["run_attempt"], receipt["result"]),
+                         (SHA, str(RUN_ID), "1", "satisfied"))
+
+        run = dict(world.run, conclusion="failure")
+        queue_notice = {"annotation_level": "failure",
+                        "message": "Queue is full for concurrency group 'deploy-staging-main'"}
+        rejected = {"run": run, "jobs": page("jobs", []), "annotations": [queue_notice]}
+        jobs = copy.deepcopy(world.jobs)
+        jobs[-1]["conclusion"] = "failure"
+        jobs[-1]["steps"][0]["conclusion"] = "failure"
+        for step in jobs[-1]["steps"][1:]:
+            step["conclusion"] = "skipped"
+        failed = {"run": run, "jobs": page("jobs", jobs), "annotations": []}
+
+        generic = "::error::Candidate admission refused: missing, unapproved, stale or incoherent evidence\n"
+
+        def assert_diagnosis(raw, expected):
+            result = subprocess.run(
+                [sys.executable, "-I", str(HERE / "staging_admission.py"), "diagnose-terminal-push", SHA],
+                input=raw, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, expected)
+
+        for case, evidence, expected in (
+            ("queue rejected", rejected,
+             f"Staging run {RUN_ID}, attempt 1 was rejected before jobs by the deploy-staging-main queue. "
+             "Exact-build qualification is pending. The next eligible automatic staging admission can "
+             "provide evidence for the build it runs.\n"),
+            ("E2E failed", failed, f"Staging run {RUN_ID}, attempt 1 was admitted, and the full E2E journey failed. "
+             "Inspect the journey job and return to candidate qualification.\n"),
+            ("no annotation", dict(rejected, annotations=[]), generic),
+            ("different annotation", dict(rejected, annotations=[dict(queue_notice, message="synthetic diagnostic")]),
+             generic),
+            ("different queue", dict(rejected, annotations=[dict(
+                queue_notice, message="Queue is full for concurrency group 'deploy-staging-other'",
+            )]), generic),
+            ("incomplete job list", dict(rejected, jobs=page("jobs", [], total=1)), generic),
+            ("different build", dict(rejected, run=dict(run, head_sha=OTHER_SHA)), generic),
+            ("manual run", dict(rejected, run=dict(run, event="workflow_dispatch")), generic),
+            ("rerun", dict(rejected, run=dict(run, run_attempt=2)), generic),
+            ("jobs present", dict(rejected, jobs=page("jobs", world.jobs)), generic),
+            ("different job attempt", dict(failed, jobs=page("jobs", [*jobs[:-1], dict(jobs[-1], run_attempt=2)])),
+             generic),
+            ("missing E2E step", dict(failed, jobs=page("jobs", [*jobs[:-1], dict(jobs[-1], steps=[])])), generic),
+            ("successful run", dict(rejected, run=world.run, jobs=page("jobs", world.jobs)), generic),
+        ):
+            with self.subTest(case=case):
+                assert_diagnosis(json.dumps(evidence), expected)
+        with self.subTest(case="excessive nesting"):
+            assert_diagnosis('{"nested":' + '[' * 10_000 + '0' + ']' * 10_000 + '}', generic)
+
     def test_positive_ignores_skipped_gate_only_later_run(self):
         w = World()
         w.add_other("skipped")
         self.assertEqual(w.verify()["result"], "satisfied")
+
+    def test_independent_same_sha_runs_use_deployment_history(self):
+        other_id = RUN_ID - 1
+        other_jobs = f"runs/{other_id}/jobs?filter=all&per_page=100&page=1"
+        selected_jobs = f"runs/{RUN_ID}/jobs?filter=all&per_page=100&page=1"
+        for api_conclusion, started, completed in (
+            (None, None, None), ("skipped", -2.75, -2.25),
+            ("success", -2.75, -2.25), ("success", 6, 7),
+        ):
+            with self.subTest(api_conclusion=api_conclusion, started=started):
+                w = World()
+                if api_conclusion is not None:
+                    # Cover both overlapping evidence and a deploy after the
+                    # selected journey releases the workflow lock at minute 5.
+                    # Both push SHAs stay fixed.
+                    w.runs.append(dict(w.run, id=other_id, created_at=iso(-30), updated_at=iso(completed + 1)))
+                    w.others[other_id] = [
+                        dict(w.job("staging-web", completed, started=started), id=201,
+                             run_id=other_id, conclusion="skipped"),
+                        dict(w.job("staging-api", completed, started=started, steps=[
+                            w.step(sa.DEPLOY_STEPS["staging-api"], 1, api_conclusion)
+                        ]), id=202, run_id=other_id, conclusion=api_conclusion),
+                    ]
+                actions = FakeActions(w.routes())
+                if api_conclusion == "success":
+                    self.refused("^known intervening staging deployment; fresh journey required$",
+                                 w.verify_with_actions, actions)
+                else:
+                    self.assertEqual(w.verify_with_actions(actions), w.receipt)
+                self.assertNotIn(selected_jobs, actions.calls)
+                self.assertEqual(other_jobs in actions.calls, api_conclusion is not None)
 
     def test_hash_source_and_manifest_mismatch(self):
         w = World()

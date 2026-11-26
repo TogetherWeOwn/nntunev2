@@ -368,6 +368,78 @@ for (const [name, error] of [
   });
 }
 
+for (const [name, loseAck, changedDigest] of [
+  ['publishes one multipart version when the final part acknowledgement arrives', false, false],
+  ['publishes one multipart version when the final part acknowledgement is lost', true, false],
+  ['keeps multipart completion pending when the unacknowledged part has a different digest', true, true],
+]) {
+  test(name, async (t) => {
+    const stored = new Map();
+    const requests = [];
+    let published;
+    let finalBody;
+    t.mock.method(globalThis, 'fetch', async (request) => {
+      const url = new URL(request.url);
+      requests.push(`${request.method} ${url.search.slice(1)}`);
+      if (request.method === 'PUT') {
+        const number = Number(url.searchParams.get('partNumber'));
+        assert.equal(number, stored.size + 1, 'a stored part must never be sent again');
+        assert.ok(number <= 2);
+        const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
+        const receipt = { etag: `"fixture-part-${number}"`, 'x-amz-checksum-sha256': checksum(body) };
+        stored.set(number, { receipt, len: body.length });
+        if (number === 2 && loseAck) {
+          finalBody = body;
+          throw new Error('synthetic final part acknowledgement lost after storing ciphertext');
+        }
+        return new Response(null, { headers: receipt });
+      }
+      const manifest = (await verifySignedRequest(request, 'POST', uploadQuery)).toString();
+      assert.deepEqual([...stored.keys()], [1, 2]);
+      assert.equal(published, undefined, 'the upload can publish only once');
+      const receipts = new Map([...stored].map(([number, part]) => [number, part.receipt]));
+      assert.equal(manifest, multipartManifest(receipts));
+      published = version;
+      return multipartCompletionReceipt(receipts);
+    });
+
+    const readPage = (listedBucket, key, uploadId, marker) => {
+      assert.deepEqual([listedBucket, key, uploadId, marker], [
+        bucket, mediaKey, new URLSearchParams(uploadQuery).get('uploadId'), null,
+      ]);
+      assert.deepEqual([...stored.keys()], [1, 2]);
+      assert.equal(published, undefined);
+      requests.push('LIST parts');
+      if (changedDigest) {
+        // A separate write replaces the stored part with bytes matching its own checksum.
+        const replacement = Buffer.from(finalBody);
+        replacement[0] ^= 1;
+        const digest = checksum(replacement);
+        assert.notEqual(digest, stored.get(2).receipt['x-amz-checksum-sha256']);
+        stored.set(2, {
+          receipt: { etag: '"replacement-part-2"', 'x-amz-checksum-sha256': digest },
+          len: replacement.length,
+        });
+      }
+      return { next_marker: null, parts: [...stored].map(([number, { receipt, len }]) => ({
+        number, len, etag: receipt.etag, digest: [...Buffer.from(receipt['x-amz-checksum-sha256'], 'base64')],
+      })) };
+    };
+
+    const result = complete(loseAck ? 'multipart-resume-lost-ack' : 'multipart-resume-full', loseAck ? readPage : undefined);
+    if (changedDigest) {
+      await assert.rejects(result, rejectedWith('unconfirmed final part inventory'));
+    } else {
+      assert.equal(await result, version);
+    }
+    assert.equal(published, changedDigest ? undefined : version);
+    assert.deepEqual(requests, [
+      `PUT partNumber=1&${uploadQuery}`, `PUT partNumber=2&${uploadQuery}`,
+      ...(loseAck ? ['LIST parts'] : []), ...(changedDigest ? [] : [`POST ${uploadQuery}`]),
+    ]);
+  });
+}
+
 const readbackPageVersion = 'page+%2F/=';
 const readbackPageQuery = 'versionId=page%2B%252F%2F%3D';
 const readbackHeaders = (bytes, id) => ({
@@ -795,3 +867,46 @@ test('an ambiguous or mismatched abort response stays unconfirmed', async (t) =>
     await assert.rejects(complete('reconcile-replay'), rejectedWith('unconfirmed abort'));
   }
 });
+
+for (const [kind, repeatedPart] of [
+  ['identical', (part) => ({ ...part })],
+  ['conflicting', (part) => ({ ...part, etag: '"overlapping-part-1"' })],
+]) {
+  test(`keeps the checkpoint across ${kind} multipart page overlap and resumes on a coherent retry`, async (t) => {
+    const confirmed = [];
+    const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+      const number = confirmed.length + 1;
+      assert.ok(number <= 2, 'status and resume must only read inventory');
+      const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
+      const etag = `"inventory-part-${number}"`;
+      const sha = checksum(body);
+      confirmed.push({ number, len: body.length, etag, digest: [...Buffer.from(sha, 'base64')] });
+      return new Response(null, { headers: { etag, 'x-amz-checksum-sha256': sha } });
+    });
+    const markers = [];
+    const uploadId = new URLSearchParams(uploadQuery).get('uploadId');
+    const readPage = (observedBucket, key, id, marker) => {
+      assert.deepEqual([observedBucket, key, id], [bucket, mediaKey, uploadId]);
+      assert.equal(confirmed.length, 2);
+      markers.push(marker);
+      const [first, second] = confirmed;
+      if (marker === null) return { next_marker: 1, parts: [first] };
+
+      assert.equal(marker, 1);
+      // The first terminal page repeats part 1 alongside genuine part 2.
+      const parts = markers.length === 2 ? [repeatedPart(first), second] : [second];
+      return { next_marker: null, parts };
+    };
+
+    const result = JSON.parse(await complete('multipart-resume', readPage));
+    assert.deepEqual(markers, [null, 1, null, 1]);
+    assert.equal(fetch.mock.callCount(), 2);
+    assert.deepEqual(result, {
+      statuses: [
+        { status: 'pending', upload_id: uploadId, parts: confirmed },
+        { status: 'resumable', upload_id: uploadId, parts: confirmed },
+      ],
+      manifest: confirmed.map(({ number, etag, digest }) => [number, etag, Buffer.from(digest).toString('base64')]),
+    });
+  });
+}

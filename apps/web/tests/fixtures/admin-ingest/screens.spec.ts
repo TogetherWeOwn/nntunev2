@@ -108,6 +108,159 @@ test('ten separate FLAC inputs keep independent outcomes through a denial', asyn
 	await expect(page.locator('video, audio, iframe')).toHaveCount(0);
 });
 
+test('the FLAC picker stays locked during a file read and accepts the next selection', async ({ page, ingestOrigin }) => {
+	const firstFile = new URL('fixture-1.flac', clips);
+	const nextFile = new URL('fixture-2.flac', clips);
+	const expectedFiles = await Promise.all([readFile(firstFile), readFile(nextFile)]);
+	const readStarted = Promise.withResolvers<void>();
+	const releaseRead = Promise.withResolvers<void>();
+	const received: Buffer[] = [];
+	await page.exposeFunction('queueFixture', () => queuePage([]));
+	await page.exposeFunction('uploadFixture', (bytes: number[]) => {
+		received.push(Buffer.from(bytes));
+		return 'accepted';
+	});
+	await page.exposeFunction('holdFirstFileRead', () => {
+		readStarted.resolve();
+		return releaseRead.promise;
+	});
+	await page.addInitScript(() => {
+		const arrayBuffer = File.prototype.arrayBuffer;
+		File.prototype.arrayBuffer = async function (this: File) {
+			if (this.name === 'fixture-1.flac') {
+				await (window as Window & { holdFirstFileRead(): Promise<void> }).holdFirstFileRead();
+			}
+			return arrayBuffer.call(this);
+		};
+	});
+	await openScreens(page, ingestOrigin, 'owner', true);
+	const picker = page.getByLabel('FLAC files');
+	const upload = page.getByRole('button', { name: 'Upload files' });
+	const results = page.getByRole('list', { name: 'Upload results' }).getByRole('listitem');
+	await picker.setInputFiles(fileURLToPath(firstFile));
+	await upload.click();
+	await readStarted.promise;
+	try {
+		await expect(picker).toHaveJSProperty('disabled', true);
+		await expect(upload).toHaveJSProperty('disabled', true);
+		await expect(results).toHaveText(['fixture-1.flac · Uploading']);
+		expect(received).toHaveLength(0);
+	} finally {
+		releaseRead.resolve();
+	}
+
+	await expect(results).toHaveText(['fixture-1.flac · Accepted for processing.']);
+	await expect(picker).toBeEnabled();
+	await expect(picker).toHaveValue('');
+	expect(received).toEqual([expectedFiles[0]]);
+
+	await picker.setInputFiles(fileURLToPath(nextFile));
+	await upload.click();
+	await expect(results).toHaveText(['fixture-2.flac · Accepted for processing.']);
+	expect(received).toEqual(expectedFiles);
+});
+
+type MultipartOperation =
+	| { kind: 'start' }
+	| { kind: 'put'; uploadId: string; part: number; bytes: number[] }
+	| { kind: 'complete'; uploadId: string; receipts: string[] };
+
+test('cancelling the FLAC chooser preserves the pending multipart upload', async ({ page, ingestOrigin, browserName }) => {
+	test.skip(browserName !== 'chromium', 'Native chooser cancellation is driven by Chromium CDP');
+	const file = new URL('fixture-1.flac', clips);
+	const bytes = Array.from(await readFile(file));
+	const split = Math.ceil(bytes.length / 2);
+	const operations: MultipartOperation[] = [];
+	let nextUpload = 0;
+	let interrupt = true;
+	await page.exposeFunction('queueFixture', () => queuePage([]));
+	await page.exposeFunction('multipartOperation', (operation: MultipartOperation) => {
+		operations.push(operation);
+		if (operation.kind === 'start') return `upload-${++nextUpload}`;
+		if (operation.kind === 'put') {
+			if (operation.part === 2 && interrupt) {
+				interrupt = false;
+				throw new Error('Synthetic interruption before part 2 was confirmed');
+			}
+			return `${operation.uploadId}-part-${operation.part}`;
+		}
+		return 'completed';
+	});
+	await page.addInitScript(() => {
+		const { multipartOperation } = window as Window & {
+			multipartOperation(operation: MultipartOperation): Promise<string>;
+		};
+		// The fixture adapter owns the browser checkpoint. The test-side
+		// transport records each operation without keeping a checkpoint.
+		let pending: { uploadId: string; receipts: string[] } | undefined;
+		window.uploadFixture = async (bytes) => {
+			const upload = pending ??= { uploadId: await multipartOperation({ kind: 'start' }), receipts: [] };
+			const split = Math.ceil(bytes.length / 2);
+			const parts = [bytes.slice(0, split), bytes.slice(split)];
+			const { uploadId, receipts } = upload;
+			for (let index = receipts.length; index < parts.length; index++) {
+				receipts.push(await multipartOperation({ kind: 'put', uploadId, part: index + 1, bytes: parts[index] }));
+			}
+			await multipartOperation({ kind: 'complete', uploadId, receipts });
+			pending = undefined;
+			return 'accepted';
+		};
+	});
+	await openScreens(page, ingestOrigin, 'owner', true);
+	const picker = page.getByLabel('FLAC files');
+	const upload = page.getByRole('button', { name: 'Upload files' });
+	const result = page.getByRole('list', { name: 'Upload results' }).getByRole('listitem');
+	const pendingResult = 'fixture-1.flac · Upload could not be confirmed. Check the review queue before submitting again.';
+	const uploadId = 'upload-1';
+	const secondPart: MultipartOperation = { kind: 'put', uploadId, part: 2, bytes: bytes.slice(split) };
+	const interrupted: MultipartOperation[] = [
+		{ kind: 'start' },
+		{ kind: 'put', uploadId, part: 1, bytes: bytes.slice(0, split) },
+		secondPart
+	];
+	await picker.setInputFiles(fileURLToPath(file));
+	await upload.click();
+	await expect(result).toHaveText(pendingResult);
+	expect(operations).toEqual(interrupted);
+
+	await picker.evaluate((input) => {
+		input.addEventListener('cancel', (event) => {
+			if (event.isTrusted) input.setAttribute('data-chooser-cancelled', '');
+		}, { once: true });
+	});
+	const cdp = await page.context().newCDPSession(page);
+	try {
+		// Chromium dismisses the intercepted chooser and emits the trusted
+		// input event even in headless runs.
+		await cdp.send('Page.enable', { enableFileChooserOpenedEvent: true });
+		await cdp.send('Page.setInterceptFileChooserDialog', { enabled: true, cancel: true });
+		const opened = new Promise<void>((resolve) => cdp.once('Page.fileChooserOpened', () => resolve()));
+		await picker.click();
+		await opened;
+		await expect(picker).toHaveAttribute('data-chooser-cancelled', '');
+	} finally {
+		await cdp.send('Page.setInterceptFileChooserDialog', { enabled: false });
+		await cdp.detach();
+	}
+	await expect(picker).toHaveValue('');
+	await expect(result).toHaveText(pendingResult);
+	expect(operations).toEqual(interrupted);
+
+	const [chooser] = await Promise.all([page.waitForEvent('filechooser'), picker.click()]);
+	await chooser.setFiles(fileURLToPath(file));
+	expect(await picker.evaluate((input: HTMLInputElement) => Array.from(input.files ?? [], ({ name }) => name)))
+		.toEqual(['fixture-1.flac']);
+	await expect(result).toHaveText(pendingResult);
+	expect(operations).toEqual(interrupted);
+	await upload.click();
+	await expect(result).toHaveText('fixture-1.flac · Accepted for processing.');
+	expect(operations).toEqual([
+		...interrupted,
+		secondPart,
+		{ kind: 'complete', uploadId, receipts: ['upload-1-part-1', 'upload-1-part-2'] }
+	]);
+});
+
 test('queue status filters, paging, and detail expose supported states and fixed reasons', async ({ page, ingestOrigin }) => {
 	const rows = [
 		{ job_id: 'accepted-job', status: 'accepted', revision: 0 },
