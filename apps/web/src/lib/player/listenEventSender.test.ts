@@ -115,6 +115,8 @@ it('bounds transient retries and honors a capped Retry-After', async () => {
 	f.sender.send(complete);
 	await vi.advanceTimersByTimeAsync(60_499);
 	expect(f.bodies()).toEqual(Array(2).fill({ ...start, context }));
+	await vi.advanceTimersByTimeAsync(1);
+	expect(f.bodies()).toEqual(Array(3).fill({ ...start, context }));
 	await vi.advanceTimersByTimeAsync(20_000);
 	expect(f.bodies()).toEqual(Array(3).fill({ ...start, context }));
 });
@@ -193,6 +195,33 @@ it('drains only accepted terminals and cancels their pending retry on close', as
 	await f.sender.close();
 	await vi.advanceTimersByTimeAsync(2500);
 	expect(f.bodies()).toEqual([{ ...start, context }, { ...complete, context }]);
+});
+
+it('cancels a pending start on close and drops its queued terminal after a late acknowledgement', async () => {
+	vi.useFakeTimers();
+	const pendingStart = Promise.withResolvers<Response>();
+	const fetchFn = contextFetch().mockImplementationOnce(() => pendingStart.promise)
+		.mockImplementation(async () => ack());
+	const f = fixture(fetchFn);
+	await f.sender.ready;
+	expect(await f.openGrant()).toBe(true);
+	f.sender.send(start);
+	f.sender.send(complete);
+	await vi.advanceTimersByTimeAsync(0);
+	expect(f.bodies()).toEqual([{ ...start, context }]);
+	const signal = fetchFn.mock.calls[1][1]?.signal;
+	expect(signal?.aborted).toBe(false);
+
+	const closed = vi.fn();
+	const closing = f.sender.close().then(closed);
+	await vi.advanceTimersByTimeAsync(0);
+	expect(closed).toHaveBeenCalledOnce();
+	expect(signal?.aborted).toBe(true);
+	// A response delivered after cancellation cannot release the queued terminal.
+	pendingStart.resolve(ack());
+	await closing;
+	await vi.advanceTimersByTimeAsync(2_500);
+	expect(f.bodies()).toEqual([{ ...start, context }]);
 });
 
 it('waits on a ready terminal during close and aborts the drain when the account retires', async () => {
