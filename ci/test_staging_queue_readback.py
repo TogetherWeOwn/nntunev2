@@ -74,7 +74,7 @@ class QueueReadbackTests(unittest.TestCase):
 
     def test_pending_job_activity_disqualifies_a_newer_run(self):
         for activity in ({"status": "in_progress"}, {"started_at": "2026-01-01T00:00:00Z"},
-                         {"runner_id": 9}, {"steps": [{"status": "in_progress"}]}):
+                         {"runner_id": 9}, {"runner_id": False}, {"steps": [{"status": "in_progress"}]}):
             with self.subTest(activity=activity):
                 code, report = self.invoke(snapshot(run(1), run(2), jobs={1: [], 2: [job(2, **activity)]}))
                 self.assertEqual(code, 0)
@@ -124,6 +124,9 @@ class QueueReadbackTests(unittest.TestCase):
 
     def test_missing_or_cross_attempt_evidence_returns_no_selection(self):
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={2: []}))
+        missing_runner = job(1)
+        del missing_runner["runner_id"]
+        self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [missing_runner], 2: []}))
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [job(1, run_attempt=2)], 2: []}))
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [job(2)], 2: []}))
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [job(1, head_sha="b" * 40)], 2: []}))
