@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { smoke } from '../../bin/smoke.mjs';
 import { cloudflare, requireCompletePage } from './seed.mjs';
 import { admitRecovery, intentFile, recoveryContext, workflow } from './recovery-evidence.mjs';
+import proof from '../release-promotion-proof.cjs';
 
 const name = 'nntune-web';
 const deployments = `/scripts/${name}/deployments`;
@@ -187,16 +188,20 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
 }
 
 if (import.meta.main) {
+  const command = process.argv[2];
   try {
-    const command = process.argv[2];
     const env = { ...process.env };
     if (command === 'admit-recovery') delete process.env.INTENT_KEY; // Withhold from subprocesses.
     const verdict = command === 'admit-recovery' ? admitRecovery(env) : await finalSmokeRollback(command, env);
     // Report a failed summary write even when the allocation was verified.
     if (verdict) writeFileSync(process.stdout.fd, `${verdict}\n`);
-  } catch {
+  } catch (error) {
     // Errors may contain protected input or provider data. Keep details in private custody.
-    console.error('::error::Protected rollback check failed. Reconcile Worker, deployment, routes and provider audit before any retry.');
+    if (command === 'admit-recovery' && error instanceof proof.ArtifactUnavailableError) {
+      console.error('::error::Switch-off pending: pinned rollback intent unavailable. Read the Actions artifact metadata for the original rollout and reconcile the pinned rollback allocation and provider audit read-only. Keep the original recovery inputs and writer freeze.');
+    } else {
+      console.error('::error::Protected rollback check failed. Reconcile Worker, deployment, routes and provider audit before any retry.');
+    }
     process.exitCode = 1;
   }
 }

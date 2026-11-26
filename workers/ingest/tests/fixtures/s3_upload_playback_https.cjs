@@ -48,6 +48,8 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   let originError;
   let expectedRange;
   let fault;
+  let uploads = 0;
+  let failCompletion = false;
   let onInterruptedClose;
 
   function store(versions, version, body) {
@@ -90,7 +92,7 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
       verify(initiationHeaders);
       assert.equal(path, mediaPath);
       assert.equal(pending, undefined);
-      pending = { id: `upload+/${media.size + 1}?` };
+      pending = { id: `upload+/${++uploads}?` };
       res.end(initiationReceipt(bucket, mediaKey, pending.id));
       return;
     }
@@ -107,6 +109,10 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
       assert.equal(path, mediaPath);
       assert.equal(query, `uploadId=${encodeURIComponent(pending.id)}`);
       assert.ok(body.includes(`<ChecksumSHA256>${checksum(pending.body)}</ChecksumSHA256>`));
+      if (failCompletion) {
+        res.writeHead(503).end();
+        return;
+      }
       const version = `media+/%?=&${media.size + 1}`;
       const receipt = completionReceipt(body.toString(), 'fixture-part');
       store(media, version, pending.body);
@@ -193,18 +199,27 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   const endpoint = `https://${host}`;
 
   const track = await upload_for_playback(endpoint, true);
-  assert.equal(await upload_for_playback(endpoint, false), replacement);
-  const current = [...media.entries()].at(-1);
-  assert.equal(current[0], replacement);
-  assert.notDeepEqual(current[1].subarray(suffixStart), media.get(original).subarray(suffixStart));
+  const upload = ['POST media', 'PUT media', 'POST media', 'HEAD media', 'PUT page', 'GET media', 'GET page'];
+  assert.deepEqual(operations.splice(0), upload);
+
+  failCompletion = true;
+  await assert.rejects(upload_for_playback(endpoint, false),
+    error => error === 'Unconfirmed(Some(CompletionStatus))');
+  assert.deepEqual(operations.splice(0), ['POST media', 'PUT media', 'POST media']);
+  assert.deepEqual([...media.keys()], [original]);
+  assert.deepEqual([...pages.keys()], [originalPage]);
+  assert.ok(pending.body, 'the refused completion received a replacement part');
+
+  // Discard the failed upload from the synthetic origin. Open a separate
+  // upload for the successful control, with its own provider upload ID.
+  pending = undefined;
+  failCompletion = false;
 
   const unsigned = await fetch(`${endpoint}${mediaPath}?${queryFor(original)}`, {
     headers: { range: suffixRange }, signal: AbortSignal.timeout(5000),
   });
   assert.equal(unsigned.status, 403);
   assert.equal(rejectedUnsigned, 1);
-  const upload = ['POST media', 'PUT media', 'POST media', 'HEAD media', 'PUT page', 'GET media', 'GET page'];
-  assert.deepEqual(operations.splice(0), [...upload, ...upload]);
 
   const grantKey = 'synthetic catalogue playback test key';
   const custodyKey = 'synthetic catalogue custody test key';
@@ -344,6 +359,15 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   assert.equal(full.response.headers.get('content-type'), 'audio/flac');
   assert.equal(full.response.headers.get('content-range'), null);
   assert.equal(full.bytes.length, plaintextLength);
+  assert.equal(full.bytes.toString('ascii', 0, 4), 'fLaC');
+  assert.equal(full.bytes[4] & 0x7f, 0, 'the first metadata block is STREAMINFO');
+  assert.equal(full.bytes.readUIntBE(5, 3), 34, 'STREAMINFO payload length');
+  // STREAMINFO packs the sample format and count into one big-endian word.
+  const streamInfo = full.bytes.readBigUInt64BE(18);
+  assert.equal(Number(streamInfo >> 44n), 44_100, 'sample rate in Hz');
+  assert.equal(Number((streamInfo >> 41n) & 7n) + 1, 1, 'channels');
+  assert.equal(Number((streamInfo >> 36n) & 31n) + 1, 8, 'bits per sample');
+  assert.equal(Number(streamInfo & ((1n << 36n) - 1n)), 19, 'total samples');
   assert.equal(sha256(full.bytes), plaintextHash);
   assert.deepEqual(operations.splice(0), ['GET range', 'GET page']);
   assert.deepEqual(custody.splice(0), ['resolve', 'lease', 'lease', 'lease']);
@@ -371,7 +395,21 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
     { ...interval, start: plaintextLength - 1, end: plaintextLength },
     { ...interval, start: plaintextLength - 2, end: plaintextLength },
   ]);
+
+  assert.equal(await upload_for_playback(endpoint, false), replacement);
+  assert.equal(uploads, 3);
+  assert.deepEqual(operations.splice(0), upload);
+  const current = [...media.entries()].at(-1);
+  assert.equal(current[0], replacement);
+  assert.notDeepEqual(current[1].subarray(suffixStart), media.get(original).subarray(suffixStart));
   expectedRange = suffixRange;
+  const pinned = await request(seek);
+  assert.equal(pinned.response.status, 206);
+  assert.deepEqual(pinned.bytes, Buffer.from([0x1d]));
+  assert.deepEqual(operations.splice(0), ['GET range', 'GET page']);
+  assert.deepEqual(custody.splice(0), ['resolve', 'lease', 'lease']);
+  assert.deepEqual(reports.splice(0), [{ ...interval, start: plaintextLength - 1, end: plaintextLength }]);
+
   for (fault of ['wrong version', 'changed bytes', 'short range']) {
     const refused = await request(seek);
     assert.equal(refused.response.status, 502, fault);

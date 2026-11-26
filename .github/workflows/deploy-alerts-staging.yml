@@ -1,3 +1,4 @@
+# guards: release:staging Tail alerts deploy
 name: deploy-alerts-staging
 
 # Staging Tail alert runtime deploy (frozen-source activation lane).

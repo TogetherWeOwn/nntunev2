@@ -72,6 +72,8 @@ until their evidence is available.
    release only with a reviewed staging window that supports admission and
    timely cleanup. Otherwise perform cleanup and leave promotion blocked.
    [Trial cleanup](../e2e/README.md#private-music-journey-preparation)
+   For an unusable receipt, use the
+   [receipt recovery handoff](#synthetic-handoff-for-an-unusable-receipt).
 4. Quiesce launch writes and schema/grant changes. Use the
    [protected read-only database baseline](production-database-bootstrap.md#protected-baseline)
    on the pinned production branch and logical database. Require `empty` and
@@ -86,7 +88,9 @@ until their evidence is available.
    and pre-schema snapshots distinct when their recovery targets differ. If
    writes could have resumed after the baseline, repeat it and re-qualify the
    snapshot. The empty-first-release path requires no restore rehearsal.
-   Reconcile the current migration manifest and ledger before app cutover.
+   Reconcile the current migration manifest and ledger and check the
+   [post-migration schema inventory](production-database-bootstrap.md#post-migration-schema-inventory)
+   before app cutover.
    [Snapshot and metering](production-database-bootstrap.md#snapshot-and-metering)
 6. Verify the binding-free maintenance fallback, private Access route and
    backend/media switch-off. Commission an independent cross-family production
@@ -99,12 +103,13 @@ until their evidence is available.
 ### Offline handoff example after a rerun
 
 In this synthetic handoff, `deploy.yml` reruns the same `<sha>` under the same
-`<run-id>`. The run-level artifact listing can contain receipts from both attempts.
+`<run-id>`. The run-level artifact listing can contain receipts from multiple
+attempts.
 
 | Artifact name | Handoff disposition |
 | --- | --- |
 | `staging-admission-<sha>-<run-id>-1-private-music` | Historical evidence from attempt 1, which the rerun superseded. |
-| `staging-admission-<sha>-<run-id>-2-private-music` | Use for verification when the run and required jobs identify attempt 2 and exactly one artifact has this name. |
+| `staging-admission-<sha>-<run-id>-<current-attempt>-private-music` | Use for verification when the run and required jobs identify the current attempt and exactly one artifact has this name. |
 
 If the handoff only identifies the run ID, the attempt records disagree, or
 the selected attempt has no unique matching artifact, record **Staging
@@ -112,6 +117,70 @@ admission** as Pending and **Dispatch readiness** as Blocked. Resolve the
 attempt and artifact from the same protected run before resuming step 3.
 The name selects the artifact for verification. The verifier still checks
 the archive digest and the receipt's own SHA, run ID and attempt.
+
+If attempt 2 reran only `staging-ingest`, the run can show green while the
+private journey and its Web, API and Stream deployments still belong to attempt
+1. Record attempt 2, the job that reran and the missing same-attempt jobs in the
+candidate record. Keep **Staging admission** Pending and **Dispatch readiness**
+Blocked. Follow the [unusable receipt handoff](#synthetic-handoff-for-an-unusable-receipt)
+to qualify a complete replacement attempt.
+
+### Synthetic handoff for an unusable receipt
+
+For candidate `<sha>`, record the `deploy.yml` run, attempt, available job
+references and fixture pins in the private release record. The examples below
+describe evidence failures. Leave any journey case without its own verified
+verdict Pending. In each case, record **Staging admission** as Pending and
+**Dispatch readiness** as Blocked.
+
+| Receipt failure | What to record and do |
+| --- | --- |
+| Expired evidence | Record that the selected attempt's artifact expired, even if its journey job passed. Qualify a replacement attempt. |
+| Interrupted recording or upload | Record where the attempt stopped. If the run, private journey job, receipt recording or upload ended without success, qualify a replacement attempt even if Actions lists a matching artifact. |
+| SHA-256 mismatch | Record the verifier refusal when the downloaded ZIP differs from the Actions digest. Repeat qualification step 3 through the authorized Actions read path if the same artifact and attempt are still eligible. If the mismatch persists or the evidence is no longer eligible, qualify a replacement attempt. |
+
+Keep scheduled [trial cleanup](ops/private-staging-trial.md#retire-and-recover)
+on time. For a replacement, reconcile the prior invite, upload, publication
+and fixture pins before using
+[fresh single-use inputs](ops/private-staging-trial.md#setup-and-trial).
+
+During the next approved staging window, use **Re-run all jobs** only within
+GitHub's 30-day rerun window and if the original protected push uses the
+`deploy-staging-main` lock. Follow the
+[staging rollback procedure](ops.md#staging-deploy-lock-cutover-and-rollback)
+before starting the rerun. Pause merges, pushes and other staging reruns,
+drain active and queued deploys through post-deploy E2E, and keep the pause
+until the rerun finishes and staging serves the pinned SHA. If those conditions
+cannot be met, use a fresh protected push to `main` during an approved staging
+window and pin its reviewed SHA.
+
+Repeat [qualification steps 1–3](#qualify-the-candidate) on the selected build.
+Require successful deployment and journey jobs, a pass without a Playwright
+retry for every required case, and the verified receipt from one complete
+protected main-push `deploy.yml` attempt.
+[Select the replacement receipt by attempt](#offline-handoff-example-after-a-rerun).
+Keep the original evidence under its own attempt. Record the selected run,
+attempt and artifact digest when the verifier emits matching staging pins.
+
+## Staging rollback rehearsal with launch readback pending
+
+This offline example uses placeholders. The maintenance seed was recorded
+earlier. The application candidate's release decision is `Pending` while the
+operator checks that fallback before dispatch.
+
+| Record | Example entry |
+| --- | --- |
+| Staging rollback rehearsal | **Passed.** Push-triggered staging `deploy.yml` run `<staging-run>` had `staging-web` conclude `success` on `<last-good-staging-sha>`. [**Re-run all jobs**](ops.md#staging-deploy-lock-cutover-and-rollback) produced attempt `<attempt>` with `staging-web` at `success`, passing health and the matching SHA from staging `/api/build`. |
+| Launch maintenance target | The maintenance seed record pins production Worker ID `<worker-id>` (`nntune-web`), `<maintenance-deployment>` and `<maintenance-version>` at 100%. |
+| Launch serving readback | **Missing.** The current launch allocation is unavailable. In the disagreement variant, the latest launch deployment reports 100% on `<other-launch-version>`. |
+| Handoff | In either variant, retain the staging pass, leave verification of the maintenance fallback open and keep the release decision `Pending`. |
+
+The next serving readback is the complete deployment history for the pinned
+Worker ID (`nntune-web`) in the pinned production account. Confirm that the
+current deployment is `<maintenance-deployment>` and serves
+`<maintenance-version>` at 100%, then continue the existing fallback checks.
+[Protected recovery](ops.md#protected-production-worker-recovery) ·
+[Switch-off verification](#switch-off-and-verify)
 
 ## Switch off and verify
 
@@ -247,15 +316,36 @@ receipt for release publication.
 | Staging rollback | Last-good SHA, run/attempt, restore and identity readback |
 | Production baseline | Protected source SHA, run/attempt and job URL, private provider branch and logical DB/OID reference, manifest digest, read time and `empty` verdict, separate no-live-user/data confirmation, writer fence and custodian |
 | Pre-schema snapshot | Private snapshot reference, capture and completion UTC, branch and restore scope, expiry, verification reference and first schema apply boundary |
+| Post-migration schema inventory | Successful protected migration run and attempt, launch branch and database OID, reconciled inventory reference, readback time and offline consistency verdict |
 | Protected switch-off | Executors and protected controls for Access/invites and API/media, private seed evidence for the verified maintenance Worker/deployment/version/seed SHA/module digest, sealed intent custody reference and original rollout artifact link when published, expected denials and grant expiry boundary |
 | Release review and dispatch | Independent reviewer, decision (initially `Pending`, then `APPROVE` or `BLOCK`), UTC and review reference for the pinned SHA and staging attempt, protected workflow and rollout run/attempt, final deployment/version and smoke result |
-| Dispatch readiness | Pending. Record ready or blocked under the [existing qualification steps](#qualify-the-candidate), with a safe reference to the supporting evidence or blocker. |
+| Dispatch readiness | Pending while an applicable journey case lacks a verdict or safe evidence reference from the pinned staging attempt, unless qualification identifies a blocker. Record Blocked for a blocker such as a failed applicable case or a [required staging receipt that cannot be verified](../ci/staging-admission.md#synthetic-handoff-when-actions-evidence-is-unavailable). Record Ready only after the [existing qualification steps](#qualify-the-candidate) are satisfied and every applicable case has a passing verdict and safe reference. Cite the evidence or blocker. |
 | Health watch and recovery | Watcher, backup, UTC start/end, health and error baseline/threshold, readback schedule and results. Actual disposition pending until the [watch](#watch-the-first-30-minutes) or [switch-off](#switch-off-and-verify) has an outcome. Record the watch result when run and whether recovery was invoked. If used, record the trigger and UTC, recovery attempt and outcome, denial and final allocation readbacks. Link the release thread and product log entries. |
 
 When a scheduled readback is still pending during the watch, name the check
 and its scheduled UTC time in the private release handoff. For example, “The
 Stream error threshold readback scheduled for 12:15 UTC is `Pending`. The
 release disposition is `Pending`.”
+
+### Rehearse the artifact handoff offline
+
+Keep the staging and production run IDs distinct. Each carries its own attempt
+number and artifact digest. Retain the complete staging receipt and the
+verified staging pins in the candidate record.
+
+| Artifact | File | Handoff |
+| --- | --- | --- |
+| `staging-admission-<candidate-sha>-<staging-run-id>-<staging-attempt>-private-music` | `staging-admission.json` | The staging verifier binds the candidate SHA to the attempt, serving deployments and contract. The protected rollout uses that same candidate SHA. |
+| `production-promotion-<candidate-sha>-<original-rollout-run-id>-1` | `promotion.json` | After final smoke, the receipt records the promoted version UUID. Its `sha` and `run_id` are the existing recovery inputs `sha` and `recovery_run_id` for the successful rollout. |
+| `production-rollback-intent-<original-rollout-run-id>-1` | `production-rollback-intent.sealed` | `recover-worker` uses `admit-recovery` to verify and load the original artifact. `prepare-recovery` uses its sealed candidate and maintenance identities with the original custody and checks the current allocation. |
+
+The [staging admission fixture](../ci/test_staging_admission.py) verifies the
+private staging pins, and the [first-release handoff fixture](../ci/test-production-maintenance.mjs)
+uses the production receipt writer and the existing recovery caller with
+synthetic IDs. The fixture checks that recovery receives the original sealed
+bytes and prepares the allocation without a write. Keep artifact links and
+the protected custody reference in the release record. The current application
+promotion preflight is closed.
 
 ### Personal-use exit assessment
 
@@ -264,9 +354,18 @@ attempt** and **Staging admission** fields above for the same-build evidence.
 Record pass or fail only when the protected attempt supplies a case-level
 verdict. Cite the case ID and a safe reference to that verdict in the accepted
 receipt or protected job evidence. An aggregate job verdict leaves each case
-pending unless its own verdict is available.
+Pending until its own verdict and safe reference are available.
 See the [journey assertions](../ci/staging-admission.md#draft-contract-for-the-first-private-music-release).
-Live billing is assessed separately.
+Record **Paid qualification** separately in the protected release thread.
+When the pinned private candidate meets the requirements above, record
+**Dispatch readiness** as Ready even if paid qualification is still Pending
+under the [paid acceptance checklist](paid-invite-acceptance.md).
+
+For an offline rehearsal, fill a separate copy of the record with synthetic
+outcomes and references. Keep the rehearsal Pending if an applicable journey
+case lacks a verdict or safe reference. Record the rehearsal as complete once
+the synthetic record satisfies the existing pre-dispatch requirements. Use
+protected evidence for dispatch readiness in the actual candidate record.
 
 - **Private invite scope:** Pending. Record the approved scope and access window
   for the owner and explicitly invited friends and family.

@@ -1,3 +1,4 @@
+# guards: required:CodeQL
 name: codeql
 
 # CodeQL scans JavaScript/TypeScript and GitHub Actions; CodeQL has no Rust support.
@@ -6,26 +7,24 @@ name: codeql
 
 # No path filters: the `baseline-codeql` ruleset requires CodeQL results on
 # every PR once main has analyses, so a filtered-out PR (Rust or docs only)
-# waits forever for results that never arrive. Every PR and every main push
-# is scanned so the rule always has a result to compare.
+# waits forever for results that never arrive. Schedule or dispatch a scan
+# to refresh default-branch results.
 on:
   pull_request:
     types: [opened, synchronize, reopened]
   # Merge queue validation: report on merge_group so the code_scanning rule
   # never stalls the queue.
   merge_group:
-  push:
-    branches: [main]
   schedule:
     - cron: '23 3 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  # Never cancel a queue validation run (see ci.yml).
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'merge_group' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   analyze:

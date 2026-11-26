@@ -437,7 +437,7 @@ def prove_setup_caller(cluster, *, interrupt, reader):
         route = {"PATH": routed_client(cluster, "route")}
         env |= route
         for overrides in (
-            {"GITHUB_RUN_ATTEMPT": "2"}, {"GITHUB_RUN_ID": "0"}, {"BOOTSTRAP_STEP_DEBUG": "true"},
+            {"GITHUB_RUN_ID": "0"}, {"BOOTSTRAP_STEP_DEBUG": "true"},
             {"BOOTSTRAP_PLAN_DIGEST": secrets.token_hex(32)},
             {"GITHUB_SHA": secrets.token_hex(20)}, {"GITHUB_REPOSITORY": "fixture/fork"},
         ):
@@ -535,10 +535,15 @@ def prove_setup_caller(cluster, *, interrupt, reader):
         run(env, "complete", 3)
         identity_sql = f"""SELECT oid FROM pg_database WHERE datname = '{LAUNCH}' AND datallowconn
             AND NOT datistemplate AND datdba = '{OWNER}'::regrole
+            AND has_database_privilege('{MIGRATOR}', oid, 'CONNECT')
+            AND has_database_privilege('{MIGRATOR}', oid, 'CREATE')
+            AND NOT EXISTS (SELECT FROM aclexplode(datacl) WHERE grantee = 0)
             AND NOT has_database_privilege('{reader}', oid, 'CONNECT');"""
         identity = cluster.sql(identity_sql)
         checked(identity, "read back the new database identity with the reader still fenced")
         require(identity.stdout.strip().isdigit(), "observe a single launch database OID")
+        run(env | {"GITHUB_RUN_ATTEMPT": "2"}, "refused", 0)
+        cluster.ok("preserve the verified launch identity after rerun refusal", identity_sql, identity.stdout)
         run(env, "refused", 1)  # The name collision stops any second write.
         cluster.ok("preserve the new database OID after collision refusal", identity_sql, identity.stdout)
         cluster.ok("preserve both sibling database identities and ACLs", sibling_sql, siblings.stdout)
@@ -583,6 +588,27 @@ def prove_baseline_partial_read(cluster, env, reader):
         require((process.returncode, stdout, stderr) == expected, f"enforce the child exit status for {mode}")
         require(not list(cluster.directory.glob("database-baseline-ca-*")), "remove the baseline caller's temporary CA")
     routed_client(cluster, "route", reader)
+
+
+def prove_baseline_inventory_limit(cluster, reader, run):
+    launch = {"role": MIGRATOR, "database": LAUNCH}
+    tables = "\n".join(
+        f"CREATE TABLE baseline_inventory.fixture_{index} (id integer);" for index in range(256)
+    )
+    cluster.ok("prepare 256 readable empty tables at the documented inventory limit", f"""
+        CREATE SCHEMA baseline_inventory;
+        {tables}
+        GRANT USAGE ON SCHEMA baseline_inventory TO "{reader}";
+        GRANT SELECT ON ALL TABLES IN SCHEMA baseline_inventory TO "{reader}";
+        """, **launch)
+    run("empty")
+
+    cluster.ok("add one more readable empty table beyond the inventory limit", f"""
+        CREATE TABLE baseline_inventory.extra (id integer);
+        GRANT SELECT ON baseline_inventory.extra TO "{reader}";
+        """, **launch)
+    run("refused")
+    cluster.ok("remove the inventory limit fixture", "DROP SCHEMA baseline_inventory CASCADE;", **launch)
 
 
 def prove_baseline(cluster):
@@ -636,6 +662,7 @@ def prove_baseline(cluster):
     require(b"baseline scope refused" in (cluster.directory / "standby-result").read_bytes(),
             "refuse the simulated PostgreSQL recovery verdict for an otherwise eligible reader")
     routed_client(cluster, "route", reader)
+    prove_baseline_inventory_limit(cluster, reader, run)
     cluster.ok("prepare a partition with hidden child grants", f"""
         CREATE SCHEMA baseline_fixture;
         CREATE TABLE baseline_fixture.parent (id integer) PARTITION BY RANGE (id);

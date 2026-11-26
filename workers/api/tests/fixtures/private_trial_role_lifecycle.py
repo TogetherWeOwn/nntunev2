@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / ".github/scripts"))
 from private_trial_catalog import apply_catalog, create_catalog
 from staging_apply import StagingApplyError
 import staging_trial_ambient_acl as ambient_acl
+import staging_trial_role_lifecycle as lifecycle
 from staging_trial_isolated import target_config
 from staging_trial_role_acl import audit
 from staging_trial_role_lifecycle import CONFIG_ENV, DATABASE, FIXTURE, NAMES, SCOPE_ENV
@@ -43,16 +44,17 @@ def sql(text, *, database=DATABASE):
 
 
 def exercise_catalog_preflight(config, digest):
+    env = {
+        f"PRIVATE_TRIAL_{key.upper()}_URL": f"postgresql://{config[key]}:{password}@127.0.0.1:{port}/{DATABASE}"
+        for key in ("owner", "executor")
+    }
+    env["PATH"] = base["PATH"]
+
     def check(*, target=config, failure=None):
-        env = {"PATH": base["PATH"], CONFIG_ENV: json.dumps(target)}
-        for key in ("owner", "executor"):
-            env[f"PRIVATE_TRIAL_{key.upper()}_URL"] = (
-                f"postgresql://{config[key]}:{password}@127.0.0.1:{port}/{DATABASE}"
-            )
         result = subprocess.run(
             [sys.executable, "-B", "-E", "-s", str(ROOT / ".github/scripts/staging_trial_role_lifecycle.py"), "check-catalog",
              "--isolated", "--fixture-only-oid", str(target["database_oid"])],
-            env=env, text=True, capture_output=True, timeout=30,
+            env={**env, CONFIG_ENV: json.dumps(target)}, text=True, capture_output=True, timeout=30,
         )
         output = result.stdout + result.stderr
         assert all(value not in output for value in (password, config["owner"], config["executor"], digest))
@@ -64,6 +66,23 @@ def exercise_catalog_preflight(config, digest):
 
     before = sql(ambient_acl.CATALOG)
     check()
+    run_psql = subprocess.run
+    # Keep the same disposable identity and catalog while substituting only the version read.
+    for login in (owner, executor):
+        for version in (180012, 170006):
+            def reported_version(*args, input, env, **kwargs):
+                if env["PGUSER"] == login:
+                    input = input.replace("pg_catalog.current_setting('server_version_num')::int", str(version))
+                return run_psql(*args, input=input, env=env, **kwargs)
+
+            with patch.dict(os.environ, env, clear=True), patch.object(subprocess, "run", reported_version):
+                try:
+                    lifecycle.check_catalog(config, fixture=True)
+                except StagingApplyError as error:
+                    assert version == 170006 and "expected PostgreSQL 18" in str(error), error
+                else:
+                    assert version == 180012, f"{login} passed catalog preflight on PostgreSQL 17"
+
     check(target=config | {"database_oid": 16500}, failure="Trial role lifecycle refused")
     check(target=config | {"database_oid": config["database_oid"] + 1}, failure="isolated owner identity")
     check(target=config | {"executor_oid": config["executor_oid"] + 1}, failure="isolated executor identity")

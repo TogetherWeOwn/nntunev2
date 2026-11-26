@@ -6,7 +6,8 @@ platform's compressed script-size ceiling. This script builds every Worker
 crate for ``wasm32-unknown-unknown --release``, gzip-compresses the
 resulting cdylib ``.wasm`` (level 9, fixed mtime for determinism), and
 fails (exit 1) when any Worker is missing, unbuildable, unreadable, or
-over budget.
+over budget. The budget table also serves as the CI size report, with raw
+and compressed byte counts from these same measurements.
 
 Byte convention (explicit, never loosened without a reviewed policy
 change): ``BUDGET_BYTES = 3_000_000`` decimal bytes of gzip-9 output per
@@ -189,13 +190,13 @@ def build_worker(root: Path, spec: dict) -> tuple[bool, str]:
 def measure_worker(root: Path, spec: dict) -> tuple[int | None, int | None, str]:
     """Measure raw + gzip bytes for one worker's ``.wasm`` artifact."""
     path = wasm_path(root, spec)
-    if not path.is_file():
-        try:
-            shown = path.relative_to(root)
-        except ValueError:
-            shown = path
-        return None, None, f"missing artifact: {shown}"
     try:
+        if not path.is_file():
+            try:
+                shown = path.relative_to(root)
+            except ValueError:
+                shown = path
+            return None, None, f"missing artifact: {shown}"
         raw = path.stat().st_size
         compressed = gzip_size(path)
     except OSError as exc:

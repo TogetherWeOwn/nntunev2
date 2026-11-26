@@ -4,12 +4,14 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+from textwrap import dedent
 import tomllib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 SPEC = importlib.util.spec_from_file_location("check_worker_upload", Path(__file__).with_name("check_worker_upload.py"))
@@ -130,6 +132,90 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         self.assertIn("if len(ids) != 4:", items[cache])
         self.assertIn('while IFS= read -r id; do\n            ./check_hyperdrive_cache.sh --config-id "$id"', items[cache])
 
+    def test_private_upload_requires_explicitly_disabled_cache_on_each_connection(self):
+        workflow = (ROOT / UPLOAD.WORKFLOW).read_text()
+        step = UPLOAD.step_text(UPLOAD.job_text(workflow, "staging-api"), "Require uncached private trial connections")
+        script = UPLOAD.run_script(step)
+        config_ids = {
+            role.lower(): f"{index:032x}"
+            for index, role in enumerate(("UPLOAD", "AUTH", "PUBLISH", "ENROLL"), 1)
+        }
+        bindings = {f"PRIVATE_TRIAL_{role.upper()}_DB_STAGING_ID": value for role, value in config_ids.items()}
+        ordinary_id = "c" * 32
+        config = ['[[env.staging.hyperdrive]]', 'binding = "HYPERDRIVE"', f'id = "{ordinary_id}"']
+        config.extend(STREAM_CONFIG.trial_db_bindings({"PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED": "true", **bindings}))
+        provider = "https://api.cloudflare.com/client/v4/accounts/" + "a" * 32 + "/hyperdrive/configs/"
+        # Cloudflare's GET wraps the config and its caching object in result.
+        responses = {
+            provider + config_id: {
+                "success": True, "errors": [], "messages": [],
+                "result": {
+                    "id": config_id, "name": f"trial-{role}",
+                    "origin": {
+                        "host": "trial-db.example.test", "database": "synthetic_trial",
+                        "scheme": "postgresql", "user": f"synthetic_{role}", "access_client_id": "fixture-client",
+                    },
+                    "mtls": {"sslmode": "verify-full", "ca_certificate_id": "b" * 32},
+                    "caching": {"disabled": True},
+                },
+            }
+            for role, config_id in config_ids.items()
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "wrangler.toml").write_text("\n".join(config))
+            (work / "check_hyperdrive_cache.sh").symlink_to(ROOT / "workers/api/check_hyperdrive_cache.sh")
+            # Give the workflow shell only the tools this fixture needs. Curl
+            # serves local fixtures and refuses URLs outside the four expected GETs.
+            for command in ("bash", "python3", "mktemp", "rm"):
+                path = shutil.which(command)
+                self.assertIsNotNone(path, command)
+                (work / command).symlink_to(path)
+            curl = work / "curl"
+            curl.write_text("#!" + sys.executable + " -I\n" + dedent("""\
+                import json
+                from pathlib import Path
+                import sys
+
+                args = sys.argv[1:]
+                url = args[-1]
+                response = json.loads(Path("provider.json").read_text())[url]
+                with Path("requests").open("a") as requests:
+                    requests.write(url + "\\n")
+                Path(args[args.index("-o") + 1]).write_text(json.dumps(response))
+                print(200)
+                """))
+            curl.chmod(0o700)
+            requests = work / "requests"
+
+            def run_cache_step():
+                (work / "provider.json").write_text(json.dumps(responses))
+                requests.write_text("")
+                return subprocess.run([str(work / "bash"), "-c", script], cwd=work, capture_output=True,
+                                      text=True, timeout=10, env={
+                                          "PATH": tmp, "TMPDIR": tmp,
+                                          "CLOUDFLARE_ACCOUNT_ID": "a" * 32,
+                                          "CLOUDFLARE_API_TOKEN": "fixture-token",
+                                      })
+
+            passed = run_cache_step()
+            self.assertEqual(passed.returncode, 0, passed.stderr)
+            self.assertCountEqual(requests.read_text().splitlines(), responses.keys())
+
+            for response in responses.values():
+                result = response["result"]
+                for caching in (None, {}, {"disabled": False}):
+                    with self.subTest(config=result["id"], caching=caching):
+                        if caching is None:
+                            del result["caching"]
+                        else:
+                            result["caching"] = caching
+                        refused = run_cache_step()
+                        self.assertEqual(refused.returncode, 1, refused.stderr)
+                        self.assertIn(f'config {result["id"]} must have query caching disabled', refused.stderr)
+                result["caching"] = {"disabled": True}
+
     def test_private_upload_is_default_off_and_uses_distinct_staging_bindings(self):
         self.assertEqual(STREAM_CONFIG.api_vars({}), [])
         self.assertEqual(STREAM_CONFIG.trial_db_bindings({}), [])
@@ -165,6 +251,77 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         for invalid in ("", "1" * 32, ordinary["prod"], ordinary["staging"]):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "distinct scoped binding"):
                 STREAM_CONFIG.trial_db_bindings(env | bindings | {"PRIVATE_TRIAL_AUTH_DB_STAGING_ID": invalid})
+
+    def test_lost_trial_connection_create_prepares_original_binding(self):
+        # Offline C1 runbook fixture. These are normalized, synthetic records
+        # from the attempt, provider lookup and protected SQL/transport pins.
+        request_ref = "synthetic-enroll-request"
+        requested = {
+            "account": "synthetic-trial-account",
+            "binding": "PRIVATE_TRIAL_ENROLL_DB",
+            "database": ("nntunev2_staging", 40200),
+            "role": ("fixture_enroll", 40204),
+            "origin": "trial.example.invalid",
+            "access_client_ref": "synthetic-serving-client",
+            "origin_ca_ref": "synthetic-trial-ca",
+            "sslmode": "verify-full",
+            "caching_disabled": True,
+        }
+        config_id = "4" * 32
+        configs, protected_results = [], {}
+
+        def lose_create_response(ref, scope):
+            configs.append(scope | {"id": config_id})
+            protected_results[scope["account"], ref] = config_id
+            raise TimeoutError("synthetic response lost after create")
+
+        create = Mock(side_effect=lose_create_response)
+
+        def plan_handoff(results, readbacks, *, sent):
+            if not sent:
+                return {"next_action": "create", "connection": None}
+            bound_id = results.get((requested["account"], request_ref))
+            expected = requested | {"id": bound_id}
+            matches = [row for row in readbacks if row == expected] if bound_id else []
+            if len(matches) != 1:
+                return {"next_action": "reconcile", "connection": None}
+            return {"next_action": "prepare", "connection": matches[0]}
+
+        def execute_create_step(plan):
+            if plan["next_action"] == "create":
+                create(request_ref, requested)
+
+        with self.assertRaises(TimeoutError):
+            execute_create_step(plan_handoff({}, [], sent=False))
+
+        original = requested | {"id": config_id}
+        unrelated = original | {"id": "9" * 32}
+        handoff = plan_handoff(protected_results, [unrelated, *configs], sent=True)
+        self.assertEqual(handoff, {"next_action": "prepare", "connection": original})
+        execute_create_step(handoff)
+        for case, results, readbacks in (
+            ("missing", protected_results, [unrelated]),
+            ("duplicate", protected_results, configs * 2),
+            ("unbound", {}, configs),
+            ("wrong request", {(requested["account"], "synthetic-other-request"): config_id}, configs),
+            ("wrong account", protected_results, [original | {"account": "other-account"}]),
+            ("wrong role", protected_results, [original | {"role": ("fixture_enroll", 40205)}]),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(plan_handoff(results, readbacks, sent=True),
+                                 {"next_action": "reconcile", "connection": None})
+
+        connection = handoff["connection"]
+        already_verified = {"UPLOAD": "1" * 32, "AUTH": "2" * 32, "PUBLISH": "3" * 32}
+        inputs = {f"PRIVATE_TRIAL_{role}_DB_STAGING_ID": value for role, value in already_verified.items()}
+        inputs[f"{connection['binding']}_STAGING_ID"] = connection["id"]
+        rendered = STREAM_CONFIG.trial_db_bindings(inputs | {"PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED": "true"})
+        bindings = tomllib.loads("\n".join(rendered))["env"]["staging"]["hyperdrive"]
+        self.assertEqual(bindings, [
+            {"binding": f"PRIVATE_TRIAL_{role}_DB", "id": value}
+            for role, value in (already_verified | {"ENROLL": config_id}).items()
+        ])
+        create.assert_called_once_with(request_ref, requested)
 
     def test_stream_config_is_internal_and_uses_the_dedicated_fixture_bucket(self):
         source = tomllib.loads((ROOT / "workers/stream/wrangler.toml").read_text())

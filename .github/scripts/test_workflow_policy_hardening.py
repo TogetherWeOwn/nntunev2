@@ -4,6 +4,8 @@ from pathlib import Path
 import re
 import unittest
 
+from test_ci_pnpm_retry import job_level_field, split_jobs
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github/workflows"
 
@@ -16,6 +18,56 @@ def job(text, name):
 
 
 class WorkflowPolicyHardeningTests(unittest.TestCase):
+    def test_pr_size_rechecks_exceptions_in_the_same_pr_group(self):
+        text = (WORKFLOWS / "pr-size.yml").read_text()
+        triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)
+        self.assertEqual(
+            re.findall(r"^  (\w+):", triggers, re.M),
+            ["pull_request", "pull_request_review", "schedule", "workflow_dispatch"],
+        )
+        self.assertRegex(triggers, r"(?m)^  pull_request:\n(?:    #.*\n)*"
+                         r"    types: \[opened, synchronize, reopened, labeled, unlabeled\]$")
+        self.assertRegex(triggers, r"(?m)^  pull_request_review:\n(?:    #.*\n)*"
+                         r"    types: \[submitted, dismissed\]$")
+        self.assertIn("    - cron: '17 7 * * 1'", triggers)
+        self.assertIn(
+            "concurrency:\n"
+            "  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}\n"
+            "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n",
+            text,
+        )
+
+    def test_pr_size_gate_and_tally_keep_context_dispatch_and_permissions(self):
+        text = (WORKFLOWS / "pr-size.yml").read_text()
+        jobs = split_jobs(text)
+        self.assertEqual(set(jobs), {"pr-size-gate", "pr-size-weekly"})
+        gate = jobs["pr-size-gate"]
+        weekly = jobs["pr-size-weekly"]
+        self.assertEqual(job_level_field(gate, "name"), "pr-size-gate")
+        self.assertEqual(job_level_field(gate, "if"),
+                         "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''")
+        self.assertEqual(job_level_field(weekly, "if"),
+                         "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')")
+        self.assertIn("      pr-number: ${{ inputs.pr_number || '' }}", gate)
+        self.assertIn('      exclude-extra: ""', gate)
+        self.assertRegex(gate, r"(?m)^      advisory-label: true$")
+        pins = []
+        for name, caller, access in (("pr-size-gate", gate, "write"),
+                                     ("pr-size-weekly", weekly, "read")):
+            with self.subTest(job=name):
+                uses = job_level_field(caller, "uses") or ""
+                match = re.fullmatch(
+                    rf"TogetherWeOwn/\.github/\.github/workflows/{name}\.yml@([0-9a-f]{{40}})", uses,
+                )
+                self.assertIsNotNone(match, uses)
+                pins.append(match.group(1))
+                self.assertEqual(
+                    re.findall(r"^      ([\w-]+): (read|write|none)(?: +#.*)?$", caller, re.M),
+                    [("contents", "read"), ("issues", access), ("pull-requests", access)],
+                )
+                self.assertIsNone(job_level_field(caller, "secrets"))
+        self.assertEqual(pins[0], pins[1])
+
     def test_native_rustup_keeps_each_jobs_components_and_targets(self):
         expected = {
             "ci.yml": {
@@ -23,7 +75,6 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                 "rust-wasm": ("clippy", "wasm32-unknown-unknown"),
                 "cargo-deny": (None, None),
                 "worker-wasm-budget": (None, "wasm32-unknown-unknown"),
-                "worker-wasm-sizes": (None, "wasm32-unknown-unknown"),
                 "test-nntp": ("rustfmt,clippy", None),
                 "api": ("rustfmt,clippy", "wasm32-unknown-unknown"),
                 "api-migrations": (None, None),
@@ -53,17 +104,13 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                 self.assertIn("python3 -I .github/scripts/worker_rust_provenance.py rust", section)
                 self.assertNotIn("rustup toolchain install stable", section)
 
-    def test_deployment_gate_groups_do_not_hold_deploy_or_e2e_locks(self):
-        for path in ("deploy.yml", "deploy-alerts-staging.yml"):
-            with self.subTest(path=path):
-                text = (WORKFLOWS / path).read_text()
-                # The separate alerts deploy must not hold a run-level lock.
-                if path == "deploy-alerts-staging.yml":
-                    self.assertNotRegex(text, r"(?m)^concurrency:")
-                gate = job(text, "gate")
-                self.assertIn("group: ${{ github.workflow }}-gate-${{ github.ref }}", gate)
-                self.assertIn("cancel-in-progress: false", gate)
-                self.assertIn("queue: max", gate)
+    def test_alerts_deploy_retains_its_separate_gate_queue(self):
+        text = (WORKFLOWS / "deploy-alerts-staging.yml").read_text()
+        self.assertNotRegex(text, r"(?m)^concurrency:")
+        gate = job(text, "gate")
+        self.assertIn("group: ${{ github.workflow }}-gate-${{ github.ref }}", gate)
+        self.assertIn("cancel-in-progress: false", gate)
+        self.assertIn("queue: max", gate)
 
     def test_staging_build_does_not_restore_or_save_package_caches(self):
         web = job((WORKFLOWS / "deploy.yml").read_text(), "staging-web")
@@ -131,8 +178,7 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
     def test_snapshot_spike_is_build_and_recall_only(self):
         text = (WORKFLOWS / "mb-snapshot-spike.yml").read_text()
         self.assertRegex(text, r"(?m)^  workflow_dispatch:$")
-        self.assertIn("  pull_request:\n    types: [labeled]", text)
-        self.assertIn("github.event.label.name == 'mb-snapshot-spike'", text)
+        self.assertNotRegex(text, r"(?m)^  (pull_request|pull_request_target|push):")
         self.assertIn("permissions:\n  contents: read", text)
         self.assertNotRegex(text, r"(?m)^\s*(stage|environment|workflow_call):")
         self.assertNotRegex(text, r"\b(secrets|inputs\.stage|CLOUDFLARE_\w+|wrangler)\b")

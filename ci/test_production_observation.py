@@ -234,6 +234,34 @@ class ProductionObservationTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "Production observation refused: readback failed, missing or unusable\n")
 
+    def test_cli_refuses_unsaved_final_watch_until_evidence_is_saved(self):
+        pins, watch = fixture()
+        script = Path(__file__).with_name("production_observation.py")
+        with TemporaryDirectory(prefix="nntune-observation-") as directory:
+            pin_file = Path(directory) / "pins.json"
+            watch_file = Path(directory) / "evidence" / "watch.json"
+            pin_payload = json.dumps(pins).encode("utf-8")
+            watch_payload = json.dumps(watch).encode("utf-8")
+            pin_file.write_bytes(pin_payload)
+            command = [sys.executable, script, pin_file, watch_file]
+
+            # A missing destination directory prevents the completed watch from being saved.
+            with self.assertRaises(FileNotFoundError):
+                watch_file.write_bytes(watch_payload)
+            refused = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual((refused.returncode, refused.stdout, refused.stderr), (
+                1, "", "Production observation refused: unreadable evidence\n",
+            ))
+            self.assertFalse(watch_file.exists())
+            self.assertEqual(pin_file.read_bytes(), pin_payload)
+
+            watch_file.parent.mkdir()
+            watch_file.write_bytes(watch_payload)
+            verified = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual((verified.returncode, verified.stdout, verified.stderr), (
+                0, "Production observation evidence satisfied\n", "",
+            ))
+
 
 if __name__ == "__main__":
     unittest.main()

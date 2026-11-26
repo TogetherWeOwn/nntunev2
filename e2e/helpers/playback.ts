@@ -29,8 +29,61 @@ export interface PlaybackEvidence {
   readyState: number;
   /** MediaError.code, or null when the element has no error. */
   errorCode: number | null;
-  /** The element has a resolved currentSrc/src. Never the URL itself. */
+  /** The element has a resolved source. Never the URL itself. */
   hasSource: boolean;
+}
+
+type AudioWithPlaybackRecorder = HTMLAudioElement & {
+  __nnPlayback?: { source: string; sawPlaying: boolean; maxCurrentTime: number };
+};
+
+/** Runs inside Locator.evaluate. Only the numeric and boolean sample leaves the page. */
+export function observePlayback(element: Element, mode: 'arm' | 'reset' | 'sample'): PlaybackEvidence {
+  const player = element as AudioWithPlaybackRecorder;
+  // The staging player uses a direct src. currentSrc can still describe the
+  // outgoing media while the browser is selecting the newly assigned src.
+  const readSource = () => player.currentSrc === player.src ? player.currentSrc : '';
+  const reset = (source: string) => {
+    const recorder = { source, sawPlaying: false, maxCurrentTime: 0 };
+    player.__nnPlayback = recorder;
+    return recorder;
+  };
+  const forSource = (source: string) =>
+    player.__nnPlayback?.source === source ? player.__nnPlayback : reset(source);
+
+  const source = readSource();
+  let recorder = player.__nnPlayback;
+  if (!recorder && mode !== 'sample') {
+    const record = (event: Event) => {
+      const source = readSource();
+      const recorder = forSource(source);
+      if (!source) return;
+      recorder.sawPlaying ||= event.type === 'playing';
+      recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+    };
+    player.addEventListener('playing', record);
+    player.addEventListener('timeupdate', record);
+    player.addEventListener('emptied', () => reset(''));
+    recorder = reset(source);
+  } else if (recorder && (mode === 'reset' || recorder.source !== source)) {
+    recorder = reset(source);
+  }
+
+  if (mode === 'arm' && recorder && source) {
+    recorder.sawPlaying ||= !player.paused && !player.ended && player.readyState >= 2;
+    recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+  }
+  return {
+    sawPlaying: recorder?.sawPlaying ?? false,
+    maxCurrentTime: source ? Math.max(recorder?.maxCurrentTime ?? 0, player.currentTime || 0) : 0,
+    paused: player.paused,
+    ended: player.ended,
+    currentTime: player.currentTime,
+    duration: player.duration,
+    readyState: player.readyState,
+    errorCode: player.error?.code ?? null,
+    hasSource: Boolean(source),
+  };
 }
 
 /**

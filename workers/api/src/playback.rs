@@ -31,8 +31,9 @@
 //!   the grant, so the displaced player's next heartbeat reports
 //!   `superseded` and it pauses itself. The hard guarantee is its next
 //!   grant request, which the lease gate refuses.
-//! - Idle expiry and the per-play deadline are strict: at either
-//!   boundary the lease is no longer eligible for renewal.
+//! - Idle expiry and the per-play deadline are strict. The browser's
+//!   explicit retry can authorize a new lease for the still-current
+//!   receipt within its original authorization window and keep its play ID.
 
 use crate::billing::{EffectivePlan, SubscriptionView};
 

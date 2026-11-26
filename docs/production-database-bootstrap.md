@@ -106,8 +106,10 @@ admission, configure `production-db-bootstrap` **before** enabling the job.
 GitHub can create a missing Environment from a workflow reference without
 protection. Verify both `production-db-bootstrap` and `production-db-baseline`
 using the [Environment protection readback](#environment-protection-readback)
-before enabling the corresponding job. Keep Environment administration with
-the custodian and check rule changes before approval. One listed reviewer
+before enabling the corresponding job. Follow the
+[custodian handoff](#custodian-handoff) for the setup and baseline order.
+Keep Environment administration with the custodian and check rule changes
+before approval. One listed reviewer
 suffices on GitHub, so require only the approved independent user or team in
 each Environment. The release review and T0 code reviews are separate from
 this deployment approval.
@@ -206,6 +208,81 @@ this deployment approval.
    readback. The Settings readback covers administrator bypass only. An explicit
    REST value of `true` is a failed protection check.
 
+#### Offline before and after rehearsal
+
+Run this single case from the repository root. It uses the existing checker
+on temporary synthetic response bodies for both Environments. Reviewer
+identities in the fixture are synthetic.
+
+```sh
+python3 -B .github/scripts/test_database_bootstrap_environment_readback.py \
+  EnvironmentReadbackTests.test_custodian_handoff_before_and_after
+```
+
+| Synthetic fixture | `production-db-bootstrap` | `production-db-baseline` | Checker exit |
+| --- | --- | --- | --- |
+| Before | `main` branch and `main` tag refused | Administrator bypass enabled and refused | `1` |
+| After | Sole `main` branch and bypass disabled | Sole `main` branch and bypass disabled | `0` |
+
+Both after readbacks also include the sole approved reviewer and prevention
+of self-review. The result applies to the synthetic bodies. The custodian
+records the actual Settings and REST readbacks for the live handoff.
+
+### Custodian handoff
+
+| Workflow | Protected job Environment | Repository variable kept unset until that attempt is authorized |
+| --- | --- | --- |
+| [First-launch database bootstrap](../.github/workflows/deploy-database-bootstrap.yml) | `production-db-bootstrap` | `DATABASE_BOOTSTRAP_CANDIDATE_SHA` |
+| [First-launch database baseline](../.github/workflows/deploy-database-baseline.yml) | `production-db-baseline` | `DATABASE_BASELINE_CANDIDATE_SHA` |
+
+1. Keep both candidate variables unset while the prerequisites are gathered.
+   For the stock PostgreSQL staging target, carry the merged disposable
+   Stage A result into the fresh Stage B rerun, then qualify capacity,
+   scoped authority, and combined Tunnel/Access and origin TLS at Stage C0.
+   Before production database setup, complete the served private trial on
+   the approved staging target and capture the exact-candidate staging
+   evidence in steps 1–3 of
+   [Qualify the candidate](first-private-music-launch.md#qualify-the-candidate).
+   [Staging database qualification](../ops/staging-trial-pg/README.md)
+2. Obtain the GitHub custodian's recorded authorization for the separate
+   Environment change and record the independently approved reviewer for each
+   Environment. The custodian captures the before state, including an absent
+   Environment if applicable. In the approved change, explicitly configure
+   both Environments with their sole required reviewer, self-review
+   prevention, administrator bypass disabled, and a custom deployment rule
+   for the `main` **branch** only. Capture the after state and recheck Settings
+   using the [Environment protection readback](#environment-protection-readback).
+   If REST leaves only bypass unresolved, retain the nonzero result and the
+   custodian's explicit Settings readback. Any other discrepancy keeps the
+   handoff pending. Completing this change leaves both variables
+   unset and stages no authorization.
+3. Before the first protected write, verify SQL custodian authority, the
+   exact production branch and direct TLS route, and the ability to issue,
+   fence and retire the scoped roles. Verify the successful pre-bootstrap
+   snapshot and obtain independent release approval for the exact candidate
+   and protected setup plan. Only then use the bootstrap admission and pending
+   deployment checks above. The approved Environment reviewer authorizes that
+   exact pending attempt after verifying its pins and current protection.
+   [Setup role custody](#setup-role-custody-and-lifecycle) ·
+   [Snapshot and metering](#snapshot-and-metering) ·
+   [Production releases](../CONTRIBUTING.md#production-releases)
+4. When the setup attempt ends, clear its candidate variable and authorization.
+   Complete cleanup even when setup is refused, canceled or needs
+   reconciliation. Under [setup role custody](#setup-role-custody-and-lifecycle),
+   reconcile any uncertain issuance before proceeding. If the temporary
+   setup role was issued, retire it using the verified issuance OID,
+   require `retired`, and confirm removal of its credential, role and
+   sessions. If the attempt ended before issuance, verify and record that
+   the planned role is absent on the approved branch. Keep baseline pending
+   until cleanup, setup success and the new database OID, reader fence,
+   grants and sibling isolation are verified.
+5. Use the verified database OID and the separately issued reader OID for the
+   baseline plan. Recheck the baseline Environment and confirm approval of
+   the baseline candidate and plan. Obtain Environment approval for its exact
+   pending attempt as part of the [protected baseline](#protected-baseline)
+   sequence. Require `empty` and completed reader teardown before handing off
+   to the later migration and cutover gates.
+
 ### Setup plan and enforced limits
 
 Version 2 is one UTF-8 JSON object with exactly `version`, `host`, `port`,
@@ -275,6 +352,36 @@ timeouts. Server processing, wire bytes, provider metering and hard-kill
 session closure require separate evidence. A failure from the point of
 attempted creation is uncertain. The caller stops without retry or deletion.
 
+### Setup handoff after a rerun
+
+GitHub keeps the run ID and increments the attempt on a rerun. The
+[setup workflow](../.github/workflows/deploy-database-bootstrap.yml) gates
+both jobs on attempt `1`, and the
+[setup caller](../.github/scripts/database_bootstrap_setup.py) checks the
+same attempt and authorized run before opening a SQL connection. The
+caller's fixed `complete` verdict carries no run identity. Attribute it to
+the protected job in its attempt-specific GitHub record. The setup plan
+digest and the database OID identify the approved bytes and the SQL target.
+Both can match a saved readback for an earlier attempt.
+
+Rehearse with synthetic run `8102`, branch `fixture001`, database
+`launch_fixture` (OID `41003`) and issued setup role OID `41001`. Use the
+same candidate SHA and setup plan digest throughout. Assume the saved
+Environment protection and scoped SQL issuer authority are verified for the
+original approval. Evaluate these records in order:
+
+| Evidence presented | Handoff decision |
+| --- | --- |
+| Run `8102` was rerun. The presented setup readback cites `8102/1`, and the branch, database OID and plan digest match. The latest attempt has no verified job readback. | Keep the handoff pending. Preserve the original approval and issuer records under `8102/1`. Read back the current attempt and its jobs from the attempt-specific GitHub endpoints. |
+| The `8102/2` readback confirms the protected setup job was skipped. The original setup job ended without a verified `complete` verdict or its SQL cleanup is unresolved. | Record the rerun as skipped. Reconcile the original attempt under SQL custody on the approved TLS route, using the recorded issuance OID for role cleanup where applicable. Keep baseline pending while the outcome or cleanup is unresolved. |
+| Complete control — the `8102/2` readback confirms the skip. The separate `8102/1` record shows the approved protected job succeeded and emitted `complete`, with the approved candidate and exact plan digest. Cleanup readback confirms removal of the candidate variable, authorization and credential material, retirement of the issued setup role and absence of its sessions. A current read-only catalog check on the approved TLS route confirms OID `41003`, expected owner and grants, the pending reader's connection fence and unchanged sibling databases. | Retain the completed setup under `8102/1` and carry its verified database OID into preparation for a separately approved baseline. Record `8102/2` only as skipped. |
+
+The original approval and issuance records remain evidence for their own
+attempt and role. A later authorized setup needs a new dispatch and its own
+approval. The baseline retains its separate Environment, run and reader
+issuer checks. [Workflow attempt readback](https://docs.github.com/en/rest/actions/workflow-runs#get-a-workflow-run-attempt)
+· [Jobs for a workflow attempt](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt)
+
 ### Protected baseline
 
 The [baseline workflow](../.github/workflows/deploy-database-baseline.yml)
@@ -307,6 +414,88 @@ grants and writes through the read.
 One TLS-verified read-only snapshot checks primary status, identity and rights.
 It scans up to 256 user relations and large objects, and refuses incomplete coverage.
 Ledger and reference rows count as data. Record the job URL, attempt and verdict.
+
+When reviewing the first-launch baseline, reconcile the saved catalog inventory
+and required reader privilege result with the accepted baseline plan. Use the
+[offline reader evidence check](../.github/scripts/database_bootstrap_reader_evidence.py)
+from the repository root with a private, normalized JSON record on stdin.
+
+```sh
+python3 -IB .github/scripts/database_bootstrap_reader_evidence.py < evidence.json
+```
+
+- `review` contains the approved `branch_id`, `database_oid`, `reader_role`,
+  `reader_oid` and `inventory_sha256` of the reviewed catalog inventory.
+- `inventory` contains the observed `branch_id`, `database_oid` and
+  `inventory_sha256` for the complete catalog readback.
+- `reader_privileges` contains the observed `branch_id`, `database_oid`,
+  `inventory_sha256` of the catalog covered by the privilege result, and the
+  role name and OID that the result actually checked (`reader_role` and
+  `reader_oid`). Record `result: passed` only for a completed, successful
+  privilege check. Use JSON integers for OIDs and lowercase hex for digests.
+
+The protected baseline emits a fixed verdict. It does not emit an inventory
+digest. For `reader_privileges`, use a retained private readback that records
+the observed role identity, effective privilege result and covered inventory in
+the same read-only catalog snapshot. Hash that inventory using the same
+representation as the reviewed and saved inventories. If this readback is
+unavailable, omit `reader_privileges` so the evidence stays pending.
+
+Keep the baseline evidence pending if the check exits nonzero with `pending`,
+including when the catalog matches but the privilege result belongs to a
+different reader. `consistent` confirms the supplied evidence agrees. The
+protected run's `empty` verdict, provenance and retirement evidence are still
+required. Keep credentials and raw SQL results out of the normalized record.
+
+### Carry verified staging evidence into database approval
+
+Use the [pinned staging attempt and admission record](first-private-music-launch.md#qualify-the-candidate)
+for each exact database candidate. Match the candidate SHA, current staging run
+and attempt, and unique attempt-bound artifact and Actions digest. Retain the
+matching `verified_private_music_staging` pins and verifier job reference from
+[staging admission](../ci/staging-admission.md#verified-private-staging-pins).
+If verification is unavailable, the receipt is superseded or the candidate SHA
+changes, keep the affected approval pending until the exact candidate has
+eligible staging evidence. Live evidence depends on the protected same-build
+journey and reviewed Product and QA enrollment. The checked-in policy has no
+approval, and the [workflow that calls the verifier](../.github/workflows/deploy-production.yml)
+currently closes application promotion at preflight.
+
+In the private release record, cite that staging evidence from each exact-plan
+approval. For example, with a synthetic candidate `<sha>` and staging run `100`,
+attempt `1`, `#evidence-staging-100-1` points to
+`staging-admission-<sha>-100-1-private-music`, its verified digest and job
+evidence. The first-attempt database run IDs below come from the corresponding
+pending deployments.
+
+| Private approval reference | Candidate and protected authorization |
+| --- | --- |
+| `#evidence-bootstrap-200-1`, citing `#evidence-staging-100-1` | `DATABASE_BOOTSTRAP_CANDIDATE_SHA` is `<sha>`. The bootstrap Environment binds `BOOTSTRAP_SHA` to `<sha>` and `BOOTSTRAP_RUN_ID` to `200`, with the approved setup plan's exact bytes and SHA-256 in `BOOTSTRAP_PLAN_B64` and `BOOTSTRAP_PLAN_DIGEST`. |
+| `#evidence-baseline-201-1`, citing `#evidence-staging-100-1` and the verified setup readback | `DATABASE_BASELINE_CANDIDATE_SHA` is `<sha>` while that exact candidate remains eligible. The baseline Environment binds `BASELINE_SHA` to `<sha>` and `BASELINE_RUN_ID` to `201`, with its separately approved plan's exact bytes and SHA-256 in `BASELINE_PLAN_B64` and `BASELINE_PLAN_DIGEST`. The plan uses the verified launch database OID and the separately issued reader OID. |
+
+Both preflights require the approved SHA to be the dispatched `main` tip.
+If `main` advances between successful setup and baseline dispatch, retain the
+original setup approval and verified database OID. Qualify the new tip in
+staging and obtain fresh baseline approval for that SHA and the exact baseline
+plan before enabling baseline. The earlier receipt stays bound to its own SHA.
+
+Both workflows dispatch with zero inputs. The evidence references stay in the
+private release record. The protected runners consume their own Environment's
+authorization. Bootstrap uses `BOOTSTRAP_EXPIRY` and `BOOTSTRAP_SETUP_PASSWORD`.
+Baseline uses `BASELINE_EXPIRY`, `BASELINE_READER_PASSWORD` and
+`BASELINE_ENABLED=true`. Keep the pending-deployment readback, approval and
+cleanup rules above. Setup success and verified setup-role retirement precede
+baseline approval.
+
+Rehearse the mapping from the repository root with a synthetic receipt, synthetic
+run IDs and synthetic plan bytes. The fixture uses the existing verifier with
+substitutes for Actions and serving identity reads, then checks the real database
+admission and plan parsers with certificate validation stubbed out.
+
+```sh
+python3 -B ci/test_staging_admission.py \
+  SourceBindingTests.test_private_staging_receipt_handoff_to_database_admission
+```
 
 ### Reader role custody and lifecycle
 
@@ -503,3 +692,25 @@ snapshot `fixture-a` and the response names the existing label
 | The response names only the label. | Keep migration closed pending readback. |
 | The same label points to `fixture-b` on the same branch, captured before setup and completed after setup. | Keep migration closed. The readback identifies a different snapshot, and the capture predates setup. |
 | The readback identifies `fixture-a` and confirms a successful capture after setup with the reviewed timing and restore scope. | The offline check accepts the complete evidence. The separate protected release checks still apply. |
+
+## Post-migration schema inventory
+
+Before app cutover, reconcile the current migration manifest and ledger on
+the launch database. Keep the schema inventory readback and its provenance
+in private custody. Run the [offline inventory check](../.github/scripts/database_bootstrap_inventory.py)
+from the repository root with `python3 -IB .github/scripts/database_bootstrap_inventory.py < inventory-binding.json`.
+
+Supply exactly two JSON objects under `migration` and `inventory` in one
+record. Both contain `branch_id`, the integer `database_oid`, and the decimal
+strings `run_id` and `run_attempt`. Take the `migration` fields and integer
+`completed_at` from the current successful protected migration. Take the
+`inventory` fields and integer `readback_at` from the saved readback and its
+recorded provenance. Use UTC Unix seconds. Keep the run and attempt from that
+provenance when preparing the record.
+
+The checker reads up to 4 KiB and returns `consistent` only when the branch,
+database OID, run and attempt match and the readback follows completion. A
+recent readback associated with an earlier migration run still refuses.
+On refusal or missing provenance, keep cutover pending until a readback for
+the current run can be verified. Confirm provenance and schema completeness
+separately during the manifest and ledger reconciliation.
