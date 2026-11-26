@@ -625,6 +625,60 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     assert.equal(reports.length, firstReport);
   });
 
+  for (const [name, short] of [
+    ['an empty media chunk after delivery preserves the tail and receipt', false],
+    ['true EOF after the prefix aborts and reports only the prefix', true],
+  ]) {
+    await t.test(name, { timeout: 5_000 }, async (t) => {
+      const firstFetch = fetches.length;
+      const firstReport = reports.length;
+      const prefixRead = Promise.withResolvers();
+      const fetch = globalThis.fetch;
+      t.mock.method(globalThis, 'fetch', async (req) => {
+        const response = await fetch(req);
+        if (req.url !== `https://${host}${path}?${query}`) return response;
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        // The last frame is one plaintext byte plus its 16-byte tag.
+        const body = new ReadableStream({
+          start(controller) { controller.enqueue(bytes.subarray(0, -17)); },
+          async pull(controller) {
+            // Expose the next read result only after the client receives the prefix.
+            await prefixRead.promise;
+            if (!short) {
+              controller.enqueue(new Uint8Array(0));
+              controller.enqueue(bytes.subarray(-17));
+            }
+            controller.close();
+          },
+        });
+        return new Response(body, { status: response.status, headers: response.headers });
+      });
+
+      const { response, settled } = await open({}, '/play/track', bearer, { range: 'bytes=65534-65536' });
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-range'), 'bytes 65534-65536/65537');
+      const client = response.body.getReader();
+      const first = await client.read();
+      prefixRead.resolve();
+      assert.equal(first.done, false);
+      assert.deepEqual(Buffer.from(first.value), Buffer.from('XY'));
+      if (short) {
+        await assert.rejects(client.read());
+      } else {
+        const tail = await client.read();
+        assert.equal(tail.done, false);
+        assert.deepEqual(Buffer.from(tail.value), Buffer.from('Z'));
+        assert.equal((await client.read()).done, true);
+      }
+      await settled;
+      assert.deepEqual(fetches.slice(firstFetch), ['media', 'page']);
+      assert.deepEqual(reports.slice(firstReport), [{
+        user_id: 'member', play_id: play, track_id: 'track',
+        start: 65_534, end: short ? 65_536 : 65_537, file_bytes: 65_537,
+      }]);
+    });
+  }
+
   await t.test('re-reading an earlier pinned range delivers bytes without new credit', { timeout: 5_000 }, async (t) => {
     const { NntpPool } = require('./s3_stream_wasm.cjs');
     const stored = new Map();
