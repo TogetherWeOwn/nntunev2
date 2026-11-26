@@ -172,10 +172,11 @@ provider readbacks and leaves serving qualification to Stage C2.
 
 The [offline binding fixture](../../.github/scripts/test_worker_build_workflow.py)
 rehearses an interruption later in C1, after `UPLOAD`, `AUTH` and `PUBLISH`
-were verified. The `ENROLL` create succeeds but the executor loses its
-response. Two records have the requested settings, and only one has the
-config ID tied to the original request in the admitted account. The prepared
-handoff supplies that ID as `PRIVATE_TRIAL_ENROLL_DB_STAGING_ID` for the
-staging binding renderer and omits an `ENROLL` create. If the same ID is
-linked only to a different request, preparation remains pending. The fixture
-uses synthetic records and ends at configuration preparation.
+were verified. At the unsent checkpoint the fixture plans an `ENROLL` create.
+The synthetic create succeeds but the executor loses its response. Two
+records have the requested settings, and only one has the config ID tied to
+the original request in the admitted account. The prepared handoff supplies
+that ID as `PRIVATE_TRIAL_ENROLL_DB_STAGING_ID` for the staging binding
+renderer and omits an `ENROLL` create. If the same ID is linked only to a
+different request, preparation remains pending. The fixture uses synthetic
+records and ends at configuration preparation.

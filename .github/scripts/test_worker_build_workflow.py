@@ -276,10 +276,10 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
             raise TimeoutError("synthetic response lost after create")
 
         create = Mock(side_effect=lose_create_response)
-        with self.assertRaises(TimeoutError):
-            create(request_ref, requested)
 
-        def reconcile(results, readbacks):
+        def plan_handoff(results, readbacks, *, sent):
+            if not sent:
+                return {"next_action": "create", "connection": None}
             bound_id = results.get((requested["account"], request_ref))
             expected = requested | {"id": bound_id}
             matches = [row for row in readbacks if row == expected] if bound_id else []
@@ -287,10 +287,18 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
                 return {"next_action": "reconcile", "connection": None}
             return {"next_action": "prepare", "connection": matches[0]}
 
+        def execute_create_step(plan):
+            if plan["next_action"] == "create":
+                create(request_ref, requested)
+
+        with self.assertRaises(TimeoutError):
+            execute_create_step(plan_handoff({}, [], sent=False))
+
         original = requested | {"id": config_id}
         unrelated = original | {"id": "9" * 32}
-        handoff = reconcile(protected_results, [unrelated, *configs])
+        handoff = plan_handoff(protected_results, [unrelated, *configs], sent=True)
         self.assertEqual(handoff, {"next_action": "prepare", "connection": original})
+        execute_create_step(handoff)
         for case, results, readbacks in (
             ("missing", protected_results, [unrelated]),
             ("duplicate", protected_results, configs * 2),
@@ -300,7 +308,8 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
             ("wrong role", protected_results, [original | {"role": ("fixture_enroll", 40205)}]),
         ):
             with self.subTest(case=case):
-                self.assertEqual(reconcile(results, readbacks), {"next_action": "reconcile", "connection": None})
+                self.assertEqual(plan_handoff(results, readbacks, sent=True),
+                                 {"next_action": "reconcile", "connection": None})
 
         connection = handoff["connection"]
         already_verified = {"UPLOAD": "1" * 32, "AUTH": "2" * 32, "PUBLISH": "3" * 32}
