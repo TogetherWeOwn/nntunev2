@@ -71,7 +71,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	let attachmentVersion = 0;
 	let endGeneration = 0;
 	let playIntent = 0;
-	let grantIntent = 0, pendingGrant: number | undefined;
+	let pendingGrant: { retry: boolean } | undefined;
 	let pendingPlay: { result: Promise<PlayOutcome>; finish: (outcome: PlayOutcome) => void } | undefined;
 	const playbackStatus = writable<PlaybackStatus>('unavailable');
 	const sound = createNativeSound();
@@ -348,7 +348,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		{ retry, retireSuperseded, failureMessage = 'Could not start playback.' }:
 		{ retry?: boolean; retireSuperseded?: boolean; failureMessage?: string } = {}) {
 		if (!selection?.prepare || destroyed || queue.purging || !isEligible()) return;
-		const request = pendingGrant = ++grantIntent;
+		const request = pendingGrant = { retry: retry === true };
 		const revision = queue.revision, intent = playIntent, position = positionIntent, version = attachmentVersion;
 		const current = () => !destroyed && pendingGrant === request && queue.isCurrent(revision) && isEligible() &&
 			intent === playIntent && position === positionIntent && version === attachmentVersion;
@@ -515,7 +515,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const queueRevision = queue.revision;
 		// These controls can report a refusal while the failed decoder waits
 		// for its receipt. The refusal must leave that recovery current.
-		const recoveringFailedSource = pendingGrant !== undefined && get(playbackStatus) === 'error';
+		const recoveringFailedSource = pendingGrant?.retry === true && get(playbackStatus) === 'error';
 		const intent = recoveringFailedSource ? positionIntent : ++positionIntent;
 		// Cancel on acceptance, even if the native seek is deferred or refused.
 		if (track && !recoveringFailedSource) pendingShare.supersede(track.id, source);
