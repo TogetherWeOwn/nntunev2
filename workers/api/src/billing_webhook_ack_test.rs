@@ -21,6 +21,7 @@ pub(crate) enum Delivery {
     LoseCommitAck,
     Retry,
     HourlyOverlap,
+    HistoryConflict,
 }
 
 pub(super) async fn connect() -> Result<PgClient, StoreError> {
@@ -119,6 +120,13 @@ impl StripeScript {
             commit_hourly_observation(subscription, invoice)
                 .await
                 .map_err(|_| StripeError::transport())?;
+        }
+        if index == 2
+            && matches!(
+                self.delivery,
+                Delivery::HourlyOverlap | Delivery::HistoryConflict
+            )
+        {
             response["data"][1]["amount_paid"] = json!(801);
         }
         let decoded = serde_json::from_value(response).map_err(|_| StripeError::transport())?;
