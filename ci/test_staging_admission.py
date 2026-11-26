@@ -752,7 +752,7 @@ class VerifyTests(Base):
 
         run = dict(world.run, conclusion="failure")
         queue_notice = {"annotation_level": "failure",
-                        "message": "Queue is full for concurrency group deploy-staging-main"}
+                        "message": "Queue is full for concurrency group 'deploy-staging-main'"}
         rejected = {"run": run, "jobs": page("jobs", []), "annotations": [queue_notice]}
         jobs = copy.deepcopy(world.jobs)
         jobs[-1]["conclusion"] = "failure"
@@ -782,6 +782,9 @@ class VerifyTests(Base):
             ("no annotation", dict(rejected, annotations=[]), generic),
             ("different annotation", dict(rejected, annotations=[dict(queue_notice, message="synthetic diagnostic")]),
              generic),
+            ("different queue", dict(rejected, annotations=[dict(
+                queue_notice, message="Queue is full for concurrency group 'deploy-staging-other'",
+            )]), generic),
             ("incomplete job list", dict(rejected, jobs=page("jobs", [], total=1)), generic),
             ("different build", dict(rejected, run=dict(run, head_sha=OTHER_SHA)), generic),
             ("manual run", dict(rejected, run=dict(run, event="workflow_dispatch")), generic),

@@ -555,7 +555,7 @@ def diagnose_terminal_push(sha, evidence):
     target = f"Staging run {run_id}, attempt 1"
     if not jobs:
         require(any(note.get("annotation_level") == "failure"
-                    and note.get("message") == "Queue is full for concurrency group deploy-staging-main"
+                    and note.get("message") == "Queue is full for concurrency group 'deploy-staging-main'"
                     for note in annotations), "missing workflow queue rejection annotation")
         return (f"{target} was rejected before jobs by the deploy-staging-main queue. "
                 "Exact-build qualification is pending. The next eligible automatic staging admission can "
