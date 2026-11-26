@@ -94,15 +94,9 @@ pub async fn run(
         plan: &r.plan_id,
         cancel_at_period_end: r.cancel_at_period_end,
     };
-    let (subscription_id, paid_through, paid_invoice, read_anchor, read_plan, plan, cancel) = binds.ordered();
     // Fresh global lookup, a separate statement after the lock; no owner filter.
     let found = tx
-        .query(
-            &tx.prepare_typed(&lookup, &[Type::TEXT, Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT, Type::TEXT, Type::BOOL])
-                .await
-                .map_err(e)?,
-            &[&subscription_id, &paid_through, &paid_invoice, &read_anchor, &read_plan, &plan, &cancel],
-        )
+        .query_typed(&lookup, &binds.typed())
         .await
         .map_err(e)?;
     let observed = found

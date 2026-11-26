@@ -7,6 +7,8 @@
 //! fixtures need their own trusted relation-specific SQL; no schema name is an
 //! input to these production primitives.
 
+use tokio_postgres::types::{ToSql, Type};
+
 /// Excludes subscription DML until the enclosing transaction ends.
 pub const LOCK_SUBSCRIPTIONS: &str = "LOCK TABLE public.subscriptions IN SHARE ROW EXCLUSIVE MODE";
 
@@ -80,26 +82,16 @@ pub struct LookupBinds<'a> {
 }
 
 impl<'a> LookupBinds<'a> {
-    pub fn ordered(
-        &self,
-    ) -> (
-        &str,
-        Option<i64>,
-        Option<&str>,
-        Option<&str>,
-        Option<&str>,
-        &str,
-        bool,
-    ) {
-        (
-            self.subscription_id,
-            self.paid_through_seconds,
-            self.paid_invoice_id,
-            self.read_anchor,
-            self.read_plan,
-            self.plan,
-            self.cancel_at_period_end,
-        )
+    pub fn typed(&self) -> [(&(dyn ToSql + Sync), Type); 7] {
+        [
+            (&self.subscription_id, Type::TEXT),
+            (&self.paid_through_seconds, Type::INT8),
+            (&self.paid_invoice_id, Type::TEXT),
+            (&self.read_anchor, Type::TEXT),
+            (&self.read_plan, Type::TEXT),
+            (&self.plan, Type::TEXT),
+            (&self.cancel_at_period_end, Type::BOOL),
+        ]
     }
 }
 
@@ -130,7 +122,6 @@ pub(crate) async fn apply_reconcile_transaction(
         validate_equal_end_provenance, validate_read_provenance, Identity, ObservedTarget, Target,
     };
     use crate::{billing_reconcile::reconcile_lock_statement, handlers::StoreError};
-    use tokio_postgres::types::{ToSql, Type};
     let row = &outcome.row;
     let work = async {
         transaction
@@ -164,20 +155,10 @@ pub(crate) async fn apply_reconcile_transaction(
             plan: &row.plan_id,
             cancel_at_period_end: row.cancel_at_period_end,
         };
-        let (subscription_id, paid_through, paid_invoice, read_anchor, read_plan, plan, cancel) =
-            binds.ordered();
         let observed_rows = transaction
             .query_typed(
                 crate::billing_transaction_sql::LOOKUP_TARGET,
-                &[
-                    (&subscription_id, Type::TEXT),
-                    (&paid_through, Type::INT8),
-                    (&paid_invoice, Type::TEXT),
-                    (&read_anchor, Type::TEXT),
-                    (&read_plan, Type::TEXT),
-                    (&plan, Type::TEXT),
-                    (&cancel, Type::BOOL),
-                ],
+                &binds.typed(),
             )
             .await
             .map_err(|_| StoreError)?;
@@ -438,18 +419,6 @@ mod tests {
             plan: "pro",
             cancel_at_period_end: true,
         };
-        assert_eq!(
-            binds.ordered(),
-            (
-                "sub-example",
-                Some(42),
-                Some("invoice-example"),
-                Some("original-anchor"),
-                Some("plus"),
-                "pro",
-                true,
-            )
-        );
         let nulls = LookupBinds {
             subscription_id: "sub-null",
             paid_through_seconds: None,
@@ -459,9 +428,46 @@ mod tests {
             plan: "free",
             cancel_at_period_end: false,
         };
-        assert_eq!(
-            nulls.ordered(),
-            ("sub-null", None, None, None, None, "free", false)
-        );
+        for (binds, expected) in [
+            (
+                binds,
+                [
+                    "\"sub-example\"",
+                    "Some(42)",
+                    "Some(\"invoice-example\")",
+                    "Some(\"original-anchor\")",
+                    "Some(\"plus\")",
+                    "\"pro\"",
+                    "true",
+                ],
+            ),
+            (
+                nulls,
+                [
+                    "\"sub-null\"",
+                    "None",
+                    "None",
+                    "None",
+                    "None",
+                    "\"free\"",
+                    "false",
+                ],
+            ),
+        ] {
+            let params = binds.typed();
+            assert_eq!(
+                params.clone().map(|(_, ty)| ty),
+                [
+                    Type::TEXT,
+                    Type::INT8,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::BOOL
+                ]
+            );
+            assert_eq!(params.map(|(value, _)| format!("{value:?}")), expected);
+        }
     }
 }
