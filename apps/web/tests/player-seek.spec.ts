@@ -93,3 +93,69 @@ test('10x rapid seeks never wedge the player', async ({ page, openPlayer }) => {
 	await expect(audio).toHaveAttribute('src', AUDIO_PATH);
 	await expect.poll(() => audio.evaluate((element: HTMLAudioElement) => element.duration)).toBeGreaterThan(0);
 });
+
+test('a late range read cannot replace or credit the current seek', async ({ page, openPlayer }) => {
+	await openPlayer();
+	const result = await page.evaluate(async () => {
+		const readStarted = Promise.withResolvers<void>();
+		const releaseRead = Promise.withResolvers<void>();
+		const requests: string[] = [];
+		let lateBytes: number[] = [];
+		const player = window.createSeekFixture(async (_url, { headers }) => {
+			requests.push(headers.range);
+			if (headers.range === 'bytes=10-11') {
+				const response = new Response(Uint8Array.of(10, 11), {
+					status: 206, headers: { 'content-range': 'bytes 10-11/100' }
+				});
+				const body = response.body;
+				if (!body) throw new Error('Missing fixture response body');
+				const reader = body.getReader();
+				const read = reader.read.bind(reader);
+				// Hold the fetched chunk at the read boundary, even if the real reader is cancelled.
+				reader.read = async () => {
+					reader.read = read;
+					const chunk = await read();
+					readStarted.resolve();
+					await releaseRead.promise;
+					lateBytes = Array.from(chunk.value ?? []);
+					return chunk;
+				};
+				Object.defineProperty(body, 'getReader', { value: () => reader });
+				return response;
+			}
+			if (headers.range !== 'bytes=30-32') throw new Error('Unexpected fixture range');
+			return new Response(Uint8Array.of(30, 31, 32), {
+				status: 206, headers: { 'content-range': 'bytes 30-32/100' }
+			});
+		});
+
+		const earlier = player.seek(10, 11).then(
+			({ bytes }) => Array.from(bytes),
+			(error: DOMException) => error.name
+		);
+		await Promise.race([
+			readStarted.promise,
+			earlier.then(() => { throw new Error('Earlier seek settled before the read was parked'); })
+		]);
+		try {
+			const current = await player.seek(30, 32);
+			const before = player.snapshot();
+			releaseRead.resolve();
+			return {
+				requests, before, currentBytes: Array.from(current.bytes),
+				earlier: await earlier, lateBytes, after: player.snapshot()
+			};
+		} finally {
+			releaseRead.resolve();
+		}
+	});
+
+	expect(result).toEqual({
+		requests: ['bytes=10-11', 'bytes=30-32'],
+		before: { position: 30, lastBytes: 3, completed: 1, aborted: 1 },
+		currentBytes: [30, 31, 32],
+		earlier: 'AbortError',
+		lateBytes: [10, 11],
+		after: { position: 30, lastBytes: 3, completed: 1, aborted: 1 }
+	});
+});

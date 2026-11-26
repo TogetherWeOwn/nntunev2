@@ -5,12 +5,17 @@ import { expect, test as base } from '@playwright/test';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { ARTWORK_PLACEHOLDER_SRC } from '../../../src/lib/player/artwork.js';
 import { artworkCacheHeaders, audioCacheHeaders } from '../../../src/lib/player/cacheHeaders.js';
+import type { SeekFetch, SeekResult } from '../../../src/lib/player/seekController.js';
 import { withIsolatedViteFixture } from '../../vite-fixture.helpers.js';
 import { ARTWORK_PATH, AUDIO_PATH } from './paths.js';
 
 declare global {
 	interface Window {
 		seekFixtureStorm(): Promise<{ completed: number; aborted: number; lastBytes: number }>;
+		createSeekFixture(fetchRange: SeekFetch): {
+			seek(start: number, end: number): Promise<SeekResult>;
+			snapshot(): { position: number | null; lastBytes: number; completed: number; aborted: number };
+		};
 	}
 }
 
