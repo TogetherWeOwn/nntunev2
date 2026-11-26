@@ -616,6 +616,49 @@ def require_steps(job, names, reason):
         previous = steps[0]["number"]
 
 
+def diagnose_pending_push(sha, evidence):
+    repo = "TogetherWeOwn/nntunev2"
+    run, job_page = evidence.get("run"), evidence.get("jobs")
+    require(isinstance(run, dict) and SHA.fullmatch(sha) and run.get("head_sha") == sha
+            and run.get("path") == WORKFLOW and run.get("head_branch") == "main"
+            and run.get("event") == "push" and decimal(run.get("run_attempt")) == "1"
+            and run["conclusion"] is None, "expected an unresolved automatic staging push")
+    run_id = decimal(run.get("id"))
+    for repository in (run.get("repository"), run.get("head_repository")):
+        require(isinstance(repository, dict) and repository.get("full_name") == repo,
+                "foreign staging push")
+    require(isinstance(job_page, dict), "missing attempt jobs")
+    jobs, count = job_page.get("jobs"), job_page.get("total_count")
+    require(isinstance(jobs, list) and type(count) is int and count == len(jobs) <= 100,
+            "incomplete attempt jobs")
+
+    target = f"Staging run {run_id}, attempt 1"
+    api = f"/repos/{repo}/actions"
+    if not jobs:
+        require(run.get("status") in ("pending", "queued", "requested"), "expected a pending workflow run")
+        return (f"{target} was accepted and has no jobs yet. "
+                f"Next read: GET {api}/runs/{run_id}/attempts/1/jobs?per_page=100&page=1")
+
+    require(run.get("status") in ("queued", "in_progress"), "expected a run with queued work")
+    by_id = {}
+    for job in jobs:
+        require(isinstance(job, dict) and decimal(job.get("run_id")) == run_id
+                and decimal(job.get("run_attempt")) == "1" and job.get("head_sha") == sha,
+                "job belongs to a different staging attempt")
+        job_id = decimal(job.get("id"))
+        require(job_id not in by_id, "duplicate job")
+        by_id[job_id] = job
+    journeys = [(job_id, job) for job_id, job in by_id.items() if job.get("name") == JOURNEY]
+    require(len(journeys) == 1, "missing or ambiguous full journey job")
+    job_id, job = journeys[0]
+    # Captured queued jobs can populate started_at before runner assignment.
+    require(job.get("status") == "queued" and job["conclusion"] is None and job["completed_at"] is None
+            and type(job.get("runner_id")) is int and job["runner_id"] == 0
+            and job.get("runner_name") == "" and job.get("steps") == [], "journey is not clearly unassigned")
+    return (f"{target} has a queued full-journey job {job_id} with no runner assigned. "
+            f"Next read: GET {api}/jobs/{job_id}")
+
+
 def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifest_hash,
            producer_source_ok, private_track_sha256=None):
     # Approval absence is a refusal even when every legacy job is green.
@@ -757,20 +800,23 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("produce", "produce-private", "verify", "diagnose-terminal-push"))
-    parser.add_argument("candidate_sha", nargs="?", help="pinned source SHA for diagnose-terminal-push")
+    diagnoses = {"diagnose-terminal-push": ("terminal", diagnose_terminal_push),
+                 "diagnose-pending-push": ("pending push", diagnose_pending_push)}
+    parser.add_argument("mode", choices=("produce", "produce-private", "verify", *diagnoses))
+    parser.add_argument("candidate_sha", nargs="?", help="pinned source SHA for a diagnose mode")
     args = parser.parse_args()
-    if args.mode == "diagnose-terminal-push":
+    if args.mode in diagnoses:
+        label, diagnose = diagnoses[args.mode]
         if args.candidate_sha is None:
-            parser.error("diagnose-terminal-push requires the pinned candidate SHA")
+            parser.error(f"{args.mode} requires the pinned candidate SHA")
         try:
             evidence = parse_json(sys.stdin.buffer.read(MAX_JSON + 1))
         except RecursionError:
-            raise Refused("terminal evidence is nested too deeply") from None
-        print(diagnose_terminal_push(args.candidate_sha, evidence), file=sys.stderr)
+            raise Refused(f"{label} evidence is nested too deeply") from None
+        print(diagnose(args.candidate_sha, evidence), file=sys.stderr)
         sys.exit(1)
     if args.candidate_sha is not None:
-        parser.error("candidate_sha is only for diagnose-terminal-push")
+        parser.error("candidate_sha is only for a diagnose mode")
     env = os.environ
     policy = parse_json((ROOT / POLICY).read_bytes())
     contract_bytes = (ROOT / CONTRACT).read_bytes() if (ROOT / CONTRACT).is_file() else b""
