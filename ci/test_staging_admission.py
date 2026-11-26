@@ -45,6 +45,16 @@ CONTRACT = {
     ],
 }
 CONTRACT_BYTES = json.dumps(CONTRACT).encode()
+ORDINARY_IDENTITY_CASES = {
+    "build-identity": (
+        "build-identity.spec.ts",
+        "deployed build matches the promotion SHA (exact-head staging evidence)",
+    ),
+    "build-identity-final": (
+        "zz-build-identity-final.spec.ts",
+        "deployed build still matches the promotion SHA at journey end (superseded-deploy guard)",
+    ),
+}
 PRIVATE_CASES = ("upload-to-library", "play", "seek", "queue", "anonymous-refused",
                  "unlisted-refused", "revoked-or-expired-refused", "video-off")
 PRIVATE_CONTRACT = dict(CONTRACT, journey="private-music", criteria=[
@@ -75,7 +85,8 @@ def make_junit(skip=False, fail=False, omit=False, final_sha=None):
         if fail:
             ET.SubElement(case, "failure")
     for phase, minutes, web in (("build-identity", -3, SHA), ("build-identity-final", -2, final_sha)):
-        case = ET.SubElement(suite, "testcase", classname="identity", name=phase)
+        classname, name = ORDINARY_IDENTITY_CASES[phase]
+        case = ET.SubElement(suite, "testcase", classname=classname, name=name)
         props = ET.SubElement(case, "properties")
         value = {"phase": phase, "web": web, "api": SHA, "expected": SHA, "observed_at": iso(minutes)}
         ET.SubElement(props, "property", name="candidate-identity", value=json.dumps(value))
@@ -716,6 +727,23 @@ class ProduceTests(Base):
         receipt = World().receipt
         self.assertEqual((receipt["result"], receipt["reasons"]), ("satisfied", []))
         self.assertEqual(receipt["coverage"], [{"id": "signup", "outcome": "passed"}])
+
+    def test_identity_properties_must_come_from_the_designated_ordinary_cases(self):
+        xml = make_junit()
+        control = World(xml=xml).receipt
+        self.assertEqual((control["result"], control["reasons"]), ("satisfied", []))
+        self.assertEqual(control["coverage"], [{"id": "signup", "outcome": "passed"}])
+
+        for phase, (classname, _) in ORDINARY_IDENTITY_CASES.items():
+            with self.subTest(phase=phase):
+                suite = ET.fromstring(xml)
+                source = suite.find(f"testcase[@classname='{classname}']")
+                properties = source.find("properties")
+                source.remove(properties)
+                suite.find("testcase[@name='signup']").append(properties)
+                receipt = World(xml=ET.tostring(suite)).receipt
+                self.assertEqual((receipt["result"], receipt["reasons"]),
+                                 ("incomplete", ["unexpected ordinary identity case"]))
 
     def test_incomplete_criteria_are_never_satisfied(self):
         for kind in ({"skip": True}, {"fail": True}, {"omit": True}):
