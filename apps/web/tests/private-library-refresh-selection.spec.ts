@@ -68,7 +68,10 @@ for (const { name, retainSelection } of [
 		expect(response.status()).toBe(200);
 		await expect(rows).toHaveCount(refreshed.length);
 		// The updated artist is the first sign of the new listing when both IDs remain.
-		for (const track of refreshed) await expect(titleButton(track)).toBeVisible();
+		for (const track of refreshed) {
+			await expect(titleButton(track)).toBeVisible();
+			await expect(checkbox(track)).toBeVisible();
+		}
 		await expect(checkbox(peer)).not.toBeChecked();
 		await expect(queue).toHaveCount(0);
 
