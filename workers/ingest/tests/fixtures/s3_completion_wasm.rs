@@ -17,8 +17,10 @@ use nntune_core::{
     s3_locator::S3Binding,
 };
 use sha2::{Digest, Sha256};
-use worker::js_sys::Function;
-use worker::wasm_bindgen::{self, prelude::*};
+use worker::{
+    js_sys::Function,
+    wasm_bindgen::{self, prelude::*},
+};
 
 #[path = "catalogue_upload_wasm.rs"]
 mod catalogue;
@@ -47,7 +49,7 @@ pub async fn s3_completion_test(
         "path" => "https://fixture.test:8443/api",
         _ => "https://fixture.test:8443",
     };
-    run(&mode, endpoint, read_page).await
+    run(&mode, endpoint, read_page, None).await
 }
 
 #[wasm_bindgen]
@@ -71,16 +73,25 @@ pub async fn s3_fixture_retirement_test(
 }
 
 #[wasm_bindgen]
-pub async fn upload_for_playback(endpoint: String, publish: bool) -> Result<String, JsValue> {
+pub async fn upload_for_playback(
+    endpoint: String,
+    publish: bool,
+    reconcile_completion: Option<Function>,
+) -> Result<String, JsValue> {
     let mode = if publish {
         "readback-publish"
     } else {
         "readback-playback"
     };
-    run(mode, &endpoint, None).await
+    run(mode, &endpoint, None, reconcile_completion).await
 }
 
-async fn run(mode: &str, endpoint: &str, read_page: Option<Function>) -> Result<String, JsValue> {
+async fn run(
+    mode: &str,
+    endpoint: &str,
+    read_page: Option<Function>,
+    reconcile_completion: Option<Function>,
+) -> Result<String, JsValue> {
     let configuration = id(7);
     let bucket = "fixture-bucket";
     let sender = S3CompletionSender::new(
@@ -341,15 +352,54 @@ async fn run(mode: &str, endpoint: &str, read_page: Option<Function>) -> Result<
         binding,
         parts: &parts,
     };
-    let completion =
-        SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint).unwrap();
-    let completed = if initiated.is_some() {
-        let durable = DurableUpload::new(target, &context, binding.session, until);
-        sender.complete(&durable, completion).await
+    let pending_publication = if mode == "readback-publish" {
+        Some(
+            catalogue::prepare(
+                &context,
+                &manifest,
+                record.as_ref().unwrap(),
+                map_id,
+                target,
+            )
+            .await,
+        )
     } else {
-        sender.complete_fixture(completion, until).await
-    }
-    .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+        None
+    };
+    let prepare = |receipt| {
+        SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint).unwrap()
+    };
+    let dispatch_error = |error| JsValue::from_str(&format!("{error:?}"));
+    let durable = initiated
+        .is_some()
+        .then(|| DurableUpload::new(target, &context, binding.session, until));
+    let complete = async |completion| match &durable {
+        Some(durable) => sender.complete(durable, completion).await,
+        None => sender.complete_fixture(completion, until).await,
+    };
+    let completed = match (complete(prepare(receipt)).await, reconcile_completion) {
+        (
+            Err(error @ DispatchError::Unconfirmed(Some(MultipartError::EmbeddedError))),
+            Some(reconcile),
+        ) => {
+            pending_publication
+                .as_ref()
+                .unwrap()
+                .assert_unpublished(target)
+                .await;
+            // The synthetic origin confirms the upload and its part are still pending.
+            // Only then does the fixture dispatch again from the same checkpoint.
+            assert_eq!(
+                reconcile
+                    .call1(&JsValue::UNDEFINED, &dispatch_error(error))?
+                    .as_bool(),
+                Some(true)
+            );
+            let restored = part.verify_reply(etag.clone(), checksum).unwrap();
+            complete(prepare(restored)).await.map_err(dispatch_error)?
+        }
+        (result, _) => result.map_err(dispatch_error)?,
+    };
     if mode == "head-context" {
         context.identities[1] = id(8);
     }
@@ -391,20 +441,12 @@ async fn run(mode: &str, endpoint: &str, read_page: Option<Function>) -> Result<
             .verify_readback(&inventory, envelope, readback_until)
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
-        if mode == "readback-publish" {
+        if let Some(pending) = pending_publication {
             let object = crate::admin_review::ObjectRef {
                 media: completed.metadata().clone(),
                 plaintext_sha256: *verified.origin().plaintext_sha256(),
             };
-            return Ok(catalogue::publish(
-                &verified,
-                &context,
-                &record,
-                map_id,
-                object,
-                target.upload_id,
-            )
-            .await);
+            return Ok(catalogue::publish(pending, &verified, context.identities[0], object).await);
         }
     }
     let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {

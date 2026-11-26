@@ -51,7 +51,8 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   let expectedRange;
   let fault;
   let uploads = 0;
-  let failCompletion = false;
+  let failCompletion = 'embedded';
+  let refusedCompletion;
   let interruptRange;
 
   function store(versions, version, body) {
@@ -111,9 +112,25 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
       assert.equal(path, mediaPath);
       assert.equal(query, `uploadId=${encodeURIComponent(pending.id)}`);
       assert.ok(body.includes(`<ChecksumSHA256>${checksum(pending.body)}</ChecksumSHA256>`));
-      if (failCompletion) {
+      if (failCompletion === 'embedded') {
+        assert.equal(refusedCompletion, undefined);
+        refusedCompletion = { id: pending.id, manifest: body, part: pending.body };
+        res.writeHead(200, { 'content-type': 'application/xml' }).end(
+          '<?xml version="1.0" encoding="UTF-8"?>\n \n'
+          + '<Error><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message>'
+          + '<RequestId>fixture-completion</RequestId></Error>',
+        );
+        return;
+      }
+      if (failCompletion === 'unavailable') {
         res.writeHead(503).end();
         return;
+      }
+      if (refusedCompletion) {
+        assert.equal(pending.id, refusedCompletion.id);
+        assert.deepEqual(body, refusedCompletion.manifest);
+        assert.deepEqual(pending.body, refusedCompletion.part);
+        refusedCompletion = undefined;
       }
       const version = `media+/%?=&${media.size + 1}`;
       const receipt = completionReceipt(body.toString(), 'fixture-part');
@@ -207,12 +224,27 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   host = `127.0.0.1:${server.address().port}`;
   const endpoint = `https://${host}`;
 
-  const { track, mediaVersion, seek: indexedSeek, retrySeek } = JSON.parse(await upload_for_playback(endpoint, true));
-  assert.equal(mediaVersion, original);
   const upload = ['POST media', 'PUT media', 'POST media', 'HEAD media', 'PUT page', 'GET media', 'GET page'];
-  assert.deepEqual(operations.splice(0), upload);
+  let reconciled = false;
+  const { track, mediaVersion, seek: indexedSeek, retrySeek } = JSON.parse(await upload_for_playback(endpoint, true, error => {
+    assert.equal(error, 'Unconfirmed(Some(EmbeddedError))');
+    assert.equal(reconciled, false);
+    assert.deepEqual(operations.splice(0), upload.slice(0, 3));
+    assert.equal(pending.id, refusedCompletion.id);
+    assert.deepEqual(pending.body, refusedCompletion.part);
+    assert.equal(media.size, 0);
+    assert.equal(pages.size, 0);
+    reconciled = true;
+    failCompletion = undefined;
+    return true;
+  }));
+  assert.equal(mediaVersion, original);
+  assert.equal(reconciled, true);
+  assert.equal(uploads, 1);
+  assert.equal(refusedCompletion, undefined);
+  assert.deepEqual(operations.splice(0), upload.slice(2));
 
-  failCompletion = true;
+  failCompletion = 'unavailable';
   await assert.rejects(upload_for_playback(endpoint, false),
     error => error === 'Unconfirmed(Some(CompletionStatus))');
   assert.deepEqual(operations.splice(0), ['POST media', 'PUT media', 'POST media']);
@@ -223,7 +255,7 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   // Discard the failed upload from the synthetic origin. Open a separate
   // upload for the successful control, with its own provider upload ID.
   pending = undefined;
-  failCompletion = false;
+  failCompletion = undefined;
 
   const unsigned = await fetch(`${endpoint}${mediaPath}?${queryFor(original)}`, {
     headers: { range: suffixRange }, signal: AbortSignal.timeout(5000),
