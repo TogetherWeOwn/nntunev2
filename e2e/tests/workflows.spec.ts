@@ -949,6 +949,22 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     expect(jobIf(stagingWorkflow, 'synthetic')).toBeUndefined();
   });
 
+  test('ordinary staging E2E installs only the default Chromium headless shell', () => {
+    const staging = config.projects?.find((project) => project.name === 'staging');
+    expect(staging).toBeDefined();
+    const use = { ...config.use, ...staging?.use };
+    expect(use.browserName ?? 'chromium').toBe('chromium');
+    expect(use.channel).toBeUndefined();
+    expect(use.headless).not.toBe(false);
+    expect(use.launchOptions?.executablePath).toBeUndefined();
+
+    for (const job of ['synthetic', 'e2e']) {
+      expect(jobSection(stagingWorkflow, job)).toContain(
+        'run: npx playwright install --with-deps --only-shell chromium\n',
+      );
+    }
+  });
+
   test('deploy calls e2e-staging only after successful push staging-web and staging-api (evaluated)', () => {
     // The deploy being sequenced after is itself push-only and gated on
     // the Cloudflare token; when it skips, dependents must skip too.
