@@ -108,6 +108,8 @@ verifies that the invited listener stays unsubscribed and playback stays gated.
 After the abandoned session expires in the Stripe fixture, the same listener
 can explicitly open a fresh Checkout Session.
 
+### Qualify the Stripe test clock
+
 The browser Checkout path does not supply a test clock. Before arming the
 protected trial, still verify in the approved Stripe test account that a
 fresh customer can be created under the selected clock, that Checkout uses
@@ -118,6 +120,16 @@ cancel the selected subscription and complete the runner's closing
 readback while its Stripe records are still available. Retire the clock
 after that readback. The fixture does not exercise Stripe clock timing or
 deletion against the provider.
+
+### Hand off pending paid qualification
+
+If the personal launch records **Dispatch readiness** as Ready and the paid
+candidate has only a hosted fixture pass, hand off its pinned SHA and safe job
+reference with paid qualification Pending and paid dispatch Off. Point the
+incoming operator to the [Stripe test-clock qualification](#qualify-the-stripe-test-clock)
+for the protected staging window. Paid qualification still requires the
+protected evidence check and the staging journey. An offline walkthrough ends
+at the handoff.
 
 ## Record the staging journey
 
