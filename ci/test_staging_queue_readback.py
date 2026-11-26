@@ -62,35 +62,39 @@ class QueueReadbackTests(unittest.TestCase):
         evidence = snapshot(*records, jobs={101: [], 102: [], 103: [], 104: [job(104)], 6: [],
                                             105: [job(105, status="completed", conclusion="success"),
                                                   job(105, 2, name="post-deploy full journey")]})
-        code, report = self.invoke(evidence, "--pin-run", "102", "--pin-sha", records[2]["head_sha"])
+        code, report = self.invoke(evidence, "--pin-run", "102", "--pin-sha", records[2]["head_sha"],
+                                   "--pin-run", "907", "--pin-run", "908", "--pin-sha", "b" * 40)
         self.assertEqual(code, 0)
         self.assertEqual(report["status"], "complete")
         self.assertEqual(report["newest_eligible_run_id"], 6)
+        self.assertEqual(report["unlisted_pins"], {"run_ids": [907, 908], "head_shas": ["b" * 40]})
         self.assertEqual({row["run_id"]: row["disposition"] for row in report["runs"]}, {
-            101: "superseded", 102: "keep_pinned", 103: "keep_pinned", 104: "superseded",
-            105: "keep_job_activity", 6: "keep_newest_eligible",
+            101: "superseded", 102: "keep_pinned", 103: "keep_pinned", 104: "keep_existing_jobs",
+            105: "keep_existing_jobs", 6: "keep_newest_eligible",
             **dict.fromkeys(range(107, 115), "keep_outside_selection"),
         })
 
-    def test_pending_job_activity_disqualifies_a_newer_run(self):
-        for activity in ({"status": "in_progress"}, {"started_at": "2026-01-01T00:00:00Z"},
-                         {"runner_id": 9}, {"runner_id": False}, {"steps": [{"status": "in_progress"}]}):
-            with self.subTest(activity=activity):
-                code, report = self.invoke(snapshot(run(1), run(2), jobs={1: [], 2: [job(2, **activity)]}))
+    def test_admitted_gate_is_kept_before_runner_assignment(self):
+        for state, run_number in (("pending", 2), ("queued", 4)):
+            with self.subTest(state=state, run_number=run_number):
+                gate = job(2, name="gate")  # No runner, timestamps or started steps.
+                code, report = self.invoke(snapshot(run(1), run(2, status=state, run_number=run_number), run(3),
+                                                    jobs={1: [], 2: [gate], 3: []}))
                 self.assertEqual(code, 0)
-                self.assertEqual(report["newest_eligible_run_id"], 1)
-                self.assertEqual(report["runs"][1]["disposition"], "keep_job_activity")
+                self.assertEqual(report["newest_eligible_run_id"], 3)
+                self.assertEqual(report["runs"][0]["disposition"], "superseded")
+                self.assertEqual(report["runs"][1]["disposition"], "keep_existing_jobs")
 
     def test_github_ref_qualified_paths_and_optional_job_attempt(self):
         queued_job = job(1)
         del queued_job["run_attempt"]
-        evidence = snapshot(run(1, path=f"{PATH}@main"), run(2), run(3, path=f"{PATH}@other"),
-                            jobs={1: [queued_job], 2: []})
+        evidence = snapshot(run(1, path=f"{PATH}@main"), run(2, path=f"{PATH}@main"),
+                            run(3), run(4, path=f"{PATH}@other"), jobs={1: [queued_job], 2: [], 3: []})
         code, report = self.invoke(evidence)
         self.assertEqual(code, 0)
-        self.assertEqual(report["newest_eligible_run_id"], 2)
+        self.assertEqual(report["newest_eligible_run_id"], 3)
         self.assertEqual([row["disposition"] for row in report["runs"]],
-                         ["superseded", "keep_newest_eligible", "keep_outside_selection"])
+                         ["keep_existing_jobs", "superseded", "keep_newest_eligible", "keep_outside_selection"])
         self.assert_indeterminate(snapshot(run(1, path=".github/workflows/other.yml@main"), jobs={1: []}))
         evidence["jobs"]["runs/1/attempts/2/jobs"] = evidence["jobs"].pop("runs/1/attempts/1/jobs")
         self.assert_indeterminate(evidence)
@@ -114,7 +118,7 @@ class QueueReadbackTests(unittest.TestCase):
         code, report = self.invoke(evidence)
         self.assertEqual(code, 0)
         self.assertEqual(report["newest_eligible_run_id"], 101)
-        self.assertEqual(report["runs"][0]["disposition"], "keep_job_activity")
+        self.assertEqual(report["runs"][0]["disposition"], "keep_existing_jobs")
         for inventory in (evidence["runs"]["pending"], evidence["jobs"]["runs/1/attempts/1/jobs"]):
             page = inventory.pop()
             self.assert_indeterminate(evidence)
@@ -124,9 +128,6 @@ class QueueReadbackTests(unittest.TestCase):
 
     def test_missing_or_cross_attempt_evidence_returns_no_selection(self):
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={2: []}))
-        missing_runner = job(1)
-        del missing_runner["runner_id"]
-        self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [missing_runner], 2: []}))
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [job(1, run_attempt=2)], 2: []}))
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [job(2)], 2: []}))
         self.assert_indeterminate(snapshot(run(1), run(2), jobs={1: [job(1, head_sha="b" * 40)], 2: []}))

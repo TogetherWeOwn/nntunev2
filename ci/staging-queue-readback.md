@@ -27,11 +27,13 @@ must match the route. Job rows must also match the listed run ID, URL and SHA.
 A complete report gives the newest eligible run ID and one disposition per
 listed run. The selector compares GitHub workflow run numbers. The eligible
 pool consists of first-attempt, same-repository `main` pushes in `queued` or
-`pending` with no job activity. An empty job listing or exclusively unstarted
-jobs qualifies. An active or completed job, runner assignment, step records,
-or non-null job timestamps keep the run. The newest eligible run and every pin
-are kept. `superseded` means a different eligible run has a higher run number.
-Dispatches, reruns, other refs and underway runs stay outside selection.
+`pending` with a complete, empty job listing. Any job record keeps the run.
+A queued gate can hold the staging writer group while it waits for a runner.
+The newest eligible run and every listed pin are kept. `superseded` means a
+different eligible run has a higher run number. Dispatches, reruns, other refs
+and underway runs stay outside selection. Terminal runs stay outside this
+active inventory. The `unlisted_pins` field accounts for any supplied run ID
+or SHA absent from the inventory, including pins for completed or rejected runs.
 
 Missing pages, changing totals, duplicate run identities, job evidence bound
 to a different run or attempt, and inputs beyond the supported limits return

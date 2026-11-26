@@ -11,7 +11,6 @@ REPO = "TogetherWeOwn/nntunev2"
 WORKFLOW = ".github/workflows/deploy.yml"
 RUN_PATH = re.compile(rf"{re.escape(WORKFLOW)}(?:@(?P<ref>[^\s\x00-\x1f\x7f]+))?")
 RUN_STATES = ("queued", "pending", "requested", "waiting", "in_progress")
-UNSTARTED_JOBS = ("queued", "pending", "requested")
 PAGE_SIZE = 100
 MAX_ROWS = 999  # GitHub search-filtered run listings are capped at 1,000.
 MAX_INPUT = 16 * 1024 * 1024
@@ -66,7 +65,7 @@ def staging_repository(repo):
     return isinstance(repo, dict) and repo.get("full_name") == REPO and positive_id(repo.get("id"))
 
 
-def no_jobs_started(run, inventory):
+def has_no_jobs(run, inventory):
     run_route = f"runs/{run['id']}"
     attempt = run["run_attempt"]
     # GitHub may omit run_attempt on an attempt-specific jobs response.
@@ -79,13 +78,8 @@ def no_jobs_started(run, inventory):
                 and type(job_attempt) is int and job_attempt == attempt
                 and isinstance(job_run_url, str) and job_run_url.lower() == run_url
                 and job.get("head_sha") == run["head_sha"], "job evidence belongs to a different run attempt")
-        require({"status", "started_at", "completed_at", "conclusion", "runner_id"} <= job.keys(),
-                "missing job state evidence")
-    return all(job["status"] in UNSTARTED_JOBS and job["started_at"] is None
-               and job["completed_at"] is None and job["conclusion"] is None
-               and (job["runner_id"] is None or type(job["runner_id"]) is int and job["runner_id"] == 0)
-               and job.get("steps", []) == []
-               for job in jobs.values())
+    # A queued gate job can already hold the writer group without a runner.
+    return not jobs
 
 
 def select(evidence, pinned_runs, pinned_shas):
@@ -117,10 +111,10 @@ def select(evidence, pinned_runs, pinned_shas):
             if (not from_main or not automatic_pending(run)
                     or not staging_repository(head_repo) or head_repo["id"] != repo["id"]):
                 kept[rid] = "keep_outside_selection"
-            elif no_jobs_started(run, jobs):
+            elif has_no_jobs(run, jobs):
                 eligible[rid] = number
             else:
-                kept[rid] = "keep_job_activity"
+                kept[rid] = "keep_existing_jobs"
 
     # Run numbers increase within the workflow. A rerun keeps its number.
     newest = max(eligible, key=eligible.get, default=None)
@@ -133,7 +127,9 @@ def select(evidence, pinned_runs, pinned_shas):
         else:
             disposition = kept.get(rid, "superseded")
         rows.append({"run_id": rid, "head_sha": sha, "disposition": disposition})
-    return {"status": "complete", "newest_eligible_run_id": newest, "runs": rows}
+    return {"status": "complete", "newest_eligible_run_id": newest, "runs": rows,
+            "unlisted_pins": {"run_ids": sorted(pinned_runs.difference(runs)),
+                              "head_shas": sorted(pinned_shas.difference(runs.values()))}}
 
 
 def main():
