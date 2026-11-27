@@ -199,6 +199,7 @@ class World:
                     "created_at": iso(-20), "updated_at": iso(5)}
         self.runs = [self.run]
         self.others = {}
+        self.next_job_id = 1
         self.jobs = [self.job("staging-web", -10), self.job("staging-api", -10),
                      self.job(sa.JOURNEY, 5, started=-9, steps=[
                          self.step("Run full journey", 1), self.step(
@@ -212,9 +213,10 @@ class World:
     def step(name, number, conclusion="success"):
         return {"name": name, "number": number, "status": "completed", "conclusion": conclusion}
 
-    @staticmethod
-    def job(name, done, started=-15, steps=None):
-        return {"name": name, "run_id": RUN_ID, "run_attempt": 1, "head_sha": SHA, "status": "completed",
+    def job(self, name, done, started=-15, steps=None):
+        job_id = self.next_job_id
+        self.next_job_id += 1
+        return {"id": job_id, "name": name, "run_id": RUN_ID, "run_attempt": 1, "head_sha": SHA, "status": "completed",
                 "conclusion": "success", "started_at": iso(started), "completed_at": iso(done),
                 "steps": steps or []}
 
@@ -842,6 +844,58 @@ class ProduceTests(Base):
         self.refused("empty", sa.junit_evidence, b"<testsuite/>", CONTRACT)
 
 
+class AttemptJobsPaginationTests(Base):
+    first = f"runs/{RUN_ID}/attempts/1/jobs?per_page=100&page=1"
+    second = f"runs/{RUN_ID}/attempts/1/jobs?per_page=100&page=2"
+
+    def setUp(self):
+        self.world = World()
+        self.unrelated = [self.world.job(f"unrelated {i}", -10) for i in range(98)]
+        self.routes = self.world.routes()
+
+    def test_required_journey_on_second_page(self):
+        *deploy, journey = self.world.jobs
+        steps = [dict(self.world.step(f"Build task {number}", number),
+                      started_at=iso(-12), completed_at=iso(-11)) for number in range(1, 25)]
+        first_jobs = deploy + [dict(job, steps=steps) for job in self.unrelated]
+        first_page = json.dumps(page("jobs", first_jobs, total=101)).encode()
+        self.assertGreater(len(first_page), sa.MAX_JSON)
+        self.routes[self.first] = first_page
+        self.routes[self.second] = page("jobs", [journey], total=101)
+        actions = FakeActions(self.routes)
+        self.assertEqual(self.world.verify_with_actions(actions)["result"], "satisfied")
+        self.assertEqual([route for route in actions.calls if "/attempts/" in route],
+                         [self.first, self.second])
+
+    def test_refuses_unproven_inventory_after_finding_all_required_jobs(self):
+        first_jobs = self.world.jobs + self.unrelated[:-1]
+        last_job = self.unrelated[-1]
+        self.routes[self.first] = page("jobs", first_jobs, total=101)
+        for case, payload, reason in (
+            ("dropped", None, "unavailable"),
+            ("short", page("jobs", [], total=101), "incomplete or exhausted jobs"),
+            ("count drift", page("jobs", [last_job], total=102), "incomplete or exhausted jobs"),
+            ("overlap", page("jobs", [first_jobs[-1]], total=101), "incomplete or exhausted jobs"),
+            ("duplicate required name", page("jobs", [dict(last_job, name=sa.JOURNEY)], total=101),
+             "missing or ambiguous required staging job"),
+            ("oversized", b" " * (4 * 1024 * 1024 + 1), "response exceeds bounds"),
+        ):
+            with self.subTest(case=case):
+                routes = dict(self.routes)
+                if payload is not None:
+                    routes[self.second] = payload
+                actions = FakeActions(routes)
+                self.refused(reason, self.world.verify_with_actions, actions)
+                self.assertIn(self.second, actions.calls)
+                self.assertNotIn(f"artifacts/{ARTIFACT_ID}/zip", actions.calls)
+
+    def test_refuses_inventory_above_the_page_bound(self):
+        self.routes[self.first] = page("jobs", self.world.jobs + self.unrelated[:-1], total=1001)
+        actions = FakeActions(self.routes)
+        self.refused("incomplete or exhausted jobs", self.world.verify_with_actions, actions)
+        self.assertNotIn(self.second, actions.calls)
+
+
 class VerifyTests(Base):
     def test_positive(self):
         w = World()
@@ -1343,7 +1397,7 @@ class VerifyTests(Base):
         w.jobs.pop(0)
         self.assertWorldRefused(w, "missing or ambiguous required")
         w = World()
-        w.jobs.append(dict(w.jobs[1]))
+        w.jobs.append(dict(w.jobs[1], id=100))
         self.assertWorldRefused(w, "missing or ambiguous required")
         w = World()
         w.jobs[1]["conclusion"] = "skipped"
