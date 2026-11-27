@@ -23,11 +23,11 @@
 	let generation = 0;
 	let alive = true;
 	let actionKey: string | undefined;
-	let downloadKey: string | undefined;
 	const download = createM3UDownload();
 
 	function beginExport(): number {
 		generation += 1;
+		if (selectionKey !== actionKey) download.release();
 		actionKey = selectionKey;
 		status = '';
 		fallback = null;
@@ -36,10 +36,6 @@
 
 	$effect(() => {
 		if (selectionKey !== actionKey) beginExport();
-		if (downloadKey !== undefined && selectionKey !== downloadKey) {
-			download.release();
-			downloadKey = undefined;
-		}
 	});
 
 	onDestroy(() => {
@@ -81,7 +77,6 @@
 	function downloadSelectedM3U(): void {
 		beginExport();
 		if (!alive || snapshot.tracks.length === 0) return;
-		const key = selectionKey;
 		let m3u: string;
 		try {
 			m3u = formatQueueM3U(snapshot);
@@ -93,10 +88,8 @@
 		try {
 			link = document.createElement('a');
 			status = download.download(link, () => m3u, 'selected.m3u');
-			downloadKey = key;
 		} catch {
 			download.release();
-			downloadKey = undefined;
 			status = m3uDownloadFailure('selected tracks');
 		} finally {
 			link?.remove();

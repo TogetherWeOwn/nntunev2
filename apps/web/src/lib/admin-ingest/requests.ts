@@ -34,8 +34,10 @@ export type IngestRequests = {
 export const MAX_REVISION = 0xffff_ffff;
 export const PAGE_SIZE = 50;
 
-function record(value: unknown): Record<string, unknown> | undefined {
-	if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
+function record(value: unknown, fields: string[]): Record<string, unknown> | undefined {
+	if (value && typeof value === 'object' && !Array.isArray(value) && fields.every((key) => Object.hasOwn(value, key))) {
+		return value as Record<string, unknown>;
+	}
 }
 
 function u32(value: unknown): value is number {
@@ -47,11 +49,10 @@ function isStatus(value: unknown): value is ReviewStatus {
 }
 
 export function readJob(value: unknown): Job {
-	const row = record(value) ?? {};
+	const row = record(value, ['job_id', 'revision', 'status']) ?? {};
 	const { job_id, revision, status, reason } = row;
 	if (typeof job_id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(job_id) ||
-		!u32(revision) || !isStatus(status) ||
-		!['job_id', 'revision', 'status'].every((key) => Object.hasOwn(row, key))) {
+		!u32(revision) || !isStatus(status)) {
 		throw new Error('Invalid review job');
 	}
 	const explanation = Object.hasOwn(row, 'reason') && typeof reason === 'string' && Object.hasOwn(REASONS, reason)
@@ -61,12 +62,10 @@ export function readJob(value: unknown): Job {
 }
 
 export function readQueue(value: unknown, query: QueueRequest): ReviewQueue {
-	const page = record(value) ?? {};
-	const { jobs, limit, offset } = page;
+	const { jobs, limit, offset } = record(value, ['jobs', 'limit', 'offset']) ?? {};
 	if (!u32(limit) || limit === 0 || limit > 100 || !u32(offset) ||
 		limit !== query.limit || offset !== query.offset || !Array.isArray(jobs) || jobs.length > limit ||
-		(query.status !== undefined && !isStatus(query.status)) ||
-		!['jobs', 'limit', 'offset'].every((key) => Object.hasOwn(page, key))) {
+		(query.status !== undefined && !isStatus(query.status))) {
 		throw new Error('Invalid review page');
 	}
 	const rows = Array.from({ length: jobs.length }, (_, index) => {

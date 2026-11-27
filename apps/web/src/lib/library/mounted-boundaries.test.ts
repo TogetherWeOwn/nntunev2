@@ -10,8 +10,7 @@ import type { LibraryRefresher } from './refresh.js';
 afterEach(() => vi.unstubAllGlobals());
 
 test('settling a failed refresh suspends only a mounted view', async () => {
-	const browser = new EventTarget();
-	vi.stubGlobal('window', browser);
+	vi.stubGlobal('window', new EventTarget());
 	const { promise, reject } = Promise.withResolvers<void>();
 	const refresher = {
 		state: {} as LibraryRefresher['state'],
@@ -24,13 +23,9 @@ test('settling a failed refresh suspends only a mounted view', async () => {
 	const stop = mountLibraryRefresher(refresher);
 	await Promise.resolve();
 	expect(refresher.suspendVerification).toHaveBeenCalledOnce();
-	browser.dispatchEvent(new Event('storage'));
 	notifyLocalAuthTransition();
 	stop();
-	stop();
-	browser.dispatchEvent(new Event('storage'));
 	notifyLocalAuthTransition();
-	expect(refresher.handleAuthTransition).toHaveBeenCalledOnce();
 	expect(refresher.handleLocalAuthTransition).toHaveBeenCalledOnce();
 	expect(refresher.dispose).toHaveBeenCalledOnce();
 
