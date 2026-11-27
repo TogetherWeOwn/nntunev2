@@ -26,9 +26,9 @@ export const WEB_TOOL_PACKAGES = [
 export const attributionInventory: AttributionInventory = {
 	schemaVersion: 1,
 	entries: [
-		runtimePackage('svelte', '^5.57.3', '5.57.3',
+		runtimePackage('svelte', '^5.58.0', '5.58.0',
 			'https://github.com/sveltejs/svelte', 'https://github.com/sveltejs/svelte/blob/main/LICENSE.md'),
-		runtimePackage('@sveltejs/kit', '^3.2.0', '3.2.0',
+		runtimePackage('@sveltejs/kit', '^3.4.0', '3.4.0',
 			'https://github.com/sveltejs/kit', 'https://github.com/sveltejs/kit/blob/main/LICENSE'),
 		runtimePackage('@sveltejs/adapter-cloudflare', '^8.0.2', '8.0.2',
 			'https://github.com/sveltejs/kit/tree/main/packages/adapter-cloudflare',

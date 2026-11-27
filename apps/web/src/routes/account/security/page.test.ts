@@ -142,9 +142,9 @@ describe('account security page', () => {
 
 	it('keeps the page available and announces a non-401 verification failure', async () => {
 		const data = await load({ fetch: sessionFetch(503) } as never);
+		expect(data).toEqual({ sessionCheckFailed: true });
 		const { body } = render(SecurityPage, { props: { data } });
 
-		expect(data?.sessionCheckFailed).toBe(true);
 		expect(body).toContain('role="status"');
 		expect(body).toContain('Could not verify your sign-in status.');
 		expect(body).toContain('Sign out everywhere');

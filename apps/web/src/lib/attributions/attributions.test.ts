@@ -110,10 +110,12 @@ describe('attribution inventory v1', () => {
 		expect(inventoryDrift(changed, lockfile)).toContain('package drift: svelte');
 		delete changed.devDependencies['@sveltejs/kit'];
 		expect(inventoryDrift(changed, lockfile)).toContain('package drift: @sveltejs/kit');
-		expect(inventoryDrift(packageJson, lockfile.replace('version: 5.57.3\n', 'version: 5.57.4\n')))
-			.toContain('package drift: svelte');
-		expect(inventoryDrift(packageJson, lockfile.replace('version: 3.2.0(', 'version: 3.1.1(')))
-			.toContain('package drift: @sveltejs/kit');
+		const svelteVersion = /(?<=^      svelte:\n        specifier: [^\n]+\n        version: )[^\n]+/m;
+		const kitVersion = /(?<=^      '@sveltejs\/kit':\n        specifier: [^\n]+\n        version: )[^\n(]+/m;
+		expect(inventoryDrift(packageJson, lockfile.replace(svelteVersion, '0.0.0')))
+			.toEqual(['package drift: svelte']);
+		expect(inventoryDrift(packageJson, lockfile.replace(kitVersion, '0.0.0')))
+			.toEqual(['package drift: @sveltejs/kit']);
 		expect(inventoryDrift(packageJson, '')).toHaveLength(3);
 	});
 });

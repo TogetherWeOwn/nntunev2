@@ -10,7 +10,7 @@ import { invalidateLibraryCache } from '#lib/library/cache.js';
 // read route rather than trying to inspect the cookie or rotate the session.
 export const ssr = false;
 
-export const load: PageLoad = async ({ fetch }) => {
+export const load = (async ({ fetch }) => {
 	const owner = await captureAuthFence();
 	// Keep the status-only check on browsers without Web Locks. With a
 	// fence available, a refused capture may indicate an active transition.
@@ -29,4 +29,4 @@ export const load: PageLoad = async ({ fetch }) => {
 		if (signedOut) throw redirect(307, '/login');
 	}
 	return { sessionCheckFailed: result !== true || (owner !== undefined && !owner.isCurrent()) };
-};
+}) satisfies PageLoad;
