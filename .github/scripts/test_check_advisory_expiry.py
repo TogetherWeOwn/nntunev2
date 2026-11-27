@@ -81,6 +81,8 @@ class AdvisoryExpiryTests(unittest.TestCase):
             "review by 2027-02-17..",
             "review by 2027-02-17; review by 2027-02-17",
             "review by 2027-02-17; review by 2028-01-01",
+            "review by2027-01-15; review by 2027-02-17",
+            "review by 2027-02-17; review by2028-01-01",
             "review by 2027-02-17; review by",
             "review by\n2027-02-17",
             "review\nby 2027-02-17",

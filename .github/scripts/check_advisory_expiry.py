@@ -11,7 +11,8 @@ ADVISORY = "RUSTSEC-2026-0543"
 # Conservative boundary at the start of the recorded review date, UTC.
 EXPIRY = dt.datetime(2027, 2, 17, tzinfo=dt.timezone.utc)
 
-_REVIEW_BY_RE = re.compile(r"\breview(\s+)by\b(?:(\s+)(\S+))?", re.IGNORECASE)
+# Count a date attached directly to "by" as a malformed marker.
+_REVIEW_BY_RE = re.compile(r"\breview(\s+)by(?=\b|\d)(?:(\s+)(\S+))?", re.IGNORECASE)
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
