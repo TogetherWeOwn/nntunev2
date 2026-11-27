@@ -10,7 +10,6 @@
 
 use sha2::{Digest, Sha256};
 
-pub use crate::jobs::validate_user_id;
 use crate::jobs::{derive_idempotency_key, JobSource, JobState};
 use crate::newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
 use crate::nzb_intake::estimate_nzb;
@@ -68,6 +67,13 @@ pub fn payload_retry_delay_ms(attempt: u32) -> u64 {
         2 => 30_000,
         _ => MAX_PAYLOAD_RETRY_DELAY_MS,
     }
+}
+
+/// User handles are 1..=128 chars without `:` (the idempotency key
+/// delimiter). Callers' grants are checked against this too
+/// (`crate::caller_auth::verify`), so a signed id always forms a valid key.
+pub fn validate_user_id(raw: &str) -> bool {
+    !raw.is_empty() && raw.len() <= 128 && !raw.contains(':') && !raw.contains('\0')
 }
 
 /// Lowercase sha256 hex of canonical content bytes.

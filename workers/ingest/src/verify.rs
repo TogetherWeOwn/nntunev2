@@ -510,18 +510,11 @@ impl Spend {
     }
 }
 
-fn spool_matches(
-    segments: &[StagedSpoolSegment],
-    job_id: &str,
-    round: u32,
-    index: usize,
-    segment_count: usize,
-) -> bool {
-    segments.len() <= segment_count
-        && segments
-            .iter()
-            .enumerate()
-            .all(|(n, segment)| segment.key == VerifyProgress::spool_key(job_id, round, index, n))
+fn spool_keys_match(spool: &[StagedSpoolSegment], job: &str, round: u32, index: usize) -> bool {
+    spool
+        .iter()
+        .enumerate()
+        .all(|(n, segment)| segment.key == VerifyProgress::spool_key(job, round, index, n))
 }
 
 fn scratch_progress_matches(job_id: &str, files: &[ParsedFile], progress: &VerifyProgress) -> bool {
@@ -533,12 +526,13 @@ fn scratch_progress_matches(job_id: &str, files: &[ParsedFile], progress: &Verif
             } else {
                 staged.key == VerifyProgress::spool_meta_key(job_id, round, index)
                     && staged.spool.len() == file.segment_ids.len()
-                    && spool_matches(&staged.spool, job_id, round, index, file.segment_ids.len())
+                    && spool_keys_match(&staged.spool, job_id, round, index)
             }
         })
     }) && progress.spool.iter().all(|(&index, segments)| {
         files.get(index).is_some_and(|file| {
-            spool_matches(segments, job_id, round, index, file.segment_ids.len())
+            segments.len() <= file.segment_ids.len()
+                && spool_keys_match(segments, job_id, round, index)
         })
     })
 }
@@ -674,13 +668,7 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                                 && adopted.sha256 == meta.sha256
                                 && adopted.size == meta.size
                                 && adopted.spool.len() == file.segment_ids.len()
-                                && spool_matches(
-                                    &adopted.spool,
-                                    job_id,
-                                    round,
-                                    idx,
-                                    file.segment_ids.len(),
-                                )
+                                && spool_keys_match(&adopted.spool, job_id, round, idx)
                             {
                                 // Same guard as resume trust: adopt the
                                 // staged judgement only while every
@@ -738,20 +726,23 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                         break;
                     }
                     let key = VerifyProgress::spool_key(job_id, round, idx, n);
-                    let Some(meta) = scratch
+                    match scratch
                         .head(&key)
                         .await?
-                        .filter(|m| m.key == key && !m.missing)
-                    else {
-                        break;
-                    };
-                    adopted.push(StagedSpoolSegment {
-                        key,
-                        size: meta.size,
-                        crc32: meta.crc32,
-                        missing: false,
-                        size_refused: false,
-                    });
+                        .filter(|meta| meta.key == key && !meta.missing)
+                    {
+                        Some(meta) => adopted.push(StagedSpoolSegment {
+                            key: meta.key,
+                            size: meta.size,
+                            crc32: meta.crc32,
+                            missing: meta.missing,
+                            // Refused segments stage no object, so a
+                            // rebuilt cursor never adopts one: any
+                            // object found here held real bytes.
+                            size_refused: false,
+                        }),
+                        None => break,
+                    }
                 }
                 if !adopted.is_empty() {
                     progress.spool.insert(idx, adopted);

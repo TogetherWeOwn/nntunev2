@@ -77,7 +77,9 @@
 use futures_util::{Stream, StreamExt};
 use worker::{Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
 
-use crate::dispatch::{make_job_id, validate_user_id, INGEST_QUEUE_BINDING, PAYLOAD_KV_BINDING};
+use crate::dispatch::{
+    make_job_id, validate_user_id, INGEST_QUEUE_BINDING, PAYLOAD_KEY_PREFIX, PAYLOAD_KV_BINDING,
+};
 use crate::jobs::{
     advance_checkpoint, validate_job_id, JobCheckpoint, JobSource, JobState, MAX_ATTEMPTS,
     MAX_REPAIR_ROUNDS,
@@ -158,8 +160,7 @@ enum Settlement {
     Quarantine(Box<DlqEntry>),
 }
 
-/// Validate the original queue envelope before logging or accessing job state.
-pub fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
+fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
     if !validate_job_id(&msg.job_id) || !validate_user_id(&msg.user_id) {
         return Err("invalid job or user id");
     }
@@ -210,8 +211,14 @@ pub fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
             }
         }
         JobSource::NzbUpload => {
-            let sha = msg.upload_digest().ok_or("invalid payload handle")?;
-            if msg.query.is_some()
+            let payload_ref = msg.payload_ref.as_deref().ok_or("missing payload handle")?;
+            let sha = payload_ref
+                .strip_prefix(PAYLOAD_KEY_PREFIX)
+                .ok_or("invalid payload handle")?;
+            if sha.len() != 64
+                || !sha.bytes().all(|b| b.is_ascii_hexdigit())
+                || sha != sha.to_ascii_lowercase()
+                || msg.query.is_some()
                 || msg.indexer_ref.is_some()
                 || !msg.categories.is_empty()
                 || msg.limit.is_some()
@@ -1106,16 +1113,9 @@ impl MbFetchFailure {
 /// retry within the job budget, since a KV miss cannot establish that the
 /// upload has no catalogue match.
 async fn load_payload_for_match(env: &Env, msg: &QueueMsg) -> Result<String, JobError> {
-    let transient = |detail: &'static str| JobError::transient(ERR_MATCH_FAILED, detail);
-    let Some(payload_ref) = msg.payload_ref.as_deref() else {
-        return Err(JobError::permanent(
-            ERR_MATCH_FAILED,
-            "upload payload handle missing",
-        ));
-    };
-    let store = env
-        .kv(PAYLOAD_KV_BINDING)
-        .map_err(|_| transient("upload payload unavailable"))?;
+    let unavailable = || JobError::transient(ERR_MATCH_FAILED, "upload payload unavailable");
+    let payload_ref = msg.payload_ref.as_deref().ok_or_else(unavailable)?;
+    let store = env.kv(PAYLOAD_KV_BINDING).map_err(|_| unavailable())?;
     let payload = store
         .get(payload_ref)
         .cache_ttl(PAYLOAD_CACHE_TTL_SECS)
@@ -1128,9 +1128,15 @@ async fn load_payload_for_match(env: &Env, msg: &QueueMsg) -> Result<String, Job
                 "ingest.match_payload.read_failed",
                 serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
             );
-            transient("upload payload unavailable")
-        })?
-        .ok_or_else(|| transient("upload payload unavailable"))?;
+            unavailable()
+        })?;
+    validate_match_payload(msg, payload)
+}
+
+/// Classify the upload bytes read from KV before matching.
+pub fn validate_match_payload(msg: &QueueMsg, payload: Option<String>) -> Result<String, JobError> {
+    let payload = payload
+        .ok_or_else(|| JobError::transient(ERR_MATCH_FAILED, "upload payload unavailable"))?;
     if !msg.matches_upload_payload(payload.as_bytes()) {
         return Err(JobError::permanent(
             ERR_MATCH_FAILED,

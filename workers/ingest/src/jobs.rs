@@ -228,11 +228,6 @@ pub fn can_retry(attempt: u32) -> bool {
     (1..MAX_ATTEMPTS).contains(&attempt)
 }
 
-/// Check the length and delimiters shared by caller grants and ingest keys.
-pub fn validate_user_id(raw: &str) -> bool {
-    !raw.is_empty() && raw.len() <= 128 && !raw.contains(':') && !raw.contains('\0')
-}
-
 /// Build the idempotency key for a job: `ingest:{user}:{sha}:{ref}`.
 ///
 /// - `content_sha256_hex`: sha256 of the canonical NZB bytes (upload) or of
@@ -250,8 +245,11 @@ pub fn derive_idempotency_key(
     content_sha256_hex: &str,
     source_ref: &str,
 ) -> Result<String, &'static str> {
-    if !validate_user_id(user_id) {
-        return Err("invalid user id");
+    if user_id.is_empty() || user_id.len() > 128 {
+        return Err("user id must be 1..=128 chars");
+    }
+    if user_id.contains(':') || user_id.contains('\0') {
+        return Err("user id must not contain ':'");
     }
     let hex_ok =
         content_sha256_hex.len() == 64 && content_sha256_hex.bytes().all(|b| b.is_ascii_hexdigit());
