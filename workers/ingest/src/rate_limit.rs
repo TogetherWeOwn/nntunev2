@@ -73,6 +73,9 @@ impl TokenBucket {
 
     /// Take `n` tokens if available. Clock skew backwards = no refill.
     pub fn take(&mut self, now_s: u64, n: f64) -> bool {
+        if !n.is_finite() || n <= 0.0 {
+            return false;
+        }
         if now_s > self.last_tick_s {
             let dt = (now_s - self.last_tick_s) as f64;
             self.tokens = (self.tokens + dt * self.refill_per_sec).min(self.capacity);
@@ -259,8 +262,7 @@ impl std::fmt::Debug for SearchThrottleKey {
 }
 
 /// Cap on tracked bucket keys per dimension in [`SearchThrottleStore`].
-/// Past the cap the maps are cleared (fresh buckets): the store is an
-/// in-isolate best-effort layer, so bounding memory beats perfect recall.
+/// At the cap, admitting a new key requires reclaiming a fully refilled bucket.
 pub const SEARCH_THROTTLE_MAX_KEYS: usize = 4096;
 
 /// Bucket store behind the live search route: one bucket per source IP and
@@ -276,6 +278,7 @@ pub const SEARCH_THROTTLE_MAX_KEYS: usize = 4096;
 pub struct SearchThrottleStore {
     by_ip: HashMap<String, TokenBucket>,
     by_account: HashMap<String, TokenBucket>,
+    last_pruned_s: Option<u64>,
 }
 
 impl SearchThrottleStore {
@@ -291,12 +294,9 @@ impl SearchThrottleStore {
         cfg: &SearchRateLimitConfig,
         now_s: u64,
     ) -> SearchDecision {
-        if self.by_ip.len() >= SEARCH_THROTTLE_MAX_KEYS
-            || self.by_account.len() >= SEARCH_THROTTLE_MAX_KEYS
-        {
-            self.by_ip.clear();
-            self.by_account.clear();
-        }
+        // Reclaimed balances were observed at the last prune, so any new
+        // buckets must start at or after that time even on clock rollback.
+        let now_s = now_s.max(self.last_pruned_s.unwrap_or_default());
         let fresh = || TokenBucket::per_window(cfg.max_attempts, cfg.window_secs, now_s);
         // Peek + decide on copies, then write back: a denial must not
         // mutate either stored bucket (`take` refills `last_tick_s`, which
@@ -310,11 +310,29 @@ impl SearchThrottleStore {
             .unwrap_or_else(fresh);
         let decision = check_search_throttle(&mut ip_bucket, &mut account_bucket, now_s);
         if decision == SearchDecision::Allow {
+            if self.needs_slot(key) && self.last_pruned_s != Some(now_s) {
+                self.by_ip
+                    .retain(|_, bucket| bucket.remaining(now_s) < bucket.capacity);
+                self.by_account
+                    .retain(|_, bucket| bucket.remaining(now_s) < bucket.capacity);
+                self.last_pruned_s = Some(now_s);
+            }
+            if self.needs_slot(key) {
+                return SearchDecision::Deny {
+                    retry_after_secs: 1,
+                };
+            }
             self.by_ip.insert(key.ip().to_string(), ip_bucket);
             self.by_account
                 .insert(key.account().to_string(), account_bucket);
         }
         decision
+    }
+
+    fn needs_slot(&self, key: &SearchThrottleKey) -> bool {
+        (self.by_ip.len() >= SEARCH_THROTTLE_MAX_KEYS && !self.by_ip.contains_key(key.ip()))
+            || (self.by_account.len() >= SEARCH_THROTTLE_MAX_KEYS
+                && !self.by_account.contains_key(key.account()))
     }
 }
 
@@ -352,6 +370,7 @@ mod tests {
         for _ in 0..10 {
             assert!(b.take(1_000, 1.0));
         }
+        assert!(!b.take(1_000, -1.0));
         assert!(!b.take(1_000, 1.0));
         assert!(b.take(1_060, 1.0));
     }
