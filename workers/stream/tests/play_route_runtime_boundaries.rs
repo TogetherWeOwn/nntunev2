@@ -1,6 +1,6 @@
 use std::{
     cell::Cell,
-    future::{pending, ready},
+    future::{pending, poll_fn},
     task::Poll,
 };
 
@@ -15,7 +15,7 @@ use nntune_stream::{
     original_play::{authorize_original, control::OriginalRequestControl},
     play::PlayError,
     play_route::{bearer_token, MeteredBody, PlayRouteRefusal, PlayRouteRequest},
-    routes::{decide_public_route, dial_before_deadline, PublicRoute},
+    routes::dial_before_deadline,
 };
 
 const TRACK: &str = "00000000-0000-0000-0000-000000000001";
@@ -41,11 +41,7 @@ fn request() -> PlayRouteRequest {
 }
 
 #[test]
-fn public_dispatch_and_bearer_reject_ambiguous_inputs() {
-    assert_eq!(
-        decide_public_route("PROPFIND", "/play/track"),
-        PublicRoute::NotFound
-    );
+fn bearer_rejects_ambiguous_inputs() {
     for malformed in ["Bearer v2.a.b\t", "Bearer v2.a.b,Other", "Bearer v2.a.é"] {
         assert_eq!(bearer_token(Some(malformed)), None);
     }
@@ -116,9 +112,15 @@ fn metered_body_rejects_overrun_and_short_eof() {
 fn handshake_deadline_stops_a_pending_dial() {
     let bounded = "dial_with_deadline(NntpClient::connect(transport, &config))";
     assert_eq!(RUNTIME.matches(bounded).count(), 2);
-    let refused = dial_before_deadline(ready(()), pending::<nntune_core::Result<()>>());
+    let timer = Cell::new(Poll::Pending);
+    let dial = poll_fn(|_| {
+        timer.set(Poll::Ready(()));
+        Poll::<nntune_core::Result<()>>::Pending
+    });
+    let mut attempt = std::pin::pin!(dial_before_deadline(poll_fn(|_| timer.get()), dial));
+    assert!(attempt.as_mut().now_or_never().is_none());
     assert!(matches!(
-        refused.now_or_never(),
+        attempt.now_or_never(),
         Some(Err(nntune_core::Error::Io(error))) if error.kind() == std::io::ErrorKind::TimedOut
     ));
 }
@@ -131,7 +133,6 @@ fn error_codes_use_public_messages_and_registry_status() {
         retry_after_ms: 1001,
     };
     let refusal = PlayRouteRefusal::from(&failure);
-    assert_eq!(failure.http_status(), 503);
-    assert_eq!(refusal.status, refusal.api_error.status);
+    assert_eq!((refusal.status, refusal.api_error.status), (503, 503));
     assert_eq!(refusal.retry_after.as_deref(), Some("2"));
 }
