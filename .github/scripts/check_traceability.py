@@ -63,7 +63,9 @@ NON_TEST_QUOTES = frozenset(
 # `  [staging] › health.spec.ts:19:3 › describe chain › test title`
 # Playwright may emit the path relative to the e2e root with a `tests/`
 # prefix (`tests/health.spec.ts:19:3`); accept both, capture the filename.
-LIST_LINE = re.compile(r"^.*›\s*(?:tests/)?([\w][\w.-]*\.spec\.ts):\d+:\d+\s*›\s*(.+?)\s*$")
+LIST_LINE = re.compile(
+    r"^\s*(?:\[[^\]]+\]\s*›\s*)?(?:tests/)?([\w][\w.-]*\.spec\.ts):\d+:\d+\s*›\s*(.+?)\s*$"
+)
 TOTAL_LINE = re.compile(r"^Total:\s*(\d+) tests? in (\d+) files?\s*$")
 
 BACKTICK_SPAN = re.compile(r"`([^`]+)`")
@@ -108,9 +110,14 @@ def parse_list_output(text, source="<list-output>"):
             leaf = normalize(chain.split("›")[-1])
             files.setdefault(f"e2e/tests/{spec}", []).append(leaf)
             continue
-        match = TOTAL_LINE.match(line.strip())
-        if match:
-            total = (int(match.group(1)), int(match.group(2)))
+        if line.lstrip().startswith("Total:"):
+            match = TOTAL_LINE.fullmatch(line.strip())
+            if not match or total is not None:
+                raise TraceabilityError(f"{source}: malformed or duplicate Total line")
+            try:
+                total = (int(match.group(1)), int(match.group(2)))
+            except ValueError as exc:
+                raise TraceabilityError(f"{source}: invalid Total counts") from exc
     if not files:
         raise TraceabilityError(
             f"{source}: parsed zero tests; "
@@ -196,10 +203,16 @@ def check(root, matrix_path, list_text):
             "from `e2e:list` output (moved, renamed, or deleted)"
         )
     for path in sorted(cited_paths):
-        if not (root / path).is_file():
+        try:
+            target = (root / path).resolve()
+            inside = target.is_relative_to(root.resolve() / "e2e")
+            exists = inside and target.is_file()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise TraceabilityError(f"cannot resolve cited path {path!r}") from exc
+        if not exists:
             drifts.append(
                 f"stale path citation `{path}`: cited in the matrix but "
-                "missing on disk"
+                + ("missing on disk" if inside else "outside the e2e tree")
             )
     for title in sorted(cited_titles):
         if title in listed_titles or title in NON_TEST_QUOTES:

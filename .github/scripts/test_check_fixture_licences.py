@@ -60,8 +60,22 @@ class TestManifest(unittest.TestCase):
         for field in ("license", "license_url", "source"):
             data = json.loads(manifest())
             del data[field]
-            violations, _ = check_manifest(MANIFEST_PATH, json.dumps(data))
+            violations, keys = check_manifest(MANIFEST_PATH, json.dumps(data))
             self.assertIn((1, "manifest-licence"), violations, field)
+            self.assertFalse(keys)
+
+    def test_malformed_manifest_cannot_authorize_tracks(self):
+        track = {"file": "f.flac", "bytes": 1, "sha256": SHA}
+        for raw in (
+            manifest(license=[]),
+            manifest().replace('"license":', '"license": "bad", "license":'),
+            manifest(tracks=[track, track]),
+            manifest(tracks=[track, {**track, "file": "other.flac", "sha256": SHA + "\n"}]),
+        ):
+            with self.subTest(raw=raw):
+                violations, keys = check_manifest(MANIFEST_PATH, raw)
+                self.assertTrue(violations)
+                self.assertFalse(keys)
 
     def test_bad_track_shapes(self):
         bad_tracks = [

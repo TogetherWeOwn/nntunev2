@@ -62,7 +62,8 @@ from docs_link_lint import (  # noqa: E402
     LintError,
     _escape_annotation_property,
     changed_markdown_files,
-    is_fixture_path,
+    confined_path,
+    explicit_markdown_files,
     lines_outside_fences,
     markdown_files,
 )
@@ -406,7 +407,7 @@ def local_anchors(text, spans, idx):
 def citation_occurrences(source_rel, root):
     """Yield occurrence dicts for every citation in one markdown file."""
     try:
-        text = (root / source_rel).read_text(encoding="utf-8")
+        text = confined_path(root, source_rel).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise LintError(f"cannot read {source_rel}: {exc}") from exc
     occurrences = []
@@ -433,7 +434,7 @@ def citation_occurrences(source_rel, root):
 def twin_path_targets(source_rel, root):
     """Map bare basenames to resolved files cited in full in this doc."""
     try:
-        text = (root / source_rel).read_text(encoding="utf-8")
+        text = confined_path(root, source_rel).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise LintError(f"cannot read {source_rel}: {exc}") from exc
     twins = {}
@@ -584,20 +585,7 @@ def main(argv=None):
         if not root.is_dir():
             raise LintError(f"repository root is not a directory: {root}")
         if args.files is not None:
-            files = []
-            for name in args.files:
-                rel = Path(name)
-                if rel.is_absolute():
-                    try:
-                        rel = rel.resolve().relative_to(root)
-                    except ValueError:
-                        raise LintError(f"file is outside --root: {name}")
-                if rel.suffix.lower() not in (".md", ".markdown", ".mdown"):
-                    continue
-                if is_fixture_path(rel):
-                    continue
-                if (root / rel).is_file():
-                    files.append(rel)
+            files = explicit_markdown_files(root, args.files)
         elif args.base_ref:
             files = changed_markdown_files(root, args.base_ref)
         else:

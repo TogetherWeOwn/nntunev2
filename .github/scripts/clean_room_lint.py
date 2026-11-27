@@ -77,7 +77,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from public_text_lint import _escape_annotation_property, _failure_category
+from public_text_lint import _escape_annotation_property, _failure_category, read_public_bytes
 
 # Files that state or test the prohibition and so must name the banned
 # shapes. Exact paths only; see the docstring.
@@ -236,8 +236,7 @@ def main(argv):
         hits = [(1, f"{rule_id}-path") for rule_id in find_path_violations(path)]
         if path not in DEFINITIONAL_EXCLUSIONS:
             try:
-                with open(path, "rb") as fh:
-                    data = fh.read()
+                data = read_public_bytes(path)
             except (OSError, UnicodeError) as exc:
                 failed += 1
                 print(

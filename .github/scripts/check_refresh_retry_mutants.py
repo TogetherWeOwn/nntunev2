@@ -6,6 +6,7 @@ are temporary and always restored; compiler errors never count as killed mutants
 Local compiling invocations retain the repository's bounded Cargo pool.
 """
 import os
+import re
 from pathlib import Path
 import subprocess
 
@@ -85,9 +86,10 @@ CASES = (
 def run(args):
     prefix = (["cargo"] if os.environ.get("GITHUB_ACTIONS") == "true" else
               ["python3", "scripts/cargo_cache.py", "run", "--"])
+    # Keep libtest capture on so baseline results have intact per-test lines.
     return subprocess.run(
         prefix + ["test", "--locked", "--manifest-path", "workers/api/Cargo.toml",
-                  "--features", "postgres-tests", *args, "--", "--nocapture"],
+                  "--features", "postgres-tests", *args],
         cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         timeout=180,
     )
@@ -127,8 +129,9 @@ def main():
         if original.count(old) != 1:
             raise RuntimeError(f"{label}: mutation anchor must occur exactly once")
         baseline = run(args)
+        passed = set(re.findall(r"^test (\S+) \.\.\. ok$", baseline.stdout, re.MULTILINE))
         if (baseline.returncode != 0
-                or any(name not in baseline.stdout for name in expected_names)
+                or not all(killed_by(name, passed) for name in expected_names)
                 or "test result: ok." not in baseline.stdout):
             raise RuntimeError(f"{label}: baseline did not pass\n{baseline.stdout[-6000:]}")
         try:

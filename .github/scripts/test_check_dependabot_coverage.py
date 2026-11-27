@@ -89,6 +89,25 @@ def run_check(root):
 
 
 class DependabotCoverageTests(unittest.TestCase):
+    def test_workspace_rejects_malformed_members_and_excludes(self):
+        tmp = make_fixture()
+        self.addCleanup(shutil.rmtree, tmp)
+        for entry in ('members = [123]', 'exclude = ["../outside"]'):
+            with self.subTest(entry=entry):
+                write(tmp / "Cargo.toml", "[workspace]\n" + entry)
+                _, err = check_coverage(tmp)
+                self.assertIn("workspace.", err or "")
+
+    def test_cargo_entry_cannot_point_outside_repository(self):
+        with tempfile.TemporaryDirectory() as outside:
+            write(Path(outside) / "Cargo.toml", "[workspace]\n")
+            tmp = make_fixture(
+                f'  - package-ecosystem: "cargo"\n    directory: "/../{Path(outside).name}"\n'
+            )
+            self.addCleanup(shutil.rmtree, tmp)
+            rc, out, err = run_check(tmp)
+            self.assertNotEqual(0, rc, out + err)
+
     def test_shipped_repo_is_green(self):
         drift, err = check_coverage(ROOT)
         self.assertIsNone(err, err)
