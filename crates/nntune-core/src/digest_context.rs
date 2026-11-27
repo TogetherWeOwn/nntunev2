@@ -6,6 +6,10 @@
 use crate::digest_geometry::DigestGeometry;
 use sha2::{Digest, Sha256};
 
+pub(crate) fn is_uuid_v4(id: &[u8; 16]) -> bool {
+    id[6] >> 4 == 4 && id[8] >> 6 == 2
+}
+
 /// Encodes the root-version-independent scheme-2 context. This value alone
 /// cannot enroll a map, verify a page, or authorize serving.
 pub fn context_hash(
@@ -13,10 +17,7 @@ pub fn context_hash(
     geometry: DigestGeometry,
     header: &[u8; 48],
 ) -> Option<[u8; 32]> {
-    if identities
-        .iter()
-        .any(|id| id[6] >> 4 != 4 || id[8] >> 6 != 2)
-    {
+    if !identities.iter().all(is_uuid_v4) {
         return None;
     }
     let mut hash = Sha256::new();

@@ -5,7 +5,7 @@
 //! sealer. A verifier must compare a page against an independently trusted row
 //! before parsing it; hashing provider bytes here cannot create that row.
 
-use crate::digest_geometry::DigestGeometry;
+use crate::{digest_context::is_uuid_v4, digest_geometry::DigestGeometry};
 use sha2::{Digest, Sha256};
 
 /// Encode the unique page partition for trusted geometry. Inputs to this
@@ -18,7 +18,7 @@ pub fn encode_page(
     entries: &[[u8; 32]],
 ) -> Option<Vec<u8>> {
     let page = geometry.page(index)?;
-    if map_id[6] >> 4 != 4 || map_id[8] >> 6 != 2 || entries.len() != page.count as usize {
+    if !is_uuid_v4(map_id) || entries.len() != page.count as usize {
         return None;
     }
     let mut bytes = Vec::with_capacity(page.encoded_len as usize);

@@ -4,7 +4,7 @@
 //! immutable rows, lifecycle fencing and pinned sidecar identities. This
 //! in-memory result neither supplies those controls nor verifies fetched pages.
 
-use crate::digest_context::context_hash;
+use crate::digest_context::{context_hash, is_uuid_v4};
 use crate::digest_geometry::DigestGeometry;
 use crate::digest_page::{encode_page, page_hash};
 use crate::digest_read_snapshot::DigestReadSnapshot;
@@ -14,6 +14,16 @@ use sha2::{Digest, Sha256};
 
 fn invalid() -> crate::Error {
     crate::Error::Malformed("invalid digest enrollment state".into())
+}
+
+fn snapshot_identities(pins: &DigestReadSnapshot<'_>) -> [[u8; 16]; 5] {
+    [
+        pins.environment_id,
+        pins.library_id,
+        pins.object_id,
+        pins.generation_id,
+        pins.provider_configuration,
+    ]
 }
 
 /// Complete sealer-origin evidence, produced only by the enrollment sealer.
@@ -55,20 +65,16 @@ impl StoredManifest {
         rows: Vec<[u8; 32]>,
     ) -> Option<Self> {
         let geometry = DigestGeometry::new(pins.plaintext_len)?;
-        if geometry.plaintext_len() == 0 || rows.len() != geometry.pages() as usize {
+        if geometry.plaintext_len() == 0
+            || !is_uuid_v4(&pins.map_id)
+            || rows.len() != geometry.pages() as usize
+        {
             return None;
         }
-        let identities = [
-            pins.environment_id,
-            pins.library_id,
-            pins.object_id,
-            pins.generation_id,
-            pins.provider_configuration,
-        ];
         Some(Self(OriginManifest {
             geometry,
             map_id: pins.map_id,
-            context: context_hash(&identities, geometry, &header)?,
+            context: context_hash(&snapshot_identities(pins), geometry, &header)?,
             header,
             plaintext_sha256: pins.plaintext_sha256,
             rows,
@@ -113,8 +119,11 @@ impl<'a> PlaybackManifest<'a> {
         context: &crate::media_envelope::EnvelopeContext,
     ) -> bool {
         let origin = self.origin();
-        let [_, identities @ ..] = context.identities;
-        &pins.plaintext_sha256 == origin.plaintext_sha256()
+        let [root_version, identities @ ..] = context.identities;
+        root_version == pins.root_version_id
+            && identities == snapshot_identities(pins)
+            && context.plaintext_len == pins.plaintext_len
+            && &pins.plaintext_sha256 == origin.plaintext_sha256()
             && origin
                 .candidate_page_hashes(
                     &identities,
@@ -227,7 +236,7 @@ impl DigestEnrollment {
         map_id: [u8; 16],
     ) -> crate::Result<Self> {
         let geometry = DigestGeometry::new(plaintext_len).ok_or_else(invalid)?;
-        if plaintext_len == 0 || map_id[6] >> 4 != 4 || map_id[8] >> 6 != 2 {
+        if plaintext_len == 0 || !is_uuid_v4(&map_id) {
             return Err(invalid());
         }
         // Reject bad identities before drawing secret key material.

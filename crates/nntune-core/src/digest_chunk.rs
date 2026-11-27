@@ -56,8 +56,8 @@ pub fn open_chunk_part(
 }
 
 /// Verify the enrolled header and page, then authenticate one complete chunk.
-/// Chunk zero additionally requires the exact wire header. No plaintext escapes
-/// on failure; successful plaintext is zeroized when dropped.
+/// Supply the exact wire header for chunk zero only. No plaintext escapes on
+/// failure; successful plaintext is zeroized when dropped.
 pub fn open_chunk(
     manifest: &OriginManifest,
     key: &FileKey,
@@ -73,9 +73,12 @@ pub fn open_chunk(
     let reader = header
         .reader(geometry.plaintext_len())
         .map_err(|_| ChunkError::Header)?;
-    if index == 0 {
+    if (index == 0) != wire_header.is_some() {
+        return Err(ChunkError::Header);
+    }
+    if let Some(wire_header) = wire_header {
         reader
-            .check_wire_header(wire_header.ok_or(ChunkError::Header)?)
+            .check_wire_header(wire_header)
             .map_err(|_| ChunkError::Header)?;
     }
     let expected = manifest

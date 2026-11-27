@@ -117,7 +117,7 @@ impl<'a> DigestRange<'a> {
             .map(|chunk| (chunk.index, chunk.page))
     }
 
-    /// Verify and open exactly the next chunk. Chunk zero requires its wire header.
+    /// Verify and open exactly the next chunk. Supply the wire header for chunk zero only.
     /// An error fences this cursor; already returned authenticated parts remain valid.
     pub fn open_next(
         &mut self,
