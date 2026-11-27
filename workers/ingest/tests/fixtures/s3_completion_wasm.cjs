@@ -1039,17 +1039,28 @@ const firstPartPage = ([first]) => ({ next_marker: 1, parts: [first] });
 
 function mockResumeInventory(t, laterPages) {
   const confirmed = [];
+  const pages = [[null, () => terminalInventory([])], ...laterPages];
+  let reads = 0;
+  let completions = 0;
   const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+    if (request.method === 'POST') {
+      assert.equal(reads, pages.length, 'completion must wait for the coherent reread');
+      const receipts = new Map(confirmed.map(({ number, etag, digest }) => [number, {
+        etag, 'x-amz-checksum-sha256': Buffer.from(digest).toString('base64'),
+      }]));
+      const body = await verifySignedRequest(request, 'POST', uploadQuery);
+      assert.equal(body.toString(), multipartManifest(receipts));
+      completions += 1;
+      return multipartCompletionReceipt(receipts);
+    }
     const number = confirmed.length + 1;
-    assert.ok(number <= 2, 'status and resume must only read inventory');
+    assert.ok(number <= 2, 'resume must preserve both confirmed uploads');
     const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
     const etag = `"inventory-part-${number}"`;
     const sha = checksum(body);
     confirmed.push({ number, len: body.length, etag, digest: [...Buffer.from(sha, 'base64')] });
     return new Response(null, { headers: { etag, 'x-amz-checksum-sha256': sha } });
   });
-  const pages = [[null, () => terminalInventory([])], ...laterPages];
-  let reads = 0;
   const readPage = (observedBucket, key, id, marker) => {
     assert.deepEqual([observedBucket, key, id], [bucket, mediaKey, inventoryUploadId]);
     assert.equal(confirmed.length, reads === 0 ? 0 : 2);
@@ -1058,15 +1069,22 @@ function mockResumeInventory(t, laterPages) {
     assert.equal(marker, expectedMarker);
     return reply(confirmed);
   };
-  const verifyCalls = () => {
+  const verifyCalls = (expectedCompletions) => {
     assert.equal(reads, pages.length);
-    assert.equal(fetch.mock.callCount(), 2);
+    assert.equal(completions, expectedCompletions);
+    assert.equal(fetch.mock.callCount(), 2 + expectedCompletions);
   };
   return { confirmed, readPage, verifyCalls };
 }
 
 for (const [kind, firstAttempt] of [
   ['a complete empty inventory', [[null, () => terminalInventory([])]]],
+  ['a changed multipart part checksum', [
+    [null, firstPartPage],
+    [1, ([, second]) => terminalInventory([{
+      ...second, digest: [second.digest[0] ^ 1, ...second.digest.slice(1)],
+    }])],
+  ]],
   ['identical multipart page overlap', [
     [null, firstPartPage],
     [1, ([first, second]) => terminalInventory([{ ...first }, second])],
@@ -1087,7 +1105,7 @@ for (const [kind, firstAttempt] of [
       [1, ([, second]) => terminalInventory([second])],
     ]);
     const result = JSON.parse(await complete('multipart-resume', readPage));
-    verifyCalls();
+    verifyCalls(1);
     assert.deepEqual(result, {
       statuses: [
         { status: 'resumable', upload_id: inventoryUploadId, parts: [] },
@@ -1095,6 +1113,7 @@ for (const [kind, firstAttempt] of [
         { status: 'resumable', upload_id: inventoryUploadId, parts: confirmed },
       ],
       manifest: confirmed.map(({ number, etag, digest }) => [number, etag, Buffer.from(digest).toString('base64')]),
+      version,
     });
   });
 }
@@ -1103,7 +1122,7 @@ test('stops after the retry if complete multipart inventories stay empty', async
   const emptyPage = [null, () => terminalInventory([])];
   const { readPage, verifyCalls } = mockResumeInventory(t, [emptyPage, emptyPage]);
   await assert.rejects(complete('multipart-resume', readPage), rejectedWith('fixture inventory did not recover'));
-  verifyCalls();
+  verifyCalls(0);
 });
 
 for (const [name, code, prefix, marker] of [
@@ -1117,7 +1136,7 @@ for (const [name, code, prefix, marker] of [
       [marker, () => { throw unavailable; }],
     ]);
     await assert.rejects(complete('multipart-resume', readPage), (error) => error === unavailable);
-    verifyCalls();
+    verifyCalls(0);
   });
 }
 
@@ -1146,7 +1165,7 @@ test('recovers after an inventory continuation fails beyond a confirmed prefix',
   ]);
 
   const result = JSON.parse(await complete('multipart-resume-inventory-retry', readPage));
-  verifyCalls();
+  verifyCalls(1);
   assert.equal(interruptions, 1);
   assert.deepEqual(readParts, [1, 1, 2]);
   assert.deepEqual(result, {
@@ -1156,5 +1175,6 @@ test('recovers after an inventory continuation fails beyond a confirmed prefix',
       { status: 'resumable', upload_id: inventoryUploadId, parts: confirmed },
     ],
     manifest: confirmed.map(({ number, etag, digest }) => [number, etag, Buffer.from(digest).toString('base64')]),
+    version,
   });
 });
