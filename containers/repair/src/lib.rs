@@ -353,46 +353,46 @@ fn store_input(
     {
         return Err(ApiError::invalid());
     }
-    if let Some(len) = declared_len {
-        if len > MAX_SCRATCH_TOTAL_BYTES {
-            return Err(ApiError::new(413, "payload_too_large"));
-        }
+    let too_large = || ApiError::new(413, "payload_too_large");
+    if declared_len.is_some_and(|len| len > MAX_SCRATCH_TOTAL_BYTES) {
+        return Err(too_large());
     }
     let dir = job_dir(config, job_id, round).join("in");
     fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("{key}.tmp"));
+    // The upload replaces this key, so only other entries count against it.
     let mut staged_total: u64 = 0;
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
-        if entry.file_name().to_string_lossy() != key {
+        if entry.file_name() != key && entry.path() != tmp {
             staged_total = staged_total
                 .checked_add(entry.metadata()?.len())
-                .ok_or_else(|| ApiError::new(413, "payload_too_large"))?;
+                .ok_or_else(too_large)?;
         }
     }
-    let tmp = dir.join(format!("{key}.tmp"));
-    let mut file = fs::File::create(&tmp)?;
-    let mut written: u64 = 0;
-    let mut buf = [0u8; 64 << 10];
-    loop {
-        let n = body.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        written += n as u64;
-        if staged_total + written > MAX_SCRATCH_TOTAL_BYTES {
-            let _ = fs::remove_file(&tmp);
-            return Err(ApiError::new(413, "payload_too_large"));
-        }
-        file.write_all(&buf[..n])?;
+    let capacity = MAX_SCRATCH_TOTAL_BYTES
+        .checked_sub(staged_total)
+        .ok_or_else(too_large)?;
+    if declared_len.is_some_and(|len| len > capacity) {
+        return Err(too_large());
     }
-    if let Some(len) = declared_len {
-        if written != len {
-            let _ = fs::remove_file(&tmp);
+
+    // Discard a stale upload for this key without following links.
+    // Keep the current staged object in place until the new body is complete.
+    allow_missing(fs::remove_file(&tmp))?;
+    let mut file = fs::File::create_new(&tmp)?;
+    let result = (|| {
+        let written = copy_upload(body, &mut file, capacity)?;
+        if declared_len.is_some_and(|len| written != len) {
             return Err(ApiError::invalid());
         }
+        fs::rename(&tmp, dir.join(key))?;
+        Ok(written)
+    })();
+    if result.is_err() {
+        allow_missing(fs::remove_file(&tmp))?;
     }
-    fs::rename(&tmp, dir.join(key))?;
-    Ok(written)
+    result
 }
 
 // --- HTTP/1.1 plumbing (std only; one job at a time per Container) ---
@@ -404,61 +404,61 @@ struct Request {
     chunked: bool,
 }
 
-/// Read the header block, leaving any already-buffered body bytes in
-/// `leftover` for the body reader.
-fn read_head(stream: &mut impl Read) -> Result<(Request, Vec<u8>), ApiError> {
+/// Read only the header block, including its final CRLF pair.
+fn read_head(stream: &mut impl Read) -> Result<Request, ApiError> {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        if buf.len() > MAX_HEADER_BYTES {
+        if buf.len() == MAX_HEADER_BYTES {
             return Err(ApiError::invalid());
         }
-        let n = stream.read(&mut byte)?;
-        if n == 0 {
-            return Err(ApiError::invalid());
-        }
+        stream.read_exact(&mut byte).map_err(body_read_error)?;
         buf.push(byte[0]);
         if buf.ends_with(b"\r\n\r\n") {
             break;
         }
     }
-    let head = String::from_utf8_lossy(&buf);
-    let mut lines = head.lines();
-    let mut first = lines
+    let head = std::str::from_utf8(&buf[..buf.len() - 4]).map_err(|_| ApiError::invalid())?;
+    let mut lines = head.split("\r\n");
+    let mut first = lines.next().ok_or_else(ApiError::invalid)?.split(' ');
+    let method = first
         .next()
-        .ok_or_else(ApiError::invalid)?
-        .split_whitespace();
-    let method = first.next().ok_or_else(ApiError::invalid)?.to_string();
-    let path = first.next().ok_or_else(ApiError::invalid)?.to_string();
+        .filter(|s| is_http_token(s))
+        .ok_or_else(ApiError::invalid)?;
+    let path = first.next().ok_or_else(ApiError::invalid)?;
+    if !path.starts_with('/')
+        || !path.bytes().all(|b| b.is_ascii_graphic())
+        || first.next() != Some("HTTP/1.1")
+        || first.next().is_some()
+    {
+        return Err(ApiError::invalid());
+    }
     let mut content_length = None;
     let mut chunked = false;
     for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            let value = value.trim();
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse::<u64>().ok();
-            } else if name.eq_ignore_ascii_case("transfer-encoding")
-                && value.eq_ignore_ascii_case("chunked")
-            {
-                chunked = true;
+        let (name, value) = parse_http_field(line).ok_or_else(ApiError::invalid)?;
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() || chunked || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ApiError::invalid());
             }
+            content_length = Some(value.parse().map_err(|_| ApiError::invalid())?);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked || content_length.is_some() || !value.eq_ignore_ascii_case("chunked") {
+                return Err(ApiError::invalid());
+            }
+            chunked = true;
         }
     }
-    // The head reader consumes byte-by-byte, so nothing past the header
-    // terminator has been read yet.
-    Ok((
-        Request {
-            method,
-            path,
-            content_length,
-            chunked,
-        },
-        Vec::new(),
-    ))
+    Ok(Request {
+        method: method.to_string(),
+        path: path.to_string(),
+        content_length,
+        chunked,
+    })
 }
 
-/// Body reader over a socket: fixed-length or chunked, always bounded
-/// by the caller through `limit`.
+/// Decode fixed-length or chunked bodies. The JSON and upload consumers
+/// enforce their respective limits on decoded bytes.
 struct BodyReader<'a> {
     stream: &'a mut dyn Read,
     mode: BodyMode,
@@ -496,37 +496,31 @@ impl<'a> BodyReader<'a> {
     }
 
     fn read_chunk_header(&mut self) -> io::Result<u64> {
-        let mut line = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            if line.len() > 32 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk header"));
-            }
-            let n = self.stream.read(&mut byte)?;
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunk header"));
-            }
-            line.push(byte[0]);
-            if line.ends_with(b"\r\n") {
-                break;
-            }
+        let line = read_crlf_line(self.stream, 32)?;
+        let text = std::str::from_utf8(&line).map_err(|_| invalid_framing())?;
+        let size = match text.split_once(';') {
+            // Chunk extensions are ignored, subject to the line and character limits.
+            Some((size, _)) => size.trim_end_matches([' ', '\t']),
+            None => text,
+        };
+        if !is_http_field_value(text) || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(invalid_framing());
         }
-        let text = String::from_utf8_lossy(&line);
-        let size = text.trim().split(';').next().unwrap_or("");
-        u64::from_str_radix(size.trim(), 16)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk size"))
+        u64::from_str_radix(size, 16).map_err(|_| invalid_framing())
     }
 }
 
 impl Read for BodyReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
         match self.mode {
             BodyMode::Fixed => {
                 if self.remaining == 0 {
                     return Ok(0);
                 }
-                let take = (out.len() as u64).min(self.remaining) as usize;
-                let n = self.stream.read(&mut out[..take])?;
+                let n = read_body_bytes(self.stream, out, self.remaining)?;
                 self.remaining -= n as u64;
                 Ok(n)
             }
@@ -537,36 +531,42 @@ impl Read for BodyReader<'_> {
                 if self.chunk_left == 0 {
                     let size = self.read_chunk_header()?;
                     if size == 0 {
-                        // Trailer part ends with a blank line; consume it.
-                        let mut trailer = Vec::new();
-                        let mut byte = [0u8; 1];
-                        loop {
-                            let n = self.stream.read(&mut byte)?;
-                            if n == 0 {
-                                break;
-                            }
-                            trailer.push(byte[0]);
-                            if trailer.ends_with(b"\r\n") {
-                                break;
-                            }
-                            if trailer.len() > MAX_HEADER_BYTES {
-                                break;
-                            }
-                        }
+                        read_chunk_trailers(self.stream)?;
                         self.done = true;
                         return Ok(0);
                     }
                     self.chunk_left = size;
                 }
-                let take = (out.len() as u64).min(self.chunk_left) as usize;
-                let n = self.stream.read(&mut out[..take])?;
+                let n = read_body_bytes(self.stream, out, self.chunk_left)?;
                 self.chunk_left -= n as u64;
                 if self.chunk_left == 0 {
                     let mut crlf = [0u8; 2];
                     self.stream.read_exact(&mut crlf)?;
+                    if crlf != *b"\r\n" {
+                        return Err(invalid_framing());
+                    }
                 }
                 Ok(n)
             }
+        }
+    }
+}
+
+/// Consume the trailer block through its empty line, within one aggregate cap.
+fn read_chunk_trailers(stream: &mut dyn Read) -> io::Result<()> {
+    let mut remaining = MAX_HEADER_BYTES;
+    loop {
+        let line = read_crlf_line(stream, remaining)?;
+        if line.is_empty() {
+            return Ok(());
+        }
+        remaining -= line.len() + 2;
+        let text = std::str::from_utf8(&line).map_err(|_| invalid_framing())?;
+        let (name, _) = parse_http_field(text).ok_or_else(invalid_framing)?;
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            return Err(invalid_framing());
         }
     }
 }
@@ -581,14 +581,14 @@ fn read_json_body(stream: &mut dyn Read, req: &Request) -> Result<Vec<u8>, ApiEr
     let mut body = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = reader.read(&mut buf).map_err(body_read_error)?;
         if n == 0 {
             break;
         }
-        body.extend_from_slice(&buf[..n]);
-        if body.len() as u64 > MAX_JSON_BYTES {
+        if (body.len() + n) as u64 > MAX_JSON_BYTES {
             return Err(ApiError::new(413, "payload_too_large"));
         }
+        body.extend_from_slice(&buf[..n]);
     }
     Ok(body)
 }
@@ -636,7 +636,7 @@ fn parse_job_path(path: &str) -> Option<(String, u32, &'static str, String)> {
 
 fn handle(stream: &mut std::net::TcpStream, config: &ServerConfig, gate: &RwLock<()>) {
     let result = (|| -> Result<(), ApiError> {
-        let (req, _leftover) = read_head(stream)?;
+        let req = read_head(stream)?;
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/health") => {
                 respond_json(stream, 200, br#"{"ok":true}"#)?;
@@ -665,7 +665,7 @@ fn handle(stream: &mut std::net::TcpStream, config: &ServerConfig, gate: &RwLock
                 }
                 let _guard = gate.write().unwrap_or_else(|e| e.into_inner());
                 let dir = job_dir(config, &cleanup.job_id, cleanup.round);
-                let _ = fs::remove_dir_all(&dir);
+                allow_missing(fs::remove_dir_all(&dir))?;
                 // Remove the now-empty per-job parent too (best effort).
                 let _ = fs::remove_dir(dir.parent().unwrap_or(&dir));
                 respond_json(stream, 200, br#"{"ok":true}"#)?;
@@ -726,4 +726,82 @@ pub fn serve(listener: TcpListener, config: Arc<ServerConfig>) -> io::Result<()>
         std::thread::spawn(move || handle(&mut stream, &config, &gate));
     }
     Ok(())
+}
+
+fn allow_missing(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+fn copy_upload(body: &mut impl Read, file: &mut fs::File, capacity: u64) -> Result<u64, ApiError> {
+    let mut written = 0;
+    let mut buf = [0u8; 64 << 10];
+    loop {
+        let n = body.read(&mut buf).map_err(body_read_error)?;
+        if n == 0 {
+            return Ok(written);
+        }
+        written += n as u64;
+        if written > capacity {
+            return Err(ApiError::new(413, "payload_too_large"));
+        }
+        file.write_all(&buf[..n])?;
+    }
+}
+
+fn invalid_framing() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP body framing")
+}
+
+fn body_read_error(err: io::Error) -> ApiError {
+    match err.kind() {
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => ApiError::invalid(),
+        _ => err.into(),
+    }
+}
+
+fn read_body_bytes(stream: &mut dyn Read, out: &mut [u8], remaining: u64) -> io::Result<usize> {
+    let limit = (out.len() as u64).min(remaining) as usize;
+    let n = stream.read(&mut out[..limit])?;
+    if n == 0 {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(n)
+}
+
+fn read_crlf_line(stream: &mut dyn Read, limit: usize) -> io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    for _ in 0..limit {
+        stream.read_exact(&mut byte)?;
+        if byte[0] == b'\n' {
+            return match line.pop() {
+                Some(b'\r') => Ok(line),
+                _ => Err(invalid_framing()),
+            };
+        }
+        line.push(byte[0]);
+    }
+    Err(invalid_framing())
+}
+
+fn is_http_token(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^`_|~".contains(&b))
+}
+
+fn is_http_field_value(text: &str) -> bool {
+    text.bytes().all(|b| !b.is_ascii_control() || b == b'\t')
+}
+
+fn parse_http_field(line: &str) -> Option<(&str, &str)> {
+    let (name, value) = line.split_once(':')?;
+    if !is_http_token(name) || !is_http_field_value(value) {
+        return None;
+    }
+    Some((name, value.trim_matches([' ', '\t'])))
 }

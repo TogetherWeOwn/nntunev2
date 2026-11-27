@@ -93,7 +93,7 @@ impl Fixture {
         stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
         stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
         stream.write_all(raw).unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        let _ = stream.shutdown(Shutdown::Write);
         let mut response = Vec::new();
         // A refusal (411/413) is sent without consuming already-arrived
         // request body bytes, so the kernel answers the close with RST
@@ -320,6 +320,7 @@ fn malformed_chunked_put_preserves_the_staged_input() {
     let head = format!(
         "PUT /jobs/{JOB}/r1/in/{key} HTTP/1.1\r\nHost: container\r\nTransfer-Encoding: chunked\r\n\r\n"
     );
+    let long_trailer = format!("3\r\nNEW\r\n0\r\nX-Test: {}\r\n\r\n", "x".repeat(16 << 10));
     for body in [
         "3\r\nNEWxx0\r\n\r\n",
         "3\r\nNE",
@@ -329,6 +330,7 @@ fn malformed_chunked_put_preserves_the_staged_input() {
         "3\r\nNEW\r\n0\r\nContent-Length: 3\r\n\r\n",
         "3\r\nNEW\r\n0\r\ninvalid trailer\r\n\r\n",
         "3\r\nNEW\r\n+0\r\n\r\n",
+        &long_trailer,
     ] {
         let (status, response) = f.request(format!("{head}{body}").as_bytes());
         assert_eq!(status, 400, "{body:?}");
