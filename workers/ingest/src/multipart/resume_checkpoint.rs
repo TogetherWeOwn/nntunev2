@@ -68,6 +68,8 @@ pub fn matches_checkpoint(
     checkpoint: &ResumeCheckpoint<'_>,
 ) -> bool {
     expected.envelope_scheme == 2
+        && (1..=36).contains(&expected.session.len())
+        && expected.session.bytes().all(|byte| byte.is_ascii_graphic())
         && expected == checkpoint.binding
         && receipts.len() == checkpoint.parts.len()
         && receipts

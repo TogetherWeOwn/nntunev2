@@ -188,8 +188,8 @@ pub fn backup_fixture(
     plaintext: &[u8],
     tool: &str,
 ) -> Result<(Manifest, KeyringRecovery), DrillError> {
-    let mut kek = [0u8; KEK_LEN];
-    fill_random(&mut kek)?;
+    let mut kek = Zeroizing::new([0u8; KEK_LEN]);
+    fill_random(&mut *kek)?;
     // `FileKey` is zeroized on drop, so every `?` exit below wipes it.
     let media_key = FileKey::generate(&mut SystemRng).map_err(crypto)?;
 
@@ -241,8 +241,7 @@ pub fn backup_fixture(
     let manifest = w.finish()?;
 
     let mut keys = BTreeMap::new();
-    keys.insert(DRILL_KEK_VERSION, kek);
-    kek.zeroize();
+    keys.insert(DRILL_KEK_VERSION, *kek);
     Ok((manifest, KeyringRecovery::new(keys)))
 }
 
@@ -279,8 +278,9 @@ fn verify_drill_bundle(dir: &Path) -> Result<Manifest, DrillError> {
     Ok(manifest)
 }
 
-/// Restore from the bundle into `restore_dir` (isolated from the
-/// backup side) and decrypt the fixture end to end using the restored
+/// Restore into a new `restore_dir` under an existing scratch parent,
+/// outside the backup tree. Keep both trees stable while restoring.
+/// Decrypt the fixture end to end using the restored
 /// material + the recovered keyring only. The caller must drop every
 /// other copy first; this function takes no key material except
 /// `keyring`.
@@ -291,13 +291,16 @@ pub fn restore_and_decrypt(
     tool: &str,
 ) -> Result<DrillEvidence, DrillError> {
     let started = now_unix();
-
     // Fail closed before touching any row: the bundle must verify,
     // both at the backup store and again after the copy into the
     // isolated restore environment.
     verify_drill_bundle(bundle_dir)?;
     copy_dir(bundle_dir, restore_dir).map_err(|e| DrillError::Bundle(BundleError::Io(e)))?;
-    decrypt_restored_dir(restore_dir, keyring, tool, started)
+    let result = decrypt_restored_dir(restore_dir, keyring, tool, started);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(restore_dir);
+    }
+    result
 }
 
 /// Decrypt the fixture from an already-isolated restore directory.
@@ -442,6 +445,34 @@ fn crypto(e: nntune_core::Error) -> DrillError {
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
+    let source = src.canonicalize().map_err(|e| e.to_string())?;
+    let parent = dst
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let destination = parent
+        .canonicalize()
+        .map_err(|e| e.to_string())?
+        .join(dst.file_name().ok_or("invalid restore directory")?);
+    if destination.starts_with(source) {
+        return Err("restore directory overlaps backup".into());
+    }
+    create_private_dir(&destination).map_err(|e| e.to_string())?;
+    let result = copy_contents(src, &destination);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&destination);
+    }
+    result
+}
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path)
+}
+
+fn copy_contents(src: &Path, dst: &Path) -> Result<(), String> {
     let mut stack = vec![src.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let rel = dir.strip_prefix(src).map_err(|e| e.to_string())?;
@@ -454,12 +485,14 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
             // restore instead of traversing outside the bundle boundary.
             let ftype = entry.file_type().map_err(|e| e.to_string())?;
             if ftype.is_symlink() {
-                return Err(format!("refuses symlink: {}", entry.path().display()));
+                return Err("refuses symlink".into());
             }
             let path = entry.path();
             let rel = path.strip_prefix(src).map_err(|e| e.to_string())?;
             if ftype.is_dir() {
                 stack.push(path);
+            } else if !ftype.is_file() {
+                return Err("refuses non-regular backup entry".into());
             } else {
                 std::fs::copy(&path, dst.join(rel)).map_err(|e| e.to_string())?;
             }
@@ -508,19 +541,23 @@ pub fn run_synthetic_drill(
     let base = std::env::temp_dir().join(format!("nntune-drill-{tag}"));
     let bundle_dir = base.join("backup-store");
     let restore_dir = base.join("isolated-restore");
-    let _ = std::fs::remove_dir_all(&base);
-
-    let (_manifest, keyring) = backup_fixture(&bundle_dir, plaintext, tool)?;
-    // Wipe: the plaintext slice is the caller's; every drill-owned
-    // copy (KEK, media key, payload key) was zeroized or moved into the
-    // bundle/keyring above. Restore sees only bundle_dir + keyring.
-    let mut evidence = restore_and_decrypt(&bundle_dir, &restore_dir, &keyring, tool)?;
-    evidence.plaintext_sha256 = bundle::sha256_hex(plaintext);
-    evidence.hash_match = evidence.plaintext_sha256 == evidence.restored_sha256;
-    if !evidence.hash_match {
-        return Err(DrillError::HashMismatch);
+    create_private_dir(&base).map_err(|e| BundleError::Io(e.to_string()))?;
+    let result = (|| {
+        let plaintext_sha256 = bundle::sha256_hex(plaintext);
+        let (_manifest, keyring) = backup_fixture(&bundle_dir, plaintext, tool)?;
+        // Restore sees only the bundle and the recovered keyring.
+        let mut evidence = restore_and_decrypt(&bundle_dir, &restore_dir, &keyring, tool)?;
+        evidence.plaintext_sha256 = plaintext_sha256;
+        evidence.hash_match = evidence.plaintext_sha256 == evidence.restored_sha256;
+        if !evidence.hash_match {
+            return Err(DrillError::HashMismatch);
+        }
+        Ok((evidence, bundle_dir, restore_dir))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&base);
     }
-    Ok((evidence, bundle_dir, restore_dir))
+    result
 }
 
 #[cfg(test)]
@@ -625,6 +662,12 @@ mod tests {
         std::os::unix::fs::symlink(src.join("real.bin"), src.join("link.bin")).unwrap();
         let err = copy_dir(&src, &dst).unwrap_err();
         assert!(err.contains("symlink"), "unexpected error: {err}");
+        assert!(!dst.exists());
+        std::fs::remove_file(src.join("link.bin")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(src.join("socket")).unwrap();
+        let err = copy_dir(&src, &dst).unwrap_err();
+        assert_eq!(err, "refuses non-regular backup entry");
+        assert!(!dst.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -677,6 +720,7 @@ mod tests {
             err,
             DrillError::KeyringMissingVersion(DRILL_KEK_VERSION)
         ));
+        assert!(!restore_dir.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

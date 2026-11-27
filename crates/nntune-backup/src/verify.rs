@@ -12,9 +12,11 @@
 //! failures, not skips: the keyring backup is incomplete.
 
 use std::collections::BTreeMap;
+use std::io::{self, BufRead, Read};
 
+use nntune_core::original_source::MAX_CIPHERTEXT_BYTES;
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::envelope::{self, Envelope, ENVELOPE_VERSION_V2, KEK_LEN};
 
@@ -53,7 +55,7 @@ impl Keyring {
 }
 
 /// One production-shaped envelope row, BYTEA columns hex-encoded.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct VerifyRow {
     pub user_id: String,
     pub row_key: String,
@@ -121,31 +123,59 @@ pub fn decode_hex(s: &str) -> Option<Vec<u8>> {
 }
 
 fn hex_bytes(s: &str, expect: usize) -> Option<Vec<u8>> {
-    let v = decode_hex(s)?;
-    if v.len() != expect {
+    if s.len() != expect * 2 {
         return None;
     }
-    Some(v)
+    decode_hex(s)
 }
 
 /// Authenticate every row in `rows_jsonl` against `keyring`. The
-/// per-row KEK copy and the opened DEK are zeroized immediately: this
-/// leg proves openability, it never uses the plaintext.
+/// per-row KEK copy and decrypted payload are zeroized immediately.
 pub fn verify_rows(rows_jsonl: &str, keyring: &Keyring, tool: &str) -> VerifyReport {
+    let lines = rows_jsonl.lines().map(Ok::<_, core::convert::Infallible>);
+    verify_lines(lines, keyring, tool).unwrap()
+}
+
+// Hex ciphertext plus room for the other columns and the line terminator.
+const MAX_ROW_BYTES: usize = 2 * MAX_CIPHERTEXT_BYTES + 16 * 1024;
+
+/// Verify an export one bounded row at a time. An I/O error, oversized row
+/// or invalid UTF-8 invalidates the entire report.
+pub fn verify_reader(
+    mut reader: impl BufRead,
+    keyring: &Keyring,
+    tool: &str,
+) -> io::Result<VerifyReport> {
+    let lines = std::iter::from_fn(|| {
+        let mut line = String::new();
+        let mut row = reader.by_ref().take(MAX_ROW_BYTES as u64 + 1);
+        match row.read_line(&mut line) {
+            Ok(0) => None,
+            Ok(n) if n <= MAX_ROW_BYTES => Some(Ok(line)),
+            Ok(_) => Some(Err(io::ErrorKind::InvalidData.into())),
+            Err(error) => Some(Err(error)),
+        }
+    });
+    verify_lines(lines, keyring, tool)
+}
+
+fn verify_lines<T: AsRef<str>, E>(
+    lines: impl Iterator<Item = Result<T, E>>,
+    keyring: &Keyring,
+    tool: &str,
+) -> Result<VerifyReport, E> {
     let mut rows = 0u64;
     let mut ok = 0u64;
     let mut failed = 0u64;
-    for line in rows_jsonl.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
+    for line in lines {
+        let line = line?;
         rows += 1;
         let opened = (|| -> Result<(), VerifyError> {
-            let row: VerifyRow = serde_json::from_str(line).map_err(|_| VerifyError::Shape)?;
+            let row: VerifyRow =
+                serde_json::from_str(line.as_ref()).map_err(|_| VerifyError::Shape)?;
             if row.envelope_version != ENVELOPE_VERSION_V2 {
                 return Err(VerifyError::Auth);
             }
-            let mut kek = keyring.get(row.kek_version).ok_or(VerifyError::Auth)?;
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(
                 &hex_bytes(&row.dek_wrapped_nonce_hex, 12).ok_or(VerifyError::Shape)?,
@@ -155,6 +185,9 @@ pub fn verify_rows(rows_jsonl: &str, keyring: &Keyring, tool: &str) -> VerifyRep
             let mut pnonce = [0u8; 12];
             pnonce
                 .copy_from_slice(&hex_bytes(&row.payload_nonce_hex, 12).ok_or(VerifyError::Shape)?);
+            if row.ciphertext_hex.len() > 2 * MAX_CIPHERTEXT_BYTES {
+                return Err(VerifyError::Shape);
+            }
             let ct = decode_hex(&row.ciphertext_hex).ok_or(VerifyError::Shape)?;
             let env = Envelope {
                 dek_wrapped_nonce: nonce,
@@ -162,7 +195,8 @@ pub fn verify_rows(rows_jsonl: &str, keyring: &Keyring, tool: &str) -> VerifyRep
                 payload_nonce: pnonce,
                 ciphertext: ct,
             };
-            let opened = envelope::open_media_key(
+            let kek = Zeroizing::new(keyring.get(row.kek_version).ok_or(VerifyError::Auth)?);
+            let mut plaintext = envelope::open_media_key(
                 &kek,
                 &row.user_id,
                 &row.row_key,
@@ -171,10 +205,8 @@ pub fn verify_rows(rows_jsonl: &str, keyring: &Keyring, tool: &str) -> VerifyRep
                 row.kek_version,
                 &env,
             )
-            .map_err(|_| VerifyError::Auth);
-            kek.zeroize();
-            let mut dek = opened?;
-            dek.zeroize();
+            .map_err(|_| VerifyError::Auth)?;
+            plaintext.zeroize();
             Ok(())
         })();
         if opened.is_ok() {
@@ -183,14 +215,14 @@ pub fn verify_rows(rows_jsonl: &str, keyring: &Keyring, tool: &str) -> VerifyRep
             failed += 1;
         }
     }
-    VerifyReport {
+    Ok(VerifyReport {
         tool: tool.to_string(),
         env: "staging".to_string(),
         rows,
         ok,
         failed,
         keyring_versions: keyring.versions(),
-    }
+    })
 }
 
 #[cfg(test)]

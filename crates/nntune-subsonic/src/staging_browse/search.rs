@@ -1,9 +1,13 @@
-use super::{album_fields, charged_list, song_item, MemberBrowse};
+use super::{
+    album_fields, charged_list, page_param, song_item, MemberBrowse, MAX_PAGE_OFFSET, MAX_PAGE_SIZE,
+};
 use crate::construction_budget::{BudgetExceeded, ConstructionBudget};
 use crate::endpoints::Params;
 use crate::envelope::{charged_error_document, charged_ok_document, code};
 use crate::value::{copy_text, Value};
 use std::cmp::Ordering;
+
+const MAX_QUERY_BYTES: usize = 1_024;
 
 // Rust 1.98.1 alloc::str::to_lowercase starts with the input byte capacity
 // and pushes one scalar at a time. RawVec grows to max(8, 2 * cap, need).
@@ -48,18 +52,23 @@ fn matches<const N: usize>(
 fn page<'a, T>(
     budget: &mut ConstructionBudget,
     rows: &'a [T],
-    offset: usize,
-    count: usize,
+    (offset, count): (usize, usize),
+    legacy: bool,
     mut includes: impl FnMut(&mut ConstructionBudget, &'a T) -> Result<bool, BudgetExceeded>,
     compare: impl Fn(&T, &T) -> Ordering,
     build: impl FnMut(&mut ConstructionBudget, &'a T) -> Result<Value, BudgetExceeded>,
-) -> Result<Vec<Value>, BudgetExceeded> {
+) -> Result<Option<Vec<Value>>, BudgetExceeded> {
     if count == 0 || offset >= rows.len() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
-    let mut found = budget.allocate_exact::<(usize, &T)>(rows.len())?;
+    let limit = if legacy { count } else { rows.len() };
+    let mut found = budget.allocate_exact::<(usize, &T)>(rows.len().min(limit))?;
     for (i, row) in rows.iter().enumerate() {
         if includes(budget, row)? {
+            // Legacy search has no pagination. Refuse an oversized result as a unit.
+            if found.len() == limit {
+                return Ok(None);
+            }
             found.push((i, row));
         }
     }
@@ -69,6 +78,7 @@ fn page<'a, T>(
         found.iter().skip(offset).take(count).map(|&(_, row)| row),
         build,
     )
+    .map(Some)
 }
 
 impl MemberBrowse<'_> {
@@ -87,25 +97,26 @@ impl MemberBrowse<'_> {
                 "Required parameter is missing.",
             )
         };
-        if legacy && query.is_empty() {
+        if query.len() > MAX_QUERY_BYTES || (legacy && query.is_empty()) {
             return missing(budget);
         }
         let (offset, [artist_count, album_count, song_count]) = if legacy {
-            (0, [self.artists.len(), self.albums.len(), self.songs.len()])
+            (0, [MAX_PAGE_SIZE; 3])
         } else {
             let default = if query.is_empty() {
-                params
-                    .get("size")
-                    .or_else(|| params.get("count"))
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(10)
+                let key = if params.get("size").is_some() {
+                    "size"
+                } else {
+                    "count"
+                };
+                let Some(size) = page_param(params, key, 10, MAX_PAGE_SIZE) else {
+                    return missing(budget);
+                };
+                size
             } else {
                 20
             };
-            let count = |key| match params.get(key) {
-                None => Some(default),
-                Some(value) => value.parse::<usize>().ok().filter(|&n| n <= 500),
-            };
+            let count = |key| page_param(params, key, default, MAX_PAGE_SIZE);
             let (Some(artists), Some(albums), Some(songs)) = (
                 count("artistCount"),
                 count("albumCount"),
@@ -113,18 +124,24 @@ impl MemberBrowse<'_> {
             ) else {
                 return missing(budget);
             };
-            let offset = params
-                .get("offset")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let Some(offset) = page_param(params, "offset", 0, MAX_PAGE_OFFSET) else {
+                return missing(budget);
+            };
             (offset, [artists, albums, songs])
         };
         let query = lowercase(budget, query)?;
-        let artists = page(
+        let too_many = |budget: &mut ConstructionBudget| {
+            charged_error_document(
+                budget,
+                code::GENERIC,
+                "Too many search results. Narrow the query.",
+            )
+        };
+        let Some(artists) = page(
             budget,
             self.artists,
-            offset,
-            artist_count,
+            (offset, artist_count),
+            legacy,
             |budget, row| matches(budget, &query, [&row.name]),
             |_, _| Ordering::Equal,
             |budget, row| {
@@ -137,30 +154,39 @@ impl MemberBrowse<'_> {
                     Value::charged_map(budget, [("id", id), ("name", name), ("albumCount", count)])
                 }
             },
-        )?;
-        let albums = page(
+        )?
+        else {
+            return too_many(budget);
+        };
+        let Some(albums) = page(
             budget,
             self.albums,
-            offset,
-            album_count,
+            (offset, album_count),
+            legacy,
             |budget, row| matches(budget, &query, [&row.name, &row.artist]),
             |_, _| Ordering::Equal,
             |budget, row| {
                 let fields = album_fields(budget, row, self.songs_for(row).count() as i64)?;
                 Value::charged_map(budget, fields)
             },
-        )?;
+        )?
+        else {
+            return too_many(budget);
+        };
         // The ordinary search orders by recording ID, preserving catalogue
         // occurrence order among equal IDs. Do not deduplicate before paging.
-        let songs = page(
+        let Some(songs) = page(
             budget,
             self.songs,
-            offset,
-            song_count,
+            (offset, song_count),
+            legacy,
             |budget, row| matches(budget, &query, [&row.title, &row.album, &row.artist]),
             |a, b| a.id.cmp(&b.id),
             song_item,
-        )?;
+        )?
+        else {
+            return too_many(budget);
+        };
         let entries = [("artist", artists), ("album", albums), ("song", songs)];
         let include = |(_, items): &(&str, Vec<Value>)| !legacy || !items.is_empty();
         let mut payload =
@@ -284,7 +310,7 @@ pub fn search_matches_dispatch() {
         ("search3", ""),
         ("search3", "count=1"),
         ("search3", "size=0&count=1"),
-        ("search3", "size=invalid&offset=invalid"),
+        // The staging adapter deliberately rejects malformed size and offset.
         ("search3", "size=2&offset=1&artistCount=0&songCount=500"),
         ("search3", "artistCount=501"),
         ("search3", "albumCount=-1"),

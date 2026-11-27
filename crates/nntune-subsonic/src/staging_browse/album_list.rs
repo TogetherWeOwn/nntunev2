@@ -1,4 +1,4 @@
-use super::{album_fields, charged_list, MemberBrowse};
+use super::{album_fields, charged_list, page_param, MemberBrowse, MAX_PAGE_OFFSET, MAX_PAGE_SIZE};
 use crate::construction_budget::{BudgetExceeded, ConstructionBudget};
 use crate::endpoints::Params;
 use crate::envelope::{charged_error_document, charged_ok_document, code};
@@ -96,13 +96,13 @@ impl MemberBrowse<'_> {
             Some("alphabeticalByName") => AlbumOrder::Name,
             Some("alphabeticalByArtist") => AlbumOrder::Artist { catalogue },
             Some("byYear") => {
-                let year = |key| params.get(key).and_then(|s| s.parse().ok());
+                let year = |key| params.get(key).and_then(|s| s.parse::<i16>().ok());
                 let (Some(from), Some(to)) = (year("fromYear"), year("toYear")) else {
                     return missing(budget);
                 };
                 AlbumOrder::Year {
-                    from,
-                    to,
+                    from: from.into(),
+                    to: to.into(),
                     catalogue,
                 }
             }
@@ -113,15 +113,12 @@ impl MemberBrowse<'_> {
             Some("recent" | "starred" | "highest" | "byGenre") => AlbumOrder::Empty,
             _ => return missing(budget),
         };
-        let Ok(size) = params.get("size").unwrap_or("10").parse::<usize>() else {
+        let Some(size @ 1..) = page_param(params, "size", 10, MAX_PAGE_SIZE) else {
             return missing(budget);
         };
-        let Ok(offset) = params.get("offset").unwrap_or("0").parse::<usize>() else {
+        let Some(offset) = page_param(params, "offset", 0, MAX_PAGE_OFFSET) else {
             return missing(budget);
         };
-        if !(1..=500).contains(&size) {
-            return missing(budget);
-        }
         if catalogue {
             let message = match list_type {
                 Some("frequent") => Some("Unsupported album list type: frequent"),
@@ -140,14 +137,15 @@ impl MemberBrowse<'_> {
         } else {
             offset
         };
-        let mut ordered =
-            budget.allocate_exact(self.albums.iter().filter(|a| order.includes(a)).count())?;
-        for (position, album) in self
+        let candidates = self
             .albums
             .iter()
             .enumerate()
-            .filter(|(_, a)| order.includes(a))
-        {
+            .filter(|(_, album)| order.includes(album));
+        let count = candidates.clone().count();
+        let limit = if offset < count { count } else { 0 };
+        let mut ordered = budget.allocate_exact(limit)?;
+        for (position, album) in candidates.take(limit) {
             let count = self.songs_for(album).count() as i64;
             if !catalogue || count != 0 {
                 ordered.push((position, album, count));

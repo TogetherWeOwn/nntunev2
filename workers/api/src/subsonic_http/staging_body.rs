@@ -9,6 +9,10 @@ use nntune_subsonic::construction_budget::ConstructionBudget;
 
 use super::{validate_staging_sources, CredentialParseError, STAGING_SOURCE_BYTES};
 
+// Nonempty chunks are bounded by the byte cap. Empty chunks need their own
+// limit so immediate reads cannot keep the collection loop busy indefinitely.
+const MAX_EMPTY_CHUNKS: usize = 64;
+
 /// Payload-free collection failures. A failure permanently rejects the body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StagingBodyError {
@@ -23,6 +27,7 @@ pub enum StagingBodyError {
 pub struct StagingBody {
     declared: Option<usize>,
     bytes: Vec<u8>,
+    empty_chunks: usize,
     budget: ConstructionBudget,
     fault: Option<StagingBodyError>,
 }
@@ -40,6 +45,7 @@ impl StagingBody {
             declared,
             budget,
             bytes: Vec::new(),
+            empty_chunks: 0,
             fault: None,
         })
     }
@@ -69,6 +75,13 @@ impl StagingBody {
         if let Some(fault) = self.fault {
             return Err(fault);
         }
+        if len == 0 {
+            self.empty_chunks += 1;
+            if self.empty_chunks > MAX_EMPTY_CHUNKS {
+                return self.fail(StagingBodyError::TooLarge);
+            }
+            return Ok(());
+        }
         let start = self.bytes.len();
         let Some(end) = start
             .checked_add(len)
@@ -76,7 +89,7 @@ impl StagingBody {
         else {
             return self.fail(StagingBodyError::TooLarge);
         };
-        if len != 0 && self.bytes.capacity() == 0 {
+        if self.bytes.capacity() == 0 {
             self.bytes = match self.budget.allocate_exact(STAGING_SOURCE_BYTES) {
                 Ok(bytes) => bytes,
                 Err(_) => return self.fail(StagingBodyError::Capacity),

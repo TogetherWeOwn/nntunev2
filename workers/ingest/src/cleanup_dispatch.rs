@@ -12,6 +12,14 @@ pub use postgres::dispatch_multipart_scope;
 pub use postgres::{dispatch_scope, CleanupScope, DispatchError};
 
 const MAX_DELAY_SECONDS: u32 = 24 * 60 * 60;
+const NIL_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+fn canonical_row_id(id: &str) -> bool {
+    // PostgreSQL returns UUID columns as 36-byte lowercase text.
+    id.len() == 36
+        && !id.bytes().any(|byte| byte.is_ascii_uppercase())
+        && crate::queue::validate_provider_id(id)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,8 +46,9 @@ impl CleanupClaim {
         let delay_seconds = u32::try_from(delay_seconds).ok()?;
         if delay_seconds > MAX_DELAY_SECONDS
             || (kind == CleanupKind::TerminalReconcile && delay_seconds != 0)
-            || !crate::queue::validate_provider_id(&session_id)
-            || !crate::queue::validate_provider_id(&claim_id)
+            || !canonical_row_id(&session_id)
+            || !canonical_row_id(&claim_id)
+            || claim_id == NIL_UUID
         {
             return None;
         }
