@@ -12,20 +12,26 @@ pub const GRACE_SECONDS: i64 = 86_400;
 /// Atomically fence the user and create, or return, the unique account operation.
 ///
 /// `$1` is the TEXT user id. The operation's 24-hour deadline is based on the
-/// database clock, and a retry returns the existing operation id without
-/// extending its deadline. A zero-row result means the user does not exist.
+/// database clock sampled after acquiring the user lock, and a retry returns
+/// the existing operation id without extending its deadline. A zero-row result
+/// means the user does not exist.
 pub const SCHEDULE_ACCOUNT_DELETION_SQL: &str = r#"
-WITH fenced_user AS (
+WITH locked_user AS MATERIALIZED (
+    SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE
+), request_time AS MATERIALIZED (
+    SELECT id, clock_timestamp() AS requested_at FROM locked_user
+), fenced_user AS (
     UPDATE users
-    SET deleting_at = COALESCE(deleting_at, now())
-    WHERE id = $1
-    RETURNING id
+    SET deleting_at = COALESCE(users.deleting_at, request_time.requested_at)
+    FROM request_time
+    WHERE users.id = request_time.id
+    RETURNING users.id, request_time.requested_at
 )
 INSERT INTO delete_operations (
     user_id, scope, container_id, cursor, state, erase_after, started_at
 )
 SELECT id, 'account', NULL, '{}'::jsonb, 'scheduled',
-       now() + interval '24 hours', now()
+       requested_at + interval '24 hours', requested_at
 FROM fenced_user
 ON CONFLICT (user_id) WHERE scope = 'account'
 DO UPDATE SET id = delete_operations.id
@@ -62,14 +68,18 @@ WHERE users.id = cancelled.user_id
 RETURNING users.id
 "#;
 
-/// Start erasure only after the grace deadline; this CAS competes with cancel.
+/// Start erasure only for a fenced owner after the grace deadline.
 ///
-/// `$1` is the operation UUID. The caller treats a zero-row result as a lost
-/// race or an operation whose deadline has not elapsed (ADR 0002 rule 3).
+/// `$1` is the operation UUID. A zero-row result never authorizes erasure.
+/// Cancel clears the fence only after deleting this same scheduled row, so
+/// this compare-and-set still serializes start with cancel (ADR 0002 rule 3).
 pub const START_ACCOUNT_ERASURE_SQL: &str = r#"
 UPDATE delete_operations
 SET state = 'running', heartbeat_at = now()
 WHERE id = $1 AND scope = 'account' AND state = 'scheduled' AND erase_after <= now()
+  AND EXISTS (
+      SELECT 1 FROM users WHERE users.id = delete_operations.user_id AND deleting_at IS NOT NULL
+  )
 RETURNING id
 "#;
 
