@@ -8582,9 +8582,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Header-only bearer transports (ADR 0010 native keys, the QA seam
     // bearer): the raw `Authorization` value rides the request's
     // `authorization` field only, never the cookie or query shapes (which
-    // the gates never read). Server logs redact this header the way
-    // `/rest/*` logging redacts `u/p/t/s` material — nothing in this
-    // module logs header values.
+    // the gates never read). Nothing in this module logs header values.
     let request = handlers::Request {
         method: req.method().to_string(),
         path: route_path(req.method(), req.path(), || req.url().ok()),
