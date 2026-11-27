@@ -412,7 +412,7 @@ jobs:
       - name: Gradual promotion 5-50-100 with automatic rollback
         if: inputs.mode == 'promote'
         id: gradual
-        uses: TogetherWeOwn/.github/actions/gradual-promote@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
+        uses: TogetherWeOwn/.github/actions/gradual-promote@bfdaf1532e1605281d366186e4ed9e8cfa0113fc # v0.13.0
         with:
           worker-name: ${{ env.PRODUCTION_WORKER_NAME }}
           version-tag: ${{ needs.preflight.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

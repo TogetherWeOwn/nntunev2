@@ -25,7 +25,7 @@ from test_ci_pnpm_retry import (
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
 COMMAND = "python3 .github/scripts/test_ci_public_pr_security.py"
-PIN = "c05610872587137c3c492b7025f02585a1b8ba7d"
+PIN = "bfdaf1532e1605281d366186e4ed9e8cfa0113fc"
 GUARD = "github.event_name == 'pull_request' && github.event.repository.private == false"
 
 
@@ -62,7 +62,7 @@ class PublicPrSecurityTests(unittest.TestCase):
         self.assertEqual(job_level_field(caller, "if"), GUARD)
         self.assertEqual(job_level_field(caller, "uses"),
                          "TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@" + PIN)
-        self.assertRegex(caller, rf"(?m)^    uses: .+@{PIN} # v0\.11\.0$")
+        self.assertRegex(caller, rf"(?m)^    uses: .+@{PIN} # v0\.13\.0$")
         # An exact key set prevents inherited secrets, inputs, skip/soft-fail
         # overrides or a second caller configuration from hiding in this job.
         self.assertEqual(re.findall(r"^    ([\w-]+):", caller, re.MULTILINE),
