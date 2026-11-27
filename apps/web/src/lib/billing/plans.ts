@@ -25,6 +25,25 @@ export interface Plan {
 	blurb: string;
 }
 
+export type PlanDTO = Omit<Plan, 'name' | 'blurb'>;
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+	return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function isValidPlanRow(value: unknown): value is PlanDTO {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+	const row = value as Record<string, unknown>;
+	return (
+		typeof row.id === 'string' && /^[a-z0-9-]+$/.test(row.id) &&
+		isNonNegativeSafeInteger(row.priceCents) &&
+		isNonNegativeSafeInteger(row.streamHoursMonth) &&
+		Number.isSafeInteger(streamCapSeconds({ streamHoursMonth: row.streamHoursMonth })) &&
+		isNonNegativeSafeInteger(row.maxConcurrentStreams) &&
+		typeof row.selectable === 'boolean'
+	);
+}
+
 /**
  * Max blurb from the live cap, never a second hard-coded figure: the
  * static row and `planFromDTO` share this, so a plans-table change can
@@ -100,13 +119,8 @@ export function listSelectablePlans(): Plan[] {
  * the client cannot name a plan it has no copy for, so it never renders
  * or offers it.
  */
-export function planFromDTO(dto: {
-	id: string;
-	priceCents: number;
-	streamHoursMonth: number;
-	maxConcurrentStreams: number;
-	selectable: boolean;
-}): Plan | undefined {
+export function planFromDTO(dto: PlanDTO): Plan | undefined {
+	if (!isValidPlanRow(dto)) return undefined;
 	const base = getPlan(dto.id);
 	if (!base) return undefined;
 	return {
@@ -114,7 +128,7 @@ export function planFromDTO(dto: {
 		priceCents: dto.priceCents,
 		streamHoursMonth: dto.streamHoursMonth,
 		maxConcurrentStreams: dto.maxConcurrentStreams,
-		selectable: dto.selectable,
+		selectable: base.selectable && dto.selectable,
 		// Quota-dependent copy regenerates from the hydrated cap so the
 		// blurb can never quote a superseded figure next to the new quota.
 		blurb: dto.id === 'max' ? maxBlurb(dto.streamHoursMonth) : base.blurb
@@ -141,8 +155,25 @@ export function planButtonName(plan: Plan, pendingPlanId: string | null): string
 }
 
 /** Stream cap in seconds (plans table stores hours). */
-export function streamCapSeconds(plan: Plan): number {
+export function streamCapSeconds(plan: Pick<Plan, 'streamHoursMonth'>): number {
 	return plan.streamHoursMonth * 3600;
+}
+
+const BILLING_DATE_RE =
+	/^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?:T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,9})?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d))?$/;
+
+/** Parse an ISO calendar date or zoned timestamp without accepting date rollover. */
+export function parseBillingDate(value: unknown): number | null {
+	if (typeof value !== 'string') return null;
+	const match = BILLING_DATE_RE.exec(value);
+	if (!match) return null;
+	const [, year, month, day] = match;
+	// Date.UTC treats years 00–99 as 1900–1999.
+	const calendar = new Date(0);
+	calendar.setUTCFullYear(Number(year), Number(month) - 1, Number(day));
+	if (calendar.getUTCDate() !== Number(day)) return null;
+	const instant = Date.parse(value);
+	return Number.isFinite(instant) ? instant : null;
 }
 
 /**
@@ -178,8 +209,8 @@ export interface EffectivePlan {
  */
 function inGraceWindow(subscription: SubscriptionRef, now: Date): boolean {
 	if (subscription.status !== 'past_due') return false;
-	if (!subscription.graceUntil) return false;
-	return new Date(subscription.graceUntil).getTime() > now.getTime();
+	const graceEnd = parseBillingDate(subscription.graceUntil);
+	return graceEnd !== null && graceEnd > now.getTime();
 }
 
 /**
