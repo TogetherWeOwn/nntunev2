@@ -29,8 +29,7 @@ export function favoritesKey(session: SnapshotStorage | null): string | null {
 /**
  * Load the current context's favorites. Missing or corrupt stored values
  * yield an empty list. Unavailable storage/context also defaults to empty;
- * a caller with a current context may supply in-memory state when local
- * storage cannot be read.
+ * a current context can use in-memory state when local storage is unreadable.
  */
 export function loadFavorites(
 	session: SnapshotStorage | null,

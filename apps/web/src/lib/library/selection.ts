@@ -118,7 +118,6 @@ export function pruneSelection(
 	const kept: string[] = [];
 	let changed = false;
 	for (const entry of selection as readonly unknown[]) {
-		// Deleting a matched ID also excludes duplicate selections.
 		if (!isValidId(entry) || !loaded.delete(entry)) {
 			changed = true;
 			continue;

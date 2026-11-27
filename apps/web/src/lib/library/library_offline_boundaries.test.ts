@@ -71,7 +71,7 @@ it('clears provenance and cached bytes when context removal fails', () => {
 	for (const key of keys) expect(session.getItem(key)).toBeNull();
 });
 
-it('publishes verified rows without inheriting unbound device storage', async () => {
+it('keeps legacy favorites device-only across verified refreshes', async () => {
 	const session = memoryStorage(), local = memoryStorage();
 	session.setItem(LIBRARY_AUTH_CONTEXT_KEY, 'old-scope');
 	const oldKey = favoritesKey(session)!;
@@ -80,14 +80,20 @@ it('publishes verified rows without inheriting unbound device storage', async ()
 	let update: LibraryRefreshUpdate | undefined;
 	const refresher = createLibraryRefresher({ sessionStorage: () => session, invalidateLibraryCache: vi.fn(),
 		onStateChange: (_, next) => { update = next; } });
-	await refresher.refresh(async () => Response.json([{ id: 'Track_A' }], { headers }));
+	const refresh = () => refresher.refresh(async () => Response.json([{ id: 'Track_A' }], { headers }));
+	await refresh();
 	expect(refresher.state.items).toEqual([{ id: 'Track_A' }]);
 	const scope = update?.storageScope ?? null;
-	expect(update).toMatchObject({ authoritative: true, sessionBinding: binding, deviceScope: favoritesKey(scope) });
-	expect(favoritesKey(scope)).not.toBe(oldKey);
-	expect(loadFavorites(scope, local)).toEqual([]);
-	expect(await updateStoredFavorites(scope, local, update?.deviceScope ?? null, () => ['Track_A'])).toEqual(['Track_A']);
-	expect(local.getItem(oldKey)).toBe('["old-track"]');
+	expect(update).toMatchObject({ authoritative: true, sessionBinding: binding, deviceScope: undefined });
+	expect(loadFavorites(scope, local)).toEqual(['old-track']);
+	expect(await updateStoredFavorites(scope, local, oldKey, (ids) => [...ids, 'Track_A'])).toEqual(['old-track', 'Track_A']);
+	await refresh();
+	expect(loadFavorites(update?.storageScope ?? null, local)).toEqual(['old-track', 'Track_A']);
+	expect(update?.deviceScope).toBeUndefined();
+	expect(session.getItem(`${LIBRARY_SNAPSHOT_KEY}.old-scope`)).toBeNull();
+	session.setItem(LIBRARY_SESSION_BINDING_KEY, 'malformed');
+	await refresh();
+	expect(update?.storageScope).toBeNull();
 });
 
 it.each(['stream', 'buffer'])('suspends signed-in refresh on malformed UTF-8 in a %s listing', async (mode) => {

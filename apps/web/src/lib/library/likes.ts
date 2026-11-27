@@ -51,7 +51,7 @@ export async function loadLikes(client: Pick<LikesClient, 'get'>) {
 	const likes = items.map((item: unknown): LibraryLike => {
 		const { kind, target_id, created_at } = record(item);
 		if ((kind !== 'track' && kind !== 'release') || !isTrackId(target_id) ||
-			(kind === 'release' && !isReleaseId(target_id)) || !isCount(created_at)) {
+			(kind === 'release' && !RELEASE_ID.test(target_id)) || !isCount(created_at)) {
 			throw new Error('Invalid likes list');
 		}
 		const key = `${kind}:${target_id}`;

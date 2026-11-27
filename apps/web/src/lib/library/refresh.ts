@@ -5,6 +5,7 @@ import {
 	clearSnapshot,
 	establishVerifiedLibraryScope,
 	LIBRARY_AUTH_TRANSITION_KEY,
+	LIBRARY_SESSION_BINDING_KEY,
 	libraryScopeBinding,
 	loadSnapshot,
 	saveSnapshot,
@@ -349,8 +350,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			activeResponse = null;
 			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
-			const commit = () => {
-				const snapshot = saveSnapshot(label ? storageScope ?? null : storage, fresh, undefined, !label);
+			const commit = (snapshotStorage = storage) => {
+				const snapshot = saveSnapshot(snapshotStorage, fresh, undefined, !label);
 				if (!label) storageScope = scopeLibraryStorage(storage);
 				if (!isCurrent()) return;
 				authenticatedThisLoad = true;
@@ -372,10 +373,14 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const matches = await started.result;
 			const committed = await runBeforeDeadline(fence, () => {
 				if (!matches) return refuse(true);
-				const deviceScope = establishVerifiedLibraryScope(storage, label, true);
-				storageScope = deviceScope ? scopeLibraryStorage(storage, fence) : null;
-				verified = { binding: label, fence, storage: storageScope };
-				commit();
+				const deviceScope = establishVerifiedLibraryScope(storage, label);
+				// Legacy favorites and finds remain device-only. Snapshots and import require provenance.
+				try {
+					storageScope = deviceScope || storage?.getItem(LIBRARY_SESSION_BINDING_KEY) === null
+						? scopeLibraryStorage(storage, fence) : null;
+				} catch { storageScope = null; }
+				verified = { binding: label, fence, storage: deviceScope ? storageScope : null };
+				commit(verified.storage);
 				publish(label, deviceScope);
 				return true;
 			});
