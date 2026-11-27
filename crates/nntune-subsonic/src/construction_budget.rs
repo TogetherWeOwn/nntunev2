@@ -32,13 +32,17 @@ impl ConstructionBudget {
     pub fn allocate_exact<T>(&mut self, capacity: usize) -> Result<Vec<T>, BudgetExceeded> {
         let mut out = Vec::new();
         if capacity != 0 && std::mem::size_of::<T>() != 0 {
+            let previous_charge = self.charged;
             self.charge(
                 capacity,
                 std::mem::size_of::<T>(),
                 std::mem::align_of::<T>(),
             )?;
-            out.try_reserve_exact(capacity)
-                .map_err(|_| BudgetExceeded)?;
+            if out.try_reserve_exact(capacity).is_err() {
+                // The failed reservation left the fresh vector unallocated.
+                self.charged = previous_charge;
+                return Err(BudgetExceeded);
+            }
             if out.capacity() != capacity {
                 return Err(BudgetExceeded);
             }
