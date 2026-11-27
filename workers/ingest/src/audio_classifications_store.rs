@@ -198,7 +198,7 @@ pub async fn freeze(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio_classifications::{classify_entries, ClassKind};
+    use crate::audio_classifications::{classify_entries, ClassError, ClassKind};
     use crate::audio_grouping::prepare_manifest;
     use crate::audio_manifest::AudioHints;
     use crate::audio_selection::{AudioSelectionPlan, ExtractedAudio};
@@ -268,7 +268,9 @@ mod tests {
         let raw = encode_candidate(&checkpoint).unwrap();
         let hash = checkpoint.original_content_sha256().to_string();
         let accept = |raw: &str| accept_stored(raw, "class_store_job", "class_store_owner", &hash);
-        let oversized = format!("{raw}{}", " ".repeat(MAX_MANIFEST_BYTES));
+        let at_limit = format!("{raw}{}", " ".repeat(MAX_MANIFEST_BYTES - raw.len()));
+        assert_eq!(accept(&at_limit), Ok(checkpoint));
+        let oversized = format!("{at_limit} ");
         for raw in ["null", "{}", "not json", &oversized] {
             assert_eq!(accept(raw), Err(StoreError::InvalidStored));
         }
@@ -286,24 +288,29 @@ mod tests {
         let first = &value["entries"][0];
         let mut second = first.clone();
         second["audio_ordinal"] = 2.into();
-        for (pointer, replacement) in [
-            ("/version", 2.into()),
-            ("/entries", serde_json::json!([])),
-            ("/entries/0/track_no", 0.into()),
-            ("/entries/0/audio_ordinal", 2.into()),
-            ("/entries/0/release_group_ref", 0.into()),
-            ("/entries/0/duplicate_of", 1.into()),
-            ("/entries", serde_json::json!([first, second])),
+        for (pointer, replacement, rejected_by_parser) in [
+            ("/version", 2.into(), true),
+            ("/entries", serde_json::json!([]), true),
+            ("/entries/0/track_no", 0.into(), false),
+            ("/entries/0/audio_ordinal", 2.into(), false),
+            ("/entries/0/release_group_ref", 0.into(), false),
+            ("/entries/0/duplicate_of", 1.into(), false),
+            ("/entries", serde_json::json!([first, second]), false),
         ] {
             let mut bad = value.clone();
             *bad.pointer_mut(pointer).unwrap() = replacement;
             let raw = bad.to_string();
             assert_eq!(accept(&raw), Err(StoreError::InvalidStored), "{pointer}");
-            assert_eq!(
-                encode_candidate(&ClassificationCheckpoint::parse(&raw).unwrap()),
-                Err(StoreError::Permanent),
-                "{pointer}"
-            );
+            let parsed = ClassificationCheckpoint::parse(&raw);
+            if rejected_by_parser {
+                assert_eq!(parsed, Err(ClassError::Evidence), "{pointer}");
+            } else {
+                assert_eq!(
+                    encode_candidate(&parsed.unwrap()),
+                    Err(StoreError::Permanent),
+                    "{pointer}"
+                );
+            }
         }
     }
 
