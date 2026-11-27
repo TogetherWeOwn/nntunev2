@@ -11,7 +11,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use super::{OriginalSource, RangeHint, SourceError, MAX_ARTICLE_BYTES};
+use super::{extent_fits_articles, OriginalSource, RangeHint, SourceError, MAX_ARTICLE_BYTES};
 use crate::yenc::{self, DecodedPart};
 
 /// Open exactly one private reference. Implementations must enforce their
@@ -30,6 +30,52 @@ pub trait ReadControl {
 struct Part {
     bytes: Vec<u8>,
     geometry: DecodedPart,
+}
+
+fn optional_number_matches<'a>(
+    fields: impl Iterator<Item = &'a [u8]>,
+    key: &[u8],
+    expected: usize,
+) -> bool {
+    let mut values = fields.filter_map(|field| field.strip_prefix(key));
+    values.next().is_none_or(|value| {
+        std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()) == Some(expected)
+            && values.next().is_none()
+    })
+}
+
+// The shared decoder checks payload length, placement and checksums up to the
+// first trailer. Require one complete frame and corroborate its optional labels.
+fn check_frame(encoded: &[u8], index: usize, count: usize) -> Result<(), SourceError> {
+    let mut began = false;
+    let mut ended = false;
+    for raw in encoded.split_inclusive(|&b| b == b'\n') {
+        if raw.first() != Some(&b'=') {
+            continue;
+        }
+        let line = raw.strip_suffix(b"\n").unwrap_or(raw);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let mut fields = line.split(|&b| b == b' ' || b == b'\t');
+        match fields.next().unwrap_or_default() {
+            b"=ybegin" if !began => {
+                began = true;
+                let labels = fields.take_while(|field| !field.starts_with(b"name="));
+                if !optional_number_matches(labels, b"total=", count) {
+                    return Err(SourceError::Integrity);
+                }
+            }
+            b"=ypart" if began && !ended => {}
+            b"=yend" if began && !ended && raw.ends_with(b"\n") => {
+                ended = true;
+                if !optional_number_matches(fields, b"part=", index + 1) {
+                    return Err(SourceError::Integrity);
+                }
+            }
+            b"=ybegin" | b"=ypart" | b"=yend" => return Err(SourceError::Integrity),
+            _ => {}
+        }
+    }
+    ended.then_some(()).ok_or(SourceError::Integrity)
 }
 
 fn decode<C: ReadControl>(
@@ -57,6 +103,7 @@ fn decode<C: ReadControl>(
         encoded.extend_from_slice(&chunk[..n]);
     }
     control.check()?;
+    check_frame(&encoded, index, source.article_count())?;
     let decode_cap = decoded_budget.min(MAX_ARTICLE_BYTES as u64) as usize;
     let mut decoded = vec![0u8; encoded.len().min(decode_cap)];
     let geometry = yenc::decode_part_to("original-source", &encoded, &mut decoded)
@@ -237,6 +284,9 @@ impl<'a> RangeReader<'a> {
             .ok_or(SourceError::Integrity)?;
         let last_index = self.source.article_count() - 1;
         if !self.final_loaded {
+            if !extent_fits_articles(part.geometry.offset, last_index) {
+                return Err(SourceError::Integrity);
+            }
             self.final_loaded = true;
             self.last = Some(part);
         } else {
@@ -267,6 +317,13 @@ impl<'a> RangeReader<'a> {
             .checked_add(actual.written as u64)
             .filter(|&n| n <= self.source.file_size())
             .ok_or(SourceError::Integrity)?;
+        if let Some(last) = &self.last {
+            let between = self.source.article_count() - self.index - 2;
+            let gap = last.geometry.offset.checked_sub(end);
+            if !gap.is_some_and(|bytes| extent_fits_articles(bytes, between)) {
+                return Err(SourceError::Integrity);
+            }
+        }
         if self.index == 0 {
             let last_geometry = self.last.as_ref().map_or(actual, |p| p.geometry);
             self.hint = corroborate_hint(self.source, &actual, &last_geometry);

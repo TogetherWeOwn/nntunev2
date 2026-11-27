@@ -50,7 +50,7 @@ impl ChunkExpectation {
 }
 
 impl OriginManifest {
-    /// Hash the complete bounded untrusted bytes before parsing any fields.
+    /// Require the exact page length, then hash the complete bytes before parsing fields.
     pub fn verify_page<'a>(
         &self,
         index: u32,
@@ -58,13 +58,13 @@ impl OriginManifest {
     ) -> Result<VerifiedPage<'a>, PageError> {
         let geometry = self.geometry();
         let page = geometry.page(index).ok_or(PageError::InvalidIndex)?;
+        if bytes.len() != page.encoded_len as usize {
+            return Err(PageError::InvalidLength);
+        }
         let expected_hash = self.row(index as usize).ok_or(PageError::InvalidIndex)?;
         let actual_hash = page_hash(bytes).ok_or(PageError::InvalidLength)?;
         if &actual_hash != expected_hash {
             return Err(PageError::HashMismatch);
-        }
-        if bytes.len() != page.encoded_len as usize {
-            return Err(PageError::InvalidLength);
         }
         if &bytes[0..8] != b"NNTDGP01"
             || bytes[8..10] != 1_u16.to_be_bytes()
@@ -302,7 +302,7 @@ mod tests {
         manifest.replace_test_row(0, page_hash(&page).unwrap());
         assert!(matches!(
             manifest.verify_page(0, truncated),
-            Err(PageError::HashMismatch)
+            Err(PageError::InvalidLength)
         ));
         manifest.replace_test_row(0, page_hash(truncated).unwrap());
         assert!(matches!(
