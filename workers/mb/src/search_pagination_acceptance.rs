@@ -166,6 +166,17 @@ fn result_mbids(body: &serde_json::Value) -> Vec<String> {
 
 #[test]
 fn malformed_pagination_coordinates_are_client_errors() {
+    let route = include_str!("lib.rs")
+        .split_once("pub async fn search_route(")
+        .unwrap()
+        .1;
+    let parse = route.find("match search_pagination(&query) {").unwrap();
+    let empty = route.find("empty_query_response()").unwrap();
+    let reject = route
+        .find("return serve(url.to_string(), api, &trace_id)")
+        .unwrap();
+    let edge = route.find("edge_hit(req,").unwrap();
+    assert!(parse < empty && empty < reject && reject < edge);
     for key in ["limit", "offset"] {
         for raw in ["", "-1", "invalid", "4294967296"] {
             let params = [(key.to_owned(), raw.to_owned())].into();
