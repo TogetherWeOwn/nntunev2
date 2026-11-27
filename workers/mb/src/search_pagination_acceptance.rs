@@ -167,9 +167,10 @@ fn result_mbids(body: &serde_json::Value) -> Vec<String> {
 fn malformed_pagination_coordinates_are_client_errors() {
     let source = include_str!("lib.rs");
     let route = &source[source.find("pub async fn search_route(").unwrap()..];
-    let parse = route.find("match search_pagination(&query) {").unwrap();
-    assert!(parse < route.find("edge_hit(req,").unwrap());
-    assert!(include_str!("snapshot.rs").contains("match crate::search_pagination(&query) {"));
+    let reject = "return serve(url.to_string(), error_response(err), &trace_id)";
+    assert!(route.find(reject).unwrap() < route.find("edge_hit(req,").unwrap());
+    let reject = "Err(err) => return render(crate::error_response(err), started, 0)";
+    assert!(include_str!("snapshot.rs").contains(reject));
     for key in ["limit", "offset"] {
         for raw in ["", "-1", "invalid", "4294967296"] {
             let params = [
@@ -182,8 +183,8 @@ fn malformed_pagination_coordinates_are_client_errors() {
         }
     }
     let blank = [("limit".into(), "bad".into()), ("q".into(), " ".into())].into();
-    let resp = super::error_response(super::search_pagination(&blank).unwrap_err());
-    assert!(resp.body.contains("MB_SEARCH_EMPTY_QUERY"));
+    let error = super::search_pagination(&blank).unwrap_err();
+    assert_eq!(error, super::empty_query_error());
 }
 
 #[test]

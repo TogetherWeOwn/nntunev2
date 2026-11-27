@@ -1807,8 +1807,7 @@ fn is_valid_cached_search(
 /// Search core: validate → bound → KV → DB serving `GET /v1/mb/search` with
 /// `limit`/`offset`. `limit`: `None` defaults to
 /// [`MAX_PAGE_SIZE`]; `Some(0)` is a 400; `1..=MAX_PAGE_SIZE` is honored;
-/// anything above is clamped, never rejected. `offset`: `None` defaults
-/// to `0`; `0..=MAX_SEARCH_OFFSET` queries
+/// anything above is clamped. `None` offset defaults to `0`; `0..=MAX_SEARCH_OFFSET` queries
 /// as before; anything above short-circuits to a 200 with `"results": []`
 /// (effective `limit`/`offset` echoed) BEFORE the KV lookup and the repo
 /// call, so no cache key is minted and no `OFFSET` scan runs. Past the end
