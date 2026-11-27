@@ -2,8 +2,7 @@
 //! The registry test checks that this worker's declared codes stay in sync.
 //!
 //! Wire shape: `{"code": "...", "message": "...", "retryable": bool}` with
-//! the registry HTTP status. This crate stays dependency-free, so the
-//! envelope JSON is escaped by hand below. Messages are static per code:
+//! the registry HTTP status. Messages are static per code:
 //! provider replies, message-ids, and decode detail never reach `message`.
 
 /// One registry row: the HTTP status and retry policy for a `code`.
@@ -99,8 +98,16 @@ pub fn spec(code: &str) -> CodeSpec {
         .unwrap_or(FALLBACK)
 }
 
-fn message_for_server_error(code: &str) -> &'static str {
+fn public_message(code: &str) -> &'static str {
     match code {
+        "unauthorized" => "authentication required",
+        "provider_auth_expired" => "provider credentials expired",
+        "plan_limit_exceeded" => "plan limit reached",
+        "forbidden" => "not the owner",
+        "not_found" => "not found",
+        "invalid_request" => "invalid request",
+        "range_not_satisfiable" => "range not satisfiable",
+        "rate_limited" => "too many requests",
         "corrupt_content" => "content could not be decoded",
         "transport_port_not_allowed" => "upstream endpoint not allowed",
         "upstream_unavailable" => "upstream unavailable",
@@ -121,65 +128,60 @@ pub struct ApiError {
 
 impl ApiError {
     /// Build from a registry code; unknown codes become the generic
-    /// fallback. Registered 5xx codes use fixed public text.
-    pub fn by_code(code: &str, message: &'static str) -> Self {
+    /// fallback. All codes use fixed public text. The second argument is
+    /// retained for callers of the existing constructor.
+    pub fn by_code(code: &str, _detail: &'static str) -> Self {
+        Self::from_code(code)
+    }
+
+    fn from_code(code: &str) -> Self {
         let spec = spec(code);
-        let message = if spec.code != code {
-            "unexpected error"
-        } else if spec.status >= 500 {
-            message_for_server_error(spec.code)
-        } else {
-            message
-        };
         Self {
             code: spec.code,
-            message,
+            message: public_message(spec.code),
             retryable: spec.retryable,
             status: spec.status,
         }
     }
 
     pub fn unauthorized() -> Self {
-        Self::by_code("unauthorized", "authentication required")
+        Self::from_code("unauthorized")
     }
     pub fn provider_auth_expired() -> Self {
-        Self::by_code("provider_auth_expired", "provider credentials expired")
+        Self::from_code("provider_auth_expired")
     }
     pub fn plan_limit_exceeded() -> Self {
-        Self::by_code("plan_limit_exceeded", "plan limit reached")
+        Self::from_code("plan_limit_exceeded")
     }
     pub fn forbidden() -> Self {
-        Self::by_code("forbidden", "not the owner")
+        Self::from_code("forbidden")
     }
     pub fn not_found() -> Self {
-        Self::by_code("not_found", "not found")
+        Self::from_code("not_found")
     }
     pub fn invalid_request() -> Self {
-        Self::by_code("invalid_request", "invalid request")
+        Self::from_code("invalid_request")
     }
     pub fn range_not_satisfiable() -> Self {
-        Self::by_code("range_not_satisfiable", "range not satisfiable")
+        Self::from_code("range_not_satisfiable")
     }
     pub fn rate_limited() -> Self {
-        Self::by_code("rate_limited", "too many requests")
+        Self::from_code("rate_limited")
     }
     pub fn internal_error() -> Self {
-        Self::by_code("internal_error", "unexpected error")
+        Self::from_code("internal_error")
     }
     pub fn corrupt_content() -> Self {
-        Self::by_code("corrupt_content", "content could not be decoded")
+        Self::from_code("corrupt_content")
     }
     pub fn transport_port_not_allowed() -> Self {
-        Self::by_code(
-            "transport_port_not_allowed",
-            "upstream endpoint not allowed",
-        )
+        Self::from_code("transport_port_not_allowed")
     }
     pub fn upstream_unavailable() -> Self {
-        Self::by_code("upstream_unavailable", "upstream unavailable")
+        Self::from_code("upstream_unavailable")
     }
     pub fn upstream_circuit_open() -> Self {
-        Self::by_code("upstream_circuit_open", "upstream circuit open")
+        Self::from_code("upstream_circuit_open")
     }
 
     /// Serialized envelope body.

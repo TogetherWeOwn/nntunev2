@@ -38,30 +38,21 @@ pub struct OriginalAuthorization {
     grant: Grant,
 }
 
-fn refusal(status: u16, api_error: ApiError) -> PlayRouteRefusal {
-    PlayRouteRefusal {
-        status,
-        api_error,
-        retry_after: None,
-        content_range: None,
-    }
-}
-
 pub fn authorize_original(
     request: &PlayRouteRequest,
     secret: &[u8],
     now_unix: u64,
 ) -> Result<OriginalAuthorization, PlayRouteRefusal> {
     if secret.is_empty() {
-        return Err(refusal(500, ApiError::internal_error()));
+        return Err(ApiError::internal_error().into());
     }
     let grant = grant::verify(request.token.as_deref().unwrap_or(""), secret, now_unix)
-        .map_err(|_| refusal(401, ApiError::unauthorized()))?;
+        .map_err(|_| ApiError::unauthorized())?;
     if grant.play_id.is_none() {
-        return Err(refusal(401, ApiError::unauthorized()));
+        return Err(ApiError::unauthorized().into());
     }
     if grant.track_id != request.track_id {
-        return Err(refusal(403, ApiError::forbidden()));
+        return Err(ApiError::forbidden().into());
     }
     Ok(OriginalAuthorization { grant })
 }
@@ -189,10 +180,15 @@ impl OriginalAuthorization {
         range_header: Option<&str>,
         control: &mut C,
     ) -> Result<OriginalPlan, PlayRouteRefusal> {
-        self.check(control)
-            .map_err(|_| refusal(401, ApiError::unauthorized()))?;
+        self.check(control).map_err(|_| {
+            if control.now_unix() >= self.grant.exp_unix {
+                ApiError::unauthorized()
+            } else {
+                ApiError::upstream_unavailable()
+            }
+        })?;
         if source.track_id() != self.grant.track_id {
-            return Err(refusal(502, ApiError::upstream_unavailable()));
+            return Err(ApiError::upstream_unavailable().into());
         }
         let size = source.file_size();
         let (status, selected) = match range::parse(range_header, size) {
@@ -205,13 +201,14 @@ impl OriginalAuthorization {
             ),
             RangeOutcome::Partial(selected) => (206, selected),
             RangeOutcome::Unsatisfiable => {
-                let mut error = refusal(416, ApiError::range_not_satisfiable());
+                let mut error = PlayRouteRefusal::from(ApiError::range_not_satisfiable());
                 error.content_range = Some(format!("bytes */{size}"));
                 return Err(error);
             }
         };
         let mut headers = vec![
             ("content-type".into(), PLAY_CONTENT_TYPE.into()),
+            ("cache-control".into(), "private, no-store".into()),
             ("accept-ranges".into(), "bytes".into()),
             ("content-length".into(), selected.len().to_string()),
         ];
@@ -246,7 +243,7 @@ impl OriginalPlan {
         sink: &'a mut dyn DeliveredSink,
     ) -> Result<OriginalPlay<'a>, PlayRouteRefusal> {
         let reader = AsyncRangeReader::new(source, self.selected.start..self.selected.end + 1)
-            .map_err(|_| refusal(502, ApiError::upstream_unavailable()))?;
+            .map_err(|_| ApiError::upstream_unavailable())?;
         Ok(OriginalPlay {
             status: self.status,
             headers: self.headers,

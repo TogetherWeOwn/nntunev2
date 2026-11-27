@@ -120,13 +120,18 @@ pub struct PlayRouteRequest {
 
 /// Extract the token from an `Authorization` header value: `Bearer
 /// <token>` with a case-insensitive scheme and a single space-separated
-/// token. Anything else (missing header, other schemes, empty or
-/// space-containing tokens) yields `None` — refused as no-grant by the
+/// token. Anything else (missing header, other schemes or characters
+/// outside the grant's wire alphabet) yields `None` — refused as no-grant by the
 /// route, never a parse error leaking shape.
 pub fn bearer_token(header: Option<&str>) -> Option<&str> {
     let header = header?;
     let (scheme, token) = header.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() || token.contains(' ') {
+    if !scheme.eq_ignore_ascii_case("bearer")
+        || token.is_empty()
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
         return None;
     }
     Some(token)
@@ -145,10 +150,19 @@ pub struct PlayRouteRefusal {
 
 impl From<&PlayError> for PlayRouteRefusal {
     fn from(error: &PlayError) -> Self {
-        PlayRouteRefusal {
-            status: error.http_status(),
-            api_error: error.api_error(),
+        Self {
             retry_after: error.retry_after_header(),
+            ..Self::from(error.api_error())
+        }
+    }
+}
+
+impl From<ApiError> for PlayRouteRefusal {
+    fn from(api_error: ApiError) -> Self {
+        Self {
+            status: api_error.status,
+            api_error,
+            retry_after: None,
             content_range: None,
         }
     }
@@ -292,12 +306,7 @@ pub fn serve_play(
                 user_id = Some(grant.user_id);
             }
             None => {
-                return PlayRouteOutcome::Refuse(PlayRouteRefusal {
-                    status: 401,
-                    api_error: ApiError::unauthorized(),
-                    retry_after: None,
-                    content_range: None,
-                });
+                return PlayRouteOutcome::Refuse(ApiError::unauthorized().into());
             }
         }
     }
@@ -338,6 +347,7 @@ pub fn serve_play(
             };
             let mut headers = vec![
                 ("content-type".to_string(), PLAY_CONTENT_TYPE.to_string()),
+                ("cache-control".to_string(), "private, no-store".to_string()),
                 ("accept-ranges".to_string(), "bytes".to_string()),
                 ("content-length".to_string(), response.body_len.to_string()),
             ];
@@ -363,12 +373,7 @@ pub fn serve_play(
             // verdict for an empty segment list is `InvalidSegment`,
             // but for the route this track is simply unknown.
             if manifest.is_none() && matches!(error, PlayError::InvalidSegment(_)) {
-                return PlayRouteOutcome::Refuse(PlayRouteRefusal {
-                    status: 404,
-                    api_error: ApiError::not_found(),
-                    retry_after: None,
-                    content_range: None,
-                });
+                return PlayRouteOutcome::Refuse(ApiError::not_found().into());
             }
             PlayRouteOutcome::Refuse(PlayRouteRefusal::from(&error))
         }

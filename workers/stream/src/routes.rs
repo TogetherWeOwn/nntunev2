@@ -201,6 +201,19 @@ pub fn decide_public_route(method: &str, path: &str) -> PublicRoute {
     }
 }
 
+/// Charge an entire chunk against a body budget before copying or sending it.
+/// For a fixed-length response, accept EOF only after the budget is exhausted.
+pub fn consume_body_bytes(remaining: &mut u64, chunk_len: Option<usize>) -> bool {
+    let Some(len) = chunk_len else {
+        return *remaining == 0;
+    };
+    let Some(next) = remaining.checked_sub(len as u64) else {
+        return false;
+    };
+    *remaining = next;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,7 +451,7 @@ mod tests {
             })
             .expect("public fetch handler");
         let expected_public_fetch = syn::parse_str::<syn::ItemFn>(
-            "async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {\n                match routes::decide_public_route(req.method().as_ref(), &req.path()) {\n                    PublicRoute::Play { track_id } => play_fetch(req, env, ctx, &track_id).await,\n                    PublicRoute::NotFound => {\n                        let (status, body) = routes::decide_public_fetch();\n                        Response::error(body, status)\n                    }\n                }\n            }",
+            "async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {\n                match routes::decide_public_route(&req.inner().method(), &req.path()) {\n                    PublicRoute::Play { track_id } => play_fetch(req, env, ctx, &track_id).await,\n                    PublicRoute::NotFound => {\n                        let (status, body) = routes::decide_public_fetch();\n                        Response::error(body, status)\n                    }\n                }\n            }",
         )
         .expect("parse expected public fetch handler");
         assert_eq!(
@@ -482,7 +495,7 @@ mod tests {
             "Durable Object fetch handler must not carry cfg/other attributes"
         );
         let expected_durable_object_fetch = syn::parse_str::<syn::ImplItemFn>(
-            "async fn fetch(&self, mut req: Request) -> Result<Response> {\n                let has_owner_name = self.state.id().name().is_some();\n                match routes::decide_pool_action(req.method().as_ref(), &req.path(), has_owner_name) {\n                    PoolAction::Respond(ProbeDecision::NotFound) => Response::error(ProbeDecision::NotFound.body(), ProbeDecision::NotFound.status(),),\n                    PoolAction::Respond(decision) => respond(route_reply(decision)),\n                    PoolAction::RunProbe => respond(self.probe(&mut req).await),\n                    PoolAction::RunBody => respond_body(self.body(&mut req).await),\n                    PoolAction::RunDelivered => respond(self.delivered(&mut req).await),\n                }\n            }",
+            "async fn fetch(&self, mut req: Request) -> Result<Response> {\n                let has_owner_name = self.state.id().name().is_some();\n                match routes::decide_pool_action(&req.inner().method(), &req.path(), has_owner_name) {\n                    PoolAction::Respond(ProbeDecision::NotFound) => Response::error(ProbeDecision::NotFound.body(), ProbeDecision::NotFound.status(),),\n                    PoolAction::Respond(decision) => respond(route_reply(decision)),\n                    PoolAction::RunProbe => respond(self.probe(&mut req).await),\n                    PoolAction::RunBody => respond_body(self.body(&mut req).await),\n                    PoolAction::RunDelivered => respond(self.delivered(&mut req).await),\n                }\n            }",
         )
         .expect("parse expected Durable Object handler");
         assert_eq!(
