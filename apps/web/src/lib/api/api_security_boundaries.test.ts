@@ -59,7 +59,7 @@ it.each(['//other.example/health', '/\\other.example/health', '/\t/other.example
 	}
 );
 
-it('holds the prefixed auth mutation lock past timeout until fetch settles', async () => {
+it('requires session binding and holds the auth lock through timeout under an API prefix', async () => {
 	const response = Promise.withResolvers<Response>();
 	const started = Promise.withResolvers<void>();
 	vi.useFakeTimers();
@@ -67,13 +67,14 @@ it('holds the prefixed auth mutation lock past timeout until fetch settles', asy
 	try {
 		const fetchFn = vi.fn(() => { started.resolve(); return response.promise; });
 		const client = new ApiClient({ baseUrl: 'https://api.example:443/prefix/', fetchFn });
+		await expect(client.get('/v1/me/taste/session')).rejects.toThrow('session binding');
 		const failure = vi.fn();
 		void client.post('/v1/auth/magic/finish?next=%2Fhome', {}).catch(failure);
 		await started.promise;
 		await vi.advanceTimersByTimeAsync(API_REQUEST_TIMEOUT_MS);
 		expect(failure).toHaveBeenCalledWith(expect.objectContaining({ code: 'request_timeout' }));
 		expect((await navigator.locks.query()).held).toContainEqual(expect.objectContaining({ name: AUTH_LOCK }));
-		expect(fetchFn).toHaveBeenCalledWith('https://api.example/prefix/v1/auth/magic/finish?next=%2Fhome',
+		expect(fetchFn).toHaveBeenCalledExactlyOnceWith('https://api.example/prefix/v1/auth/magic/finish?next=%2Fhome',
 			expect.objectContaining({ redirect: 'error' }));
 	} finally {
 		response.resolve(Response.json({ ok: true }));
