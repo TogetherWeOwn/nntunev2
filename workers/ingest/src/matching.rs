@@ -173,13 +173,22 @@ pub fn mb_search_url(query: &str) -> String {
 /// yet). It retries with backoff; every other 4xx stays `Permanent`.
 pub fn parse_mb_search_response(status: u16, body: &str) -> Result<Vec<MbSearchHit>, MatchFailure> {
     match status {
-        200 => serde_json::from_str::<MbSearchBody>(body)
-            .map(|parsed| parsed.results)
-            .map_err(|_| MatchFailure::Transient),
+        200 => {
+            let parsed: MbSearchBody =
+                serde_json::from_str(body).map_err(|_| MatchFailure::Transient)?;
+            if !valid_search_scores(&parsed.results) {
+                return Err(MatchFailure::Transient);
+            }
+            Ok(parsed.results)
+        }
         404 => Err(MatchFailure::Transient),
         400..=499 => Err(MatchFailure::Permanent),
         _ => Err(MatchFailure::Transient),
     }
+}
+
+fn valid_search_scores(hits: &[MbSearchHit]) -> bool {
+    hits.iter().all(|hit| (0.0..=1.0).contains(&hit.score))
 }
 
 /// Absolute MB release-recordings URL for the `MB_API` service binding.
@@ -424,6 +433,10 @@ fn album_retrieval_query(query: &str) -> Option<String> {
 /// guessed MBID, because the library upsert would persist the guess
 /// and replays would keep overwriting with it.
 pub fn pick_release_mbid(query: &str, hits: &[MbSearchHit]) -> Option<String> {
+    // Dropping a corrupt score could hide a competing release.
+    if !valid_search_scores(hits) {
+        return None;
+    }
     let valid = hits.iter().filter(|hit| validate_mbid(&hit.mbid));
     if let Some((artist, album)) = split_artist_album(query) {
         let mut matches: Vec<&str> = valid
@@ -461,7 +474,7 @@ pub fn pick_release_mbid(query: &str, hits: &[MbSearchHit]) -> Option<String> {
         return None;
     }
     if let Some(runner_up) = matching.iter().skip(1).find(|hit| hit.mbid != top.mbid) {
-        if top.score - runner_up.score <= MIN_MATCH_MARGIN {
+        if top.score <= runner_up.score + MIN_MATCH_MARGIN {
             return None;
         }
     }

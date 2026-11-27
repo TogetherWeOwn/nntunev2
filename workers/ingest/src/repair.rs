@@ -91,8 +91,11 @@ pub fn decide_repair(
     if missing_blocks == 0 {
         return Ok(None);
     }
-    if par2_set_id.is_empty() || par2_set_id.len() > 256 {
+    if !bounded_repair_text(par2_set_id, 256) {
         return Err("missing blocks but no par2 set covers them");
+    }
+    if !bounded_repair_text(user_id, 128) || !bounded_repair_text(idempotency_key, 512) {
+        return Err("repair identity outside the service contract");
     }
     if round == 0 || round > MAX_REPAIR_ROUNDS {
         return Err("repair round outside the paid-round budget");
@@ -109,6 +112,11 @@ pub fn decide_repair(
         round,
         scratch_prefix,
     }))
+}
+
+// Match the repair front's request text bounds.
+fn bounded_repair_text(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max && !value.bytes().any(|b| b.is_ascii_control())
 }
 
 /// Outcome of one repair call, decided from the reply alone.
@@ -129,18 +137,22 @@ pub enum RepairCall {
 /// can be terminal-success; 4xx rejections are permanent (a retry
 /// would send the same bytes), everything else retries.
 pub fn classify_repair_reply(status: u16, body: &[u8]) -> RepairCall {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum Reply {
+        Repaired,
+        Unrepairable,
+    }
+
     if body.len() > MAX_REPAIR_REPLY_BYTES {
         return RepairCall::Retry;
     }
     match status {
-        200 => {
-            let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-                return RepairCall::Retry;
-            };
-            match value.get("status").and_then(|s| s.as_str()) {
-                Some("repaired") => RepairCall::Repaired,
-                Some("unrepairable") => RepairCall::Unrepairable,
-                _ => RepairCall::Retry,
+        200 if body.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') => {
+            match serde_json::from_slice::<Reply>(body) {
+                Ok(Reply::Repaired) => RepairCall::Repaired,
+                Ok(Reply::Unrepairable) => RepairCall::Unrepairable,
+                Err(_) => RepairCall::Retry,
             }
         }
         400 | 401 | 403 | 404 | 409 | 413 => RepairCall::Unrepairable,
