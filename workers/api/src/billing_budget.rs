@@ -282,7 +282,7 @@ pub(crate) async fn test_real_connection() -> Result<(i32, i32), &'static str> {
             Err(StoreError)
         },
         |_| panic!("bootstrap ran without a connection target"),
-        |_| panic!("work ran without a connection target"),
+        async |_| panic!("work ran without a connection target"),
         |_| panic!("work observer ran without a connection target"),
     );
     if attempted.get() || failure.await.is_ok() || !attempted.get() {
