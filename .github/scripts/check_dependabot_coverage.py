@@ -379,7 +379,7 @@ def read_root_workspace(root):
         data = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None, "root Cargo.toml not found"
-    except (tomllib.TOMLDecodeError, OSError) as exc:
+    except (ValueError, OSError) as exc:
         return None, f"root Cargo.toml unreadable: {exc}"
     workspace = data.get("workspace", {})
     if not isinstance(workspace, dict):
@@ -390,6 +390,12 @@ def read_root_workspace(root):
         return None, "root Cargo.toml workspace.members is not a list"
     if not isinstance(exclude, list):
         return None, "root Cargo.toml workspace.exclude is not a list"
+    for field, entries in (("members", members), ("exclude", exclude)):
+        for entry in entries:
+            if (not isinstance(entry, str) or not entry.strip()
+                    or "\\" in entry or "\0" in entry
+                    or Path(entry).is_absolute() or ".." in Path(entry).parts):
+                return None, f"root Cargo.toml workspace.{field} has invalid path {entry!r}"
     for entry in members:
         if isinstance(entry, str) and any(c in GLOB_CHARS for c in entry):
             return None, (
@@ -412,14 +418,9 @@ def standalone_crate_dirs(root):
         return None, err
     dirs = set()
     for entry in workspace["exclude"]:
-        if not isinstance(entry, str):
-            continue
         if (root / entry / "Cargo.toml").is_file():
             dirs.add(normalize_directory(entry))
-    members = set()
-    for entry in workspace["members"]:
-        if isinstance(entry, str):
-            members.add(normalize_directory(entry))
+    members = {normalize_directory(entry) for entry in workspace["members"]}
     for manifest_dir in walk_manifests(root, "Cargo.toml"):
         if manifest_dir == "/":
             continue
@@ -603,12 +604,16 @@ def check_coverage(root):
                 f"(add it to .github/dependabot.yml)"
             )
     # Every cargo entry must point at a real manifest directory.
+    resolved_root = root.resolve()
     for ecosystem, directory in sorted(actual):
         if ecosystem != "cargo":
             continue
         if directory == "/":
             continue
-        if not (root / directory.lstrip("/") / "Cargo.toml").is_file():
+        manifest = root / directory.lstrip("/") / "Cargo.toml"
+        if ".." in manifest.relative_to(root).parts or not manifest.resolve().is_relative_to(resolved_root):
+            drift.append(f"cargo entry directory {directory!r} escapes the repository")
+        elif not manifest.is_file():
             drift.append(
                 f"stale cargo entry for directory {directory!r} "
                 f"(no Cargo.toml there)"

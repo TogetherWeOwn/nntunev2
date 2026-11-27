@@ -37,6 +37,7 @@ def parse_review_deadline(reason: str) -> dt.datetime:
     if (
         not raw
         or not sep
+        or not marker.group().isascii()
         or not all(ch in " \t" for ch in between)
         or not all(ch in " \t" for ch in sep)
     ):

@@ -126,6 +126,15 @@ def diagnostic_lines_for(output, needle):
 
 
 class TestPositiveControls(unittest.TestCase):
+    def test_scans_symlink_target_text_without_following_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(tmp, VIOLATION, CLEAN_TEXT)
+            path = os.path.join(tmp, "alias")
+            os.symlink(VIOLATION, path)
+            rc, out = run_main([path])
+            self.assertEqual(1, rc, out)
+            self.assertNotIn(VIOLATION, out)
+
     """Existing behavior that must keep passing before and after."""
 
     def test_clean_files_exit_zero(self):

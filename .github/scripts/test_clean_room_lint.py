@@ -11,6 +11,8 @@ import io
 import os
 import sys
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -214,6 +216,17 @@ class TestPathScan(unittest.TestCase):
 
 
 class TestMain(unittest.TestCase):
+    def test_scans_symlink_target_text_without_following_link(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "spotify.txt").write_text("clean", encoding="utf-8")
+            alias = root / "alias"
+            alias.symlink_to("spotify.txt")
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(1, main(["clean_room_lint.py", str(alias)]))
+            self.assertIn("competitor-brand", out.getvalue())
+            self.assertNotIn("spotify.txt", out.getvalue())
+
     def test_unreadable_input_fails_closed(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

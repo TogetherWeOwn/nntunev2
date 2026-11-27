@@ -324,10 +324,27 @@ def resolve_target(source_rel, path_part, root):
     return Path(*parts) if parts else Path(".")
 
 
+def confined_path(root, path):
+    candidate = root / path
+    try:
+        if not candidate.resolve().is_relative_to(root):
+            raise LintError(f"file is outside --root: {path}")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise LintError(f"cannot resolve path {path}: {exc}") from exc
+    return candidate
+
+
+def markdown_source(root, source_rel):
+    path = confined_path(root, source_rel)
+    if not path.is_file():
+        raise OSError("expected a regular file")
+    return path
+
+
 def check_source(source_rel, root, anchor_cache):
     """Return [(lineno, target, reason)] violations for one markdown file."""
     try:
-        text = (root / source_rel).read_text(encoding="utf-8")
+        text = markdown_source(root, source_rel).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise LintError(f"cannot read {source_rel}: {exc}") from exc
     violations = []
@@ -342,10 +359,7 @@ def check_source(source_rel, root, anchor_cache):
             if resolved is None:
                 # Escapes the repo root: a GitHub-routed path, not a file.
                 continue
-            if resolved == Path("."):
-                target_path = root
-            else:
-                target_path = root / resolved
+            target_path = confined_path(root, resolved)
             if target_path.is_dir():
                 if anchor is not None:
                     violations.append(
@@ -379,6 +393,14 @@ def is_fixture_path(path):
     return tuple(parts[: len(prefix)]) == tuple(prefix)
 
 
+def explicit_markdown_files(root, names):
+    for path in map(Path, names):
+        if path.is_absolute():
+            path = confined_path(root, path).resolve().relative_to(root)
+        if is_markdown_path(path) and not is_fixture_path(path):
+            yield path
+
+
 def _tracked_markdown_files(root):
     """Tracked markdown files under root, or None when root is outside git.
 
@@ -388,14 +410,22 @@ def _tracked_markdown_files(root):
     files so untracked/ignored trees (node_modules, build output) can never
     red a local full scan or the whole-tree self-test.
     """
+    env = dict(_clean_git_env(), LC_ALL="C")
     try:
         toplevel = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
             check=True,
             capture_output=True,
             text=True,
-            env=_clean_git_env(),
+            env=env,
         ).stdout.strip()
+    except subprocess.CalledProcessError as exc:
+        if exc.stderr.startswith("fatal: not a git repository"):
+            return None
+        raise LintError("cannot locate git worktree") from exc
+    except OSError as exc:
+        raise LintError("cannot locate git worktree") from exc
+    try:
         out = subprocess.run(
             # --full-name: paths stay relative to the toplevel even when
             # root is a subdirectory (e.g. a fixture root), so the
@@ -407,10 +437,10 @@ def _tracked_markdown_files(root):
             ["git", "-C", str(root), "ls-files", "-z", "--full-name"],
             check=True,
             capture_output=True,
-            env=_clean_git_env(),
+            env=env,
         ).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return None
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise LintError("cannot list tracked markdown files") from exc
     if not toplevel:
         return None
     try:
@@ -545,20 +575,7 @@ def main(argv=None):
         if not root.is_dir():
             raise LintError(f"repository root is not a directory: {root}")
         if args.files is not None:
-            files = []
-            for name in args.files:
-                rel = Path(name)
-                if rel.is_absolute():
-                    try:
-                        rel = rel.resolve().relative_to(root)
-                    except ValueError:
-                        raise LintError(f"file is outside --root: {name}")
-                if rel.suffix.lower() not in MARKDOWN_SUFFIXES:
-                    continue
-                if is_fixture_path(rel):
-                    continue
-                if (root / rel).is_file():
-                    files.append(rel)
+            files = list(explicit_markdown_files(root, args.files))
         elif args.base_ref:
             files = changed_markdown_files(root, args.base_ref)
         else:

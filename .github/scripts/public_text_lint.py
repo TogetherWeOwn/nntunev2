@@ -91,7 +91,9 @@ Usage:
   not yet staged) are scanned as given.
 """
 
+import os
 import re
+import stat
 import subprocess
 import sys
 
@@ -214,11 +216,21 @@ def tracked_files():
     return [p for p in out.split("\0") if p and p not in FIXTURE_EXCLUSIONS]
 
 
+def read_public_bytes(path):
+    """Read the bytes Git publishes for a regular file or symlink."""
+    mode = os.lstat(path).st_mode
+    if stat.S_ISLNK(mode):
+        return os.fsencode(os.readlink(path))
+    if not stat.S_ISREG(mode):
+        raise OSError("unsupported path type")
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
 def scan_path(path):
     if is_artifact_path(path):
         return [(1, "binary-artifact")]
-    with open(path, "rb") as fh:
-        data = fh.read()
+    data = read_public_bytes(path)
     # No binary early-return: a tracked binary IS public text once merged,
     # so the same patterns run over a lossless latin-1 decode (a tracked
     # .pyc once leaked an internal path while NUL bytes kept CI green).

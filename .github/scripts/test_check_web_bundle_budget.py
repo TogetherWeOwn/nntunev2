@@ -88,6 +88,26 @@ def test_empty_bundle_fails_closed() -> None:
     assert main(["--client-dir", str(client), "--budget", "1000"]) == 1
 
 
+def test_symlinked_bundle_entries_fail_closed() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        client = root / "client"
+        client.mkdir()
+        (client / "valid.js").write_bytes(b"ok")
+        for link, target in (("missing.js", root / "missing"), ("assets", root)):
+            path = client / link
+            path.symlink_to(target)
+            assert main(["--client-dir", str(client)]) == 1
+            path.unlink()
+
+
+def test_bundle_report_keeps_filename_on_one_line() -> None:
+    client = _client_dir_with({"chunk\nextra.js": 2})
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        assert main(["--client-dir", str(client), "--budget", "1"]) == 0
+    assert len(out.getvalue().splitlines()) == 2, out.getvalue()
+
+
 def test_non_positive_budget_rejected() -> None:
     client = _client_dir_with({"a.js": 10})
     for bad in (0, -100):
@@ -458,6 +478,8 @@ def main_test() -> int:
         test_over_budget_warns_without_failing,
         test_missing_dir_fails_closed,
         test_empty_bundle_fails_closed,
+        test_symlinked_bundle_entries_fail_closed,
+        test_bundle_report_keeps_filename_on_one_line,
         test_non_positive_budget_rejected,
         test_pinned_budget_covers_current_build,
         test_pinned_budget_value_unchanged,

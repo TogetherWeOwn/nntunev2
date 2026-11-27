@@ -9,6 +9,9 @@ per-test result line.
 import os
 import sys
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -51,6 +54,23 @@ test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 40 filtered out;
 
 
 class FailedTestsTest(unittest.TestCase):
+    def test_ignored_baseline_cannot_qualify_mutant(self):
+        from subprocess import CompletedProcess
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "source.rs"
+            path.write_text("original", encoding="utf-8")
+            case = ("example", path, "original", "changed", (), MARKER)
+            baseline = f"test handlers::tests::{MARKER} ... ignored\ntest result: ok. 0 passed"
+            with patch.object(mutants, "CASES", (case,)), patch.object(
+                mutants, "run", side_effect=[
+                    CompletedProcess([], 0, baseline), CompletedProcess([], 101, PARALLEL)
+                ],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "baseline did not pass"):
+                    mutants.main()
+            self.assertEqual(path.read_text(encoding="utf-8"), "original")
+
     def test_serial_panic_inside_result_line_still_counts(self):
         failed = mutants.failed_tests(SERIAL)
         self.assertTrue(mutants.killed_by(

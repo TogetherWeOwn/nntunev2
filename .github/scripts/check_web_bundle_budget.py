@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -59,6 +60,10 @@ class BudgetError(Exception):
 class BudgetExceeded(BudgetError):
     """The client bundle was measured and its total exceeds the budget."""
 
+    def __init__(self, message, sized):
+        super().__init__(message)
+        self.sized = sized
+
 
 def default_client_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent.joinpath(*CLIENT_DIR_PARTS)
@@ -67,20 +72,40 @@ def default_client_dir() -> Path:
 def client_js_files(client_dir: Path) -> list[Path]:
     if not client_dir.is_dir():
         raise BudgetError(
-            f"client output dir is missing: {client_dir} "
+            f"client output dir is missing: {str(client_dir)!r} "
             "(run `pnpm --dir apps/web build` first)"
         )
-    files = sorted(p for p in client_dir.rglob("*.js") if p.is_file())
+    if client_dir.is_symlink():
+        raise BudgetError(f"symlinked client output dir: {str(client_dir)!r}")
+
+    def walk_error(exc):
+        raise exc
+
+    files = []
+    for directory, dirs, names in os.walk(client_dir, onerror=walk_error):
+        for name in dirs:
+            path = Path(directory) / name
+            if path.is_symlink():
+                raise BudgetError(f"symlinked bundle directory: {str(path)!r}")
+        files.extend(Path(directory) / name for name in names if name.endswith(".js"))
     if not files:
         raise BudgetError(
-            f"no client JS files under {client_dir}; refusing to pass an empty bundle"
+            f"no client JS files under {str(client_dir)!r}; refusing to pass an empty bundle"
         )
     return files
 
 
 def measure(client_dir: Path) -> list[tuple[Path, int]]:
     """Return ``(path, size_bytes)`` for every client JS file, largest first."""
-    sized = [(path, path.stat().st_size) for path in client_js_files(client_dir)]
+    sized = []
+    try:
+        for path in client_js_files(client_dir):
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise BudgetError(f"bundle entry is not a regular file: {str(path)!r}")
+            sized.append((path, info.st_size))
+    except OSError as exc:
+        raise BudgetError(f"cannot measure bundle: {str(exc)!r}") from exc
     sized.sort(key=lambda item: (-item[1], str(item[0])))
     return sized
 
@@ -98,7 +123,8 @@ def check(client_dir: Path, budget: int) -> tuple[int, list[tuple[Path, int]]]:
     if total > budget:
         raise BudgetExceeded(
             f"client JS total {total} B exceeds budget {budget} B "
-            f"(over by {total - budget} B)"
+            f"(over by {total - budget} B)",
+            sized,
         )
     return total, sized
 
@@ -121,15 +147,10 @@ def publish_warning(message: str) -> None:
             )
 
 
-def report_top_files(client_dir: Path) -> None:
-    if not client_dir.is_dir():
-        return
-    try:
-        over = measure(client_dir)
-    except BudgetError:
-        over = []
-    for path, size in over[:TOP_FILES_ON_REPORT]:
-        print(f"bundle budget:   {size:>8} B  {path.name}", flush=True)
+def report_top_files(sized: list[tuple[Path, int]]) -> None:
+    for path, size in sized[:TOP_FILES_ON_REPORT]:
+        name = path.name if path.name.isprintable() else repr(path.name)
+        print(f"bundle budget:   {size:>8} B  {name}", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -152,12 +173,11 @@ def main(argv: list[str] | None = None) -> int:
     except BudgetExceeded as exc:
         message = f"{exc} (advisory, not a failure)"
         print(f"bundle budget: WARNING: {message}", flush=True)
-        report_top_files(args.client_dir)
+        report_top_files(exc.sized)
         publish_warning(message)
         return 0
     except BudgetError as exc:
         print(f"bundle budget: FAIL: {exc}", flush=True)
-        report_top_files(args.client_dir)
         return 1
     headroom = args.budget - total
     print(

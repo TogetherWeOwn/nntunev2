@@ -15,14 +15,17 @@ confinement. No checker changes here; this module is tests-only.
 import contextlib
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from docs_link_lint import main
+from docs_citation_lint import main as citation_main
 
 
 def make_root(tmp, files):
@@ -35,6 +38,40 @@ def make_root(tmp, files):
 
 
 class TestExplicitRootConfinement(unittest.TestCase):
+    def test_git_index_error_cannot_fall_back_to_directory_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, {"a.md": "# Clean\n"})
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / ".git" / "index").write_bytes(b"invalid")
+            for lint in (main, citation_main):
+                with self.subTest(lint=lint.__module__):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(2, lint(["--root", str(root)]))
+
+    def test_both_linters_reject_missing_and_outside_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, {"outside.md": "# Clean\n"})
+            sub = root / "repo"
+            sub.mkdir()
+            (sub / "alias.md").symlink_to(root / "outside.md")
+            os.mkfifo(sub / "pipe.md")
+            subprocess.run(["git", "init", "-q", str(sub)], check=True)
+            subprocess.run(["git", "-C", str(sub), "add", "alias.md"], check=True)
+            for lint in (main, citation_main):
+                for name in ("../outside.md", "alias.md", "missing.md", "pipe.md", None):
+                    args = ["--files", name] if name else []
+                    with self.subTest(lint=lint.__module__, name=name), contextlib.redirect_stdout(io.StringIO()):
+                        with patch.object(Path, "read_text", side_effect=AssertionError("unsafe source read")):
+                            self.assertNotEqual(0, lint(["--root", str(sub), *args]))
+
+    def test_link_target_cannot_resolve_outside_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, {"repo/a.md": "[b](alias.md#clean)\n", "b.md": "# Clean\n"})
+            sub = root / "repo"
+            (sub / "alias.md").symlink_to(root / "b.md")
+            rc, out = self._run("--root", str(sub), "--files", "a.md")
+            self.assertNotEqual(0, rc, out)
+
     def _run(self, *argv):
         buf = io.StringIO()
         err = io.StringIO()

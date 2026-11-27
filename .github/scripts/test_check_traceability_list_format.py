@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from check_traceability import TraceabilityError, main, parse_list_output
+from check_traceability import TraceabilityError, check, main, parse_list_output
 
 LIST_TWO_FILES = """\
 Listing tests:
@@ -64,6 +64,32 @@ def write_tree(root, matrix, listed):
 
 
 class ListFormatGuardTest(unittest.TestCase):
+    def test_cited_helper_must_stay_in_e2e_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            matrix = MATRIX_COVERING_BOTH + "\n`e2e/../outside.txt`\n`e2e/alias.txt`\n"
+            path = write_tree(root, matrix, LIST_TWO_FILES)
+            (root / "e2e" / "README.md").touch()
+            (root / "outside.txt").touch()
+            (root / "e2e" / "alias.txt").symlink_to("../outside.txt")
+            drifts = check(root, path, LIST_TWO_FILES)
+            self.assertEqual(2, len(drifts), drifts)
+            self.assertTrue(all("outside the e2e tree" in drift for drift in drifts))
+
+    def test_title_segment_cannot_replace_the_spec_path(self):
+        files, total = parse_list_output(
+            "  [staging] › alpha.spec.ts:1:1 › beta.spec.ts:2:2 › example\n"
+            "Total: 1 test in 1 file\n"
+        )
+        self.assertEqual({"e2e/tests/alpha.spec.ts": ["example"]}, files)
+        self.assertEqual((1, 1), total)
+
+    def test_duplicate_or_malformed_totals_fail(self):
+        row = "  [staging] › alpha.spec.ts:1:1 › example\n"
+        for tail in ("Total: missing counts\n", "Total: 2 tests in 1 file\nTotal: 1 test in 1 file\n"):
+            with self.subTest(tail=tail), self.assertRaises(TraceabilityError):
+                parse_list_output(row + tail)
+
     def test_valid_list_parses_expected_counts(self):
         # Control: the harness itself passes so the failure pins below
         # prove the guards, not a broken fixture.

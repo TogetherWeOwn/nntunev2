@@ -118,23 +118,29 @@ def _is_safe_track_file(file) -> bool:
     return all(part not in ("", ".", "..") for part in file.split("/"))
 
 
+def _unique_object(pairs):
+    result = dict(pairs)
+    if len(pairs) != len(result):
+        raise ValueError("duplicate manifest member")
+    return result
+
+
 def check_manifest(path: str, text: str) -> tuple[list[tuple[int, str]], set[str]]:
     """Validate one fixture manifest. Returns (violations, listed R2 keys).
 
     Listed keys are `<manifest dir>/<track file>` for every well-formed
-    track, returned only when the licence itself is allowed — an
-    unlicensed manifest lists nothing.
+    track, returned only when the entire manifest is valid.
     """
     violations: list[tuple[int, str]] = []
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
+        data = json.loads(text, object_pairs_hook=_unique_object)
+    except (ValueError, RecursionError):
         return [(1, "manifest-shape")], set()
     if not isinstance(data, dict):
         return [(1, "manifest-shape")], set()
 
-    licence_ok = data.get("license") in ALLOWED_LICENSES
-    if not licence_ok:
+    licence = data.get("license")
+    if not isinstance(licence, str) or licence not in ALLOWED_LICENSES:
         violations.append((1, "manifest-licence"))
     for field in ("license_url", "source"):
         value = data.get(field)
@@ -157,13 +163,14 @@ def check_manifest(path: str, text: str) -> tuple[list[tuple[int, str]], set[str
             _is_safe_track_file(file)
             and _is_positive_int(track.get("bytes"))
             and isinstance(track.get("sha256"), str)
-            and bool(SHA256_RE.match(track["sha256"]))
+            and bool(SHA256_RE.fullmatch(track["sha256"]))
+            and f"{prefix}/{file}" not in keys
         )
         if not ok:
             violations.append((1, "manifest-shape"))
             continue
         keys.add(f"{prefix}/{file}")
-    return violations, (keys if licence_ok else set())
+    return violations, (set() if violations else keys)
 
 
 def check_tracked_files(
