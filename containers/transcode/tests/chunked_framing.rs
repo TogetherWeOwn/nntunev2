@@ -400,3 +400,87 @@ fn unknown_routes_and_methods_are_not_found() {
     let (status, _) = h.get_bytes("/jobs/job_01/r1/out/abc");
     assert_eq!(status, 404);
 }
+
+#[test]
+fn malformed_request_head_does_not_stage_input() {
+    let h = Harness::start();
+    let path = format!("/jobs/job_badhead/t/{HEX_A}/in/{}", input_key());
+    for (version, headers, body) in [
+        (
+            "HTTP/1.1",
+            "Content-Length: 4\r\ncontent-length: 5",
+            "hello",
+        ),
+        (
+            "HTTP/1.1",
+            "Content-Length: 5\r\nContent-Length: 5",
+            "hello",
+        ),
+        ("HTTP/1.1", "Content-Length: +5", "hello"),
+        ("HTTP/1.1", "Content-Length: 18446744073709551616", "hello"),
+        (
+            "HTTP/1.1",
+            "Content-Length : 5\r\nContent-Length: 5",
+            "hello",
+        ),
+        ("HTTP/1.1", "Content-Length: 5\nX-Extra: yes", "hello"),
+        ("HTTP/1.1", "Content-Length: 5\rX-Extra: yes", "hello"),
+        ("HTTP/1.1", "Content-Length: 5\r\nX-Extra: \x01", "hello"),
+        ("HTTP/1.1 extra", "Content-Length: 5", "hello"),
+        ("HTTP/2.0", "Content-Length: 5", "hello"),
+        (
+            "HTTP/1.1",
+            "Transfer-Encoding: gzip\r\nContent-Length: 5",
+            "hello",
+        ),
+        (
+            "HTTP/1.1",
+            "Transfer-Encoding: chunked\r\nContent-Length: 5",
+            "5\r\nhello\r\n0\r\n\r\n",
+        ),
+        (
+            "HTTP/1.1",
+            "Transfer-Encoding: chunked\r\ntransfer-encoding: chunked",
+            "5\r\nhello\r\n0\r\n\r\n",
+        ),
+        (
+            "HTTP/1.0",
+            "Transfer-Encoding: chunked",
+            "5\r\nhello\r\n0\r\n\r\n",
+        ),
+    ] {
+        let (status, reply) = half_closed_request(
+            &h,
+            &format!("PUT {path} {version}\r\nHost: x\r\n{headers}\r\n\r\n"),
+            body.as_bytes(),
+        );
+        assert_eq!(status, 400, "{version} {headers:?}: {reply}");
+        assert_eq!(reply["error"], "invalid_request");
+    }
+    assert!(h.scratch_files().is_empty());
+}
+
+#[test]
+fn malformed_chunk_framing_leaves_existing_input_intact() {
+    let h = Harness::start();
+    let job = "job_badchunk";
+    stage_input(&h, job, HEX_A, b"original");
+    let path = format!("/jobs/{job}/t/{HEX_A}/in/{}", input_key());
+    let head = format!("PUT {path} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n");
+    for body in [
+        "5\r\nhello!!0\r\n\r\n",
+        "+5\r\nhello\r\n0\r\n\r\n",
+        " 5\r\nhello\r\n0\r\n\r\n",
+        "5 \r\nhello\r\n0\r\n\r\n",
+        "5;abcdefghijklmnopqrstuvwxyzabc\r\nhello\r\n0\r\n\r\n",
+        "5\r\nhello\r\n0\r\nMalformed trailer\r\n\r\n",
+        "5\r\nhello\r\n0\r\nContent-Length: 5\r\n\r\n",
+    ] {
+        let (status, reply) = half_closed_request(&h, &head, body.as_bytes());
+        assert_eq!(status, 400, "{body:?}: {reply}");
+        assert_eq!(reply["error"], "invalid_request");
+        let files = h.scratch_files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(std::fs::read(&files[0]).unwrap(), b"original");
+    }
+}
