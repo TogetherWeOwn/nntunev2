@@ -63,8 +63,8 @@ struct FlightState<T, E> {
 struct Flight<T, E> {
     state: Mutex<FlightState<T, E>>,
     ready: Condvar,
-    /// True when this flight is a replacement: elected by a caller that had
-    /// already timed out, or led while a superseded leader was still fetching.
+    /// True when this flight is a replacement: elected after a timeout or
+    /// abandonment, or led while a superseded leader was still fetching.
     /// Such a flight is never replaced for slowness, which is what bounds a key
     /// at two concurrent fetches.
     is_replacement: bool,
@@ -170,7 +170,8 @@ where
                 }
             };
 
-            if let Some(result) = Self::wait(&flight, self.timeout) {
+            let state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(result) = Self::wait(&flight, state, self.timeout) {
                 return result;
             }
 
@@ -257,8 +258,11 @@ where
 
     /// Wait for the leader's outcome; `None` after timeout or abandonment
     /// signals that the caller should re-run leader election.
-    fn wait(flight: &Flight<T, E>, timeout: Duration) -> Option<Result<T, E>> {
-        let state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
+    fn wait(
+        flight: &Flight<T, E>,
+        state: MutexGuard<'_, FlightState<T, E>>,
+        timeout: Duration,
+    ) -> Option<Result<T, E>> {
         let pending = |s: &mut FlightState<T, E>| !s.done && !s.abandoned;
         let state = if flight.is_replacement {
             flight
@@ -1110,7 +1114,6 @@ mod tests {
                 assert!(panic.is_err());
                 let replacement = replacement.unwrap();
                 assert!(replacement.state.lock().unwrap().abandoned);
-                assert_eq!(Singleflight::wait(&replacement, Duration::MAX), None);
                 let mut registry = group.registry();
                 let slot = registry.get_mut(key).unwrap();
                 assert_eq!(slot.outstanding, 1);
@@ -1126,41 +1129,44 @@ mod tests {
     #[test]
     fn replacement_panic_wakes_a_parked_waiter() {
         let group = Singleflight::<(), ()>::with_timeout(Duration::ZERO);
+        let group = &group;
         let key = "segment";
         thread::scope(|scope| {
             group
                 .call(key, || {
                     let mut waiter = None;
+                    let mut replacement = None;
                     let mut synchronized = false;
+                    let (finished, outcome) = std::sync::mpsc::channel();
                     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         group.call(key, || {
                             let flight =
                                 group.registry().get(key).unwrap().current.clone().unwrap();
+                            replacement = Some(Arc::clone(&flight));
                             let (entering_wait, ready) = std::sync::mpsc::channel();
                             waiter = Some(scope.spawn(move || {
-                                let deadline = Instant::now() + Duration::from_secs(2);
-                                let mut state = flight.state.lock().unwrap();
+                                let state = flight.state.lock().unwrap();
                                 // Cleanup cannot acquire the state mutex until this waiter parks.
                                 entering_wait.send(()).unwrap();
-                                while !state.abandoned {
-                                    let remaining =
-                                        deadline.saturating_duration_since(Instant::now());
-                                    let (next, elapsed) =
-                                        flight.ready.wait_timeout(state, remaining).unwrap();
-                                    assert!(
-                                        !elapsed.timed_out(),
-                                        "abandonment must notify parked waiters"
-                                    );
-                                    state = next;
+                                let result = Singleflight::wait(&flight, state, Duration::ZERO);
+                                if result.is_none() {
+                                    group.call(key, || Ok(())).unwrap();
                                 }
+                                finished.send(result).unwrap();
                             }));
                             synchronized = ready.recv_timeout(Duration::from_secs(2)).is_ok();
                             panic!("simulated replacement panic");
                         })
                     }));
+                    let result = outcome.recv_timeout(Duration::from_secs(2));
+                    if result.is_err() {
+                        // Release a stranded waiter so a regression fails promptly.
+                        Singleflight::publish(&replacement.unwrap(), Ok(()));
+                    }
                     assert!(panic.is_err());
                     assert!(synchronized, "the waiter must park before the panic");
                     waiter.unwrap().join().unwrap();
+                    assert_eq!(result, Ok(None), "abandonment must notify parked waiters");
                     Ok(())
                 })
                 .unwrap();
