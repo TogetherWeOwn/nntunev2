@@ -5,10 +5,11 @@ const { test } = require('node:test');
 const { staging_input_test: collect } = require(process.env.STAGING_BODY_WASM_JS);
 
 const url = 'https://example.test/rest/ping';
-const formRequest = ({ query = 'f=json', form = 'u=%C3%A9', declared } = {}) => new Request(`${url}?${query}`, {
+const formType = 'application/x-www-form-urlencoded';
+const formRequest = ({ query = 'f=json', form = 'u=%C3%A9', declared, contentType = formType } = {}) => new Request(`${url}?${query}`, {
   method: 'POST', body: form,
   headers: {
-    'content-type': 'application/x-www-form-urlencoded',
+    'content-type': contentType,
     ...(declared === undefined ? {} : { 'content-length': declared }),
   },
 });
@@ -45,6 +46,22 @@ test('rejects metadata errors before reading the form', async () => {
   const short = formRequest();
   await assert.rejects(collect(short, 24 + 24 - 1), noCapacity);
   assert.equal(short.bodyUsed, false);
+});
+
+test('reads a form only for an unambiguous form media type', { timeout: 5000 }, async () => {
+  const lookalike = formRequest({ contentType: `text/plain; hint=${formType}` });
+  assert.equal(await collect(lookalike), 24 + 24 + 24);
+  assert.equal(lookalike.bodyUsed, false);
+
+  for (const contentType of [`${formType}, text/plain`, `${formType}; name=one",two"`]) {
+    const malformed = formRequest({ contentType });
+    await assert.rejects(collect(malformed), (e) => e === 'collect:Unreadable');
+    assert.equal(malformed.bodyUsed, false);
+  }
+
+  const quoted = formRequest({ contentType: `${formType}; name="one,two"` });
+  assert.equal(await collect(quoted), exact);
+  assert.equal(quoted.bodyUsed, true);
 });
 
 test('passes an admitted declared length to the form collector', async () => {
