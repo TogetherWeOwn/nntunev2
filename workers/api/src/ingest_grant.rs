@@ -13,8 +13,8 @@
 //! play grant's `issue_at`. Both crates pin the shared vectors in
 //! `fixtures/ingest-caller-grant/vectors.json`.
 //!
-//! Minting fails closed: a short or absent secret, or a user id ingest
-//! would reject, yields an error instead of a token.
+//! Minting requires a configured secret, a valid user id, an accepted
+//! scope and an expiry strictly after issuance.
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -29,8 +29,11 @@ pub const CALLER_SECRET_VAR: &str = "INGEST_CALLER_SECRET";
 /// Minimum secret length in bytes; ingest refuses every caller below it.
 pub const MIN_SECRET_BYTES: usize = 32;
 
-/// The only scope the ingest routes accept.
+/// The scope accepted by the standard ingest routes.
 pub const INGEST_WRITE_SCOPE: &str = "ingest:write";
+
+/// The separate scope accepted by the admin review retry route.
+const INGEST_REVIEW_RETRY_SCOPE: &str = "ingest:review:retry";
 
 /// Maximum grant lifetime: 15 minutes, matching ingest's verifier cap.
 pub const MAX_GRANT_TTL: u64 = 900;
@@ -42,9 +45,13 @@ pub enum MintError {
     NotConfigured,
     /// The user id is empty, over 128 bytes, or contains `:`, `|` or NUL.
     InvalidUser,
+    /// The scope is unknown to the ingest Worker.
+    InvalidScope,
+    /// The grant would already be expired at issuance.
+    InvalidLifetime,
 }
 
-/// Mint an `ingest:write` grant for `user_id`, valid for
+/// Mint an `ingest:write` grant for `user_id`, valid for up to
 /// `min(ttl_secs, MAX_GRANT_TTL)` seconds from `now_unix` (saturating).
 pub fn issue_at(
     user_id: &str,
@@ -70,7 +77,13 @@ pub(crate) fn issue_scoped_at(
     if !valid_user_id(user_id) {
         return Err(MintError::InvalidUser);
     }
+    if !matches!(scope, INGEST_WRITE_SCOPE | INGEST_REVIEW_RETRY_SCOPE) {
+        return Err(MintError::InvalidScope);
+    }
     let exp_unix = now_unix.saturating_add(ttl_secs.min(MAX_GRANT_TTL));
+    if exp_unix <= now_unix {
+        return Err(MintError::InvalidLifetime);
+    }
     let payload_hex = hex_encode(format!("{user_id}|{scope}|{exp_unix}").as_bytes());
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| MintError::NotConfigured)?;
     mac.update(payload_hex.as_bytes());
@@ -130,6 +143,22 @@ mod tests {
             payload(&token),
             format!("user_01|ingest:write|{}", NOW + 600)
         );
+    }
+
+    #[test]
+    fn mints_only_supported_scopes() {
+        let retry =
+            issue_scoped_at("user_01", INGEST_REVIEW_RETRY_SCOPE, NOW, 1, Some(SECRET)).unwrap();
+        assert_eq!(
+            payload(&retry),
+            format!("user_01|ingest:review:retry|{}", NOW + 1)
+        );
+        for scope in ["", "ingest:read"] {
+            assert_eq!(
+                issue_scoped_at("user_01", scope, NOW, 1, Some(SECRET)),
+                Err(MintError::InvalidScope)
+            );
+        }
     }
 
     #[test]

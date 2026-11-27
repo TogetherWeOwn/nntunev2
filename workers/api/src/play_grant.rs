@@ -15,10 +15,9 @@
 //! shared vectors in `fixtures/play-grant/vectors.json` (generated with
 //! Python's hmac, independent of either implementation).
 //!
-//! Minting fails closed: a short or absent secret, or an identity the
-//! stream verifier would reject as unmeterable, yields an error instead
-//! of a token. Identity validity is decided by
-//! [`crate::ledger::derive_play_idempotency_key`] itself — the same
+//! Minting requires a configured secret, meterable identities, a persisted
+//! lease epoch and an expiry strictly after issuance. The mint uses
+//! [`crate::ledger::derive_play_idempotency_key`] to apply the same
 //! field rule (`[A-Za-z0-9_-]`, user ≤ 128 bytes, track/play ≤ 512
 //! bytes) the verifier enforces — so a grant minted here can always be
 //! metered by construction, with no second copy of the rule to drift.
@@ -45,21 +44,28 @@ pub const MAX_GRANT_TTL: u64 = 900;
 pub enum MintError {
     /// The secret is absent or shorter than [`MIN_SECRET_BYTES`].
     NotConfigured,
-    /// An identity field fails the ledger field rule, so the stream
-    /// verifier would refuse the minted token as malformed.
+    /// The identity fields, lease epoch or expiry do not describe a valid play.
     InvalidIdentity,
 }
 
 /// A minted grant: the token plus its expiry (the handler reports both;
 /// the client refreshes ahead of `exp_unix` for a continuing play).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IssuedGrant {
     pub token: String,
     pub exp_unix: u64,
 }
 
+impl std::fmt::Debug for IssuedGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedGrant")
+            .field("exp_unix", &self.exp_unix)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Mint a `v2` play grant for (`user_id`, `track_id`, `play_id`) at
-/// `lease_epoch`, valid for `min(ttl_secs, MAX_GRANT_TTL)` seconds from
+/// `lease_epoch`, valid for up to `min(ttl_secs, MAX_GRANT_TTL)` seconds from
 /// `now_unix` (saturating). Byte-exact with the stream Worker's
 /// `issue_v2_at`; pinned by `fixtures/play-grant/vectors.json` on both
 /// sides.
@@ -76,10 +82,14 @@ pub fn issue_v2_at(
         Some(s) if s.len() >= MIN_SECRET_BYTES => s,
         _ => return Err(MintError::NotConfigured),
     };
-    if crate::ledger::derive_play_idempotency_key(user_id, track_id, play_id).is_err() {
+    let exp_unix = now_unix.saturating_add(ttl_secs.min(MAX_GRANT_TTL));
+    // Lease epochs start at 1 and are stored as PostgreSQL BIGINT.
+    if !(1..=i64::MAX as u64).contains(&lease_epoch)
+        || exp_unix <= now_unix
+        || crate::ledger::derive_play_idempotency_key(user_id, track_id, play_id).is_err()
+    {
         return Err(MintError::InvalidIdentity);
     }
-    let exp_unix = now_unix.saturating_add(ttl_secs.min(MAX_GRANT_TTL));
     let payload = format!("{user_id}|{track_id}|{play_id}|{lease_epoch}|{exp_unix}");
     let payload_b64 = crate::b64::encode(payload.as_bytes());
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| MintError::NotConfigured)?;
