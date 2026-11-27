@@ -1,4 +1,4 @@
-import { toPublicDiscoveryTrack, type DiscoveryCandidate } from './discovery-shelf.js';
+import { isMirrorMbid, toPublicDiscoveryTrack, type DiscoveryCandidate } from './discovery-shelf.js';
 
 const SHELF_LIMIT = 5;
 
@@ -21,8 +21,10 @@ export function selectRelatedArtists(
 	mirrorArtistNames: ReadonlyMap<string, string>,
 	relationships: readonly ArtistRecordingRelationship[]
 ): RelatedArtist[] {
+	if (!isMirrorMbid(seedArtistMbid)) return [];
 	const seed = seedArtistMbid.toLowerCase();
-	if (!mirrorArtistNames.get(seed)?.trim()) return [];
+	const seedName = mirrorArtistNames.get(seed);
+	if (typeof seedName !== 'string' || !seedName.trim()) return [];
 
 	const publicRecordings = new Set<string>();
 	for (const candidate of catalogue) {
@@ -38,12 +40,12 @@ export function selectRelatedArtists(
 
 	const matches = new Map<string, { name: string; recordings: Set<string> }>();
 	for (const { artistMbid, recordingMbid } of relationships) {
-		if (artistMbid === seed || !seedRecordings.has(recordingMbid)) continue;
-		const name = mirrorArtistNames.get(artistMbid)?.trim();
-		if (!name) continue;
+		if (artistMbid === seed || !isMirrorMbid(artistMbid) || !seedRecordings.has(recordingMbid)) continue;
+		const name = mirrorArtistNames.get(artistMbid);
+		if (typeof name !== 'string' || !name.trim()) continue;
 		let match = matches.get(artistMbid);
 		if (!match) {
-			match = { name, recordings: new Set() };
+			match = { name: name.trim(), recordings: new Set() };
 			matches.set(artistMbid, match);
 		}
 		match.recordings.add(recordingMbid);

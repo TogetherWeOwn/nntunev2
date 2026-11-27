@@ -125,6 +125,14 @@ describe('persistent native sound', () => {
 		audio.muted = false;
 		audio.changed();
 		expect(read()).toEqual({ volume: 0.61, muted: true, ready: true, restricted: false });
-		expect(storage.setItem).toHaveBeenCalledTimes(2);
+		expect(storage.setItem).not.toHaveBeenCalled();
+	});
+
+	it('keeps controls usable if acquiring storage throws', () => {
+		const sound = createNativeSound(() => { throw new Error('Storage denied'); });
+		sound.connect(new Audio(), () => true, new AbortController().signal);
+		expect(sound.setVolume(0.4)).toBe(0.4);
+		sound.toggleMute();
+		expect(get(sound.state)).toMatchObject({ ready: true, volume: 0.4, muted: true });
 	});
 });

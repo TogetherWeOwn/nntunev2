@@ -21,10 +21,11 @@ export function bindSystemTransport(
 	const options = { session };
 	const guard = (action: () => void) => () => {
 		// Unregistering cannot recall a callback already queued by the OS.
-		if (!signal.aborted && readTrack()) action();
+		if (!signal.aborted && readTrack() && !signal.aborted) action();
 	};
 	const handlers = {
-		onPlay: guard(() => void playCurrent()), onPause: guard(pauseCurrent),
+		onPlay: guard(() => { void playCurrent().catch(() => { /* OS controls have no error channel. */ }); }),
+		onPause: guard(pauseCurrent),
 		onNext: onNext && guard(onNext), onPrevious: onPrevious && guard(onPrevious)
 	};
 	let published: Track | null = null;
@@ -57,7 +58,10 @@ export function bindSystemTransport(
 		if (signal.aborted) return;
 		const track = readTrack();
 		if (!track) {
-			if (published && !signal.aborted) setMediaSessionPosition(null, options);
+			if (published && !signal.aborted) {
+				published = null;
+				clearMediaSession(options);
+			}
 			return;
 		}
 		if (track === published) return;

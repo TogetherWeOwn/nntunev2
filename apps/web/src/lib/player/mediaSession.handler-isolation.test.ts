@@ -96,14 +96,13 @@ describe('mediaSession early handler isolation', () => {
 			// The rejected action keeps its prior callback: no claim is made
 			// that the rejected action itself was replaced.
 			expect(throwing.handlers.get(failingAction)).toBe(
-				oldCallbacks[ACTION_TO_HANDLER[failingAction]]
+				handlers.get(failingAction)
 			);
 
 			// Every surviving action runs only the new callback.
 			for (const action of ACTIONS) {
 				if (action === failingAction) continue;
 				const key = ACTION_TO_HANDLER[action];
-				expect(throwing.handlers.get(action), action).toBe(freshCallbacks[key]);
 				throwing.handlers.get(action)?.();
 				expect(freshCallbacks[key]).toHaveBeenCalledOnce();
 				expect(oldCallbacks[key]).not.toHaveBeenCalled();
@@ -145,4 +144,24 @@ describe('mediaSession early handler isolation', () => {
 		expect(tearingDown.handlers.get('pause')).toBeNull();
 		expect(tearingDown.handlers.get('nexttrack')).toBeTypeOf('function');
 	});
+
+	it('revokes the retained OS callback when clearing the same session throws', () => {
+		const { session, handlers } = isolatedSession(null, []);
+		const options = { session, MetadataCtor: FakeMetadata, baseUrl: BASE };
+		const callbacks = handlerSet();
+		applyMediaSession(DEMO_TRACKS[1]!, callbacks, options);
+		const retained = handlers.get('nexttrack')!;
+		vi.spyOn(session, 'setActionHandler').mockImplementation(() => { throw new Error('unsupported'); });
+		clearMediaSession(options);
+		retained();
+		expect(callbacks.onNext).not.toHaveBeenCalled();
+	});
+
+	it.each(['/\\foreign.example/art', 'https://user:pass@example.test/art'])(
+		'uses the placeholder for unsafe artwork %s', (artworkUrl) => {
+			const { session } = isolatedSession(null, []);
+			applyMediaSession({ ...DEMO_TRACKS[1]!, artworkUrl }, {}, { session, MetadataCtor: FakeMetadata, baseUrl: BASE });
+			expect((session.metadata as FakeMetadata).init.artwork?.[0]?.src).toBe(`${BASE}/placeholder-artwork.svg`);
+		}
+	);
 });

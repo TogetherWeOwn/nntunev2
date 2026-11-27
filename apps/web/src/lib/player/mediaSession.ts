@@ -67,16 +67,14 @@ const ARTWORK_SIZES = '512x512';
 
 function absolutizeArtworkSrc(src: string, baseUrl: string): string {
 	try {
-		return new URL(src, baseUrl).toString();
+		const url = new URL(src, baseUrl);
+		if (!url.username && !url.password && (!src.startsWith('/') ||
+			(url.origin !== 'null' && url.origin === new URL(baseUrl).origin))) return url.href;
+	} catch { /* Invalid artwork falls back to the shared placeholder. */ }
+	try {
+		return new URL(ARTWORK_PLACEHOLDER_SRC, new URL(baseUrl).origin).href;
 	} catch {
-		// `resolveArtwork` only prefix-checks, so a malformed URL such as
-		// `https://[` reaches here. Fall back to the placeholder rather
-		// than throwing out of metadata construction.
-		try {
-			return new URL(ARTWORK_PLACEHOLDER_SRC, baseUrl).toString();
-		} catch {
-			return ARTWORK_PLACEHOLDER_SRC;
-		}
+		return ARTWORK_PLACEHOLDER_SRC;
 	}
 }
 
@@ -105,13 +103,29 @@ function defaultMetadataCtor(): (new (init: MediaMetadataInit) => unknown) | nul
 	return MediaMetadata as unknown as new (init: MediaMetadataInit) => unknown;
 }
 
+const registeredActions = new WeakMap<MediaSessionLike, Map<string, { handler: ActionHandler; invoke: ActionHandler }>>();
+
 function setHandler(
 	session: MediaSessionLike,
 	action: string,
 	handler: ActionHandler | null | undefined
 ): void {
+	let actions = registeredActions.get(session);
+	if (!actions) registeredActions.set(session, actions = new Map());
+	const previous = actions.get(action);
+	if (previous && previous.handler === handler) return;
+	// Revoke first: an OS callback can survive a rejected replacement or clear.
+	actions.delete(action);
 	try {
-		session.setActionHandler(action, handler ?? null);
+		if (!handler) {
+			session.setActionHandler(action, null);
+			return;
+		}
+		const invoke: ActionHandler = (details) => {
+			if (actions.get(action)?.invoke === invoke) handler(details);
+		};
+		session.setActionHandler(action, invoke);
+		actions.set(action, { handler, invoke });
 	} catch {
 		// Some engines throw for unknown actions; one bad action must not
 		// take down the rest of the transport wiring.

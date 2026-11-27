@@ -51,4 +51,16 @@ describe('signed-in-email', () => {
 		expect(readSignedInEmail()).toBeNull();
 		expect(() => clearSignedInEmail()).not.toThrow();
 	});
+
+	it('suppresses malformed labels and retained bytes after a failed clear', () => {
+		const values = stubStorage();
+		values.set('nntune:signed-in-email', 'ada\u202e@example.com');
+		expect(readSignedInEmail()).toBeNull();
+		stashSignedInEmail('ada@example.com');
+		vi.spyOn(sessionStorage, 'removeItem').mockImplementation(() => { throw new Error('blocked'); });
+		stashSignedInEmail('ambiguous');
+		expect(readSignedInEmail()).toBeNull();
+		stashSignedInEmail('grace@example.com');
+		expect(readSignedInEmail()).toBe('grace@example.com');
+	});
 });

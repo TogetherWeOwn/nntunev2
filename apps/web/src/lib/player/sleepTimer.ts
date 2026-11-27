@@ -52,9 +52,11 @@ function validateMode(mode: SleepTimerMode): void {
 			throw new RangeError(`sleep duration must be a positive finite ms value, got ${mode.ms}`);
 		}
 	} else if (mode.kind === 'stop-after-tracks') {
-		if (!Number.isInteger(mode.count) || mode.count < 1) {
+		if (!Number.isSafeInteger(mode.count) || mode.count < 1) {
 			throw new RangeError(`stop-after count must be an integer >= 1, got ${mode.count}`);
 		}
+	} else if (mode.kind !== 'end-of-track') {
+		throw new RangeError('unknown sleep timer mode');
 	}
 }
 
@@ -70,7 +72,7 @@ export function createSleepTimer({ now, onFire }: SleepTimerDeps): SleepTimer {
 
 	return {
 		get mode() {
-			return mode;
+			return mode === null ? null : { ...mode };
 		},
 		get tracksElapsed() {
 			return tracksElapsed;
@@ -78,7 +80,9 @@ export function createSleepTimer({ now, onFire }: SleepTimerDeps): SleepTimer {
 		get progress(): SleepTimerProgress | null {
 			if (mode === null) return null;
 			if (mode.kind === 'duration') {
-				return { kind: 'duration', remainingMs: Math.max(0, armedAt + mode.ms - now()) };
+				const sampled = now();
+				return { kind: 'duration', remainingMs: Number.isFinite(sampled)
+					? Math.max(0, mode.ms - Math.max(0, sampled - armedAt)) : mode.ms };
 			}
 			if (mode.kind === 'end-of-track') return { kind: 'end-of-track' };
 			return {
@@ -89,17 +93,21 @@ export function createSleepTimer({ now, onFire }: SleepTimerDeps): SleepTimer {
 		start(next: SleepTimerMode) {
 			// Validate before touching state: a rejected start leaves the
 			// previous arming (if any) untouched.
-			validateMode(next);
-			mode = next;
-			armedAt = now();
+			const candidate = { ...next };
+			validateMode(candidate);
+			const sampled = candidate.kind === 'duration' ? now() : 0;
+			if (!Number.isFinite(sampled)) throw new RangeError('invalid sleep timer clock');
+			mode = candidate;
+			armedAt = sampled;
 			tracksElapsed = 0;
 		},
 		cancel() {
 			mode = null;
 		},
-		tick(nowMs: number = now()) {
+		tick(nowMs?: number) {
 			if (mode?.kind !== 'duration') return false;
-			if (nowMs >= armedAt + mode.ms) {
+			const sampled = nowMs === undefined ? now() : nowMs;
+			if (Number.isFinite(sampled) && sampled - armedAt >= mode.ms) {
 				fire();
 				return true;
 			}

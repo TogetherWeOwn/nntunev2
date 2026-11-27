@@ -38,8 +38,14 @@ export function createQueueController(initial: QueueState) {
 		subscribe: store.subscribe,
 		// The layout can outlive the route and its refresh receipts.
 		setLibraryBinding(binding: string): boolean {
+			if (!alive || purging) return false;
 			const replaced = libraryBinding !== undefined && libraryBinding !== binding;
 			libraryBinding = binding;
+			if (replaced) {
+				operation++;
+				revision.revoke();
+				librarySources = new Map();
+			}
 			return replaced;
 		},
 		restoreLibraryQueue: (storage: SnapshotStorage, catalogue: () => Track[]) =>
@@ -100,7 +106,6 @@ export function createQueueController(initial: QueueState) {
 			if (!alive || purging) return;
 			purging = true;
 			libraryBinding = undefined;
-			persistence.clear();
 			operation += 1;
 			revision.revoke();
 			librarySources = new Map();
@@ -109,7 +114,7 @@ export function createQueueController(initial: QueueState) {
 			if (previous.tracks.length || previous.currentIndex !== -1) snapshot = createQueue([]);
 			// Native cleanup sees the empty snapshot; subscribers only see it after cleanup.
 			try {
-				retirePlayer();
+				try { persistence.clear(); } finally { retirePlayer(); }
 			} finally {
 				try {
 					if (previous !== snapshot) store.set(snapshot);

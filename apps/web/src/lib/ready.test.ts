@@ -16,6 +16,11 @@ describe('readyResponse', () => {
 });
 
 describe('notReadyResponse', () => {
+	it.each([[NaN, '1'], [Infinity, '1'], [1e30, '2147483647'], [-1, '0'], [2.9, '2']])(
+		'emits a bounded decimal Retry-After for %s', (input, header) => {
+			expect(notReadyResponse(input).headers.get('retry-after')).toBe(header);
+		}
+	);
 	it('returns 503 with {ok:false} and a Retry-After header', async () => {
 		const res = notReadyResponse(5);
 

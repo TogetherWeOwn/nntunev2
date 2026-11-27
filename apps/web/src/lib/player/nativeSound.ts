@@ -1,7 +1,8 @@
 import { writable } from 'svelte/store';
 import { browserStorage } from '../library/cache.js';
 import {
-	applySoundPreference, loadSoundPreference, saveSoundPreference, type SoundPreference
+	applySoundPreference, loadSoundPreference, parseSoundPreference, saveSoundPreference,
+	SOUND_PREFERENCE_STORAGE_KEY, type SoundPreference
 } from './soundPreference.js';
 
 type SoundElement = EventTarget & Pick<HTMLMediaElement, 'volume' | 'muted'>;
@@ -13,6 +14,9 @@ export function createNativeSound(
 	let actual = { volume: 1, muted: false, restricted: false };
 	let active: { audio: SoundElement; owns: () => boolean } | undefined;
 	const state = writable({ ...actual, ready: false });
+	const storageOrNull = () => {
+		try { return getStorage(); } catch { return null; }
+	};
 
 	function publish() {
 		state.set({ ...actual, ready: !!active });
@@ -25,7 +29,7 @@ export function createNativeSound(
 		const observed = request ? applySoundPreference(audio, request) : {
 			volume: audio.volume, muted: audio.muted, restricted: false
 		};
-		if (!target.owns()) return;
+		if (active !== target || !target.owns()) return;
 		const volumeChanged = observed.volume !== actual.volume;
 		const muteChanged = observed.muted !== actual.muted;
 		// Publish clamped readback, but don't save it as an accepted request.
@@ -37,12 +41,19 @@ export function createNativeSound(
 				muted: muteChanged ? observed.muted : preference.muted
 			};
 			// Merge for storage only; replacement still uses this tab's accepted choices.
-			const storage = getStorage();
-			const saved = loadSoundPreference(storage, preference);
-			saveSoundPreference(storage, {
-				volume: saveVolume ? preference.volume : saved.volume,
-				muted: muteChanged ? preference.muted : saved.muted
-			});
+			const accepted = preference;
+			const storage = storageOrNull();
+			try {
+				const raw = storage?.getItem(SOUND_PREFERENCE_STORAGE_KEY) ?? null;
+				const saved = parseSoundPreference(raw, accepted);
+				if (active === target && target.owns() && preference === accepted) {
+					saveSoundPreference(storage, {
+						volume: saveVolume ? accepted.volume : saved.volume,
+						muted: muteChanged ? accepted.muted : saved.muted
+					});
+				}
+			} catch { /* An unreadable record cannot be merged safely. */ }
+			if (active !== target || !target.owns() || preference !== accepted) return;
 		}
 		observed.restricted ||= actual.restricted;
 		if (volumeChanged || muteChanged || observed.restricted !== actual.restricted) {
@@ -57,7 +68,7 @@ export function createNativeSound(
 		connect(audio: SoundElement, matches: () => boolean, signal: AbortSignal): void {
 			const owns = () => !signal.aborted && matches();
 			if (!owns()) return;
-			preference ??= loadSoundPreference(getStorage());
+			preference ??= loadSoundPreference(storageOrNull());
 			const observed = applySoundPreference(audio, preference);
 			if (!owns()) return;
 			observed.restricted ||= actual.restricted;

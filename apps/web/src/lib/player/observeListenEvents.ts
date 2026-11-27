@@ -27,7 +27,7 @@ export interface ListenObserver {
 
 /** Reformat the canonical unpadded base64url grant ID without changing its bits. */
 export function playbackIdFromGrant(id: string | undefined): string | undefined {
-	if (id === undefined || !/^[A-Za-z0-9_-]{21}[AQgw]$/.test(id)) return;
+	if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{21}[AQgw]$/.test(id)) return;
 	const bytes = atob(id.replace(/-/g, '+').replace(/_/g, '/'));
 	const h = Array.from(bytes, (byte) => byte.charCodeAt(0).toString(16).padStart(2, '0')).join('');
 	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
@@ -50,7 +50,9 @@ export function observeListenEvents(
 
 	function finishAbandoned(): void {
 		let ended = endedSeen;
-		try { ended = !element.seeking && (ended || element.ended === true); } catch { /* Keep the sampled value. */ }
+		try {
+			ended = element.error === null && !element.seeking && (ended || element.ended === true);
+		} catch { ended = false; }
 		finish(ended ? 'complete' : 'skip');
 	}
 
@@ -71,13 +73,13 @@ export function observeListenEvents(
 	});
 	// Teardown can clear element.ended before our ended listener runs.
 	const sampleEnded = safe(() => {
-		if (!element.seeking && element.ended === true) endedSeen = true;
+		if (element.error === null && !element.seeking && element.ended === true) endedSeen = true;
 	});
 	const onSeeking = safe(() => {
 		endedSeen = false;
 	});
 	const onEnded = safe(() => {
-		if (!element.seeking && element.ended === true) finish('complete');
+		if (element.error === null && !element.seeking && element.ended === true) finish('complete');
 	});
 	const finishCurrent = safe(finishAbandoned);
 	const listeners: [string, () => void][] = [

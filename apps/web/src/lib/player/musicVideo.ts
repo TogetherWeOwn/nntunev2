@@ -12,8 +12,9 @@ export interface VerifiedVideoLink {
 
 export function verifiedVideoId(link: VerifiedVideoLink, recordingId: string, now = Date.now()) {
 	const age = now - link.verifiedAt;
-	if (link.recordingId !== recordingId || !Number.isFinite(age) || age < 0 ||
-		age >= verificationLifetime || link.videoId.length !== 11 || !/^[A-Za-z0-9_-]+$/.test(link.videoId)) {
+	if (!recordingId || link.recordingId !== recordingId || !Number.isFinite(now) ||
+		!Number.isFinite(link.verifiedAt) || age < 0 || age >= verificationLifetime ||
+		typeof link.videoId !== 'string' || !/^[A-Za-z0-9_-]{11}$/.test(link.videoId)) {
 		return null;
 	}
 	return link.videoId;
@@ -38,29 +39,44 @@ interface YouTubeApi {
 let loadingApi: Promise<YouTubeApi> | undefined;
 
 export function loadYouTubeApi() {
-	const host = window as Window & { YT?: YouTubeApi; onYouTubeIframeAPIReady?: () => void };
-	if (host.YT?.Player) return Promise.resolve(host.YT);
-	loadingApi ??= new Promise<YouTubeApi>((resolve, reject) => {
-		const script = document.createElement('script');
-		const timer = window.setTimeout(fail, 8_000);
-		function fail() {
-			window.clearTimeout(timer);
-			script.onerror = null;
-			delete host.onYouTubeIframeAPIReady;
-			script.remove();
-			loadingApi = undefined;
-			reject(new Error('YouTube player API unavailable'));
-		}
-		host.onYouTubeIframeAPIReady = () => {
-			if (!host.YT?.Player) return fail();
-			window.clearTimeout(timer);
-			script.onerror = null;
-			delete host.onYouTubeIframeAPIReady;
-			resolve(host.YT);
-		};
-		script.onerror = fail;
-		script.src = `${YOUTUBE_API_ORIGIN}/iframe_api`;
-		document.head.append(script);
+	loadingApi ??= Promise.resolve().then(() => {
+		const host = window as Window & { YT?: YouTubeApi; onYouTubeIframeAPIReady?: () => void };
+		if (typeof host.YT?.Player === 'function') return host.YT;
+		return new Promise<YouTubeApi>((resolve, reject) => {
+			const script = document.createElement('script');
+			const timer = host.setTimeout(fail, 8_000);
+			let settled = false;
+			function cleanup() {
+				settled = true;
+				host.clearTimeout(timer);
+				script.onerror = null;
+				if (host.onYouTubeIframeAPIReady === ready) delete host.onYouTubeIframeAPIReady;
+			}
+			function fail() {
+				if (settled) return;
+				cleanup();
+				script.remove();
+				reject(new Error('YouTube player API unavailable'));
+			}
+			function ready() {
+				if (settled) return;
+				const api = host.YT;
+				if (typeof api?.Player !== 'function') return fail();
+				cleanup();
+				resolve(api);
+			}
+			try {
+				host.onYouTubeIframeAPIReady = ready;
+				script.onerror = fail;
+				script.src = `${YOUTUBE_API_ORIGIN}/iframe_api`;
+				document.head.append(script);
+			} catch {
+				fail();
+			}
+		});
+	}).catch((error: unknown) => {
+		loadingApi = undefined;
+		throw error;
 	});
 	return loadingApi;
 }

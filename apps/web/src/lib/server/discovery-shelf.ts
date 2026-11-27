@@ -16,12 +16,18 @@ export interface DiscoveryCandidate {
 
 export type DiscoveryTrack = Pick<LibraryItem, 'id' | 'title' | 'artist'>;
 
+export function isMirrorMbid(value: unknown): value is string {
+	return typeof value === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
+}
+
 export function toPublicDiscoveryTrack(candidate: DiscoveryCandidate): DiscoveryTrack | undefined {
 	const { user_id, id, release_mbid, recording_mbids, track_no, title, artist } = candidate;
 	// A track position is present only for an exact mirror release/recording match.
 	if (
-		user_id !== null || !release_mbid || track_no === null ||
-		!recording_mbids.includes(id) || !title?.trim()
+		user_id !== null || !isMirrorMbid(id) || !isMirrorMbid(release_mbid) ||
+		track_no === null || !Number.isInteger(track_no) || track_no < 0 || track_no > 32767 ||
+		!Array.isArray(recording_mbids) || !recording_mbids.includes(id) ||
+		typeof title !== 'string' || !title.trim() || (artist !== null && typeof artist !== 'string')
 	) return;
 	return { id: id.toLowerCase(), title, artist: artist ?? undefined };
 }

@@ -9,18 +9,30 @@
  * HttpOnly session cookie is the credential; this is a label on it.
  */
 const KEY = 'nntune:signed-in-email';
+const revoked = new WeakSet<Storage>();
+
+function validLabel(value: string | null): value is string {
+	return typeof value === 'string' && value.length <= 254 &&
+		!/\p{Bidi_Control}|\p{Cc}|\s/u.test(value) && /^[^@]+@[^@]*\.[^@]*$/.test(value);
+}
 
 export function stashSignedInEmail(email: string): void {
 	try {
-		sessionStorage.setItem(KEY, email);
+		const storage = sessionStorage;
+		if (!validLabel(email)) return clearSignedInEmail();
+		storage.setItem(KEY, email);
+		revoked.delete(storage);
 	} catch {
-		// Display only: unavailable storage just loses the label.
+		clearSignedInEmail();
 	}
 }
 
 export function readSignedInEmail(): string | null {
 	try {
-		return sessionStorage.getItem(KEY);
+		const storage = sessionStorage;
+		if (revoked.has(storage)) return null;
+		const value = storage.getItem(KEY);
+		return validLabel(value) ? value : null;
 	} catch {
 		return null;
 	}
@@ -28,7 +40,9 @@ export function readSignedInEmail(): string | null {
 
 export function clearSignedInEmail(): void {
 	try {
-		sessionStorage.removeItem(KEY);
+		const storage = sessionStorage;
+		revoked.add(storage);
+		storage.removeItem(KEY);
 	} catch {
 		// Display only: a missing store just leaves nothing to clear.
 	}
