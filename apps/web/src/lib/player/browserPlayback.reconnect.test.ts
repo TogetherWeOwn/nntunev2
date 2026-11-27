@@ -263,17 +263,29 @@ test('native replay while the reconnect retry grant is in flight retires the rev
 
 test('replaying or reordering while offline aborts the superseded reconnect listener without accumulating listeners', async () => {
 	const network = simulateConnectivity();
+	const { player, media, queue, fetchFn, src, attach, toggleDuringFirstPlay } = setup();
+	const originalSubscribe = queue.subscribe;
+	let queueSubscribers = 0;
+	const subscribe = vi.spyOn(queue, 'subscribe').mockImplementation((...args) => {
+		const unsubscribe = originalSubscribe(...args);
+		queueSubscribers++;
+		return () => {
+			unsubscribe();
+			queueSubscribers--;
+		};
+	});
 	try {
-		const { player, media, queue, fetchFn, src, attach, toggleDuringFirstPlay } = setup();
 		await toggleDuringFirstPlay();
 		const first = src();
 		const ended = attach(false);
+		const baselineSubscribers = queueSubscribers;
 		network.drop();
 		for (let round = 0; round < 2; round++) {
 			fetchFn.mockRejectedValueOnce(new TypeError('Failed to fetch'));
 			ended.finish();
 			await vi.waitFor(() => expect(network.onlineListeners).toBe(1));
 			await vi.waitFor(() => expect(player.queueAnnouncement.text).toBe('Could not start the next track. Choose a track to continue.'));
+			expect(queueSubscribers).toBe(baselineSubscribers + 1);
 			if (round === 0) {
 				ended.ended = false;
 				ended.paused = false;
@@ -282,9 +294,11 @@ test('replaying or reordering while offline aborts the superseded reconnect list
 				expect(player.moveQueuedTrack(0, 1)).toBe(true);
 			}
 			expect(network.onlineListeners).toBe(0);
+			expect(queueSubscribers).toBe(baselineSubscribers);
 		}
 		expect([queue.snapshot.currentIndex, src(), media.audio]).toEqual([1, first, ended]);
 	} finally {
+		subscribe.mockRestore();
 		network.cleanup();
 	}
 });
