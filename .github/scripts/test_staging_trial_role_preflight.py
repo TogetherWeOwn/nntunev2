@@ -9,7 +9,7 @@ from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from staging_apply import StagingApplyError
 import staging_trial_ambient_acl as ambient
@@ -76,6 +76,18 @@ class OfflineTrialBoundaryTests(unittest.TestCase):
                '"port":5432,"baseline":{},"consumers":[]}')
         with self.assertRaises(ValueError):
             ambient.plan_config(raw, sha256(raw.encode()).hexdigest())
+
+    def test_ambient_provider_refuses_conflicting_branch_metadata(self):
+        with patch.object(ambient.http.client, "HTTPSConnection") as connect:
+            conn = connect.return_value
+            conn.getresponse.side_effect = [
+                Mock(status=200, read=Mock(return_value=b'{"default_branch":"main"}')),
+                Mock(status=200, read=Mock(return_value=(
+                    b'{"id":"fixture","name":"staging","production":true,"production":false,"ready":true}'))),
+            ]
+            with self.assertRaises(ValueError):
+                ambient.verify_branch("fixture", "test:token")
+            conn.close.assert_called_once_with()
 
     def test_exact_acl_preserves_expected_rows_for_missing_roles(self):
         entries = [("reader", 42001, "DATABASE", preflight.DATABASE, "CONNECT", "")]
