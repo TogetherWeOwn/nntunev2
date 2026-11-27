@@ -240,6 +240,51 @@ fn validate_missing_or_invalid_line_offset_exits_2() {
 }
 
 #[test]
+fn validate_refuses_line_numbers_beyond_bigint_before_touching_outputs() {
+    let dir = scratch_dir("line-number-range");
+    let input = dir.join("in.tsv");
+    let valid = dir.join("valid.tsv");
+    let poison = dir.join("poison.tsv");
+    let bytes = format!("{VALID_ARTIST}\n{BAD_UUID_ARTIST}\n");
+    std::fs::write(&input, bytes).unwrap();
+    let limit = i64::MAX as u64;
+
+    let run = |offset: u64| {
+        run_validate_argv(validate_args(
+            "artist",
+            &input,
+            &valid,
+            &poison,
+            &offset.to_string(),
+        ))
+    };
+    let output = run(limit - 2);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"valid=1 poison=1\n");
+    let good_bytes = std::fs::read(&valid).unwrap();
+    let poison_bytes = std::fs::read(&poison).unwrap();
+    assert_eq!(
+        good_bytes,
+        format!("{VALID_ARTIST}\t{}\n", limit - 1).as_bytes()
+    );
+    assert!(poison_bytes.starts_with(format!("bad_uuid\t{limit}\t").as_bytes()));
+
+    for offset in [limit - 1, u64::MAX] {
+        let output = run(offset);
+        assert_exit_2(&output, "line number exceeds BIGINT");
+        assert!(output.stdout.is_empty());
+        assert_eq!(std::fs::read(&valid).unwrap(), good_bytes);
+        assert_eq!(std::fs::read(&poison).unwrap(), poison_bytes);
+    }
+
+    std::fs::write(&input, b"").unwrap();
+    let output = run(u64::MAX);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"valid=0 poison=0\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn validate_missing_or_unreadable_input_exits_2() {
     let dir = scratch_dir("input");
     // Missing file: point --in at a path that was never created.

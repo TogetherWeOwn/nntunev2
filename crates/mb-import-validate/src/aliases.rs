@@ -77,11 +77,14 @@ pub fn lookup(bytes: &[u8], kind: EntityKind, query: &str) -> Result<Vec<AliasMa
             .transpose()
             .map_err(invalid)?;
         let sort_name = decode_required(sort_name).map_err(invalid)?;
+        // Report poison escapes before enforcing the producer's literal spellings.
+        decode_required(primary).map_err(invalid)?;
         let primary_for_locale = match primary {
             "t" => true,
             "f" => false,
             _ => return Err(invalid(reason::BAD_BOOL)),
         };
+        decode_required(timestamp).map_err(invalid)?;
         if !is_curated_timestamp(timestamp) {
             return Err(invalid(reason::BAD_TIMESTAMP));
         }

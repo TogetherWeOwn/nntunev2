@@ -8,12 +8,15 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use mb_import_validate::{aliases, relationships, release_credits, release_labels, works};
+use mb_import_validate::{
+    aliases, reason, relationships, release_credits, release_labels, validate_line, works, Table,
+};
 
 const RELEASE: &str = "55555555-5555-4555-8555-555555555555";
 const ARTIST: &str = "11111111-1111-4111-8111-111111111111";
 const RECORDING: &str = "88888888-8888-4888-8888-888888888888";
 const WORK: &str = "80808080-8080-4808-8808-808080808080";
+const TS: &str = "2025-02-03T04:05:06Z";
 
 const PUBLISHED: &[&str] = &[
     "mbdump-artist.tsv",
@@ -210,4 +213,133 @@ fn readers_fail_closed_on_truncated_or_malformed_synthetic_inputs() {
         RELEASE
     )
     .is_err());
+}
+
+#[test]
+fn literal_alias_and_label_columns_report_poison_before_shape_errors() {
+    for (token, why) in [
+        (r"\q", reason::BAD_ESCAPE),
+        (r"\N", reason::NULL_IN_NOT_NULL),
+    ] {
+        for (primary, ts) in [(token, TS), ("f", token)] {
+            let alias = format!("{ARTIST}\tName\t\tSort\t{primary}\t{ts}\n");
+            assert_eq!(
+                aliases::lookup(alias.as_bytes(), aliases::EntityKind::Artist, "Name"),
+                Err(aliases::ReadError::InvalidRow {
+                    line: 1,
+                    reason: why
+                })
+            );
+        }
+        let label = format!("{ARTIST}\tLabel\t\\N\t\\N\t{token}\n");
+        assert_eq!(
+            release_labels::lookup(label.as_bytes(), b"", RELEASE),
+            Err(release_labels::ReadError::InvalidRow(
+                release_labels::Artifact::Labels,
+                1,
+                why
+            ))
+        );
+        let labels = format!("{ARTIST}\tLabel\t\\N\t\\N\t{TS}\n");
+        let edge = format!("{RELEASE}\t{ARTIST}\t\t{token}\n");
+        assert_eq!(
+            release_labels::lookup(labels.as_bytes(), edge.as_bytes(), RELEASE),
+            Err(release_labels::ReadError::InvalidRow(
+                release_labels::Artifact::ReleaseLabels,
+                1,
+                why
+            ))
+        );
+    }
+}
+
+#[test]
+fn copy_rows_reject_raw_newlines_and_signed_timestamp_components() {
+    let raw = format!("{ARTIST}\thttps://example.test/\nnext\t{TS}");
+    assert_eq!(
+        validate_line(Table::Url, 7, &raw),
+        Err((reason::BAD_ESCAPE, 7))
+    );
+    let escaped = raw.replace('\n', r"\n");
+    assert_eq!(
+        validate_line(Table::Url, 7, &escaped),
+        Ok(format!("{escaped}\t7"))
+    );
+
+    for timestamp in [
+        "+025-02-03T04:05:06Z",
+        "2025-+2-03T04:05:06Z",
+        "2025-02-+3T04:05:06Z",
+        "2025-02-03T+4:05:06Z",
+        "2025-02-03T04:+5:06Z",
+        "2025-02-03T04:05:+6Z",
+        r"2025-02-03T04:05:\0536Z",
+    ] {
+        let row = format!("{ARTIST}\tURL\t{timestamp}");
+        assert_eq!(
+            validate_line(Table::Url, 8, &row),
+            Err((reason::BAD_TIMESTAMP, 8))
+        );
+    }
+}
+
+#[test]
+fn credit_reader_distinguishes_invalid_artifact_bytes_from_decoded_poison() {
+    let valid = format!("{RELEASE}\t0\t{ARTIST}\tName\t\t{TS}\n");
+    let invalid_utf8 = [valid.as_bytes(), b"\xff"].concat();
+    assert_eq!(
+        release_credits::lookup(&invalid_utf8, RELEASE),
+        Err(release_credits::ReadError::InvalidUtf8)
+    );
+
+    let escaped = format!("{valid}{RELEASE}\t0\t{ARTIST}\t\\xff\t\t{TS}\n");
+    assert_eq!(
+        release_credits::lookup(escaped.as_bytes(), RELEASE),
+        Err(release_credits::ReadError::InvalidRow {
+            line: 2,
+            reason: reason::BAD_ESCAPE
+        })
+    );
+}
+
+#[test]
+fn recording_relationship_limit_counts_decoded_characters_on_unmatched_rows() {
+    let projection = relationships::Projection::RecordingRecording;
+    let link_type = r"\303\251".repeat(255);
+    let row = format!("{RECORDING}\t{ARTIST}\t{link_type}\t{TS}\n");
+    let edges = relationships::lookup(projection, row.as_bytes(), RECORDING).unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].link_type, "é".repeat(255));
+
+    let oversized = format!("{row}{ARTIST}\t{RECORDING}\t{link_type}é\t{TS}\n");
+    assert_eq!(
+        relationships::lookup(projection, oversized.as_bytes(), RECORDING),
+        Err(relationships::ReadError::InvalidRow {
+            line: 2,
+            reason: "invalid_link_type"
+        })
+    );
+}
+
+#[test]
+fn release_label_join_reports_the_first_duplicate_or_orphan_on_unmatched_rows() {
+    let query = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let labels = format!("{ARTIST}\tLabel\t\\N\t\\N\t{TS}\n");
+    let valid = format!("{RELEASE}\t{ARTIST}\tA\t{TS}\n");
+    let duplicate = format!("{RELEASE}\t{ARTIST}\t\\101\t{TS}\n");
+    let orphan = format!("{RELEASE}\t{WORK}\tA\t{TS}\n");
+    for (first, second, why) in [
+        (&duplicate, &orphan, "duplicate_release_label_key"),
+        (&orphan, &duplicate, "missing_label_mbid"),
+    ] {
+        let edges = format!("{valid}{first}{second}");
+        assert_eq!(
+            release_labels::lookup(labels.as_bytes(), edges.as_bytes(), query),
+            Err(release_labels::ReadError::InvalidRow(
+                release_labels::Artifact::ReleaseLabels,
+                2,
+                why
+            ))
+        );
+    }
 }

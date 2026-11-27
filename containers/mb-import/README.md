@@ -263,7 +263,7 @@ check every parent) — as `fk_missing_artist` / `fk_missing_release_group` /
 `fk_missing_release` / `fk_missing_recording` / `fk_missing_url` instead of
 aborting the chunk. (Sources: `crates/mb-import-validate/src/lib.rs:98-114`
 (reason codes), `:283-293` (`bad_escape` rule);
-`crates/mb-import-validate/src/main.rs:129` (`invalid_encoding` on
+`crates/mb-import-validate/src/main.rs:136` (`invalid_encoding` on
 non-UTF-8 bytes); `import.sh:526-618`
 (FK orphan split); `migrations/0014_mb_import_resume_dlq.sql`;
 `migrations/0001_mb_mirror.sql:57-65`.)

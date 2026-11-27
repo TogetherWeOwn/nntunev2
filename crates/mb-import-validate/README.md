@@ -71,7 +71,7 @@ on the decoded value (`src/lib.rs:197-297`).
   numeric offset, and >6 fractional digits are `bad_timestamp`. Impossible
   months/days and leap-day on non-leap years are also rejected
   (`is_timestamp`, `src/lib.rs:532-552`; seconds required
-  `src/lib.rs:630-633`; numeric zone only after a time
+  `src/lib.rs:642-645`; numeric zone only after a time
   `src/lib.rs:566-571`). Country must decode to
   exactly 2 chars (`bad_country`, `src/lib.rs:349-352`): `\x55S` is `US`,
   while the two-byte spelling `\t` is one character and poison.
@@ -80,7 +80,7 @@ on the decoded value (`src/lib.rs:197-297`).
   `\b \f \n \r \t \v`, octal `\` + 1-3 octal digits, hex `\x` + 1-2 hex
   digits); anything else — including `\q`, `\o`, `\u`, a bare `\x`,
   `\8`/`\9`, out-of-range `\400`, NUL-producing and non-UTF8-decoding
-  sequences, or a raw CR — is `bad_escape`
+  sequences, or a raw CR or LF inside a field — is `bad_escape`
   (`src/lib.rs:414-474`). Deliberately stricter than COPY, which would load
   unknown escapes mangled instead of refusing them.
 - **NULL discipline:** a literal `\N` in a NOT NULL column is
@@ -103,7 +103,7 @@ verbatim into the dead-letter table (`src/lib.rs:67-81`):
 `column_count`, `empty_line`, `bad_uuid`, `bad_int`, `bad_timestamp`,
 `bad_escape`, `null_in_not_null`, `bad_country`, `negative_duration`,
 `negative_position`, `invalid_encoding`. `invalid_encoding` is produced only
-by the binary for non-UTF8 input bytes (`src/main.rs:123-138`); the
+by the binary for non-UTF8 input bytes (`src/main.rs:130-145`); the
 `fk_missing_*` reasons are produced only by `import.sh`'s orphan split, not
 by this crate (`containers/mb-import/import.sh:431-506`).
 
@@ -132,7 +132,7 @@ by this crate (`containers/mb-import/import.sh:431-506`).
   chunk offset added by the caller — is appended as the final column, and
   the loader COPYs it into `line_no` (`src/lib.rs:27,123,210`).
   The binary computes it as `--line-offset + index + 1`
-  (`src/main.rs:117-118`).
+  (`src/main.rs:124-125`).
 
 `escape_poison_field` escapes a poison raw line (`reason \t line_no \t
 raw`) so it round-trips through COPY text: backslash first, then tab/CR/LF
@@ -170,27 +170,29 @@ Two modes; poison rows are expected data and never change the exit code
   --valid-out <tsv> --poison-out <tsv> --line-offset <n>`
   (`src/main.rs:17-22,74-81`). Writes normalized valid rows and
   `reason \t line_no \t escaped-raw` poison rows, then prints exactly
-  `valid=<n> poison=<m>` (`src/main.rs:144-161,173`). `import.sh` parses
+  `valid=<n> poison=<m>` (`src/main.rs:151-168,180`). `import.sh` parses
   that summary, recounts both files against it, and refuses on any
   disagreement (`containers/mb-import/import.sh:385-408`). Every output
   write and flush is checked: a short write (disk full, closed pipe) exits
   2 instead of printing counts the cursor would advance on
-  (`src/main.rs:119-172`).
+  (`src/main.rs:130-179`).
 - **Plan mode:**
   `mb-validate --plan --completed <n> --total <n> --size <n>` prints the
   1-based inclusive chunk ranges still pending after the resume cursor, one
   `start-end` per line (`src/main.rs:8-9,45-56`, ranges
   `src/lib.rs:165-180`). `--size 0` is a usage error; a closed downstream
   (BrokenPipe) is a clean shutdown (`src/main.rs:49-72`).
-- **Exit codes:** 0 success, 2 usage or I/O error (`src/main.rs:11`); any
-  validator exit other than 0 keeps the cursor pinned
+- **Exit codes:** 0 success, 2 usage or I/O error (`src/main.rs:11`). A
+  chunk whose line numbers exceed the database's `BIGINT` limit exits 2
+  before either output is opened (`src/main.rs:105-110`). Any validator
+  exit other than 0 keeps the cursor pinned
   (`containers/mb-import/import.sh:385-390`).
 - **Line splitting:** input splits on LF only, matching how Postgres reads
   the same file; one trailing newline ends the last line and is not an
   extra empty line, while an empty file yields zero lines
-  (`src/main.rs:107-116`). One trailing CR per line is stripped so CRLF
+  (`src/main.rs:94-103`). One trailing CR per line is stripped so CRLF
   dumps validate like the LF dumps COPY would read
-  (`src/main.rs:140-142`).
+  (`src/main.rs:146-149`).
 
 ## Checks
 

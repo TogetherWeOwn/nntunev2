@@ -91,6 +91,23 @@ fn run_validate(args: &[String]) {
             std::process::exit(2);
         });
 
+    // Split on LF only: a raw CR stays inside the field (COPY text data),
+    // matching how Postgres reads the same file. A trailing newline ends
+    // the last line; it is not an extra empty line.
+    let mut parts: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
+    if bytes.last() == Some(&b'\n') {
+        parts.pop();
+    }
+    if bytes.is_empty() {
+        parts.clear();
+    }
+
+    // Both COPY outputs store line_no as a Postgres BIGINT. Check the full
+    // range before touching the output files, including rows that are poison.
+    if !parts.is_empty() && offset.saturating_add(parts.len() as u64) > i64::MAX as u64 {
+        eprintln!("mb-validate: line numbers exceed the Postgres BIGINT range");
+        std::process::exit(2);
+    }
     let valid_file = File::create(&valid_path).unwrap_or_else(|e| {
         eprintln!("mb-validate: cannot write {valid_path:?}: {e}");
         std::process::exit(2);
@@ -104,16 +121,6 @@ fn run_validate(args: &[String]) {
 
     let mut valid_n: u64 = 0;
     let mut poison_n: u64 = 0;
-    // Split on LF only: a raw CR stays inside the field (COPY text data),
-    // matching how Postgres reads the same file. A trailing newline ends
-    // the last line; it is not an extra empty line.
-    let mut parts: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
-    if bytes.last() == Some(&b'\n') {
-        parts.pop();
-    }
-    if bytes.is_empty() {
-        parts.clear();
-    }
     for (idx, chunk) in parts.iter().enumerate() {
         let line_no = offset + idx as u64 + 1;
         // Every write below is checked: a short valid.tsv (disk full,
