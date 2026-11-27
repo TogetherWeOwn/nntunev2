@@ -92,28 +92,24 @@ impl Level {
     }
 }
 
-/// Construction failure. Variants name the offending key or event only:
-/// values are never echoed, so an error path cannot leak what it rejected.
+/// Construction failure. Variants carry only the rejection reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogError {
-    /// `trace_id` is not 32 lowercase hex chars.
     BadTraceId,
-    /// Event name violates the standard (carries the name: event names are
-    /// code-controlled, never caller secrets).
-    BadEvent(String),
-    /// `fields` JSON is not an object.
+    BadEvent,
+    BadTimestamp,
     FieldsNotAnObject,
-    /// A `fields` value is nested (object/array); only flat primitives log.
-    NestedField(String),
-    /// A `fields` key names personal data or credentials.
-    BannedField(String),
-    /// A `fields` string value looks like a credential.
+    NestedField,
+    BannedField,
     SecretValue,
-    /// A `fields` string value looks like personal data (email shape).
     PiiValue,
-    /// A `fields` string value looks like an IP address (v4 or v6).
     IpAddressValue,
-    /// Entropy source unavailable for ID generation.
+    /// `fields` exceeds the maximum number of entries.
+    TooManyFields,
+    /// A key is empty, too long, or contains unsupported characters.
+    BadFieldKey,
+    /// A field string exceeds the maximum UTF-8 byte length.
+    FieldValueTooLong,
     NoEntropy,
 }
 
@@ -121,13 +117,17 @@ impl fmt::Display for LogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LogError::BadTraceId => write!(f, "trace_id must be 32 lowercase hex chars"),
-            LogError::BadEvent(event) => write!(f, "invalid event name: {event}"),
+            LogError::BadEvent => write!(f, "invalid event name"),
+            LogError::BadTimestamp => write!(f, "timestamp exceeds RFC 3339 year range"),
             LogError::FieldsNotAnObject => write!(f, "fields must be a JSON object"),
-            LogError::NestedField(key) => write!(f, "nested fields value: {key}"),
-            LogError::BannedField(key) => write!(f, "banned fields key: {key}"),
+            LogError::NestedField => write!(f, "nested fields value"),
+            LogError::BannedField => write!(f, "banned fields key"),
             LogError::SecretValue => write!(f, "fields value looks like a credential"),
             LogError::PiiValue => write!(f, "fields value looks like personal data"),
             LogError::IpAddressValue => write!(f, "fields value looks like an IP address"),
+            LogError::TooManyFields => write!(f, "too many fields"),
+            LogError::BadFieldKey => write!(f, "invalid fields key"),
+            LogError::FieldValueTooLong => write!(f, "fields value is too long"),
             LogError::NoEntropy => write!(f, "trace-id randomness unavailable"),
         }
     }
@@ -287,22 +287,20 @@ const BANNED_KEY_PARTS: &[&str] = &[
     "password",
     "passwd",
     "secret",
-    "api_key",
     "apikey",
     "token",
     "credential",
     "passphrase",
     "cookie",
     "authorization",
-    "private_key",
     "privatekey",
     "mnemonic",
     "ssn",
-    "credit_card",
-    "card_number",
+    "creditcard",
+    "cardnumber",
     "cvv",
-    "payment_details",
-    "payment_method",
+    "paymentdetails",
+    "paymentmethod",
     "email",
     "session",
     "postal",
@@ -311,16 +309,18 @@ const BANNED_KEY_PARTS: &[&str] = &[
     // NOTE: no bare "payment" — payment_id must stay loggable.
     "street",
     "postcode",
-    "zip_code",
-    "request_body",
-    "response_body",
+    "zipcode",
+    "requestbody",
+    "responsebody",
     "headers",
-    "raw_query",
-    "query_string",
-    "nzb_contents",
-    "nzb_xml",
+    "rawquery",
+    "querystring",
+    "nzbcontents",
+    "nzbxml",
 ];
 
+// The key matcher removes separators before checking these name variants.
+// Bare name components are checked separately to preserve keys like filename.
 const BANNED_NAME_PARTS: &[&str] = &[
     "username",
     "firstname",
@@ -340,121 +340,120 @@ const BANNED_NAME_PARTS: &[&str] = &[
 #[must_use]
 pub fn is_banned_field_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    let has_ip_component = lower
+    let compact: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();
+    let has_sensitive_component = lower
         .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|part| part == "ip" || part == "ipv4" || part == "ipv6")
-        || ["clientip", "remoteip", "ipaddress"]
+        .any(|part| matches!(part, "ip" | "name"));
+    has_sensitive_component
+        || compact == "ip"
+        || ["clientip", "remoteip", "ipv4", "ipv6"]
             .iter()
-            .any(|part| lower.contains(part))
-        || lower.contains("ipv4")
-        || lower.contains("ipv6");
-    let has_name_component = lower == "name"
-        || lower.starts_with("name_")
+            .any(|part| compact.contains(part))
         || lower.contains("_name")
-        || BANNED_NAME_PARTS.iter().any(|part| lower.contains(part));
-    has_ip_component
-        || has_name_component
-        || BANNED_KEY_PARTS.iter().any(|part| lower.contains(part))
+        || BANNED_NAME_PARTS.iter().any(|part| compact.contains(part))
+        || BANNED_KEY_PARTS.iter().any(|part| compact.contains(part))
+        || looks_like_secret_value(key)
+        || looks_like_ipv4_value(key)
 }
 
 const SECRET_VALUE_PREFIXES: &[&str] = &[
-    "bearer ", "token ", "sk-", "sk_live_", "sk_test_", "tok_", "ghp_", "gho_", "ghu_", "xoxb-",
-    "xoxp-",
+    "sk-", "sk_live_", "sk_test_", "tok_", "ghp_", "gho_", "ghu_", "xoxb-", "xoxp-",
+];
+const CREDENTIAL_LABELS: &[&str] = &[
+    "password",
+    "secret",
+    "apikey",
+    "api_key",
+    "authorization",
+    "cookie",
+    "token",
+    "passwd",
+    "passphrase",
+    "credential",
+    "private_key",
 ];
 
-const SECRET_VALUE_MARKERS: &[&str] = &[
-    "password=",
-    "password:",
-    "secret=",
-    "secret:",
-    "apikey=",
-    "api_key=",
-];
-
-/// A string value is rejected when it opens with a known credential prefix
-/// or embeds a `key=value` credential marker. Benign task labels
-/// (`task-queued`) pass.
+/// Detect known credential prefixes, schemes, and assignments in diagnostic text.
 #[must_use]
 pub fn looks_like_secret_value(value: &str) -> bool {
-    let lower = value.trim_start().to_ascii_lowercase();
-    SECRET_VALUE_PREFIXES
-        .iter()
-        .any(|marker| lower.starts_with(marker))
-        || SECRET_VALUE_MARKERS
-            .iter()
-            .any(|marker| lower.contains(marker))
+    let lower = value.to_ascii_lowercase();
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_'))
+        .any(|word| {
+            SECRET_VALUE_PREFIXES
+                .iter()
+                .any(|prefix| word.starts_with(prefix))
+        })
+        || has_credential_marker(&lower)
 }
 
-/// A dotted-quad of valid octets (`192.0.2.1`) is treated as an IP address
-/// and rejected; out-of-range quads (`256.0.2.1`) are not IPs.
 #[must_use]
 pub fn looks_like_ipv4_value(value: &str) -> bool {
-    let parts: Vec<&str> = value.split('.').collect();
-    parts.len() == 4 && parts.iter().all(|part| part.parse::<u8>().is_ok())
+    value
+        .split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '+' | '_'))
+        .any(is_dotted_quad)
 }
 
-/// An `addr@domain.tld` shape is treated as an email address and rejected.
-/// The bar is deliberately structural (one `@`, non-empty local part, a dot
-/// in the domain): operational field values are IDs, counters, and fixed
-/// labels, so `@` in one is already a smell worth dropping the line for.
+/// Detect an email-shaped span at any `@` in the diagnostic text.
+/// Domain matching stops at non-host punctuation and ignores trailing dots.
+/// Check each candidate independently when a diagnostic mentions more than one.
 #[must_use]
 pub fn looks_like_email_value(value: &str) -> bool {
-    let mut parts = value.split('@');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(local), Some(domain), None) => {
-            !local.is_empty() && !domain.is_empty() && domain.contains('.')
-        }
-        _ => false,
-    }
+    let parts = value.split('@');
+    parts.clone().zip(parts.skip(1)).any(|(local, domain)| {
+        let host = domain
+            .split(|c: char| !c.is_alphanumeric() && !matches!(c, '.' | '-'))
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('.');
+        !local.is_empty() && !host.starts_with('.') && host.contains('.')
+    })
 }
 
-/// A hex-colon IP literal (`::1`, `2001:db8::1`, full 8-group form) is
-/// treated as an IP address and rejected. The charset gate keeps
-/// colon-joined operational refs (`nzb:sha256:…`, `12:00:00`) passing:
-/// they carry non-hex letters or too few groups.
+/// Detect IPv6 literals, including bracketed, scoped and IPv4-mapped forms.
+/// Parse candidates as IPs so clock fragments and operational labels still pass.
 #[must_use]
 pub fn looks_like_ipv6_value(value: &str) -> bool {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_hexdigit() || b == b':') {
-        return false;
-    }
-    value.contains("::") || value.split(':').count() == 8
+    value
+        .split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, ':' | '.' | '_'))
+        .any(|word| word.trim_matches('.').parse::<std::net::Ipv6Addr>().is_ok())
 }
 
-fn validate_fields(fields: &BTreeMap<String, Value>) -> Result<(), LogError> {
+/// Validate both JSON objects and maps supplied directly to the constructor.
+fn validate_fields<'a>(
+    fields: impl ExactSizeIterator<Item = (&'a String, &'a Value)>,
+) -> Result<(), LogError> {
+    if fields.len() > MAX_FIELDS {
+        return Err(LogError::TooManyFields);
+    }
     for (key, value) in fields {
+        if !is_valid_field_key(key) {
+            return Err(LogError::BadFieldKey);
+        }
         if is_banned_field_key(key) {
-            return Err(LogError::BannedField(key.clone()));
+            return Err(LogError::BannedField);
         }
         match value {
-            Value::String(text) => {
-                if looks_like_secret_value(text) {
-                    return Err(LogError::SecretValue);
-                }
-                if looks_like_email_value(text) {
-                    return Err(LogError::PiiValue);
-                }
-                if looks_like_ipv4_value(text) || looks_like_ipv6_value(text) {
-                    return Err(LogError::IpAddressValue);
-                }
-            }
+            Value::String(text) => validate_field_string(text)?,
             Value::Number(_) | Value::Bool(_) | Value::Null => {}
-            Value::Array(_) | Value::Object(_) => {
-                return Err(LogError::NestedField(key.clone()));
-            }
+            Value::Array(_) | Value::Object(_) => return Err(LogError::NestedField),
         }
     }
     Ok(())
 }
 
-/// Convert a `serde_json::Value` into a validated flat field map. Callers
-/// build the candidate with `serde_json::json!` and convert here, so nesting
-/// or a banned key is a `Result`, never a log line.
+const MAX_FIELDS: usize = 32;
+const MAX_FIELD_KEY_BYTES: usize = 64;
+const MAX_FIELD_VALUE_BYTES: usize = 256;
+
+/// Convert a JSON object into a validated field map with up to 32 flat entries.
+/// Keys use 1–64 ASCII letters, digits, underscores, dots or hyphens. String
+/// values are limited to 256 UTF-8 bytes.
 pub fn fields_from_json(value: Value) -> Result<BTreeMap<String, Value>, LogError> {
     match value {
         Value::Object(map) => {
-            let fields: BTreeMap<String, Value> = map.into_iter().collect();
-            validate_fields(&fields)?;
-            Ok(fields)
+            validate_fields(map.iter())?;
+            Ok(map.into_iter().collect())
         }
         _ => Err(LogError::FieldsNotAnObject),
     }
@@ -474,8 +473,8 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
-    /// Build a record. `ts_millis` is unix millis (production workers pass
-    /// `worker::Date::now().as_millis()`); tests pass fixed values.
+    /// Build a record with the same field limits as [`fields_from_json`].
+    /// The timestamp is Unix milliseconds through the end of year 9999 UTC.
     pub fn new(
         worker: Worker,
         level: Level,
@@ -488,11 +487,13 @@ impl LogRecord {
             return Err(LogError::BadTraceId);
         }
         if !is_valid_event_for_worker(worker, event) {
-            return Err(LogError::BadEvent(event.to_string()));
+            return Err(LogError::BadEvent);
         }
-        validate_fields(&fields)?;
+        validate_fields(fields.iter())?;
         Ok(LogRecord {
-            ts: unix_millis_to_rfc3339(ts_millis),
+            ts: (ts_millis <= MAX_RFC3339_MILLIS)
+                .then(|| unix_millis_to_rfc3339(ts_millis))
+                .ok_or(LogError::BadTimestamp)?,
             level,
             worker,
             trace_id: trace_id.to_string(),
@@ -501,8 +502,7 @@ impl LogRecord {
         })
     }
 
-    /// Render one newline-delimited JSON log line (no trailing newline; the
-    /// caller joins lines). Exactly the six schema keys.
+    /// Render the six-key JSON record without a trailing newline.
     #[must_use]
     pub fn to_json_line(&self) -> String {
         let mut map = serde_json::Map::with_capacity(6);
@@ -540,6 +540,58 @@ impl LogRecord {
     pub fn event(&self) -> &str {
         &self.event
     }
+}
+
+const MAX_RFC3339_MILLIS: u64 = 253_402_300_799_999;
+
+fn is_valid_field_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_FIELD_KEY_BYTES
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+fn validate_field_string(value: &str) -> Result<(), LogError> {
+    if value.len() > MAX_FIELD_VALUE_BYTES {
+        return Err(LogError::FieldValueTooLong);
+    }
+    if looks_like_secret_value(value) {
+        return Err(LogError::SecretValue);
+    }
+    if looks_like_email_value(value) {
+        return Err(LogError::PiiValue);
+    }
+    if looks_like_ipv4_value(value) || looks_like_ipv6_value(value) {
+        return Err(LogError::IpAddressValue);
+    }
+    Ok(())
+}
+
+fn has_credential_marker(value: &str) -> bool {
+    let has_scheme = ["bearer", "token"].iter().any(|scheme| {
+        value.match_indices(scheme).any(|(start, _)| {
+            let before = value[..start].chars().next_back();
+            let after = &value[start + scheme.len()..];
+            before.is_none_or(|c| !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-'))
+                && after.starts_with(char::is_whitespace)
+        })
+    });
+    has_scheme
+        || value.split_inclusive(['=', ':']).any(|part| {
+            part.strip_suffix(['=', ':']).is_some_and(|label| {
+                let label = label.trim_end().trim_end_matches(['"', '\'']);
+                CREDENTIAL_LABELS
+                    .iter()
+                    .any(|suffix| label.ends_with(suffix))
+            })
+        })
+}
+
+fn is_dotted_quad(word: &str) -> bool {
+    let mut octets = word.trim_matches('.').split('.');
+    (0..4).all(|_| octets.next().is_some_and(|part| part.parse::<u8>().is_ok()))
+        && octets.next().is_none()
 }
 
 #[cfg(test)]
@@ -741,7 +793,7 @@ mod tests {
                 ok_fields(),
                 0
             ),
-            Err(LogError::BadEvent("job.queued".to_string()))
+            Err(LogError::BadEvent)
         );
     }
 
@@ -820,6 +872,17 @@ mod tests {
         assert!(fields_from_json(serde_json::json!({"stage": "task-queued"})).is_ok());
         assert!(fields_from_json(serde_json::json!({"host": "192.0.2.1"})).is_err());
         assert!(fields_from_json(serde_json::json!({"host": "256.0.2.1"})).is_ok());
+    }
+
+    #[test]
+    fn repair_is_outside_the_shared_worker_vocabulary() {
+        // The shared schema reserves worker names for emitters that have
+        // adopted the logging standard and its golden fixtures.
+        assert_eq!(Worker::parse("repair"), None);
+    }
+
+    #[test]
+    fn record_rejects_email_addresses_ipv6_and_nesting() {
         // Email-shaped values are personal data, not just keys.
         for value in ["a@example.com", "user+tag@mail.example.co"] {
             assert!(
@@ -878,7 +941,6 @@ mod tests {
             assert_eq!(worker.as_str(), name);
             assert_eq!(Worker::parse(name), Some(worker));
         }
-        assert_eq!(Worker::parse("repair"), None);
         for (level, name) in [
             (Level::Debug, "debug"),
             (Level::Info, "info"),
@@ -893,12 +955,9 @@ mod tests {
 
     #[test]
     fn error_display_never_echoes_values() {
-        // Keys are schema names (safe to name); values must not appear.
         let err = LogError::SecretValue;
         assert!(!err.to_string().contains("hunter2"));
-        assert!(LogError::BannedField("password".to_string())
-            .to_string()
-            .contains("password"));
+        assert_eq!(LogError::BannedField.to_string(), "banned fields key");
     }
 
     #[test]
