@@ -372,7 +372,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const matches = await started.result;
 			const committed = await runBeforeDeadline(fence, () => {
 				if (!matches) return refuse(true);
-				const deviceScope = establishVerifiedLibraryScope(storage, label);
+				const deviceScope = establishVerifiedLibraryScope(storage, label, true);
 				storageScope = deviceScope ? scopeLibraryStorage(storage, fence) : null;
 				verified = { binding: label, fence, storage: storageScope };
 				commit();

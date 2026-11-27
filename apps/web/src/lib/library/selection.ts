@@ -8,7 +8,7 @@
  * clock or randomness, and no `window` required.
  */
 
-import { isLibraryId, type LibraryItem } from './cache.js';
+import { isLibraryId as isValidId, type LibraryItem } from './cache.js';
 import { displayArtist, displayTitle } from './order.js';
 import { addTrack, type QueueState } from '../player/queue.js';
 
@@ -30,7 +30,7 @@ export function createSelection(): string[] {
  * the input is never mutated.
  */
 export function toggleSelected(selection: readonly string[], id: unknown): string[] {
-	if (!isLibraryId(id)) return selection as string[];
+	if (!isValidId(id)) return selection as string[];
 	if ((selection as readonly unknown[]).includes(id)) {
 		return (selection as readonly unknown[]).filter((entry) => entry !== id) as string[];
 	}
@@ -55,11 +55,11 @@ export function selectRange(
 	anchorId: string | null,
 	focusId: unknown
 ): string[] {
-	if (!isLibraryId(focusId)) return selection as string[];
+	if (!isValidId(focusId)) return selection as string[];
 	const displayed = displayedIds as readonly unknown[];
 	const focusIndex = displayed.indexOf(focusId);
 	if (focusIndex < 0) return selection as string[];
-	const anchorIndex = isLibraryId(anchorId) ? displayed.indexOf(anchorId) : -1;
+	const anchorIndex = isValidId(anchorId) ? displayed.indexOf(anchorId) : -1;
 	if (anchorIndex < 0) return toggleSelected(selection, focusId);
 	const selected = new Set<unknown>(selection);
 	const added: string[] = [];
@@ -67,7 +67,7 @@ export function selectRange(
 	const to = Math.max(anchorIndex, focusIndex);
 	for (let index = from; index <= to; index += 1) {
 		const id = displayed[index];
-		if (!isLibraryId(id) || selected.has(id)) continue;
+		if (!isValidId(id) || selected.has(id)) continue;
 		selected.add(id);
 		added.push(id);
 	}
@@ -88,7 +88,7 @@ export function selectAllDisplayed(
 	const selected = new Set<string>();
 	for (const ids of [selection, displayedIds]) {
 		for (const id of ids) {
-			if (isLibraryId(id)) selected.add(id);
+			if (isValidId(id)) selected.add(id);
 		}
 	}
 	return [...selected];
@@ -113,13 +113,13 @@ export function pruneSelection(
 ): string[] {
 	const loaded = new Set<string>();
 	for (const id of loadedIds) {
-		if (isLibraryId(id)) loaded.add(id);
+		if (isValidId(id)) loaded.add(id);
 	}
 	const kept: string[] = [];
 	let changed = false;
 	for (const entry of selection as readonly unknown[]) {
 		// Deleting a matched ID also excludes duplicate selections.
-		if (!isLibraryId(entry) || !loaded.delete(entry)) {
+		if (!isValidId(entry) || !loaded.delete(entry)) {
 			changed = true;
 			continue;
 		}
@@ -144,7 +144,7 @@ export function selectSelectedItems(
 ): LibraryItem[] {
 	const selected = new Set<string>();
 	for (const entry of selectedIds as readonly unknown[]) {
-		if (isLibraryId(entry)) selected.add(entry);
+		if (isValidId(entry)) selected.add(entry);
 	}
 	return items.filter((item) => selected.has(item.id));
 }
@@ -157,7 +157,7 @@ export function hiddenSelectedCount(
 	const visible = new Set(visibleIds);
 	let hidden = 0;
 	for (const entry of new Set(selection)) {
-		if (isLibraryId(entry) && !visible.has(entry)) hidden += 1;
+		if (isValidId(entry) && !visible.has(entry)) hidden += 1;
 	}
 	return hidden;
 }
@@ -188,7 +188,7 @@ export function appendSelection(
 	let skipped = 0;
 	const seen = new Set<string>();
 	for (const entry of selection as readonly unknown[]) {
-		if (!isLibraryId(entry) || seen.has(entry)) continue;
+		if (!isValidId(entry) || seen.has(entry)) continue;
 		seen.add(entry);
 		const item = byId.get(entry);
 		if (!item) continue;

@@ -31,6 +31,15 @@ function memoryStorage(): SnapshotStorage {
 	};
 }
 
+function mockVerifiedSession(local: SnapshotStorage) {
+	local.setItem(AUTH_GENERATION_KEY, 'current');
+	vi.stubGlobal('window', { localStorage: local });
+	vi.stubGlobal('caches', { keys: async () => [] });
+	vi.stubGlobal('navigator', { locks: { request: async (_name: string, _options: LockOptions, work: LockGrantedCallback) => work({} as Lock) } });
+	vi.stubGlobal('fetch', vi.fn(async () => Response.json({ session_binding: binding })));
+	return { [SESSION_BINDING_HEADER]: binding };
+}
+
 afterEach(() => vi.unstubAllGlobals());
 
 it('requires canonical bindings for persisted library provenance', () => {
@@ -65,30 +74,40 @@ it('clears provenance and cached bytes when context removal fails', () => {
 it('publishes verified rows without inheriting unbound device storage', async () => {
 	const session = memoryStorage(), local = memoryStorage();
 	session.setItem(LIBRARY_AUTH_CONTEXT_KEY, 'old-scope');
-	local.setItem(AUTH_GENERATION_KEY, 'current');
-	vi.stubGlobal('window', { localStorage: local });
-	vi.stubGlobal('caches', { keys: async () => [] });
-	vi.stubGlobal('navigator', { locks: { request: async (_name: string, _options: LockOptions, work: LockGrantedCallback) => work({} as Lock) } });
-	vi.stubGlobal('fetch', vi.fn(async () => Response.json({ session_binding: binding })));
+	const oldKey = favoritesKey(session)!;
+	local.setItem(oldKey, '["old-track"]');
+	const headers = mockVerifiedSession(local);
 	let update: LibraryRefreshUpdate | undefined;
 	const refresher = createLibraryRefresher({ sessionStorage: () => session, invalidateLibraryCache: vi.fn(),
 		onStateChange: (_, next) => { update = next; } });
-	await refresher.refresh(async () => Response.json([{ id: 'Track_A' }], { headers: { [SESSION_BINDING_HEADER]: binding } }));
+	await refresher.refresh(async () => Response.json([{ id: 'Track_A' }], { headers }));
 	expect(refresher.state.items).toEqual([{ id: 'Track_A' }]);
-	expect(update).toMatchObject({ authoritative: true, sessionBinding: binding, storageScope: null });
-	expect(session.getItem(`${LIBRARY_SNAPSHOT_KEY}.old-scope`)).toBeNull();
+	const scope = update?.storageScope ?? null;
+	expect(update).toMatchObject({ authoritative: true, sessionBinding: binding, deviceScope: favoritesKey(scope) });
+	expect(favoritesKey(scope)).not.toBe(oldKey);
+	expect(loadFavorites(scope, local)).toEqual([]);
+	expect(await updateStoredFavorites(scope, local, update?.deviceScope ?? null, () => ['Track_A'])).toEqual(['Track_A']);
+	expect(local.getItem(oldKey)).toBe('["old-track"]');
 });
 
-it.each(['stream', 'buffer'])('rejects malformed UTF-8 in a %s listing before snapshot publication', async (mode) => {
+it.each(['stream', 'buffer'])('suspends signed-in refresh on malformed UTF-8 in a %s listing', async (mode) => {
 	const session = memoryStorage();
+	const headers = mockVerifiedSession(memoryStorage());
 	const refresher = createLibraryRefresher({ sessionStorage: () => session, invalidateLibraryCache: vi.fn() });
+	const refresh = () => refresher.refresh(async () => Response.json([{ id: 'Track_A' }], { headers }));
+	await refresh();
+	const key = `${LIBRARY_SNAPSHOT_KEY}.${session.getItem(LIBRARY_AUTH_CONTEXT_KEY)}`;
+	const snapshot = session.getItem(key);
+	expect(decodeSnapshot(snapshot)?.items).toEqual([{ id: 'Track_A' }]);
 	const body = new TextEncoder().encode('[{"id":"?"}]');
 	body[8] = 0xff;
-	const response = new Response(body);
+	const response = new Response(body, { headers });
 	if (mode === 'buffer') vi.spyOn(response, 'body', 'get').mockReturnValue(null);
 	await refresher.refresh(async () => response);
-	expect(refresher.state).toMatchObject({ items: [], loadError: 'Library is not reachable right now.' });
-	expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
+	expect(refresher.state).toMatchObject({ items: [], verificationSuspended: true });
+	expect(session.getItem(key)).toBe(snapshot);
+	await refresh();
+	expect(refresher.state).toMatchObject({ items: [{ id: 'Track_A' }], verificationSuspended: false });
 });
 
 it('withholds favorites fallback after the storage context ends', () => {

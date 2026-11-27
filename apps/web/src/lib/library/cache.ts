@@ -93,13 +93,14 @@ export function verifiedFavoritesKey(session: SnapshotStorage | null, binding: s
 	return proof && proof[1] === binding ? `${LIBRARY_FAVORITES_KEY}.${proof[0]}` : null;
 }
 
-/** After verification, bind only a newly minted, unused scope. */
-export function establishVerifiedLibraryScope(session: SnapshotStorage | null, binding: string): string | undefined {
-	if (!validSessionBinding(binding)) return;
+/** After verification, reuse matching provenance or mint an unused scope. */
+export function establishVerifiedLibraryScope(session: SnapshotStorage | null, binding: string, replaceUnbound = false): string | undefined {
+	if (!session || !validSessionBinding(binding)) return;
 	try {
-		if (!session || session.getItem(LIBRARY_AUTH_CONTEXT_KEY)) return verifiedFavoritesKey(session, binding) ?? undefined;
+		const previous = session.getItem(LIBRARY_AUTH_CONTEXT_KEY);
+		if (previous && (!replaceUnbound || provenance(session))) return verifiedFavoritesKey(session, binding) ?? undefined;
 		const context = crypto.randomUUID(), key = `${LIBRARY_FAVORITES_KEY}.${context}`;
-		if (browserStorage('local')?.getItem(key) !== null) return;
+		if (context === previous || browserStorage('local')?.getItem(key) !== null) return;
 		// Publish the context last; a failed write leaves no usable provenance.
 		session.setItem(LIBRARY_SESSION_BINDING_KEY, JSON.stringify([context, binding]));
 		session.setItem(LIBRARY_AUTH_CONTEXT_KEY, context);

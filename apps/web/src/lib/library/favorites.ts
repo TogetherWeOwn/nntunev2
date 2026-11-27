@@ -13,7 +13,7 @@
  */
 
 import {
-	isLibraryId,
+	isLibraryId as isStoredId,
 	LIBRARY_FAVORITES_KEY,
 	libraryContextKey,
 	purgeFavorites,
@@ -50,7 +50,7 @@ export function loadFavorites(
 		if (!raw) return [];
 		const parsed: unknown = JSON.parse(raw);
 		if (!Array.isArray(parsed)) return [];
-		return [...new Set(parsed.filter(isLibraryId))];
+		return [...new Set(parsed.filter(isStoredId))];
 	} catch {
 		return [];
 	}
@@ -74,10 +74,10 @@ export async function updateStoredFavorites(
 		if (favoritesKey(session) !== key) return null;
 		const raw = local.getItem(key);
 		const parsed: unknown = raw === null ? [] : JSON.parse(raw);
-		if (!Array.isArray(parsed) || !parsed.every(isLibraryId)) return null;
+		if (!Array.isArray(parsed) || !parsed.every(isStoredId)) return null;
 		const latest = [...new Set<string>(parsed)];
 		const committed = [...new Set(update(latest.slice()))];
-		if (!committed.every(isLibraryId) || favoritesKey(session) !== key) return null;
+		if (!committed.every(isStoredId) || favoritesKey(session) !== key) return null;
 		const encoded = JSON.stringify(committed);
 		if (encoded !== JSON.stringify(latest)) local.setItem(key, encoded);
 		return committed;
@@ -97,7 +97,7 @@ export function saveFavorites(
 	const key = favoritesKey(session);
 	if (!local || !key) return false;
 	try {
-		local.setItem(key, JSON.stringify([...new Set(ids.filter(isLibraryId))]));
+		local.setItem(key, JSON.stringify([...new Set(ids.filter(isStoredId))]));
 		return true;
 	} catch {
 		// Quota or privacy mode: memory remains authoritative this visit.
