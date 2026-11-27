@@ -272,4 +272,129 @@ async fn unmounted_history_receiver_writes_through_pg_store() {
     assert!(export(&observer, &owner, None).await.unwrap().is_empty());
     assert_eq!(export(&observer, &other, None).await.unwrap(), other_rows);
     observer.execute(delete_user, &[&other]).await.unwrap();
+    assert_transition_write_boundaries(&mut ctx, &observer).await;
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+async fn assert_transition_write_boundaries<S, M, D, N>(
+    ctx: &mut Ctx<'_, S, M, D, N>,
+    observer: &tokio_postgres::Client,
+) where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::listen_history::postgres_tests::{connect, seed_owner};
+    use crate::listen_history::{export, ListenEvent, ListenRow};
+    use crate::playback::LeaseAcquire;
+    use crate::worker_entry::private_aware_lease_for_postgres_test;
+
+    let owner = format!("listen-transition-{:x}", rand::random::<u64>());
+    seed_owner(observer, &owner).await;
+    ctx.now = 2000;
+    let mut base = receive_request(Some(cookie_of(&ctx.start_session(&owner).await.unwrap())));
+    base.body.clear();
+    let context_resp = receiver::context(ctx, &base).await;
+    assert_eq!(context_resp.status, 200);
+    let context_token = from_str::<Value>(&context_resp.body).unwrap()["context"].clone();
+    base.path = CLEAR_PATH.into();
+
+    let play_ids = |n: u8| {
+        let play_id = crate::b64::encode(&[
+            0x40, 0xc3, 0x25, 0xc0, 0x2c, 0xee, 0x48, 0x9d, 0xa8, 0xb6, 0xfb, 0xe9, 0x37, 0x15,
+            0x56, n,
+        ]);
+        (
+            play_id,
+            format!("40c325c0-2cee-489d-a8b6-fbe9371556{n:02x}"),
+        )
+    };
+    let req = |playback_id: &str, track_id: &str, event: &str| {
+        Request {
+        body: serde_json::to_vec(&json!({
+            "playback_id": playback_id, "track_id": track_id, "event": event, "context": context_token,
+        }))
+        .unwrap(),
+        ..base.clone()
+    }
+    };
+    let acquire = |track_id: &'static str, play_id: String, epoch: u64| {
+        let owner = owner.clone();
+        async move {
+            let res = private_aware_lease_for_postgres_test(
+                connect().await,
+                &owner,
+                "tab-transition",
+                track_id,
+                &play_id,
+                2000,
+                2045,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(res, LeaseAcquire::Acquired { epoch });
+        }
+    };
+    let (play_a, uuid_a) = play_ids(0x11);
+    let (play_b, uuid_b) = play_ids(0x12);
+    let (play_c, uuid_c) = play_ids(0x13);
+
+    // Track A starts, then rapid skip acquires Track B (never started) and Track C.
+    acquire("track-a", play_a, 1).await;
+    assert_eq!(
+        receiver::write(ctx, &req(&uuid_a, "track-a", "start"))
+            .await
+            .status,
+        200
+    );
+    acquire("track-b", play_b, 2).await;
+    acquire("track-c", play_c, 3).await;
+    // Rapid-skipped Track B never started; Track A's delayed terminal rejects wrong track,
+    // commits once idempotently, and refuses `complete` after `skip`; Track C replays start
+    // and complete idempotently while refusing mismatched track or `skip` after `complete`.
+    for (now, playback_id, track_id, event, ok) in [
+        (2005, uuid_b.as_str(), "track-b", "start", false),
+        (2005, uuid_b.as_str(), "track-b", "complete", false),
+        (2005, uuid_b.as_str(), "track-b", "skip", false),
+        (2005, uuid_a.as_str(), "track-c", "skip", false),
+        (2005, uuid_a.as_str(), "track-a", "skip", true),
+        (2006, uuid_a.as_str(), "track-a", "skip", true),
+        (2006, uuid_a.as_str(), "track-a", "complete", false),
+        (2010, uuid_c.as_str(), "track-c", "start", true),
+        (2011, uuid_c.as_str(), "track-c", "start", true),
+        (2011, uuid_c.as_str(), "track-a", "complete", false),
+        (2020, uuid_c.as_str(), "track-c", "complete", true),
+        (2021, uuid_c.as_str(), "track-c", "complete", true),
+        (2021, uuid_c.as_str(), "track-c", "skip", false),
+    ] {
+        ctx.now = now;
+        let resp = receiver::write(ctx, &req(playback_id, track_id, event)).await;
+        if ok {
+            assert_eq!(resp.status, 200, "{track_id}:{event}");
+        } else {
+            assert_history_conflict(resp);
+        }
+    }
+
+    let row = |playback_id: &str, track_id: &str, event, recorded_at| ListenRow {
+        playback_id: playback_id.into(),
+        track_id: track_id.into(),
+        event,
+        recorded_at,
+    };
+    assert_eq!(
+        export(observer, &owner, None).await.unwrap(),
+        [
+            row(&uuid_c, "track-c", ListenEvent::Complete, 2020),
+            row(&uuid_c, "track-c", ListenEvent::Start, 2010),
+            row(&uuid_a, "track-a", ListenEvent::Skip, 2005),
+            row(&uuid_a, "track-a", ListenEvent::Start, 2000),
+        ]
+    );
+    observer
+        .execute("DELETE FROM public.users WHERE id = $1", &[&owner])
+        .await
+        .unwrap();
 }
