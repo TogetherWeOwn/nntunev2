@@ -294,24 +294,30 @@ pub fn validate_transcode_input_key(key: &str) -> bool {
 /// (`ingest-scratch/{job_id}/r{round}/`); anything longer is not one.
 pub const MAX_TRANSCODE_PREFIX_BYTES: usize = 256;
 
-/// True only for the round dir the job's verify staging lives in:
-/// `ingest-scratch/{job_id}/.../` with a trailing slash, a safe
-/// charset, and the length cap. The job containment is the point: a
-/// forged prefix must never address another job's staged bytes.
+/// True only for a verify staging round directory with the canonical
+/// `ingest-scratch/{job_id}/r{round}/` spelling.
 ///
 /// Shared by the ingest dispatch and the transcode front parse so the
 /// two can never disagree on the containment rule.
 pub fn validate_transcode_prefix(prefix: &str, job_id: &str) -> bool {
-    if prefix.len() > MAX_TRANSCODE_PREFIX_BYTES || !prefix.ends_with('/') {
-        return false;
-    }
-    let root = format!("ingest-scratch/{job_id}/");
-    if !prefix.starts_with(&root) {
+    if prefix.len() > MAX_TRANSCODE_PREFIX_BYTES
+        || !(1..=64).contains(&job_id.len())
+        || !job_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
         return false;
     }
     prefix
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'_' || b == b'-' || b == b'.')
+        .strip_prefix("ingest-scratch/")
+        .and_then(|path| path.strip_prefix(job_id))
+        .and_then(|path| path.strip_prefix("/r"))
+        .and_then(|round| round.strip_suffix('/'))
+        .is_some_and(|round| {
+            (round == "0" || !round.starts_with('0'))
+                && round.bytes().all(|b| b.is_ascii_digit())
+                && round.parse::<u32>().is_ok()
+        })
 }
 
 #[cfg(test)]
@@ -573,10 +579,7 @@ mod tests {
             "ingest-scratch/job_01J9ZQ8K2M/r12/",
             JOB
         ));
-        // Another job, missing slash, hostile bytes fail. Dots pass
-        // the charset (R2 keys are flat strings, so `..` traverses
-        // nothing) but containment still holds: the prefix must start
-        // with this job's root.
+        // Only the exact verify-round directory is a transcode prefix.
         assert!(!validate_transcode_prefix(
             "ingest-scratch/job_other/r1/",
             JOB
@@ -585,7 +588,7 @@ mod tests {
             "ingest-scratch/job_01J9ZQ8K2M/r1",
             JOB
         ));
-        assert!(validate_transcode_prefix(
+        assert!(!validate_transcode_prefix(
             "ingest-scratch/job_01J9ZQ8K2M/r1.backup/",
             JOB
         ));

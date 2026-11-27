@@ -26,6 +26,26 @@ fn snapshot_identities(pins: &DigestReadSnapshot<'_>) -> [[u8; 16]; 5] {
     ]
 }
 
+pub(crate) fn valid_version_id(version: &str) -> bool {
+    version != "null"
+        && (1..=1024).contains(&version.len())
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b',')
+}
+
+fn valid_snapshot_pins(pins: &DigestReadSnapshot<'_>, geometry: DigestGeometry) -> bool {
+    geometry.plaintext_len() != 0
+        && is_uuid_v4(&pins.map_id)
+        && is_uuid_v4(&pins.root_version_id)
+        && pins.page_versions.len() == geometry.pages() as usize
+        && valid_version_id(pins.media_version)
+        && pins
+            .page_versions
+            .iter()
+            .all(|version| valid_version_id(version))
+}
+
 /// Complete sealer-origin evidence, produced only by the enrollment sealer.
 ///
 /// Provider rows cannot be substituted into an existing manifest:
@@ -65,10 +85,7 @@ impl StoredManifest {
         rows: Vec<[u8; 32]>,
     ) -> Option<Self> {
         let geometry = DigestGeometry::new(pins.plaintext_len)?;
-        if geometry.plaintext_len() == 0
-            || !is_uuid_v4(&pins.map_id)
-            || rows.len() != geometry.pages() as usize
-        {
+        if !valid_snapshot_pins(pins, geometry) || rows.len() != geometry.pages() as usize {
             return None;
         }
         Some(Self(OriginManifest {
@@ -120,7 +137,8 @@ impl<'a> PlaybackManifest<'a> {
     ) -> bool {
         let origin = self.origin();
         let [root_version, identities @ ..] = context.identities;
-        root_version == pins.root_version_id
+        valid_snapshot_pins(pins, origin.geometry())
+            && root_version == pins.root_version_id
             && identities == snapshot_identities(pins)
             && context.plaintext_len == pins.plaintext_len
             && &pins.plaintext_sha256 == origin.plaintext_sha256()

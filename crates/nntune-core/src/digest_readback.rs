@@ -4,7 +4,7 @@
 //! additionally checks full responses and EOF against an existing inventory.
 //! The enrolled path also validates FLAC. Callers establish custody and eligibility.
 
-use crate::digest_enrollment::OriginManifest;
+use crate::digest_enrollment::{valid_version_id, OriginManifest};
 use crate::digest_range::{DigestRange, RangeError};
 pub use crate::flac_prepare::FlacSeekIndex;
 use crate::flac_stream::FlacStream;
@@ -248,14 +248,6 @@ pub struct CompletedInventory<'a> {
     pub page_versions: &'a [&'a str],
 }
 
-fn valid_version(version: &str) -> bool {
-    version != "null"
-        && (1..=1024).contains(&version.len())
-        && version
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && byte != b',')
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnrolledReadbackError {
     Envelope,
@@ -379,7 +371,7 @@ async fn verify_readback<'a, B: ReadbackBody, V: MediaValidation>(
             && !pin.object_key.is_empty()
             && keys.insert(pin.object_key)
             && pin.version.is_some() == media.version.is_some()
-            && pin.version.is_none_or(valid_version)
+            && pin.version.is_none_or(valid_version_id)
     }) {
         return Err(BodyReadbackError::Inventory);
     }
@@ -388,6 +380,11 @@ async fn verify_readback<'a, B: ReadbackBody, V: MediaValidation>(
     let mut media = open_pinned(&mut open, media, geometry.sealed_len()).await?;
     let mut header = [0; 48];
     read_exact(&mut media, &mut header).await?;
+    if &header != manifest.header_bytes() {
+        return Err(BodyReadbackError::Content(ReadbackError::Frame(
+            RangeError::Header,
+        )));
+    }
     for &(index, pin) in pages {
         let page = geometry.page(index).ok_or(BodyReadbackError::Geometry)?;
         let mut bytes = vec![0; page.encoded_len as usize];

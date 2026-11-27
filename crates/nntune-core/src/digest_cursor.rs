@@ -31,14 +31,13 @@ impl RangeCursor {
         self.plan.chunk(self.next?)
     }
 
-    /// Advance only after the operation succeeds; any error fences the cursor.
+    /// Advance only after the operation succeeds; an error or unwind fences the cursor.
     pub fn advance<T, E>(
         &mut self,
         index: u32,
         operation: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, CursorError<E>> {
-        if self.next != Some(index) || self.last.is_none() {
-            self.next = None;
+        if self.next.take() != Some(index) || self.last.is_none() {
             return Err(CursorError::InvalidChunk);
         }
         match operation() {
@@ -50,10 +49,7 @@ impl RangeCursor {
                 };
                 Ok(value)
             }
-            Err(error) => {
-                self.next = None;
-                Err(CursorError::Operation(error))
-            }
+            Err(error) => Err(CursorError::Operation(error)),
         }
     }
 }
