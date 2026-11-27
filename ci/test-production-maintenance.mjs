@@ -600,7 +600,7 @@ test('protected recovery wiring keeps the production lock and contains source an
   }
 });
 
-test('maintenance-fallback preflight refuses missing, corrupted or mismatched bundle checksums before any write', async (t) => {
+test('maintenance-fallback preflight refuses invalid bundle checksum inputs before any write', async (t) => {
   const { calls, custody, rows, temp, run } = finalSmokeFixture(t, rollbackFixture);
   const baseline = structuredClone(rows);
   const validDigest = custody.maintenance.module_sha256;
@@ -612,8 +612,8 @@ test('maintenance-fallback preflight refuses missing, corrupted or mismatched bu
     ['non-hex module_sha256', { ...custody, maintenance: { ...custody.maintenance, module_sha256: 'g'.repeat(64) } }],
     ['prefixed module_sha256', { ...custody, maintenance: { ...custody.maintenance, module_sha256: `sha256:${validDigest}` } }],
     ['mismatched module_sha256', { ...custody, maintenance: { ...custody.maintenance, module_sha256: '0'.repeat(64) } }],
-    ['missing evidence_sha256', { ...custody, evidence_sha256: undefined }],
-    ['corrupted evidence_sha256', { ...custody, evidence_sha256: 'not-a-sha256' }],
+    ['missing evidence_sha256 format', { ...custody, evidence_sha256: undefined }],
+    ['corrupted evidence_sha256 format', { ...custody, evidence_sha256: 'not-a-sha256' }],
   ];
   for (const command of ['check-seed', 'record']) {
     for (const [label, badCustody] of badCustodies) {
@@ -777,6 +777,7 @@ exec(compile(script, "<staging-evidence>", "exec"), {"__name__": "__main__"})
   for (const [label, responses, expected] of [
     ['mismatched push head_sha', { [runsPath]: { workflow_runs: [{ ...goodRun, head_sha: otherSha }] } }, /No push-triggered deploy run on main/],
     ['non-success staging-web', { [runsPath]: { workflow_runs: [goodRun] }, [jobsPath]: { jobs: [{ name: 'staging-web', conclusion: 'skipped' }, goodJobs[1], goodJobs[2]] } }, /no staging-web success/],
+    ['non-success staging-api', { [runsPath]: { workflow_runs: [goodRun] }, [jobsPath]: { jobs: [goodJobs[0], { name: 'staging-api', conclusion: 'failure' }, goodJobs[2]] } }, /no staging-api success/],
     ['non-success full journey', { [runsPath]: { workflow_runs: [goodRun] }, [jobsPath]: { jobs: [goodJobs[0], goodJobs[1], { name: goodJobs[2].name, conclusion: 'failure' }] } }, /post-deploy-e2e jobs are not all success/],
     ['smoke-only without full journey', { [runsPath]: { workflow_runs: [goodRun] }, [jobsPath]: { jobs: [goodJobs[0], goodJobs[1], { name: 'post-deploy-e2e / smoke', conclusion: 'success' }] } }, /no full journey success/],
   ]) {
