@@ -19,7 +19,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use nntune_core::media::{self, FileKey, Header, Profile, Sealer, VerifiedHeader};
 use nntune_core::rng::SystemRng;
 
-use crate::bundle::{self, BundleError, BundleWriter, Manifest, TableCount};
+use crate::bundle::{self, BundleError, BundleWriter, KeyringCoverage, Manifest, TableCount};
 use crate::envelope::{
     self, Envelope, EnvelopeError, ENVELOPE_VERSION_V2, KEK_LEN, PAYLOAD_FORMAT_MEDIA_KEY_V1,
 };
@@ -29,6 +29,11 @@ pub const DRILL_KEK_VERSION: u32 = 4294967000;
 /// Drill user + track pins (synthetic; never a real identity).
 pub const DRILL_USER_ID: &str = "drill-user";
 pub const DRILL_TRACK_ID: &str = "drill-track-1";
+
+const ROW_PATH: &str = "tables/track_sources.jsonl";
+const BLOB_PATH: &str = "blobs/drill-track-1.bin";
+const KEYRING_PATH: &str = "keyring/manifest.json";
+const TABLE_NAME: &str = "track_sources";
 
 /// First ranged-read length (article-window shaped). The fixture must
 /// exceed it so *both* ranged reads authenticate ciphertext, and it
@@ -46,6 +51,7 @@ pub enum DrillError {
     Bundle(BundleError),
     Crypto(String),
     KeyringMissingVersion(u32),
+    InvalidEvidence(&'static str),
     HashMismatch,
     FixtureTooSmall,
 }
@@ -59,6 +65,7 @@ impl core::fmt::Display for DrillError {
             DrillError::KeyringMissingVersion(v) => {
                 write!(f, "drill keyring missing version: {v}")
             }
+            DrillError::InvalidEvidence(reason) => write!(f, "invalid drill evidence: {reason}"),
             DrillError::HashMismatch => write!(f, "drill hash mismatch"),
             DrillError::FixtureTooSmall => write!(
                 f,
@@ -226,10 +233,10 @@ pub fn backup_fixture(
     keyring_manifest.push_str("]}");
 
     let mut w = BundleWriter::new(bundle_dir, "synthetic", tool, now_unix());
-    w.stage_file("tables/track_sources.jsonl", &jsonl)?;
-    w.stage_file("blobs/drill-track-1.bin", &blob)?;
-    w.stage_file("keyring/manifest.json", keyring_manifest.as_bytes())?;
-    w.record_table("track_sources", 1);
+    w.stage_file(ROW_PATH, &jsonl)?;
+    w.stage_file(BLOB_PATH, &blob)?;
+    w.stage_file(KEYRING_PATH, keyring_manifest.as_bytes())?;
+    w.record_table(TABLE_NAME, 1);
     w.record_kek_version(DRILL_KEK_VERSION);
     let manifest = w.finish()?;
 
@@ -237,6 +244,39 @@ pub fn backup_fixture(
     keys.insert(DRILL_KEK_VERSION, kek);
     kek.zeroize();
     Ok((manifest, KeyringRecovery::new(keys)))
+}
+
+/// The generic bundle verifier checks the files that are listed. The
+/// synthetic drill additionally requires all of its inputs and checks
+/// the metadata it will report as evidence.
+fn verify_drill_bundle(dir: &Path) -> Result<Manifest, DrillError> {
+    let manifest = bundle::verify_bundle(dir)?;
+    let required = [ROW_PATH, BLOB_PATH, KEYRING_PATH];
+    if manifest.files.len() != required.len()
+        || required
+            .iter()
+            .any(|path| !manifest.files.iter().any(|file| file.path == *path))
+    {
+        return Err(DrillError::InvalidEvidence(
+            "unexpected bundle file inventory",
+        ));
+    }
+    if manifest.env != "synthetic"
+        || !matches!(manifest.tables.as_slice(), [table] if table.table == TABLE_NAME && table.rows == 1)
+        || manifest.keyring.versions != [DRILL_KEK_VERSION]
+    {
+        return Err(DrillError::InvalidEvidence("unexpected bundle metadata"));
+    }
+    let keyring_raw = std::fs::read(dir.join(KEYRING_PATH))
+        .map_err(|e| DrillError::Bundle(BundleError::Io(format!("keyring manifest read: {e}"))))?;
+    let coverage: KeyringCoverage = serde_json::from_slice(&keyring_raw)
+        .map_err(|e| DrillError::Bundle(BundleError::Json(e.to_string())))?;
+    if coverage != manifest.keyring {
+        return Err(DrillError::InvalidEvidence(
+            "keyring manifest disagrees with bundle",
+        ));
+    }
+    Ok(manifest)
 }
 
 /// Restore from the bundle into `restore_dir` (isolated from the
@@ -255,7 +295,7 @@ pub fn restore_and_decrypt(
     // Fail closed before touching any row: the bundle must verify,
     // both at the backup store and again after the copy into the
     // isolated restore environment.
-    bundle::verify_bundle(bundle_dir).map_err(DrillError::Bundle)?;
+    verify_drill_bundle(bundle_dir)?;
     copy_dir(bundle_dir, restore_dir).map_err(|e| DrillError::Bundle(BundleError::Io(e)))?;
     decrypt_restored_dir(restore_dir, keyring, tool, started)
 }
@@ -272,13 +312,25 @@ fn decrypt_restored_dir(
     tool: &str,
     started: i64,
 ) -> Result<DrillEvidence, DrillError> {
-    let manifest = bundle::verify_bundle(restore_dir).map_err(DrillError::Bundle)?;
+    let manifest = verify_drill_bundle(restore_dir)?;
 
-    let row_raw = std::fs::read(restore_dir.join("tables/track_sources.jsonl"))
+    let row_raw = std::fs::read(restore_dir.join(ROW_PATH))
         .map_err(|e| DrillError::Bundle(BundleError::Io(format!("row read: {e}"))))?;
-    let row: DrillRow =
-        serde_json::from_slice(row_raw.split(|b| *b == b'\n').next().unwrap_or(&row_raw))
-            .map_err(|e| DrillError::Bundle(BundleError::Json(e.to_string())))?;
+    // This drill has exactly one row. Parsing the entire input refuses
+    // an additional row or corrupt trailing data.
+    let row: DrillRow = serde_json::from_slice(&row_raw)
+        .map_err(|e| DrillError::Bundle(BundleError::Json(e.to_string())))?;
+    if row.kek_version != DRILL_KEK_VERSION
+        || row.envelope_version != ENVELOPE_VERSION_V2
+        || row.payload_format != PAYLOAD_FORMAT_MEDIA_KEY_V1
+    {
+        return Err(DrillError::InvalidEvidence(
+            "unexpected drill envelope metadata",
+        ));
+    }
+    if row.plaintext_size < MIN_FIXTURE_BYTES {
+        return Err(DrillError::FixtureTooSmall);
+    }
 
     // `Zeroizing` so every `?` exit below (malformed row fields,
     // failed open, blob read) drops the KEK zeroized instead of
@@ -332,7 +384,7 @@ fn decrypt_restored_dir(
     drop(media_key);
     let reader = verified.reader(row.plaintext_size).map_err(crypto)?;
 
-    let blob = std::fs::read(restore_dir.join("blobs/drill-track-1.bin"))
+    let blob = std::fs::read(restore_dir.join(BLOB_PATH))
         .map_err(|e| DrillError::Bundle(BundleError::Io(format!("blob read: {e}"))))?;
     let cipher_blocks = media::chunk_count(reader.plaintext_size());
 
@@ -626,6 +678,192 @@ mod tests {
             DrillError::KeyringMissingVersion(DRILL_KEK_VERSION)
         ));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn with_drill_bundle(label: &str, test: impl FnOnce(&Path, &Path, Manifest, &KeyringRecovery)) {
+        let base =
+            std::env::temp_dir().join(format!("nntune-drill-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let bundle_dir = base.join("backup-store");
+        let restore_dir = base.join("isolated-restore");
+        let (manifest, keyring) = backup_fixture(&bundle_dir, &fixture_bytes(), "test").unwrap();
+        test(&bundle_dir, &restore_dir, manifest, &keyring);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    fn write_manifest(dir: &Path, manifest: &Manifest) {
+        std::fs::write(
+            dir.join(bundle::MANIFEST_FILE),
+            serde_json::to_vec(manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn rewrite_checked_file(dir: &Path, manifest: &Manifest, path: &str, bytes: &[u8]) {
+        let mut manifest = manifest.clone();
+        let entry = manifest
+            .files
+            .iter_mut()
+            .find(|file| file.path == path)
+            .unwrap();
+        entry.bytes = bytes.len() as u64;
+        entry.sha256_hex = bundle::sha256_hex(bytes);
+        std::fs::write(dir.join(path), bytes).unwrap();
+        write_manifest(dir, &manifest);
+        bundle::verify_bundle(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_drill_inputs_fail_closed() {
+        with_drill_bundle("missing-inputs", |src, dst, manifest, keyring| {
+            for path in [ROW_PATH, BLOB_PATH, KEYRING_PATH] {
+                let mut incomplete = manifest.clone();
+                incomplete.files.retain(|file| file.path != path);
+                write_manifest(src, &incomplete);
+                assert!(
+                    matches!(
+                        restore_and_decrypt(src, dst, keyring, "test"),
+                        Err(DrillError::InvalidEvidence(
+                            "unexpected bundle file inventory"
+                        ))
+                    ),
+                    "unlisted {path}"
+                );
+                assert!(!dst.exists(), "copied an incomplete bundle");
+            }
+
+            write_manifest(src, &manifest);
+            std::fs::remove_file(src.join(KEYRING_PATH)).unwrap();
+            assert_eq!(
+                restore_and_decrypt(src, dst, keyring, "test"),
+                Err(DrillError::Bundle(BundleError::MissingFile {
+                    path: KEYRING_PATH.to_string(),
+                }))
+            );
+            std::fs::remove_file(src.join(bundle::MANIFEST_FILE)).unwrap();
+            assert_eq!(
+                restore_and_decrypt(src, dst, keyring, "test"),
+                Err(DrillError::Bundle(BundleError::MissingFile {
+                    path: bundle::MANIFEST_FILE.to_string(),
+                }))
+            );
+        });
+    }
+
+    #[test]
+    fn corrupt_drill_evidence_fails_closed() {
+        with_drill_bundle("corrupt-evidence", |src, dst, manifest, keyring| {
+            let keyring_raw = std::fs::read(src.join(KEYRING_PATH)).unwrap();
+            std::fs::write(src.join(bundle::MANIFEST_FILE), b"{").unwrap();
+            assert!(matches!(
+                restore_and_decrypt(src, dst, keyring, "test"),
+                Err(DrillError::Bundle(BundleError::Json(_)))
+            ));
+            let mut altered = manifest.clone();
+            altered.tables[0].rows = 0;
+            write_manifest(src, &altered);
+            assert_eq!(
+                restore_and_decrypt(src, dst, keyring, "test"),
+                Err(DrillError::InvalidEvidence("unexpected bundle metadata"))
+            );
+            rewrite_checked_file(src, &manifest, KEYRING_PATH, b"{}");
+            assert!(matches!(
+                restore_and_decrypt(src, dst, keyring, "test"),
+                Err(DrillError::Bundle(BundleError::Json(_)))
+            ));
+            rewrite_checked_file(src, &manifest, KEYRING_PATH, br#"{"versions":[]}"#);
+            assert_eq!(
+                restore_and_decrypt(src, dst, keyring, "test"),
+                Err(DrillError::InvalidEvidence(
+                    "keyring manifest disagrees with bundle"
+                ))
+            );
+
+            let mut rows = std::fs::read(src.join(ROW_PATH)).unwrap();
+            rows.extend_from_slice(b"{}\n");
+            std::fs::write(src.join(KEYRING_PATH), keyring_raw).unwrap();
+            rewrite_checked_file(src, &manifest, ROW_PATH, &rows);
+            assert!(matches!(
+                restore_and_decrypt(src, dst, keyring, "test"),
+                Err(DrillError::Bundle(BundleError::Json(_)))
+            ));
+        });
+    }
+
+    #[test]
+    fn drill_row_must_describe_a_valid_fixture() {
+        with_drill_bundle("drill-row-metadata", |src, dst, manifest, keyring| {
+            let mut row: DrillRow =
+                serde_json::from_slice(&std::fs::read(src.join(ROW_PATH)).unwrap()).unwrap();
+            row.envelope_version = 0;
+            let bytes = serde_json::to_vec(&row).unwrap();
+            rewrite_checked_file(src, &manifest, ROW_PATH, &bytes);
+            assert_eq!(
+                restore_and_decrypt(src, dst, keyring, "test"),
+                Err(DrillError::InvalidEvidence(
+                    "unexpected drill envelope metadata"
+                ))
+            );
+
+            row.envelope_version = ENVELOPE_VERSION_V2;
+            row.plaintext_size = MIN_FIXTURE_BYTES - 1;
+            let bytes = serde_json::to_vec(&row).unwrap();
+            rewrite_checked_file(src, &manifest, ROW_PATH, &bytes);
+            assert_eq!(
+                restore_and_decrypt(src, dst, keyring, "test"),
+                Err(DrillError::FixtureTooSmall)
+            );
+        });
+    }
+
+    #[test]
+    fn restored_bundle_is_verified_before_evidence() {
+        with_drill_bundle("corrupt-restore", |src, dst, mut manifest, keyring| {
+            copy_dir(src, dst).unwrap();
+            manifest.files.retain(|file| file.path != KEYRING_PATH);
+            write_manifest(dst, &manifest);
+            assert!(dst.join(KEYRING_PATH).is_file());
+            bundle::verify_bundle(dst).unwrap();
+            assert_eq!(
+                decrypt_restored_dir(dst, keyring, "test", now_unix()),
+                Err(DrillError::InvalidEvidence(
+                    "unexpected bundle file inventory"
+                ))
+            );
+        });
+    }
+
+    #[test]
+    fn checksummed_corruption_still_fails_authentication() {
+        with_drill_bundle("authenticated-restore", |src, dst, manifest, keyring| {
+            let row_raw = std::fs::read(src.join(ROW_PATH)).unwrap();
+            let row: DrillRow = serde_json::from_slice(&row_raw).unwrap();
+            let mut bad_wrap = row.clone();
+            let mut wrap = b64_bytes(&row.dek_wrapped_b64, 48).unwrap();
+            wrap[0] ^= 1;
+            bad_wrap.dek_wrapped_b64 = b64(&wrap);
+            let mut bad_payload = row.clone();
+            let mut payload = b64_bytes(&row.ciphertext_b64, 0).unwrap();
+            payload[0] ^= 1;
+            bad_payload.ciphertext_b64 = b64(&payload);
+            for row in [bad_wrap, bad_payload] {
+                let bytes = serde_json::to_vec(&row).unwrap();
+                rewrite_checked_file(src, &manifest, ROW_PATH, &bytes);
+                assert_eq!(
+                    restore_and_decrypt(src, dst, keyring, "test"),
+                    Err(DrillError::Envelope(EnvelopeError::Crypto))
+                );
+            }
+
+            std::fs::write(src.join(ROW_PATH), &row_raw).unwrap();
+            let mut blob = std::fs::read(src.join(BLOB_PATH)).unwrap();
+            *blob.last_mut().unwrap() ^= 1;
+            rewrite_checked_file(src, &manifest, BLOB_PATH, &blob);
+            assert!(matches!(
+                restore_and_decrypt(src, dst, keyring, "test"),
+                Err(DrillError::Crypto(_))
+            ));
+        });
     }
 
     #[test]
