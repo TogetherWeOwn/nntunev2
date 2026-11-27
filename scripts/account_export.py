@@ -347,11 +347,12 @@ class _Projection:
     def section(self, section, expected):
         if type(section) is not Section or type(section.rows) is not tuple:
             raise ExportError("missing source coverage")
-        if section.status not in ("collected", "not_collected"):
+        status = section.status
+        if type(status) is not str or status not in ("collected", "not_collected"):
             raise ExportError("unknown source coverage")
-        if section.status == "not_collected" and section.rows:
+        if status == "not_collected" and section.rows:
             raise ExportError("uncollected source contains rows")
-        if expected is None and section.status != "not_collected":
+        if expected is None and status != "not_collected":
             raise ExportError("source has no accepted schema")
         self.count(len(section.rows))
         rows = []
@@ -371,7 +372,7 @@ class _Projection:
         if expected in (Playlist, Genre):
             if len({r["public_id"] for r in rows}) != len(rows):
                 raise ExportError("duplicate public identity")
-        return {"status": section.status, "rows": rows}
+        return {"status": status, "rows": rows}
 
 
 def _mbid(value: str) -> bool:

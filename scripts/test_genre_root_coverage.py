@@ -1,6 +1,7 @@
 """Synthetic-only coverage and CLI contract tests; run in GitHub Actions."""
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -134,10 +135,20 @@ class CoverageTests(unittest.TestCase):
                 with self.assertRaises(coverage.InputError):
                     coverage.load(path)
 
+    def test_cli_rejects_fifo_without_waiting_for_a_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private-source.json"
+            os.mkfifo(path)
+            result = self.cli(path, timeout=3)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("regular file", result.stderr)
+            self.assertNotIn(path.name, result.stderr)
+
     @staticmethod
-    def cli(path):
+    def cli(path, timeout=10):
         return subprocess.run([sys.executable, str(Path(coverage.__file__)), str(path)],
-                              text=True, capture_output=True, timeout=10)
+                              text=True, capture_output=True, timeout=timeout)
 
 
 if __name__ == "__main__":

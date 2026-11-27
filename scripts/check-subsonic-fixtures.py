@@ -1,91 +1,117 @@
 #!/usr/bin/env python3
 """Validate Subsonic golden fixtures without the Rust toolchain.
 
-Checks every file in fixtures/subsonic/: XML prolog + envelope shape, JSON
-parse + `subsonic-response` root, the routes manifest counts (49 supported,
-9 unsupported), and that the README documents the contract. The byte-exact
-comparison against handler output lives in the Rust fixture suite; this is
-the cheap CI gate that catches malformed or misnamed fixtures.
+Checks XML, JSON and JSONP response envelopes, the route manifest (49 supported,
+9 unsupported), and required files in fixtures/subsonic/. The Rust fixture
+suite compares the golden bytes against handler output.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parent.parent
 FIX = ROOT / "fixtures" / "subsonic"
+ENVELOPE = "subsonic-response"
+PROLOG = '<?xml version="1.0" encoding="UTF-8"?>'
+ROUTE_COUNTS = {"supported": 49, "unsupported": 9}
 
-failures = []
+
+def unique_object(pairs):
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ValueError("duplicate JSON fields")
+    return fields
 
 
-def fail(msg):
-    failures.append(msg)
-    print(f"FAIL: {msg}")
+def reject_constant(_value):
+    raise ValueError("non-finite JSON constant")
+
+
+def parse_json(text):
+    return json.loads(text, object_pairs_hook=unique_object, parse_constant=reject_constant)
+
+
+def valid_routes(doc):
+    if not isinstance(doc, dict) or doc.keys() != ROUTE_COUNTS.keys():
+        return False
+    seen = set()
+    for kind, count in ROUTE_COUNTS.items():
+        routes = doc[kind]
+        if not isinstance(routes, list) or len(routes) != count:
+            return False
+        for route in routes:
+            if (not isinstance(route, str) or not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9]*", route)
+                    or route in seen):
+                return False
+            seen.add(route)
+    return True
+
+
+def valid_envelope(doc):
+    return (isinstance(doc, dict) and doc.get("status") in ("ok", "failed")
+            and doc.get("version") == "1.16.1")
+
+
+def valid_fixture(path):
+    text = path.read_bytes().decode("utf-8")
+    if path.name == "routes-table.json":
+        return valid_routes(parse_json(text))
+    if "\r" in text or "\n" in text:
+        return False
+    if path.suffix == ".xml":
+        if not text.startswith(PROLOG) or "<!DOCTYPE" in text:
+            return False
+        root = ElementTree.fromstring(text)
+        return root.tag == ENVELOPE and valid_envelope(root.attrib)
+    if path.name == "ping-jsonp.txt":
+        # The byte-exact Rust golden test requests the literal callback cb.
+        if not text.startswith("/**/cb(") or not text.endswith(");"):
+            return False
+        text = text.removeprefix("/**/cb(").removesuffix(");")
+    elif path.suffix != ".json":
+        return False
+    doc = parse_json(text)
+    return isinstance(doc, dict) and doc.keys() == {ENVELOPE} and valid_envelope(doc[ENVELOPE])
 
 
 def main():
-    if not FIX.is_dir():
-        fail(f"missing directory {FIX}")
+    try:
+        # Resolve before listing so a symlink anywhere in the fixed path is refused.
+        if FIX.resolve(strict=True) != FIX:
+            raise ValueError("linked fixture directory")
+        paths = sorted(FIX.iterdir())
+    except (OSError, RuntimeError, ValueError):
+        print("FAIL: missing, linked or unreadable fixture directory")
         return 1
 
-    names = sorted(p.name for p in FIX.iterdir() if p.is_file() and p.name != "README.md")
-    if not names:
-        fail("no fixtures found")
-        return 1
+    failures = []
+    names = set()
+    for path in paths:
+        try:
+            if path.is_symlink():
+                failures.append(f"{path.name!r}: linked fixture")
+            elif path.is_file():
+                names.add(path.name)
+                if path.name != "README.md" and not valid_fixture(path):
+                    failures.append(f"{path.name!r}: invalid fixture")
+            elif not path.is_dir():
+                failures.append(f"{path.name!r}: expected regular fixture file")
+        except (OSError, ValueError, RecursionError, ElementTree.ParseError):
+            failures.append(f"{path.name!r}: unreadable or malformed fixture")
 
-    manifests = {"routes-table.json"}
-    for name in names:
-        if name in manifests:
-            continue  # validated separately below
-        path = FIX / name
-        raw = path.read_bytes()
-        if name.endswith(".xml"):
-            text = raw.decode("utf-8")
-            if not text.startswith('<?xml version="1.0" encoding="UTF-8"?>'):
-                fail(f"{name}: missing XML prolog")
-            if "<subsonic-response " not in text:
-                fail(f"{name}: missing envelope root")
-            stripped = text.rstrip()
-            if not (
-                stripped.endswith("</subsonic-response>") or stripped.endswith("/>")
-            ):
-                fail(f"{name}: envelope not closed")
-            if b"\n" in raw or b"\r" in raw:
-                fail(f"{name}: must be a single line (no pretty-printing)")
-        elif name.endswith(".json"):
-            try:
-                doc = json.loads(raw.decode("utf-8"))
-            except json.JSONDecodeError as e:
-                fail(f"{name}: invalid JSON: {e}")
-                continue
-            if "subsonic-response" not in doc:
-                fail(f"{name}: missing subsonic-response root")
-            if b"\n" in raw or b"\r" in raw:
-                fail(f"{name}: must be compact single-line JSON")
-        elif name.endswith(".txt"):
-            if b"subsonic-response" not in raw:
-                fail(f"{name}: missing envelope")
-        else:
-            fail(f"{name}: unexpected extension (want .xml/.json/.txt)")
+    for name in ("README.md", "routes-table.json", "ping.xml", "ping.json",
+                 "ping-jsonp.txt", "error-auth-required.xml"):
+        if name not in names:
+            failures.append(f"missing required fixture {name}")
 
-    manifest = FIX / "routes-table.json"
-    if manifest.exists():
-        doc = json.loads(manifest.read_text())
-        if len(doc.get("supported", [])) != 49:
-            fail(f"routes-table.json: want 49 supported, got {len(doc.get('supported', []))}")
-        if len(doc.get("unsupported", [])) != 9:
-            fail(f"routes-table.json: want 9 unsupported, got {len(doc.get('unsupported', []))}")
-    else:
-        fail("routes-table.json missing")
+    for failure in failures:
+        print(f"FAIL: {failure}")
 
-    for golden in ("ping.xml", "ping.json", "error-auth-required.xml"):
-        if golden not in names:
-            fail(f"missing required fixture {golden}")
-
-    if not (FIX / "README.md").exists():
-        fail("fixtures README.md missing")
-
-    print(f"checked {len(names)} fixtures: {'OK' if not failures else f'{len(failures)} failures'}")
+    count = len(names - {"README.md"})
+    print(f"checked {count} fixtures: {'OK' if not failures else f'{len(failures)} failures'}")
     return 1 if failures else 0
 
 
