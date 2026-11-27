@@ -662,9 +662,6 @@ fn front_route_arms_the_deadline_before_dispatch_and_settles_through_the_seam() 
 
 #[test]
 fn no_new_fault_code_and_no_leaked_timers_on_the_front_hop() {
-    // (`"repair_timeout"` is an existing Container verdict code
-    // relayed by leak_code elsewhere in the file; the front-slice
-    // pin below keeps it out of the front route itself.)
     for code_name in [
         "\"do_timeout\"",
         "\"front_timeout\"",
@@ -691,4 +688,17 @@ fn no_new_fault_code_and_no_leaked_timers_on_the_front_hop() {
             "runtime.rs must not {banned}: deadline futures are owned locals dropped on every exit"
         );
     }
+}
+
+#[test]
+fn timed_out_round_cannot_be_joined_by_a_retry() {
+    let object = fn_slice(
+        RUNTIME_RS,
+        "impl DurableObject for RepairContainer",
+        "impl RepairContainer",
+    );
+    let (before_run, _) = object.split_once("self.run(&parsed).await").unwrap();
+    assert!(before_run.contains("let Some(_round) = self.round_lock.try_lock() else"));
+    let (_, busy) = before_run.split_once("self.round_lock.try_lock()").unwrap();
+    assert!(busy.contains("return fault_response(&repair_unavailable_fault())"));
 }

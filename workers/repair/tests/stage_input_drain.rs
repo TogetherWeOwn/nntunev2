@@ -127,24 +127,15 @@ fn stage_input_cancels_or_caps_the_put_reply_body() {
 }
 
 #[test]
-fn runtime_has_no_fourth_whole_body_collect() {
-    // The single legitimate whole-body collect, under an explicit
-    // size contract: read_object_capped (R2 size checked against
-    // its cap before the read). Both result replies — the front-door
-    // DO reply and container_json — stream through the shared
-    // read_response_capped helper (check-before-extend via
-    // push_chunk_capped), so neither keeps a `.bytes()` by design.
-    // A second `.bytes()` is the stage_input drain — possibly moved
-    // into a helper — or a front-door/container_json regression,
-    // and must go.
-    let collects = RUNTIME_RS.matches(".bytes()").count();
-    assert_eq!(
-        collects, 1,
-        "runtime.rs must keep exactly the 1 capped `.bytes()` collect \
-         (read_object_capped); a 2nd is an uncapped collect \
-         (stage_input drain) or a front-door/container_json regression \
-         to whole-body buffering instead of streaming under the cap"
-    );
+fn runtime_streams_bodies_without_whole_body_collects() {
+    assert!(!RUNTIME_RS.contains(".bytes()"));
+    let request = fn_text("async fn read_capped", "async fn read_response_capped");
+    assert!(request.contains("if !push_chunk_capped("));
+    let scratch = RUNTIME_RS
+        .split_once("async fn read_object_capped")
+        .unwrap()
+        .1;
+    assert!(scratch.contains("if !push_chunk_capped("));
     let body = container_json();
     assert!(
         body.contains("read_response_capped") && body.contains("MAX_RESULT_BYTES"),
@@ -257,7 +248,7 @@ fn neighbouring_body_readers_still_collect_under_their_caps() {
         whole.contains("if object.size() > cap as u64"),
         "read_object_capped must keep checking R2 metadata before reading"
     );
-    let fetch_output = fn_text("async fn fetch_output", "fn leak_code");
+    let fetch_output = fn_text("async fn fetch_output", "async fn container_json");
     assert!(
         fetch_output.contains(".stream()")
             && fetch_output.contains("FixedLengthStream::wrap(stream, output.size)"),

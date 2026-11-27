@@ -4,8 +4,8 @@
 use nntune_core::par2::scratch::object_key_for_file_name;
 use nntune_repair::contract::{
     classify_container_reply, container_repair_body, in_key, ingest_reply_body, manifest_digest,
-    manifest_key, out_key, parse_manifest, parse_request, plan, result_key, ContainerOutcome,
-    OutputFile, Plan, RepairResult, RepairStatus,
+    manifest_key, out_key, parse_do_reply, parse_manifest, parse_request, plan, result_key,
+    ContainerOutcome, OutputFile, Plan, RepairResult, RepairStatus,
 };
 
 const JOB: &str = "job_0123456789abcdef";
@@ -111,25 +111,24 @@ fn manifest_validation_mirrors_the_container_rules() {
 
 #[test]
 fn existing_result_short_circuits_the_paid_run() {
-    let req = parse_request(&request_json()).unwrap();
     let manifest = parse_manifest(&manifest_json()).unwrap();
     let digest = manifest_digest(&manifest);
-    assert_eq!(plan(&req, None, &digest).unwrap(), Plan::Run);
+    assert_eq!(plan(&manifest, None, &digest).unwrap(), Plan::Run);
 
     let stored = serde_json::to_vec(&serde_json::json!({
         "status": "repaired",
         "exit_code": 0,
-        "files": [],
+        "files": [{"file_name": "track.flac", "key": object_key_for_file_name("track.flac"), "size": 7}],
         "manifest_digest": digest,
     }))
     .unwrap();
-    match plan(&req, Some(&stored), &digest).unwrap() {
+    match plan(&manifest, Some(&stored), &digest).unwrap() {
         Plan::AlreadyDone(result) => assert_eq!(result.status.as_str(), "repaired"),
         other => panic!("stored result for the same manifest must short-circuit, got {other:?}"),
     }
 
     // A corrupt stored result is a server fault, never a silent re-run.
-    let err = plan(&req, Some(b"not json"), &digest).unwrap_err();
+    let err = plan(&manifest, Some(b"not json"), &digest).unwrap_err();
     assert_eq!(err.status, 500);
 }
 
@@ -138,15 +137,15 @@ fn stored_result_for_a_different_manifest_reruns() {
     // Redrive resets repair rounds to 1, so (job_id, round) repeats;
     // a result recorded against the previous generation's manifest
     // must not short-circuit the new run.
-    let req = parse_request(&request_json()).unwrap();
     let stored = br#"{"status":"unrepairable","exit_code":1,"files":[],"manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
-    let digest = manifest_digest(&parse_manifest(&manifest_json()).unwrap());
-    assert_eq!(plan(&req, Some(stored), &digest).unwrap(), Plan::Rerun);
+    let manifest = parse_manifest(&manifest_json()).unwrap();
+    let digest = manifest_digest(&manifest);
+    assert_eq!(plan(&manifest, Some(stored), &digest).unwrap(), Plan::Rerun);
 
     // A legacy stored result with no digest cannot be proven to
     // belong to the current manifest either.
     let legacy = br#"{"status":"unrepairable","exit_code":1,"files":[]}"#;
-    assert_eq!(plan(&req, Some(legacy), &digest).unwrap(), Plan::Rerun);
+    assert_eq!(plan(&manifest, Some(legacy), &digest).unwrap(), Plan::Rerun);
 }
 
 #[test]
@@ -155,7 +154,6 @@ fn same_names_and_sizes_with_a_new_staging_id_rerun() {
     // file names, same lengths (a damaged file keeps its full length),
     // different bytes. The digest must bind to the staging, not just
     // the file list, or the old verdict replays with no repair run.
-    let req = parse_request(&request_json()).unwrap();
     let first = parse_manifest(&manifest_json_with_staging("staging-0000000000000001")).unwrap();
     let restaged = parse_manifest(&manifest_json_with_staging("staging-0000000000000002")).unwrap();
     assert_eq!(first.files, restaged.files);
@@ -173,11 +171,11 @@ fn same_names_and_sizes_with_a_new_staging_id_rerun() {
     }))
     .unwrap();
     assert_eq!(
-        plan(&req, Some(&stored), &restaged_digest).unwrap(),
+        plan(&restaged, Some(&stored), &restaged_digest).unwrap(),
         Plan::Rerun
     );
     // The same staging still short-circuits a duplicate delivery.
-    match plan(&req, Some(&stored), &first_digest).unwrap() {
+    match plan(&first, Some(&stored), &first_digest).unwrap() {
         Plan::AlreadyDone(result) => assert_eq!(result.status.as_str(), "unrepairable"),
         other => panic!("same staging must short-circuit, got {other:?}"),
     }
@@ -256,20 +254,20 @@ fn container_replies_classify_for_the_ingest_mapping() {
     }
     match classify_container_reply(503, br#"{"error":"repair_timeout"}"#) {
         ContainerOutcome::Forward(status, code) => {
-            assert_eq!((status, code.as_str()), (503, "repair_timeout"))
+            assert_eq!((status, code), (503, "repair_timeout"))
         }
         other => panic!("expected Forward, got {other:?}"),
     }
     match classify_container_reply(409, br#"{"error":"repair_manifest_conflict"}"#) {
         ContainerOutcome::Forward(status, code) => {
-            assert_eq!((status, code.as_str()), (409, "repair_manifest_conflict"))
+            assert_eq!((status, code), (409, "repair_manifest_conflict"))
         }
         other => panic!("expected Forward, got {other:?}"),
     }
     // Unknown or malformed replies become a retryable container fault.
     match classify_container_reply(200, b"garbage") {
         ContainerOutcome::Forward(status, code) => {
-            assert_eq!((status, code.as_str()), (502, "container_unavailable"))
+            assert_eq!((status, code), (502, "container_unavailable"))
         }
         other => panic!("expected Forward, got {other:?}"),
     }
@@ -277,4 +275,42 @@ fn container_replies_classify_for_the_ingest_mapping() {
         ContainerOutcome::Forward(status, _) => assert_eq!(status, 502),
         other => panic!("expected Forward, got {other:?}"),
     }
+}
+
+#[test]
+fn untrusted_faults_cannot_become_permanent() {
+    let unavailable = ContainerOutcome::Forward(502, "container_unavailable");
+    for body in [
+        br#"{"error":"synthetic_diagnostic"}"#.as_slice(),
+        br#"{"error":"repair_timeout"}"#,
+    ] {
+        assert_eq!(classify_container_reply(400, body), unavailable);
+        let err = parse_do_reply(400, body).unwrap_err();
+        assert_eq!((err.status, err.code), (503, "repair_unavailable"));
+    }
+}
+
+#[test]
+fn do_reply_discards_diagnostic_fields_and_rejects_false_verdicts() {
+    let runtime = include_str!("../src/runtime.rs");
+    assert!(runtime.contains(".and_then(|(status, bytes)| parse_do_reply(status, &bytes))"));
+    let reply = parse_do_reply(
+        200,
+        br#"{"status":"repaired","exit_code":0,"file_count":1,"diagnostic":"synthetic_detail"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(reply).unwrap(),
+        serde_json::json!({"status":"repaired","exit_code":0,"file_count":1})
+    );
+    assert!(parse_do_reply(
+        200,
+        br#"{"status":"unrepairable","exit_code":8,"file_count":0}"#
+    )
+    .is_err());
+    assert!(parse_do_reply(
+        200,
+        br#"{"status":"unrepairable","exit_code":1,"file_count":1}"#
+    )
+    .is_err());
 }

@@ -10,25 +10,11 @@
 //! boundary against a `>=` regression), and exactly-`MAX` invalid JSON still
 //! 500s via the parser.
 
-use nntune_core::par2::scratch::object_key_for_file_name;
+use nntune_core::par2::scratch::{object_key_for_file_name, MAX_SCRATCH_TOTAL_BYTES};
 use nntune_repair::contract::{
-    manifest_digest, plan, FileRole, OutputFile, Plan, RepairRequest, RepairResult, RepairStatus,
-    ScratchFile, ScratchManifest, MAX_RESULT_BYTES,
+    classify_container_reply, manifest_digest, plan, ContainerOutcome, FileRole, OutputFile, Plan,
+    RepairResult, RepairStatus, ScratchFile, ScratchManifest, MAX_RESULT_BYTES,
 };
-
-const JOB: &str = "job_0123456789abcdef";
-
-fn dummy_req() -> RepairRequest {
-    RepairRequest {
-        job_id: JOB.to_string(),
-        user_id: "user_01".to_string(),
-        idempotency_key: "ingest:user_01:upload".to_string(),
-        par2_set_id: "par2-set-01".to_string(),
-        missing_blocks: 3,
-        round: 1,
-        scratch_prefix: format!("ingest-scratch/{JOB}/r1/"),
-    }
-}
 
 fn manifest() -> ScratchManifest {
     ScratchManifest {
@@ -79,7 +65,6 @@ fn padded_to(base: &[u8], target_len: usize) -> Vec<u8> {
 
 #[test]
 fn stored_result_one_byte_over_cap_is_500_before_parse() {
-    let req = dummy_req();
     let digest = manifest_digest(&manifest());
     let base = valid_result_bytes(&digest);
     assert!(
@@ -91,23 +76,21 @@ fn stored_result_one_byte_over_cap_is_500_before_parse() {
     let body = padded_to(&base, MAX_RESULT_BYTES + 1);
     assert_eq!(body.len(), MAX_RESULT_BYTES + 1);
     serde_json::from_slice::<RepairResult>(&body).unwrap();
-    let err = plan(&req, Some(&body), &digest).unwrap_err();
+    let err = plan(&manifest(), Some(&body), &digest).unwrap_err();
     assert_eq!((err.status, err.code), (500, "repair_unavailable"));
 }
 
 #[test]
 fn corrupt_stored_result_is_same_500() {
-    let req = dummy_req();
     let digest = manifest_digest(&manifest());
     let body = b"{not json".to_vec();
     assert!(body.len() < MAX_RESULT_BYTES);
-    let err = plan(&req, Some(&body), &digest).unwrap_err();
+    let err = plan(&manifest(), Some(&body), &digest).unwrap_err();
     assert_eq!((err.status, err.code), (500, "repair_unavailable"));
 }
 
 #[test]
 fn under_cap_valid_result_with_matching_digest_is_already_done() {
-    let req = dummy_req();
     let digest = manifest_digest(&manifest());
     let body = valid_result_bytes(&digest);
     assert!(
@@ -115,7 +98,7 @@ fn under_cap_valid_result_with_matching_digest_is_already_done() {
         "pin sensitivity: valid fixture is {} bytes, cap is {MAX_RESULT_BYTES}",
         body.len()
     );
-    match plan(&req, Some(&body), &digest).unwrap() {
+    match plan(&manifest(), Some(&body), &digest).unwrap() {
         Plan::AlreadyDone(result) => {
             assert_eq!(result.manifest_digest, digest);
             assert_eq!(result.status, RepairStatus::Repaired);
@@ -126,28 +109,55 @@ fn under_cap_valid_result_with_matching_digest_is_already_done() {
 
 #[test]
 fn exactly_at_cap_invalid_json_still_500s() {
-    let req = dummy_req();
     let digest = manifest_digest(&manifest());
     let body = vec![b'x'; MAX_RESULT_BYTES];
     assert_eq!(body.len(), MAX_RESULT_BYTES);
-    let err = plan(&req, Some(&body), &digest).unwrap_err();
+    let err = plan(&manifest(), Some(&body), &digest).unwrap_err();
     assert_eq!((err.status, err.code), (500, "repair_unavailable"));
 }
 
 #[test]
 fn valid_stored_result_exactly_at_cap_is_already_done() {
-    let req = dummy_req();
     let digest = manifest_digest(&manifest());
     let base = valid_result_bytes(&digest);
     let body = padded_to(&base, MAX_RESULT_BYTES);
     assert_eq!(body.len(), MAX_RESULT_BYTES);
     serde_json::from_slice::<RepairResult>(&body).unwrap();
 
-    match plan(&req, Some(&body), &digest).unwrap() {
+    match plan(&manifest(), Some(&body), &digest).unwrap() {
         Plan::AlreadyDone(result) => {
             assert_eq!(result.manifest_digest, digest);
             assert_eq!(result.status, RepairStatus::Repaired);
         }
         other => panic!("expected AlreadyDone, got {other:?}"),
     }
+}
+
+#[test]
+fn output_budget_rejects_oversize_and_overflow() {
+    let mut result: RepairResult = serde_json::from_slice(&valid_result_bytes("")).unwrap();
+    result.files[0].size = MAX_SCRATCH_TOTAL_BYTES;
+    let classify =
+        |result: &RepairResult| classify_container_reply(200, &serde_json::to_vec(result).unwrap());
+    assert!(matches!(classify(&result), ContainerOutcome::Done(_)));
+    result.files[0].size += 1;
+    let unavailable = ContainerOutcome::Forward(502, "container_unavailable");
+    assert_eq!(classify(&result), unavailable);
+    result.files[0].size = u64::MAX;
+    result.files.push(OutputFile {
+        size: 2,
+        ..result.files[0].clone()
+    });
+    assert_eq!(classify(&result), unavailable);
+}
+
+#[test]
+fn matching_digest_cannot_replay_a_missing_output() {
+    let manifest = manifest();
+    let digest = manifest_digest(&manifest);
+    let mut result: RepairResult = serde_json::from_slice(&valid_result_bytes(&digest)).unwrap();
+    result.files.clear();
+    let body = serde_json::to_vec(&result).unwrap();
+    let err = plan(&manifest, Some(&body), &digest).unwrap_err();
+    assert_eq!((err.status, err.code), (500, "repair_unavailable"));
 }

@@ -414,7 +414,7 @@ fn classify_rejects_valid_result_one_byte_over_cap_as_502() {
     serde_json::from_slice::<RepairResult>(&body).unwrap();
     assert_eq!(
         classify_container_reply(200, &body),
-        ContainerOutcome::Forward(502, "container_unavailable".to_string())
+        ContainerOutcome::Forward(502, "container_unavailable")
     );
 }
 
@@ -426,7 +426,7 @@ fn classify_forwards_known_container_error_code() {
     assert!(body.len() < MAX_RESULT_BYTES);
     assert_eq!(
         classify_container_reply(400, body),
-        ContainerOutcome::Forward(400, "invalid_manifest".to_string())
+        ContainerOutcome::Forward(400, "invalid_manifest")
     );
 }
 
