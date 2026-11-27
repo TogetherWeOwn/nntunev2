@@ -272,12 +272,12 @@ async fn unmounted_history_receiver_writes_through_pg_store() {
     assert!(export(&observer, &owner, None).await.unwrap().is_empty());
     assert_eq!(export(&observer, &other, None).await.unwrap(), other_rows);
     observer.execute(delete_user, &[&other]).await.unwrap();
-    assert_transition_write_boundaries(&ctx, &observer).await;
+    assert_transition_write_boundaries(&mut ctx, &observer).await;
 }
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 async fn assert_transition_write_boundaries<S, M, D, N>(
-    ctx: &Ctx<'_, S, M, D, N>,
+    ctx: &mut Ctx<'_, S, M, D, N>,
     observer: &tokio_postgres::Client,
 ) where
     S: Store + SingleUseStore,
@@ -292,10 +292,10 @@ async fn assert_transition_write_boundaries<S, M, D, N>(
 
     let owner = format!("listen-transition-{:x}", rand::random::<u64>());
     seed_owner(observer, &owner).await;
-    let mut ctx = Ctx { now: 2000, ..*ctx };
+    ctx.now = 2000;
     let mut base = receive_request(Some(cookie_of(&ctx.start_session(&owner).await.unwrap())));
     base.body.clear();
-    let context_resp = receiver::context(&ctx, &base).await;
+    let context_resp = receiver::context(ctx, &base).await;
     assert_eq!(context_resp.status, 200);
     let context_token = from_str::<Value>(&context_resp.body).unwrap()["context"].clone();
     base.path = CLEAR_PATH.into();
@@ -344,7 +344,7 @@ async fn assert_transition_write_boundaries<S, M, D, N>(
     // Track A starts, then rapid skip acquires Track B (never started) and Track C.
     acquire("track-a", play_a, 1).await;
     assert_eq!(
-        receiver::write(&ctx, &req(&uuid_a, "track-a", "start"))
+        receiver::write(ctx, &req(&uuid_a, "track-a", "start"))
             .await
             .status,
         200
@@ -370,7 +370,7 @@ async fn assert_transition_write_boundaries<S, M, D, N>(
         (2021, uuid_c.as_str(), "track-c", "skip", false),
     ] {
         ctx.now = now;
-        let resp = receiver::write(&ctx, &req(playback_id, track_id, event)).await;
+        let resp = receiver::write(ctx, &req(playback_id, track_id, event)).await;
         if ok {
             assert_eq!(resp.status, 200, "{track_id}:{event}");
         } else {

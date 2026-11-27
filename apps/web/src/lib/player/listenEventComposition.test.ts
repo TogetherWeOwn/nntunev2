@@ -327,10 +327,10 @@ it('keeps one listen across seeks and clears sampled end when seeking back befor
 	await f.flushWrites();
 	expect(f.eventWrites).toEqual([f.row(0, 'track-a', 'start')]);
 
-	// Sampled end cleared by seeking back before `ended` must record `skip`, not a false `complete`.
+	// Sampled end cleared by seeking back before `ended` (without resuming) must record `skip`, not `complete`.
 	firstAudio.ended = true; fire(firstAudio, 'timeupdate');
 	Object.assign(firstAudio, { ended: false, currentTime: 40 });
-	fire(firstAudio, 'seeking', 'seeked', 'playing');
+	fire(firstAudio, 'seeking', 'seeked');
 	f.player.media.nextFromQueue();
 	await f.flushWrites();
 
@@ -388,11 +388,14 @@ it('does not double-credit or leak across an aborted track-end transition', asyn
 	await f.flushWrites();
 	expect(f.eventWrites).toEqual([f.row(0, 'track-a', 'start'), f.row(0, 'track-a', 'complete')]);
 
-	// User aborts the automatic track-b transition by pausing and then selecting track-c.
+	// Pause alone cancels the in-flight track-b transition before any later selection.
 	f.player.media.pauseCurrent();
-	const chooseThird = f.play(2);
 	delayedSuccessor.release();
-	await chooseThird;
+	await f.flushWrites();
+	expect([f.audio() === firstAudio, currentTrack(f.player.queue.snapshot)?.id]).toEqual([true, 'track-a']);
+	expect(f.eventWrites).toEqual([f.row(0, 'track-a', 'start'), f.row(0, 'track-a', 'complete')]);
+
+	await f.play(2);
 	const thirdAudio = f.audio();
 	fire(thirdAudio, 'playing');
 	f.end(thirdAudio, 'ended');
