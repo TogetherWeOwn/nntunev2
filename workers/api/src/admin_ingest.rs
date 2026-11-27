@@ -60,9 +60,10 @@ pub const PAYLOAD_FORMAT_RAW_NZB_V1: i16 = 1;
 
 /// GCM nonce length (schema `CHECK (octet_length(..) = 12)`).
 pub const NONCE_LEN: usize = 12;
+const GCM_TAG_LEN: usize = 16;
 /// Wrapped-DEK length: 32-byte DEK + 16-byte GCM tag (schema `CHECK
 /// (octet_length(nzb_ref_dek_wrapped) = 48)`).
-pub const WRAPPED_DEK_LEN: usize = 48;
+pub const WRAPPED_DEK_LEN: usize = 32 + GCM_TAG_LEN;
 
 /// AAD domain pinning the v2 envelope family (ADR 0002 rule 1).
 const AAD_DOMAIN: &str = "nntune-envelope-v2";
@@ -198,7 +199,10 @@ pub fn classify_upload(body: &[u8]) -> Result<ValidatedNzb, FailureReason> {
 
 /// Content identity: lowercase hex SHA-256 of the raw upload bytes.
 pub fn content_sha256_hex(body: &[u8]) -> String {
-    let digest = Sha256::digest(body);
+    digest_hex(&Sha256::digest(body))
+}
+
+fn digest_hex(digest: &[u8]) -> String {
     let mut out = String::with_capacity(64);
     for byte in digest {
         out.push_str(&format!("{byte:02x}"));
@@ -211,8 +215,16 @@ pub fn content_sha256_hex(body: &[u8]) -> String {
 /// the uploader never participates, so two admins uploading the same
 /// bytes converge on one job.
 pub fn derive_job_id(body: &[u8]) -> String {
+    job_id_from_digest(&Sha256::digest(body))
+}
+
+fn job_id_from_digest(digest: &[u8]) -> String {
+    format!("adm_{}", crate::b64::encode(digest))
+}
+
+fn matches_content_identity(body: &[u8], content_hash: &str, job_id: &str) -> bool {
     let digest = Sha256::digest(body);
-    format!("adm_{}", crate::b64::encode(&digest))
+    digest_hex(&digest) == content_hash && job_id_from_digest(&digest) == job_id
 }
 
 /// Source-namespaced idempotency key: the content hash under the
@@ -290,6 +302,11 @@ pub fn encrypt_ingest_original(
     job_id: &str,
     plaintext: &[u8],
 ) -> Result<IngestOriginalEnvelope, VaultError> {
+    if !(1..=ADMIN_INGEST_BODY_LIMIT_BYTES).contains(&plaintext.len())
+        || !matches_content_identity(plaintext, content_sha256_hex, job_id)
+    {
+        return Err(VaultError::Invalid);
+    }
     let mut dek_bytes = crate::random::secure_random_bytes::<32>()?;
     let dek = Dek(dek_bytes);
     // `Dek(dek_bytes)` copies the array: clear the source buffer so
@@ -349,8 +366,8 @@ pub fn encrypt_ingest_original(
 /// being read (ADR 0002 rule 1): the caller passes the row's stored
 /// `envelope_version`, `payload_format` and `kek_version`, and the KEK
 /// for that stored version (version-pinned decrypt — no fallback
-/// loop). Stored-shape failures (negative versions, a short/long
-/// wrapped DEK) are [`VaultError::CorruptStoredData`];
+/// loop). Unsupported versions, invalid lengths, and authenticated bytes
+/// with the wrong content identity are [`VaultError::CorruptStoredData`];
 /// authentication failures are the generic [`VaultError::Crypto`].
 /// No `Debug` on the envelope: nothing here may land in a log line.
 pub fn decrypt_ingest_original(
@@ -362,11 +379,12 @@ pub fn decrypt_ingest_original(
     kek_version: u32,
     envelope: &IngestOriginalEnvelope,
 ) -> Result<Vec<u8>, VaultError> {
-    let envelope_version =
-        u16::try_from(envelope_version).map_err(|_| VaultError::CorruptStoredData)?;
-    let payload_format =
-        u16::try_from(payload_format).map_err(|_| VaultError::CorruptStoredData)?;
-    if envelope.dek_wrapped.len() != WRAPPED_DEK_LEN {
+    if envelope_version != ENVELOPE_VERSION
+        || payload_format != PAYLOAD_FORMAT_RAW_NZB_V1
+        || envelope.dek_wrapped.len() != WRAPPED_DEK_LEN
+        || !(GCM_TAG_LEN + 1..=ADMIN_INGEST_BODY_LIMIT_BYTES + GCM_TAG_LEN)
+            .contains(&envelope.ciphertext.len())
+    {
         return Err(VaultError::CorruptStoredData);
     }
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
@@ -379,8 +397,8 @@ pub fn decrypt_ingest_original(
                     "dek",
                     content_sha256_hex,
                     job_id,
-                    envelope_version,
-                    payload_format,
+                    ENVELOPE_VERSION as u16,
+                    PAYLOAD_FORMAT_RAW_NZB_V1 as u16,
                     Some(kek_version),
                 ),
             },
@@ -393,7 +411,7 @@ pub fn decrypt_ingest_original(
     dek_bytes.zeroize();
     let dek = Dek(dek_array);
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
-    dek_cipher
+    let plaintext = dek_cipher
         .decrypt(
             &Nonce::from(envelope.payload_nonce),
             Payload {
@@ -402,13 +420,17 @@ pub fn decrypt_ingest_original(
                     "payload",
                     content_sha256_hex,
                     job_id,
-                    envelope_version,
-                    payload_format,
+                    ENVELOPE_VERSION as u16,
+                    PAYLOAD_FORMAT_RAW_NZB_V1 as u16,
                     None,
                 ),
             },
         )
-        .map_err(|_| VaultError::Crypto)
+        .map_err(|_| VaultError::Crypto)?;
+    if !matches_content_identity(&plaintext, content_sha256_hex, job_id) {
+        return Err(VaultError::CorruptStoredData);
+    }
+    Ok(plaintext)
 }
 
 /// One guarded upload attempt: everything the store transaction needs.
@@ -505,9 +527,8 @@ pub const LIST_DEFAULT_LIMIT: u64 = 50;
 pub const LIST_MAX_LIMIT: u64 = 100;
 
 /// Bounded list window: limit clamps to 1..=`LIST_MAX_LIMIT` (default
-/// `LIST_DEFAULT_LIMIT`), offset saturates. Both arrive as raw query
-/// text; unparsable is the default, never an error — the window only
-/// narrows what is served.
+/// `LIST_DEFAULT_LIMIT`), offset saturates at PostgreSQL's BIGINT maximum.
+/// Unparsable query text uses the default for that parameter.
 pub fn parse_list_window(limit_raw: Option<&str>, offset_raw: Option<&str>) -> (u64, u64) {
     let limit = limit_raw
         .and_then(|raw| raw.parse::<u64>().ok())
@@ -516,7 +537,8 @@ pub fn parse_list_window(limit_raw: Option<&str>, offset_raw: Option<&str>) -> (
         .unwrap_or(LIST_DEFAULT_LIMIT);
     let offset = offset_raw
         .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(i64::MAX as u64);
     (limit, offset)
 }
 
@@ -685,5 +707,53 @@ mod tests {
             &envelope
         )
         .is_err());
+    }
+
+    #[test]
+    fn authenticated_original_requires_supported_format_and_matching_content() {
+        let body = minimal_nzb();
+        let hex = content_sha256_hex(&body);
+        let job_id = derive_job_id(&body);
+        let kek = [7; 32];
+        let dek = [8; 32];
+        let wrap_nonce = [1; NONCE_LEN];
+        let payload_nonce = [2; NONCE_LEN];
+        let version = ENVELOPE_VERSION;
+        let format = PAYLOAD_FORMAT_RAW_NZB_V1;
+        for (version, format, payload) in [
+            (version + 1, format, body.as_slice()),
+            (version, format + 1, body.as_slice()),
+            (version, format, b"different bytes"),
+        ] {
+            let seal = |key: &[u8], nonce, msg, purpose, kek_version| {
+                Aes256Gcm::new_from_slice(key)
+                    .unwrap()
+                    .encrypt(
+                        &Nonce::from(nonce),
+                        Payload {
+                            msg,
+                            aad: &aad_v2(
+                                purpose,
+                                &hex,
+                                &job_id,
+                                version as u16,
+                                format as u16,
+                                kek_version,
+                            ),
+                        },
+                    )
+                    .unwrap()
+            };
+            let envelope = IngestOriginalEnvelope {
+                dek_wrapped_nonce: wrap_nonce,
+                dek_wrapped: seal(&kek, wrap_nonce, &dek, "dek", Some(1)),
+                payload_nonce,
+                ciphertext: seal(&dek, payload_nonce, payload, "payload", None),
+            };
+            assert_eq!(
+                decrypt_ingest_original(&kek, &hex, &job_id, version, format, 1, &envelope),
+                Err(VaultError::CorruptStoredData),
+            );
+        }
     }
 }

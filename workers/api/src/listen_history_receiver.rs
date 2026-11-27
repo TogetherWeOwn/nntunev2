@@ -1,7 +1,7 @@
 //! Prepared request handlers only. The production router does not call them.
 
 use super::*;
-use crate::listen_history::{valid_playback_id, ListenEvent, ListenEventBody, WriteOutcome};
+use crate::listen_history::{ListenEvent, ListenEventBody, WriteOutcome};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,11 +82,12 @@ where
     } else if body.context.is_some() {
         return validation_failed("unexpected history context");
     }
-    if !valid_playback_id(&body.playback_id)
-        || body.track_id.is_empty()
-        || body.track_id.len() > 128
-        || body.track_id.chars().any(char::is_control)
-    {
+    let event = ListenEventBody {
+        playback_id: body.playback_id,
+        track_id: body.track_id,
+        event: body.event,
+    };
+    if !event.valid_identity() {
         return validation_failed("invalid history event");
     }
     match ctx
@@ -98,11 +99,6 @@ where
         Ok(false) => return throttled(60),
         Err(_) => return internal(),
     }
-    let event = ListenEventBody {
-        playback_id: body.playback_id,
-        track_id: body.track_id,
-        event: body.event,
-    };
     match ctx.store.record_listen_event(&owner, &event, ctx.now).await {
         Ok(WriteOutcome::Written) => json_response(200, serde_json::json!({"ok": true})),
         Ok(WriteOutcome::AccountDeleting) => account_deleting_response(),

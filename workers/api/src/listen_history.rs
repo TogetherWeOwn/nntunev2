@@ -52,6 +52,14 @@ pub struct ListenEventBody {
     pub event: ListenEvent,
 }
 
+impl ListenEventBody {
+    pub(crate) fn valid_identity(&self) -> bool {
+        valid_playback_id(&self.playback_id)
+            && (1..=128).contains(&self.track_id.len())
+            && !self.track_id.chars().any(char::is_control)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ListenRow {
     pub playback_id: String,
@@ -131,6 +139,9 @@ pub async fn record(
     body: &ListenEventBody,
     now: i64,
 ) -> Result<WriteOutcome, StoreError> {
+    if !body.valid_identity() {
+        return Err(StoreError);
+    }
     let tx = begin_write(client).await?;
     match owner_is_deleting(&tx, owner).await? {
         Some(true) => return Ok(WriteOutcome::AccountDeleting),
