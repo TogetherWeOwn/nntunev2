@@ -152,3 +152,61 @@ test('native replay during a stalled online grant prevents a late reconnect retr
 		network.cleanup();
 	}
 });
+
+test('a mid-request drop that reconnects before grant rejection still retries once after settlement', async () => {
+	const network = simulateConnectivity();
+	try {
+		const { media, queue, fetchFn, src, attach, toggleDuringFirstPlay, requests } = setup();
+		await toggleDuringFirstPlay();
+		const first = src(), tab = first.split('/')[5];
+		const ended = attach(false);
+		const started = Promise.withResolvers<void>(), fail = Promise.withResolvers<never>();
+		fetchFn.mockImplementationOnce(async () => {
+			started.resolve();
+			return fail.promise;
+		});
+		ended.finish();
+		await started.promise;
+		network.drop();
+		network.restore();
+		fail.reject(new TypeError('Failed to fetch'));
+
+		await vi.waitFor(() => expect(src()).toBe(`/v1/plays/media/second/${tab}/play-2`));
+		const successor = media.audio as unknown as { currentTime: number; paused: boolean };
+		expect([queue.snapshot.currentIndex, successor === (ended as unknown), successor.currentTime, successor.paused])
+			.toEqual([1, false, 0, false]);
+
+		// A later reconnect cannot trigger a second retry or reopen the previous track's play.
+		network.drop();
+		network.restore();
+		await Promise.resolve();
+		expect(requests().filter((body) => body.track_id === 'first')).toHaveLength(1);
+		expect(requests().slice(2)).toEqual(Array(2).fill({ track_id: 'second', session_id: tab }));
+	} finally {
+		network.cleanup();
+	}
+});
+
+test('clearing audio.ended before a queued native play cancels the armed reconnect retry', async () => {
+	const network = simulateConnectivity();
+	try {
+		const { player, media, queue, fetchFn, src, attach, toggleDuringFirstPlay, requests } = setup();
+		await toggleDuringFirstPlay();
+		const first = src();
+		const ended = attach(false);
+		network.drop();
+		fetchFn.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+		ended.finish();
+		await vi.waitFor(() => expect(player.queueAnnouncement.text).toBe('Could not start the next track. Choose a track to continue.'));
+		// Simulate native replay clearing ended before its queued play event reaches the controller.
+		ended.ended = false;
+		ended.paused = false;
+
+		network.restore();
+		await Promise.resolve();
+		expect([requests().length, queue.snapshot.currentIndex, src(), media.audio, ended.ended, ended.paused])
+			.toEqual([3, 0, first, ended, false, false]);
+	} finally {
+		network.cleanup();
+	}
+});

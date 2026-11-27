@@ -693,21 +693,37 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			// Arm before the first grant settles so a reconnect during a stalled request is retained.
 			const armed = playIntent;
 			let onlineSeen = false, retryStarted = false, listenerArmed = false;
+			const canRetry = () => !!failureMessage && !!listeners && !listeners.aborted &&
+				playIntent === armed && audio.ended && evidence.isCurrent() && ownsOrigin();
 			const armReconnect = () => {
-				if (listenerArmed || !failureMessage || !listeners || globalThis.navigator?.onLine !== false ||
-					playIntent !== armed || !audio.ended || !evidence.isCurrent() || !ownsOrigin()) return;
+				if (retryStarted || listenerArmed || globalThis.navigator?.onLine !== false || !canRetry()) return;
 				listenerArmed = true;
+				onlineSeen = false;
 				reconnectHandoffAudio = audio;
 				globalThis.addEventListener?.('online', () => {
+					listenerArmed = false;
 					onlineSeen = true;
 					reconnectHandoffAudio = undefined;
-					if (!pendingGrant && playIntent === armed && audio.ended) { retryStarted = true; void handoff(); }
+					if (!pendingGrant && !retryStarted && canRetry()) { retryStarted = true; void handoff(); }
 				}, { once: true, signal: listeners });
 			};
 			armReconnect();
-			await handoff();
+			const inflight = !listenerArmed && failureMessage && listeners ? new AbortController() : undefined;
+			if (inflight && listeners) {
+				globalThis.addEventListener?.('online', () => {
+					onlineSeen = true;
+				}, { once: true, signal: AbortSignal.any([listeners, inflight.signal]) });
+			}
+			try {
+				await handoff();
+			} finally {
+				inflight?.abort();
+			}
 			armReconnect();
-			if (onlineSeen && !retryStarted && !pendingGrant && playIntent === armed && audio.ended) void handoff();
+			if (onlineSeen && !retryStarted && !pendingGrant && globalThis.navigator?.onLine !== false && canRetry()) {
+				retryStarted = true;
+				void handoff();
+			}
 			return;
 		}
 		const streamUrl = streamFor(track);
