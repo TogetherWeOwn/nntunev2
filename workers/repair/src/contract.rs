@@ -8,7 +8,9 @@
 //! three sides.
 
 use std::collections::HashSet;
+use std::future::Future;
 
+use futures_util::lock::Mutex;
 use nntune_core::par2::scratch::{
     object_key_for_file_name, sha256_hex, validate_file_name, validate_object_key,
     validate_scratch_prefix, validate_staging_id, MAX_SCRATCH_FILES, MAX_SCRATCH_TOTAL_BYTES,
@@ -233,17 +235,15 @@ pub enum Plan {
 /// is a server fault: silently re-running would spend a second paid
 /// repair on a round that may have completed.
 pub fn plan(
-    manifest: &ScratchManifest,
+    _req: &RepairRequest,
     existing_result: Option<&[u8]>,
     current_manifest_digest: &str,
 ) -> Result<Plan, ApiFault> {
     let Some(bytes) = existing_result else {
         return Ok(Plan::Run);
     };
-    let invalid = || ApiFault::new(500, "repair_unavailable");
-    let result = parse_result(bytes).ok_or_else(invalid)?;
+    let result = parse_result(bytes).ok_or_else(|| ApiFault::new(500, "repair_unavailable"))?;
     if !current_manifest_digest.is_empty() && result.manifest_digest == current_manifest_digest {
-        validate_repaired_output_set(manifest, &result).map_err(|_| invalid())?;
         Ok(Plan::AlreadyDone(result))
     } else {
         Ok(Plan::Rerun)
@@ -259,6 +259,15 @@ pub struct RepairReply {
     pub status: RepairStatus,
     pub exit_code: Option<i32>,
     pub file_count: usize,
+}
+
+/// Refuse overlapping DO rounds while a prior round is still doing I/O.
+pub async fn try_run_round<T>(
+    lock: &Mutex<()>,
+    run: impl Future<Output = Result<T, ApiFault>>,
+) -> Result<T, ApiFault> {
+    let _round = lock.try_lock().ok_or_else(repair_unavailable_fault)?;
+    run.await
 }
 
 fn valid_verdict(status: RepairStatus, exit_code: Option<i32>, file_count: usize) -> bool {
@@ -472,6 +481,15 @@ pub fn ingest_reply_body(result: &RepairResult) -> Vec<u8> {
     serde_json::to_vec(&reply).unwrap_or_default()
 }
 
+pub fn replay_reply(
+    manifest: &ScratchManifest,
+    result: &RepairResult,
+) -> Result<Vec<u8>, ApiFault> {
+    validate_repaired_output_set(manifest, result)
+        .map_err(|_| ApiFault::new(500, "repair_unavailable"))?;
+    Ok(ingest_reply_body(result))
+}
+
 // Scratch object keys for one round. `prefix` has already been
 // validated as the canonical `ingest-scratch/{job}/r{round}/`.
 pub fn manifest_key(prefix: &str) -> String {
@@ -579,6 +597,7 @@ pub fn parse_do_reply(status: u16, body: &[u8]) -> Result<RepairReply, ApiFault>
     } else if let Some(code) = error_code(body) {
         let stable = match (status, code) {
             (404, "scratch_missing") => Some("scratch_missing"),
+            (413, "scratch_input_mismatch") => Some("scratch_input_mismatch"),
             (500 | 503, "repair_unavailable") => Some("repair_unavailable"),
             (502, "container_unavailable") => Some("container_unavailable"),
             (503, "scratch_unavailable") => Some("scratch_unavailable"),

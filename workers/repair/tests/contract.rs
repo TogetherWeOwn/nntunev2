@@ -111,24 +111,25 @@ fn manifest_validation_mirrors_the_container_rules() {
 
 #[test]
 fn existing_result_short_circuits_the_paid_run() {
+    let req = parse_request(&request_json()).unwrap();
     let manifest = parse_manifest(&manifest_json()).unwrap();
     let digest = manifest_digest(&manifest);
-    assert_eq!(plan(&manifest, None, &digest).unwrap(), Plan::Run);
+    assert_eq!(plan(&req, None, &digest).unwrap(), Plan::Run);
 
     let stored = serde_json::to_vec(&serde_json::json!({
         "status": "repaired",
         "exit_code": 0,
-        "files": [{"file_name": "track.flac", "key": object_key_for_file_name("track.flac"), "size": 7}],
+        "files": [],
         "manifest_digest": digest,
     }))
     .unwrap();
-    match plan(&manifest, Some(&stored), &digest).unwrap() {
+    match plan(&req, Some(&stored), &digest).unwrap() {
         Plan::AlreadyDone(result) => assert_eq!(result.status.as_str(), "repaired"),
         other => panic!("stored result for the same manifest must short-circuit, got {other:?}"),
     }
 
     // A corrupt stored result is a server fault, never a silent re-run.
-    let err = plan(&manifest, Some(b"not json"), &digest).unwrap_err();
+    let err = plan(&req, Some(b"not json"), &digest).unwrap_err();
     assert_eq!(err.status, 500);
 }
 
@@ -137,15 +138,15 @@ fn stored_result_for_a_different_manifest_reruns() {
     // Redrive resets repair rounds to 1, so (job_id, round) repeats;
     // a result recorded against the previous generation's manifest
     // must not short-circuit the new run.
+    let req = parse_request(&request_json()).unwrap();
     let stored = br#"{"status":"unrepairable","exit_code":1,"files":[],"manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
-    let manifest = parse_manifest(&manifest_json()).unwrap();
-    let digest = manifest_digest(&manifest);
-    assert_eq!(plan(&manifest, Some(stored), &digest).unwrap(), Plan::Rerun);
+    let digest = manifest_digest(&parse_manifest(&manifest_json()).unwrap());
+    assert_eq!(plan(&req, Some(stored), &digest).unwrap(), Plan::Rerun);
 
     // A legacy stored result with no digest cannot be proven to
     // belong to the current manifest either.
     let legacy = br#"{"status":"unrepairable","exit_code":1,"files":[]}"#;
-    assert_eq!(plan(&manifest, Some(legacy), &digest).unwrap(), Plan::Rerun);
+    assert_eq!(plan(&req, Some(legacy), &digest).unwrap(), Plan::Rerun);
 }
 
 #[test]
@@ -154,6 +155,7 @@ fn same_names_and_sizes_with_a_new_staging_id_rerun() {
     // file names, same lengths (a damaged file keeps its full length),
     // different bytes. The digest must bind to the staging, not just
     // the file list, or the old verdict replays with no repair run.
+    let req = parse_request(&request_json()).unwrap();
     let first = parse_manifest(&manifest_json_with_staging("staging-0000000000000001")).unwrap();
     let restaged = parse_manifest(&manifest_json_with_staging("staging-0000000000000002")).unwrap();
     assert_eq!(first.files, restaged.files);
@@ -171,11 +173,11 @@ fn same_names_and_sizes_with_a_new_staging_id_rerun() {
     }))
     .unwrap();
     assert_eq!(
-        plan(&restaged, Some(&stored), &restaged_digest).unwrap(),
+        plan(&req, Some(&stored), &restaged_digest).unwrap(),
         Plan::Rerun
     );
     // The same staging still short-circuits a duplicate delivery.
-    match plan(&first, Some(&stored), &first_digest).unwrap() {
+    match plan(&req, Some(&stored), &first_digest).unwrap() {
         Plan::AlreadyDone(result) => assert_eq!(result.status.as_str(), "unrepairable"),
         other => panic!("same staging must short-circuit, got {other:?}"),
     }
@@ -288,6 +290,12 @@ fn untrusted_faults_cannot_become_permanent() {
         let err = parse_do_reply(400, body).unwrap_err();
         assert_eq!((err.status, err.code), (503, "repair_unavailable"));
     }
+}
+
+#[test]
+fn do_reply_preserves_staging_size_refusal() {
+    let err = parse_do_reply(413, br#"{"error":"scratch_input_mismatch"}"#).unwrap_err();
+    assert_eq!((err.status, err.code), (413, "scratch_input_mismatch"));
 }
 
 #[test]

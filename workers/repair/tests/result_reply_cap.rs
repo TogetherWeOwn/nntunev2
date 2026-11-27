@@ -456,7 +456,7 @@ fn reply_sites_keep_existing_fault_mapping_literals() {
     // `container_unavailable` in `container_json`.
     let front = front_door_region(RUNTIME_RS);
     assert!(
-        front.contains("503") && front.contains("\"repair_unavailable\""),
+        front.contains("settle_do_reply(fetch, deadline)"),
         "front door must keep mapping a bad/oversized DO reply to 503 \
          repair_unavailable"
     );

@@ -24,9 +24,9 @@ use worker::{
 use crate::contract::{
     classify_container_reply, container_repair_body, container_unavailable_fault, in_key,
     ingest_reply_body, manifest_digest, manifest_key, out_key, parse_do_reply, parse_manifest,
-    parse_request, plan, push_chunk_capped, repair_unavailable_fault, result_key, settle_do_reply,
-    validate_repaired_output_set, ApiFault, ContainerOutcome, FileRole, Plan, RepairRequest,
-    RepairStatus, MAX_REQUEST_BYTES, MAX_RESULT_BYTES,
+    parse_request, plan, push_chunk_capped, repair_unavailable_fault, replay_reply, result_key,
+    settle_do_reply, try_run_round, validate_repaired_output_set, ApiFault, ContainerOutcome,
+    FileRole, Plan, RepairRequest, RepairStatus, MAX_REQUEST_BYTES, MAX_RESULT_BYTES,
 };
 
 /// Durable Object binding + class fronting the Container.
@@ -222,13 +222,7 @@ impl DurableObject for RepairContainer {
         if self.state.id().name().as_deref() != Some(parsed.job_id.as_str()) {
             return fault_response(&ApiFault::invalid());
         }
-        // DO events can interleave during external I/O. A front-door timeout
-        // does not end the round, so refuse retries until its writes and
-        // cleanup settle. Do not queue work past the caller's deadline.
-        let Some(_round) = self.round_lock.try_lock() else {
-            return fault_response(&repair_unavailable_fault());
-        };
-        match self.run(&parsed).await {
+        match try_run_round(&self.round_lock, self.run(&parsed)).await {
             Ok(result_body) => json_response(200, result_body),
             Err(fault) => fault_response(&fault),
         }
@@ -264,8 +258,8 @@ impl RepairContainer {
             ApiFault::new(500, "repair_unavailable"),
         )
         .await?;
-        let stale_generation = match plan(&manifest, existing.as_deref(), &digest)? {
-            Plan::AlreadyDone(result) => return Ok(ingest_reply_body(&result)),
+        let stale_generation = match plan(req, existing.as_deref(), &digest)? {
+            Plan::AlreadyDone(result) => return replay_reply(&manifest, &result),
             Plan::Rerun => true,
             Plan::Run => false,
         };

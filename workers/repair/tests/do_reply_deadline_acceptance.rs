@@ -125,7 +125,8 @@ use std::task::{Context, Poll};
 use futures_util::stream::{self, Stream};
 use futures_util::StreamExt;
 use nntune_repair::contract::{
-    push_chunk_capped, repair_unavailable_fault, settle_do_reply, ApiFault, MAX_RESULT_BYTES,
+    push_chunk_capped, repair_unavailable_fault, settle_do_reply, try_run_round, ApiFault,
+    MAX_RESULT_BYTES,
 };
 
 // ---------------------------------------------------------------------------
@@ -692,13 +693,16 @@ fn no_new_fault_code_and_no_leaked_timers_on_the_front_hop() {
 
 #[test]
 fn timed_out_round_cannot_be_joined_by_a_retry() {
-    let object = fn_slice(
-        RUNTIME_RS,
-        "impl DurableObject for RepairContainer",
-        "impl RepairContainer",
-    );
-    let (before_run, _) = object.split_once("self.run(&parsed).await").unwrap();
-    assert!(before_run.contains("let Some(_round) = self.round_lock.try_lock() else"));
-    let (_, busy) = before_run.split_once("self.round_lock.try_lock()").unwrap();
-    assert!(busy.contains("return fault_response(&repair_unavailable_fault())"));
+    assert!(RUNTIME_RS.contains("try_run_round(&self.round_lock, self.run(&parsed)).await"));
+    let lock = futures_util::lock::Mutex::new(());
+    let mut round = Box::pin(try_run_round(
+        &lock,
+        std::future::pending::<Result<(), ApiFault>>(),
+    ));
+    let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+    assert!(round.as_mut().poll(&mut cx).is_pending());
+    let retry = || try_run_round(&lock, std::future::ready(Ok(())));
+    assert_eq!(drive(retry()), Err(repair_unavailable_fault()));
+    drop(round);
+    assert_eq!(drive(retry()), Ok(()));
 }
