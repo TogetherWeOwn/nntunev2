@@ -29,14 +29,31 @@ pub use request::InputError;
 const CONSTRUCTION_BYTES: usize = 8 * 1024 * 1024;
 
 fn admits_form_media_type(mut units: impl Iterator<Item = u16>) -> bool {
-    b"application/x-www-form-urlencoded"
-        .iter()
-        .all(|&byte| units.next() == Some(u16::from(byte)))
-        && match units.find(|&unit| unit != u16::from(b' ') && unit != u16::from(b'\t')) {
-            None => true,
-            Some(unit) if unit == u16::from(b';') => !units.any(|unit| unit == u16::from(b',')),
-            _ => false,
+    let syntax = |unit| u8::try_from(unit).ok();
+    for byte in b"application/x-www-form-urlencoded" {
+        if units.next().and_then(syntax) != Some(*byte) {
+            return false;
         }
+    }
+    match units.find(|&unit| !matches!(syntax(unit), Some(b' ' | b'\t'))) {
+        None => return true,
+        Some(unit) if syntax(unit) == Some(b';') => {}
+        _ => return false,
+    }
+    let mut quoted = false;
+    while let Some(unit) = units.next() {
+        match syntax(unit) {
+            Some(b'"') => quoted = !quoted,
+            Some(b'\\') if quoted => {
+                if units.next().is_none() {
+                    return false;
+                }
+            }
+            Some(b',') if !quoted => return false,
+            _ => {}
+        }
+    }
+    !quoted
 }
 
 /// Validated input and the ledger that paid for its backing storage.
@@ -94,7 +111,11 @@ mod tests {
     #[test]
     fn form_admission_requires_one_exact_media_type() {
         let form = "application/x-www-form-urlencoded";
-        for header in [form.to_owned(), format!("{form} \t; charset=utf-8")] {
+        for header in [
+            form.to_owned(),
+            format!("{form} \t; charset=utf-8"),
+            format!(r#"{form}; name="one\",two""#),
+        ] {
             assert!(admits_form_media_type(header.encode_utf16()));
         }
         for header in [
@@ -102,6 +123,8 @@ mod tests {
             format!("{form}-extra"),
             format!("{form}, text/plain"),
             format!("{form}; charset=utf-8, text/plain"),
+            format!(r#"{form}; name="one,two"#),
+            format!(r#"{form}; name="one,two", text/plain"#),
             format!("{form}\u{a0}; charset=utf-8"),
         ] {
             assert!(!admits_form_media_type(header.encode_utf16()), "{header}");

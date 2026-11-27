@@ -80,11 +80,37 @@ mod wasm_test {
     use crate::subsonic_staging::StagingConstruction;
     use worker::wasm_bindgen::{self, prelude::*};
 
+    async fn check_form_refusals() -> Result<(), JsValue> {
+        for content_type in [
+            "text/plain; hint=application/x-www-form-urlencoded",
+            "application/x-www-form-urlencoded, text/plain",
+        ] {
+            let headers = web_sys::Headers::new()?;
+            headers.set("content-type", content_type)?;
+            let init = web_sys::RequestInit::new();
+            init.set_method("POST");
+            init.set_headers(headers.as_ref());
+            init.set_body(&JsValue::from_str("u=fixture"));
+            let request = web_sys::Request::new_with_str_and_init(
+                "https://fixture.example/rest/ping",
+                &init,
+            )?;
+            assert_eq!(
+                StagingInput::collect(&request).await.err(),
+                Some(InputError::Unreadable)
+            );
+            assert!(!request.body_used());
+        }
+        Ok(())
+    }
+
     #[wasm_bindgen]
     pub async fn staging_input_test(
         request: web_sys::Request,
         limit: Option<u32>,
     ) -> Result<u32, JsValue> {
+        // The Node suite reaches the raw Worker collector through this adapter.
+        check_form_refusals().await?;
         let input = if let Some(limit) = limit {
             StagingInput::collect_with_budget(&request, ConstructionBudget::new(limit as usize))
                 .await

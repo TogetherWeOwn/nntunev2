@@ -179,12 +179,8 @@ async fn read_mirror(
     let count = preflight(&tx, &probe, &params, limit, &mut remaining).await?;
     drop(probe);
     let releases = fetch_page(&tx, budget, query, &params, count, |budget, row| {
-        let release: &str = row.try_get("mbid").map_err(|_| StoreError)?;
-        if !member.contains_release(release) {
-            return Err(StoreError);
-        }
         Ok(Some(ReleaseDbRow {
-            mbid: text(budget, release)?,
+            mbid: text(budget, row.try_get("mbid").map_err(|_| StoreError)?)?,
             title: text(budget, row.try_get("title").map_err(|_| StoreError)?)?,
             release_type: optional_text(budget, row, "release_type")?,
             year: row.try_get("year").map_err(|_| StoreError)?,

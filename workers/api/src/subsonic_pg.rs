@@ -567,7 +567,21 @@ impl CredentialStore for PgStore {
     }
 }
 
-const MAX_ACTIVE_CREDENTIALS: i64 = 32;
+const MAX_ACTIVE_CREDENTIALS: u64 = 32;
+
+fn credential_slot_available(count: i64) -> Result<bool, StoreError> {
+    Ok(u64::try_from(count).map_err(|_| StoreError)? < MAX_ACTIVE_CREDENTIALS)
+}
+
+#[cfg(test)]
+#[test]
+fn credential_issuance_requires_a_nonnegative_count_below_the_cap() {
+    assert!(credential_slot_available(-1).is_err());
+    assert!(credential_slot_available(0).unwrap());
+    assert!(credential_slot_available(31).unwrap());
+    assert!(!credential_slot_available(32).unwrap());
+    assert!(!credential_slot_available(i64::MAX).unwrap());
+}
 
 pub(super) async fn insert(
     client: &mut impl PgConnect,
@@ -627,10 +641,7 @@ pub(super) async fn insert(
         .await
         .map_err(|_| StoreError)?;
     let count: i64 = row.try_get(0).map_err(|_| StoreError)?;
-    if count < 0 {
-        return Err(StoreError);
-    }
-    if count >= MAX_ACTIVE_CREDENTIALS {
+    if !credential_slot_available(count)? {
         return Ok(false);
     }
     let mode = match s.auth_mode {
