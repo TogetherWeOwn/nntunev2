@@ -1,7 +1,10 @@
 //! Chunked-framing and body-size refusal coverage for the repair Container.
 //!
-//! Covers complete and malformed HTTP framing, the header and JSON
-//! size limits, and preservation of staged bytes after a rejected PUT.
+//! Exercises the wire branches in `containers/repair/src/lib.rs` for
+//! multi-chunk `Transfer-Encoding: chunked` PUTs
+//! (including a short chunk extension and the normal empty trailer), the
+//! 411 `length_required` refusal when framing is absent, and the 413
+//! `payload_too_large` refusal for an oversized declared JSON body.
 //!
 //! Socket reads/writes are bounded so a decoding regression fails
 //! deterministically instead of hanging the suite. Fake `par2` only,

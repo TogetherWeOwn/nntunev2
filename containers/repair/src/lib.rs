@@ -709,7 +709,8 @@ fn handle(stream: &mut std::net::TcpStream, config: &ServerConfig, gate: &RwLock
         Ok(())
     })();
     if let Err(err) = result {
-        let _ = respond_error(stream, &err);
+        let mut buffered = io::BufWriter::new(stream);
+        let _ = respond_error(&mut buffered, &err).and_then(|()| buffered.flush());
     }
 }
 
