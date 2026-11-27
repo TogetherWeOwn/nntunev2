@@ -75,7 +75,7 @@ async fn typed_probe_refuses_bad_batches_and_never_redials_a_timeout() {
         for batch in [vec![], oversized, vec!["bad id".into()]] {
             req.segment_ids = batch;
             assert!(matches!(
-                run_probe(&pool, dial, |_| {}, &req).await,
+                run_probe(&pool, dial, |_| panic!("invalid batch must not tick"), &req).await,
                 Err(ProbeError::BadRequest(_))
             ));
             assert_eq!((pool.borrow().idle(), pool.borrow().in_use()), (1, 0));
