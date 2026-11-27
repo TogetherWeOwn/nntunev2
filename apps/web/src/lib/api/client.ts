@@ -12,6 +12,7 @@ import {
 	captureAuthFence, runAuthMutation, SESSION_BINDING_HEADER, validSessionBinding, type AccountSession
 } from '../auth-fence.js';
 import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
+import { parseApiBaseUrl } from '../security/headers.js';
 import { isJsonBodyTooLarge, readCappedJson } from './cappedJson.js';
 import { parseErrorBody } from './errors.js';
 
@@ -367,8 +368,7 @@ const COOKIE_MUTATIONS = new Set([
 	'/v1/session/reauthenticate/finish', '/v1/session/refresh', LOGOUT, REVOKE_ALL
 ]);
 
-function requiresSessionBinding(path: string, method?: string): boolean {
-	const route = path.split('?', 1)[0];
+function requiresSessionBinding(route: string, method?: string): boolean {
 	return (route === '/v1/me/taste/session' && ['GET', 'PUT', 'DELETE'].includes(method ?? '')) ||
 		((method === 'PUT' || method === 'DELETE') && /^\/v1\/me\/likes\/track\/[^/]+$/.test(route));
 }
@@ -381,7 +381,7 @@ export class ApiClient {
 	private token: string | null = null;
 
 	constructor({ baseUrl, fetchFn, signal, session }: ApiClientOptions) {
-		this.baseUrl = baseUrl.replace(/\/+$/, '');
+		this.baseUrl = parseApiBaseUrl(baseUrl, true)?.href.replace(/\/+$/, '') ?? '';
 		this.signal = signal;
 		if (session?.binding !== undefined && !validSessionBinding(session.binding)) {
 			throw new Error('Missing or invalid verified session binding');
@@ -749,6 +749,17 @@ export class ApiClient {
 		init: RequestInit,
 		{ expected, statusOnly }: { expected?: string; statusOnly?: (status: number) => boolean } = {}
 	): Promise<{ data: T; status: number; headers: Headers }> {
+		const route = path.split('?', 1)[0];
+		if (!route.startsWith('/') || route.startsWith('//') || route.includes('\\') ||
+			/[\u0000-\u0020\u007f#]/.test(path) || /\/(?:\.|%2e){1,2}(?:\/|$)/i.test(route)) {
+			throw new Error('Invalid API request path');
+		}
+		const url = `${this.baseUrl}${path}`;
+		// Root-relative fetches resolve against the document's base URL.
+		if (!this.baseUrl && typeof document !== 'undefined' &&
+			new URL(url, document.baseURI).origin !== document.location.origin) {
+			throw new Error('API request must stay on the application origin');
+		}
 		const headers: Record<string, string> = {
 			...((init.headers as Record<string, string> | undefined) ?? {}),
 			accept: 'application/json'
@@ -758,7 +769,7 @@ export class ApiClient {
 		if (session && Object.keys(headers).some((name) => name.toLowerCase() === 'authorization')) {
 			throw new Error('Account requests use the browser session');
 		}
-		const bound = requiresSessionBinding(path, init.method);
+		const bound = requiresSessionBinding(route, init.method);
 		if (bound) {
 			if (!session?.binding) throw new Error('Missing verified session binding');
 			headers[SESSION_BINDING_HEADER] = session.binding;
@@ -768,6 +779,7 @@ export class ApiClient {
 		// auth spinners always settle. The timer is cleared on settle so
 		// fast requests never wait for it and later requests are unaffected.
 		const controller = new AbortController();
+		const bodyDeadline = new AbortController();
 		const callerSignal = init.signal ?? this.signal;
 		// A same-binding refresh must wait for an already-dispatched preference
 		// write, including after a failed logout. Retirement still refuses its result.
@@ -786,22 +798,35 @@ export class ApiClient {
 		const timer = setTimeout(() => {
 			timedOut = true;
 			controller.abort(new DOMException(`request timed out after ${API_REQUEST_TIMEOUT_MS}ms`, 'TimeoutError'));
+			bodyDeadline.abort(controller.signal.reason);
 		}, API_REQUEST_TIMEOUT_MS);
 		try {
 			assertCurrent();
-			const url = `${this.baseUrl}${path}`;
-			const route = init.method === 'POST' && new URL(url, globalThis.document?.baseURI ?? 'http://localhost').pathname;
-			const dispatch = () => this.fetchFn(url, {
-				...init,
-				...(session && { cache: 'no-store', redirect: 'error' } as const),
-				signal: controller.signal,
-				headers,
-				credentials: 'include'
+			const signal = controller.signal;
+			const aborted = new Promise<never>((_, reject) => {
+				signal.addEventListener('abort', () => reject(signal.reason), { once: true });
 			});
+			const dispatch = async () => {
+				const response = await this.fetchFn(url, {
+					...init,
+					...(session && { cache: 'no-store' } as const),
+					redirect: 'error',
+					signal,
+					headers,
+					credentials: 'include'
+				});
+				if (signal.aborted) {
+					void response.body?.cancel().catch(() => undefined);
+					signal.throwIfAborted();
+				}
+				return response;
+			};
 			const intent = route === REVOKE_ALL ? { stale: staleSession(), revocation: { generation: expected } }
 				: route === LOGOUT ? { stale: staleSession() } : undefined;
-			const response = await (route && COOKIE_MUTATIONS.has(route)
-				? runAuthMutation(controller.signal, dispatch, intent) : dispatch());
+			// The caller can time out while the mutation fence still holds until dispatch settles.
+			const pending = init.method === 'POST' && COOKIE_MUTATIONS.has(route)
+				? runAuthMutation(signal, dispatch, intent) : dispatch();
+			const response = await Promise.race([aborted, pending]);
 			// A transport may ignore abort; refuse its response before touching the body.
 			assertCurrent();
 			if (!response.ok) {
@@ -815,12 +840,12 @@ export class ApiClient {
 				// share the structured contract.
 				let body: unknown = null;
 				try {
-					body = await readCappedJson(response);
+					body = await Promise.race([aborted, readCappedJson(response, bodyDeadline.signal)]);
 				} catch (error) {
 					if (session) assertCurrent();
 					// Invite reads must not lose a known denial and retain private rows.
 					if (timedOut && !(init.method === 'GET' &&
-						[MEMBER_INVITES, `${MEMBER_INVITES}/history`].includes(path.split('?', 1)[0]) &&
+						[MEMBER_INVITES, `${MEMBER_INVITES}/history`].includes(route) &&
 						[401, 403, 404, 409].includes(response.status))) throw this.timeoutError();
 					// An over-cap error body is never parsed: the generic
 					// status fallback applies, never retryable (an over-cap
@@ -838,7 +863,7 @@ export class ApiClient {
 				throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 			}
 			try {
-				const data = (await readCappedJson(response)) as T;
+				const data = (await Promise.race([aborted, readCappedJson(response, bodyDeadline.signal)])) as T;
 				assertCurrent();
 				return { data, status: response.status, headers: response.headers };
 			} catch (error) {

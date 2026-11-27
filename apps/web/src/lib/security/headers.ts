@@ -19,6 +19,24 @@ export const SECURITY_HEADERS: Readonly<Record<string, string>> = Object.freeze(
 	'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
 });
 
+/** Keep runtime fetch destinations and the build-time CSP on the same URL rules. */
+export function parseApiBaseUrl(value: string, allowHttpLoopback = false): URL | null {
+	const base = value.trim();
+	if (base === '') return null;
+
+	const authority = /^https?:\/\/([^/]+)/i.exec(base)?.[1];
+	if (!authority || authority.includes('@') || /[\u0000-\u0020\u007f\\?#]/.test(base) || !URL.canParse(base)) {
+		throw new Error('Invalid API base URL');
+	}
+	const url = new URL(base);
+	// URL host parsing alone allows punctuation that delimits CSP directives and policies.
+	const host = url.hostname;
+	if (!/^(?:[a-z0-9.-]+|\[[a-f0-9:]+\])$/i.test(host)) throw new Error('Invalid API base URL host');
+	if (url.protocol === 'https:' || (allowHttpLoopback && url.protocol === 'http:' &&
+		(host === 'localhost' || host === '127.0.0.1' || host === '[::1]'))) return url;
+	throw new Error('API base URL must use HTTPS');
+}
+
 /**
  * CSP source list for the configured API origin. Returns header-ready
  * sources (`'self'` plus the API origin with any path stripped).
@@ -39,20 +57,6 @@ export const SECURITY_HEADERS: Readonly<Record<string, string>> = Object.freeze(
  * loopback included — still throws and fails the build.
  */
 export function cspSources(apiBaseUrl: string, options?: { allowHttpLoopback?: boolean }): string[] {
-	const trimmed = apiBaseUrl.trim();
-	if (trimmed === '') {
-		return ["'self'"];
-	}
-
-	const url = new URL(trimmed);
-	if (url.protocol === 'https:') {
-		return ["'self'", url.origin];
-	}
-	if (options?.allowHttpLoopback === true && url.protocol === 'http:') {
-		const host = url.hostname.replace(/^\[|\]$/g, '');
-		if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
-			return ["'self'", url.origin];
-		}
-	}
-	throw new Error(`API base URL must use https: for CSP sources, got ${url.protocol}`);
+	const url = parseApiBaseUrl(apiBaseUrl, options?.allowHttpLoopback);
+	return url ? ["'self'", url.origin] : ["'self'"];
 }
