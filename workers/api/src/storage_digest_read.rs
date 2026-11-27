@@ -238,33 +238,6 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
-    async fn protected_read_rejects_bad_targets_before_authorization() {
-        let mut db = offline::offline_client().await;
-        let now = UNIX_EPOCH;
-        let until = now + Duration::from_secs(1);
-        let mut invalid = target();
-        invalid.object = [0; 16];
-        for (target, deadline) in [(invalid, until), (target(), now)] {
-            let result = protect_digest_read(
-                &mut db,
-                target,
-                deadline,
-                async |_| panic!("invalid read reached authorization"),
-                || now,
-            )
-            .await;
-            assert!(matches!(result, Ok(None)));
-        }
-        assert!(
-            protect_digest_read(&mut db, target(), until, async |_| Some(until), || now)
-                .await
-                .is_err(),
-            "valid input reaches the disconnected store"
-        );
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[tokio::test]
     async fn custody_rejects_another_objects_locator_before_reading() {
         use custody::{resolve_custody, PlaybackRoot};
         use nntune_core::s3_locator::{S3Binding, S3Locator};

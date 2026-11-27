@@ -26,15 +26,23 @@ async fn invalid_digest_geometry_never_requests_authority_or_storage() {
     let mut db = offline_client().await;
     let now = UNIX_EPOCH + Duration::from_secs(100);
     let until = now + Duration::from_secs(30);
-    for (plaintext_bytes, valid) in [(-1, false), (0, false), ((1 << 33) + 1, false), (1, true)] {
+    let id = |suffix: u128| (0x2100_0000_0000_4000_8000_0000_0000_0000 | suffix).to_be_bytes();
+    for (plaintext_bytes, object, deadline, valid) in [
+        (-1, id(4), until, false),
+        (0, id(4), until, false),
+        ((1 << 33) + 1, id(4), until, false),
+        (1, [4; 16], until, false),
+        (1, id(4), now, false),
+        (1, id(4), until, true),
+    ] {
         let target = DigestReadTarget {
-            environment: [1; 16],
-            library: [2; 16],
-            reference: [3; 16],
-            object: [4; 16],
-            generation: [5; 16],
-            provider_configuration: [6; 16],
-            root_version: [7; 16],
+            environment: id(1),
+            library: id(2),
+            reference: id(3),
+            object,
+            generation: id(5),
+            provider_configuration: id(6),
+            root_version: id(7),
             plaintext_sha256: [8; 32],
             plaintext_bytes,
         };
@@ -42,7 +50,7 @@ async fn invalid_digest_geometry_never_requests_authority_or_storage() {
         let result = protect_digest_read(
             &mut db,
             target,
-            until,
+            deadline,
             async |_| {
                 authorized.set(true);
                 Some(until)
@@ -53,7 +61,7 @@ async fn invalid_digest_geometry_never_requests_authority_or_storage() {
         assert_eq!(
             authorized.get(),
             valid,
-            "authorization for length {plaintext_bytes}"
+            "authorization for length {plaintext_bytes}, object {object:?}, deadline {deadline:?}"
         );
         if valid {
             assert!(
@@ -61,10 +69,7 @@ async fn invalid_digest_geometry_never_requests_authority_or_storage() {
                 "valid length must reach the disconnected store"
             );
         } else {
-            assert!(
-                matches!(result, Ok(None)),
-                "invalid media length reached storage"
-            );
+            assert!(matches!(result, Ok(None)), "invalid input reached storage");
         }
     }
 }
