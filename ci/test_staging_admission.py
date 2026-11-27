@@ -779,17 +779,41 @@ class DraftPrivateContractTests(Base):
 class PrivateEvidenceMapTests(unittest.TestCase):
     def test_offline_map_covers_requested_areas_and_keeps_live_gaps_explicit(self):
         text = (HERE.parent / "docs/ops/private-staging-evidence-map.md").read_text(encoding="utf-8")
-        for area in ("Encrypted upload", "Library visibility", "Playback", "Access refusals"):
-            self.assertIn(f"| {area} |", text)
-        for selector in (
-            "private-publication", "private-library", "private-play",
-            "private-anonymous-refusal", "private-unlisted-refusal", "private-cutoff-refusal",
-            "build-identity", "build-identity-final",
-        ):
-            self.assertIn(f"`{selector}`", text)
-        self.assertIn("ciphertext at rest", text)
-        self.assertIn("protected encrypted-storage and upload evidence", text)
+        table = text.split("## Synthetic map\n", 1)[1].split("\n\nThe `invite-acceptance`", 1)[0]
+        rows = {}
+        for line in table.splitlines():
+            if not line.startswith("| ") or line.startswith("| ---"):
+                continue
+            fields = [field.strip() for field in line.strip("|").split("|")]
+            if len(fields) == 5 and fields[0] != "Evidence area":
+                rows[fields[0]] = fields
+        expected = {
+            "Encrypted upload": ({"private-publication"}, {"upload-to-library"}),
+            "Library visibility": ({"private-library"}, {"upload-to-library"}),
+            "Playback": ({"private-play"}, {"play", "seek", "queue"}),
+            "Access refusals": (
+                {"private-anonymous-refusal", "private-unlisted-refusal", "private-cutoff-refusal"},
+                {"anonymous-refused", "unlisted-refused", "revoked-or-expired-refused"},
+            ),
+        }
+        self.assertEqual(set(rows), set(expected))
+        for area, (proofs, criteria) in expected.items():
+            source, mapping = rows[area][1:3]
+            self.assertTrue(all(f"`{proof}`" in source for proof in proofs), area)
+            self.assertEqual({part.strip(" `") for part in mapping.split(",")}, criteria, area)
+        for proof, criterion in sa.PRIVATE_TRACK_PROOFS.items():
+            self.assertIn(f"`{proof}`", rows[
+                "Encrypted upload" if proof == "private-publication" else
+                "Library visibility" if proof == "private-library" else
+                "Playback" if proof == "private-play" else "Access refusals"
+            ][1])
+            self.assertIn(f"`{criterion}`", text)
+        for phase in sa.IDENTITY_PHASES:
+            self.assertIn(f"`{phase}`", text)
+        self.assertIn("does not prove ciphertext at rest", text)
+        self.assertIn("must supply the protected encrypted-storage and upload evidence", text)
         self.assertIn("synthetic test data only", text)
+        self.assertIn("`jq`", text)
 
 
 class ProduceTests(Base):
