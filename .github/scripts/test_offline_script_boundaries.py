@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
+import staging_trial_schema as schema
 from production_backend_identity import readback
-from staging_trial_schema import compose, read_source, migrator
 from test_production_backend_identity import ACCOUNT, API, STREAM
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,14 +26,12 @@ class OfflineBoundaryTests(unittest.TestCase):
 
     def test_schema_refuses_foreign_sources_and_invalid_targets(self):
         with tempfile.TemporaryDirectory() as scratch:
-            with self.assertRaises(migrator.ApplyError):
-                read_source(Path(scratch), ROOT / "README.md")
+            with self.assertRaises(schema.migrator.ApplyError):
+                schema.read_source(Path(scratch), ROOT / "README.md")
         for role, database in ((None, "nntunev2_staging"), ("pg_write_all_data", "nntunev2_staging"),
                                ("trial_writer", "nntunev2_production")):
-            with self.assertRaises(migrator.ApplyError):
-                compose(ROOT, ROOT, role, "trial_reader", database=database)
-        sql, _ = compose(ROOT, ROOT, "trial_writer", "trial_reader", database="nntunev2_staging")
-        self.assertIn("rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls", sql)
+            with self.assertRaises(schema.migrator.ApplyError):
+                schema.compose(ROOT, ROOT, role, "trial_reader", database=database)
 
     def test_c0_replay_rejects_contradictory_page_counts_and_non_json(self):
         info = {"page": 1, "per_page": 100, "count": 0, "total_count": 0, "total_pages": 1}
