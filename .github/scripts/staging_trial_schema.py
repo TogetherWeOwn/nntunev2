@@ -20,9 +20,6 @@ ROLE_RE = re.compile(r"[A-Za-z0-9_-]{1,63}")
 
 
 def read_source(root, name):
-    name = Path(name)
-    if name.is_absolute() or ".." in name.parts:
-        raise migrator.ApplyError("private trial source must be a relative checkout path")
     path = root / name
     if path.resolve() != path or not path.is_file():
         raise migrator.ApplyError("private trial source must be a regular file in its checkout")

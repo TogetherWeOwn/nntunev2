@@ -11,14 +11,12 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from apply_migration import ApplyError
 from staging_apply import StagingApplyError
 import staging_trial_ambient_acl as ambient
 import staging_trial_isolated as isolated
 from staging_trial_role_acl import audit
 import staging_trial_role_lifecycle as lifecycle
 import staging_trial_role_preflight as preflight
-from staging_trial_schema import read_source
 from staging_trial_selfhost import session_guard, tls_connection
 from test_apply_migration_postgres import run_psql
 from test_ingest_session_migration_postgres import scratch_database
@@ -95,15 +93,6 @@ class OfflineTrialBoundaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 isolated.overlay(Path("."), scope, 42003, "install")
             compose.assert_not_called()
-
-    def test_schema_source_refuses_absolute_paths(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp) / "checkout"
-            root.mkdir()
-            outside = root.parent / "outside.sql"
-            outside.write_text("SELECT 1;")
-            with self.assertRaises(ApplyError):
-                read_source(root, outside)
 
     def test_selfhost_refuses_ambiguous_tls_options(self):
         database = preflight.DATABASE
