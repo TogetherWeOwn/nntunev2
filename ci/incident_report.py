@@ -57,6 +57,10 @@ class ResponseTooLarge(ReportError):
     """Only this transport failure permits a smaller comment read."""
 
 
+class AmbiguousGateEvidence(ReportError):
+    """Hold this gate when the required evidence step appears more than once."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args):
         return None
@@ -93,6 +97,7 @@ class API:
 
     def pages(self, path, key=None):
         result, total = [], None
+        seen_jobs = set()
         for page in range(1, 11):
             data = self.request("GET", path + ("&" if "?" in path else "?") +
                                 f"per_page=100&page={page}")
@@ -107,6 +112,11 @@ class API:
                         or len(rows) != min(100, count - len(result))):
                     raise ReportError("GitHub job listing incomplete")
                 total = count
+                for row in rows:
+                    job_id = row.get("id") if isinstance(row, dict) else None
+                    if type(job_id) is not int or job_id <= 0 or job_id in seen_jobs:
+                        raise ReportError("GitHub job identity malformed or duplicate")
+                    seen_jobs.add(job_id)
             result.extend(rows)
             if len(rows) < 100:
                 return result
@@ -249,7 +259,7 @@ def job_steps(job):
 def evidence_step(steps, name):
     selected = [step for step in steps if step.get("name") == name]
     if len(selected) > 1:
-        raise ReportError("GitHub gate evidence is ambiguous")
+        raise AmbiguousGateEvidence
     return selected[0] if selected else {}
 
 
@@ -500,11 +510,15 @@ def report(api, run_id, dry_run=False, newer_evidence=None):
         issues = [dict(i) for i in issues]
     actions = _reconcile_pending(api, issues, dry_run)
     for name, evidence in GATES[workflow].items():
-        job = gate_result(jobs, name, evidence)
-        if job is None:
+        try:
+            job = gate_result(jobs, name, evidence)
+            if job is not None and any(gate_result(rows, name, evidence) is not None for rows in newer_jobs):
+                actions.append("superseded")
+                continue
+        except AmbiguousGateEvidence:
+            actions.append(f"held: ambiguous evidence for {name}")
             continue
-        if any(gate_result(rows, name, evidence) is not None for rows in newer_jobs):
-            actions.append("superseded")
+        if job is None:
             continue
         conclusion = job.get("conclusion")
         failed = failing_step_numbers(job)

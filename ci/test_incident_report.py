@@ -42,6 +42,12 @@ def smoke(conclusion, step="success", started="2026-01-02T00:00:00Z"):
             "steps": [{"number": 3, "name": "Run synthetic smoke", "conclusion": step}]}
 
 
+def job_page(rows, window):
+    return {"jobs": [{"id": index, **job}
+                     for index, job in enumerate(rows[window], window.start + 1)],
+            "total_count": len(rows)}
+
+
 class StagingTimingTests(unittest.TestCase):
     @staticmethod
     def run_summary(run, jobs, **listing_fields):
@@ -159,7 +165,7 @@ class FakeAPI(ir.API):
             self.run_gets += 1
             return self.run if self.run_gets == 1 else self.current
         if "/jobs" in path:
-            return {"jobs": self.jobs[window], "total_count": len(self.jobs)}
+            return job_page(self.jobs, window)
         if re.search(r"/issues/\d+/comments", path):
             return []
         if path.startswith("/actions/workflows/"):
@@ -194,7 +200,13 @@ class ReportTests(unittest.TestCase):
         key = "<!-- incident-key: deploy-production.yml:deploy-production -->"
         api = FakeAPI(run=make_run(workflow="deploy-production.yml", event="workflow_dispatch"),
                       jobs=[job], issues=[issue(7, body=key)])
-        with self.assertRaisesRegex(ir.ReportError, "^GitHub gate evidence is ambiguous$"):
+        self.assertEqual(ir.report(api, 10), ["held: ambiguous evidence for deploy-production"])
+        self.assertEqual(api.writes, [])
+
+    def test_duplicate_job_id_across_pages_invalidates_the_listing(self):
+        first_page = [{"name": f"job-{i}", "steps": []} for i in range(100)]
+        api = FakeAPI(jobs=[*first_page, dict(smoke("success"), id=1)], issues=[issue(7)])
+        with self.assertRaisesRegex(ir.ReportError, "^GitHub job identity malformed or duplicate$"):
             ir.report(api, 10)
         self.assertEqual(api.writes, [])
 
@@ -494,7 +506,7 @@ class StatefulAPI(ir.API):
             return {"workflow_runs": rows[window]}
         if (m := re.search(r"/actions/runs/(\d+)/attempts/(\d+)/jobs", path)):
             rows = self.jobs.get((int(m.group(1)), int(m.group(2))), [])
-            return {"jobs": rows[window], "total_count": len(rows)}
+            return job_page(rows, window)
         if (m := re.search(r"/issues/(\d+)/comments", path)):
             return self.comments.get(int(m.group(1)), [])[window]
         return self.issues[window]
@@ -506,6 +518,20 @@ def recent_run(run_id, minutes=5, updated=1, **over):
 
 
 class RecentTests(unittest.TestCase):
+    def test_ambiguous_combined_smoke_does_not_block_later_runs(self):
+        job = dict(smoke("success"), name=ir.POST_DEPLOY_JOURNEY)
+        job["steps"].append(dict(job["steps"][0], number=4, conclusion="failure"))
+        first = recent_run(10, workflow="deploy.yml", event="push")
+        later = recent_run(11)
+        api = StatefulAPI(runs=[first, later],
+                          jobs={(10, 1): [job], (11, 1): [smoke("failure", step="failure")]})
+        self.assertEqual(ir.recent(api), [
+            f"held: ambiguous evidence for {ir.POST_DEPLOY_SMOKE}",
+            f"held: ambiguous evidence for {ir.POST_DEPLOY_JOURNEY}",
+            f"opened: {SMOKE}",
+        ])
+        self.assertEqual([write[:2] for write in api.writes], [("POST", "/issues")])
+
     def incident_state(self, api):
         return [(i["number"], i["state"]) for i in api.issues]
 
