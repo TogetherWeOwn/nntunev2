@@ -362,13 +362,15 @@ fn search_count(
     name: &str,
     default_count: usize,
 ) -> Result<usize, EndpointResult> {
-    match params.get(name) {
-        None => Ok(default_count),
-        Some(value) => match value.parse::<usize>() {
-            Ok(count) if count <= 500 => Ok(count),
-            _ => Err(missing()),
-        },
-    }
+    let count = match params.get(name) {
+        None => default_count,
+        Some(value) => value.parse().map_err(|_| missing())?,
+    };
+    bounded_result_count(count)
+}
+
+fn bounded_result_count(count: usize) -> Result<usize, EndpointResult> {
+    (count <= 500).then_some(count).ok_or_else(missing)
 }
 
 fn list_size(params: &Params) -> Result<usize, EndpointResult> {
@@ -430,9 +432,9 @@ pub fn handle_endpoint<S: Library>(
     identity: &Identity,
     name: &str,
     params: &Params,
-    legacy_media: bool,
+    legacy_fixtures: bool,
 ) -> EndpointResult {
-    if !legacy_media {
+    if !legacy_fixtures {
         match name {
             "download" => {
                 return EndpointResult::Err(
@@ -443,6 +445,23 @@ pub fn handle_endpoint<S: Library>(
             // A production adapter must use signed grants, the concurrency
             // lease and metered delivery. Never fall back to fixture bytes.
             "stream" => return not_found_with("Song not found."),
+            // These writes have no persistent production backing.
+            "createPlaylist"
+            | "updatePlaylist"
+            | "deletePlaylist"
+            | "scrobble"
+            | "star"
+            | "unstar"
+            | "setRating"
+            | "savePlayQueue"
+            | "refreshPodcasts"
+            | "createPodcastChannel"
+            | "deletePodcastChannel" => {
+                return EndpointResult::Err(
+                    code::GENERIC,
+                    "This operation is not supported by this server.".to_string(),
+                );
+            }
             _ => {}
         }
     }
@@ -753,7 +772,7 @@ pub fn handle_endpoint<S: Library>(
         "getCoverArt" => {
             let id = ok_or_return!(req(params, "id"));
             // Launch cover art needs its own membership and entitlement gate.
-            if !legacy_media {
+            if !legacy_fixtures {
                 return not_found_with("Cover art not found.");
             }
             match store.cover(id) {
@@ -950,7 +969,7 @@ pub fn handle_endpoint<S: Library>(
                         ("scrobblingEnabled", Value::bool_value(true)),
                         ("adminRole", Value::bool_value(account.is_admin)),
                         ("settingsRole", Value::bool_value(true)),
-                        ("downloadRole", Value::bool_value(legacy_media)),
+                        ("downloadRole", Value::bool_value(legacy_fixtures)),
                         ("uploadRole", Value::bool_value(account.can_manage())),
                         ("playlistRole", Value::bool_value(true)),
                         ("coverArtRole", Value::bool_value(account.can_manage())),
@@ -1006,6 +1025,7 @@ pub fn handle_endpoint<S: Library>(
         "getSongsByGenre" => {
             let genre = ok_or_return!(req(params, "genre")).to_lowercase();
             let (size, offset) = size_offset(params);
+            let size = ok_or_return!(bounded_result_count(size));
             let songs: Vec<Value> = store
                 .all_songs()
                 .iter()
