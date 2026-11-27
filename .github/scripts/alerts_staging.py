@@ -160,7 +160,7 @@ def api_get(path, account_id, token):
             # A bounded HTTPResponse.read can return short without raising.
             require(not lengths or (
                 len(lengths) == 1
-                and re.fullmatch(r"[0-9]{1,10}", lengths[0])
+                and re.fullmatch(r"[0-9]{1,10}", lengths[0].strip(" \t"))
                 and int(lengths[0]) == len(raw)
             ), "API_GET_FAILED")
         payload = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields,

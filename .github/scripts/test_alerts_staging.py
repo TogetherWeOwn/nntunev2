@@ -344,6 +344,8 @@ class PaginationAndTransportTests(unittest.TestCase):
         chunked_body = f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n"
         for headers, wire_body, valid in (
             (length, body, True), ("", body, True), (transfer, chunked_body, True),
+            (length.replace("\r\n", " \t\r\n"), body, True),
+            (transfer, chunked_body[:-5], False),
             (length + length, body, False), (f"Content-Length: {len(body) + 1}\r\n", body, False),
             (length + transfer, chunked_body, False), ("Transfer-Encoding: invalid\r\n", body, False),
         ):
