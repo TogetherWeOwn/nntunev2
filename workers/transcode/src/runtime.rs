@@ -273,10 +273,8 @@ impl TranscodeContainer {
         let mut result = match classify_container_reply(status, &reply) {
             ContainerOutcome::Done(result) => result,
             ContainerOutcome::Forward(status, code) => {
-                return Err(container_error_code(&code)
-                    .map_or_else(container_unavailable_fault, |code| {
-                        ApiFault::new(status, code)
-                    }));
+                let fault = container_error_code(&code).map(|code| ApiFault::new(status, code));
+                return Err(fault.unwrap_or_else(container_unavailable_fault));
             }
         };
         validate_transcoded_result(&result)?;

@@ -87,14 +87,8 @@ fn validate_idempotency_key(raw: &str) -> bool {
         && !raw.contains('\0')
 }
 
-fn parse_object<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
-    if !body.trim_ascii_start().starts_with(b"{") {
-        return None;
-    }
-    serde_json::from_slice(body).ok()
-}
-
-/// Validate the wire shape before `read_job_request` checks the staging identity.
+/// Validate the request's wire shape and individual fields.
+/// `read_job_request` also verifies the staging identity.
 pub fn parse_request(body: &[u8]) -> Result<TranscodeRequest, ApiFault> {
     if body.len() > MAX_REQUEST_BYTES {
         return Err(ApiFault::new(413, "payload_too_large"));
@@ -111,44 +105,6 @@ pub fn parse_request(body: &[u8]) -> Result<TranscodeRequest, ApiFault> {
         return Err(ApiFault::invalid());
     }
     Ok(req)
-}
-
-/// Read and validate a job envelope within one deadline.
-pub async fn read_job_request<S, D>(
-    mut stream: S,
-    deadline: D,
-) -> Result<TranscodeRequest, ApiFault>
-where
-    S: futures_util::Stream<Item = Result<Vec<u8>, ()>> + Unpin,
-    D: std::future::Future<Output = ()> + Unpin,
-{
-    use futures_util::future::{select, Either};
-    use futures_util::StreamExt;
-
-    let read = Box::pin(async move {
-        let mut body = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|()| ApiFault::invalid())?;
-            if !push_chunk_capped(&mut body, &chunk, MAX_REQUEST_BYTES) {
-                return Err(ApiFault::new(413, "payload_too_large"));
-            }
-        }
-        let req = parse_request(&body)?;
-        // Matches ingest's derive_transcode_staging v2 domain.
-        let sha = req.source_sha256.to_ascii_lowercase();
-        let identity = format!(
-            "{PROFILE_NAME}:v2:{}:{}:{sha}:{}",
-            req.job_id, req.scratch_prefix, req.input_key
-        );
-        if req.staging_id != sha256_hex(identity.as_bytes()) {
-            return Err(ApiFault::invalid());
-        }
-        Ok(req)
-    });
-    match select(deadline, read).await {
-        Either::Left(_) => Err(transcode_unavailable_fault()),
-        Either::Right((reply, _deadline)) => reply,
-    }
 }
 
 /// Terminal transcode status, stored in `out/result.json` and replied
@@ -221,12 +177,7 @@ pub fn plan(
     if bytes.len() > MAX_RESULT_BYTES {
         return Err(ApiFault::new(500, "transcode_unavailable"));
     }
-    let invalid = || ApiFault::new(500, "transcode_unavailable");
-    let result: TranscodeResult = parse_object(bytes).ok_or_else(invalid)?;
-    validate_transcoded_result(&result).map_err(|_| invalid())?;
-    if !result.staging_id.is_empty() && !validate_staging_id(&result.staging_id) {
-        return Err(invalid());
-    }
+    let result = parse_marker(bytes).ok_or(ApiFault::new(500, "transcode_unavailable"))?;
     if !current_staging_id.is_empty() && result.staging_id == current_staging_id {
         Ok(Plan::AlreadyDone(result))
     } else {
@@ -381,6 +332,58 @@ pub fn container_transcode_body(req: &TranscodeRequest) -> ContainerTranscodeReq
     }
 }
 
+fn parse_object<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
+    if !body.trim_ascii_start().starts_with(b"{") {
+        return None;
+    }
+    serde_json::from_slice(body).ok()
+}
+
+fn parse_marker(bytes: &[u8]) -> Option<TranscodeResult> {
+    parse_object::<TranscodeResult>(bytes).filter(|result| {
+        (result.staging_id.is_empty() || validate_staging_id(&result.staging_id))
+            && validate_transcoded_result(result).is_ok()
+    })
+}
+
+/// Read and validate a job envelope within one deadline.
+pub async fn read_job_request<S, D>(
+    mut stream: S,
+    deadline: D,
+) -> Result<TranscodeRequest, ApiFault>
+where
+    S: futures_util::Stream<Item = Result<Vec<u8>, ()>> + Unpin,
+    D: std::future::Future<Output = ()> + Unpin,
+{
+    use futures_util::future::{select, Either};
+    use futures_util::StreamExt;
+
+    let read = Box::pin(async move {
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|()| ApiFault::invalid())?;
+            if !push_chunk_capped(&mut body, &chunk, MAX_REQUEST_BYTES) {
+                return Err(ApiFault::new(413, "payload_too_large"));
+            }
+        }
+        let req = parse_request(&body)?;
+        // Matches ingest's derive_transcode_staging v2 domain.
+        let sha = req.source_sha256.to_ascii_lowercase();
+        let identity = format!(
+            "{PROFILE_NAME}:v2:{}:{}:{sha}:{}",
+            req.job_id, req.scratch_prefix, req.input_key
+        );
+        if req.staging_id != sha256_hex(identity.as_bytes()) {
+            return Err(ApiFault::invalid());
+        }
+        Ok(req)
+    });
+    match select(deadline, read).await {
+        Either::Left(_) => Err(transcode_unavailable_fault()),
+        Either::Right((reply, _deadline)) => reply,
+    }
+}
+
 /// What a Container reply means for the reply to ingest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContainerOutcome {
@@ -455,10 +458,8 @@ pub fn validate_do_reply(status: u16, body: &[u8]) -> Result<(), ApiFault> {
                     | (500, "transcode_unavailable")
                     | (502, "container_unavailable")
                     | (503, "scratch_unavailable" | "transcode_unavailable")
-                    | (
-                        503,
-                        "transcode_timeout" | "transcode_resource" | "transcode_failed"
-                    )
+                    | (503, "transcode_timeout" | "transcode_resource")
+                    | (503, "transcode_failed")
             )
         })
     };
