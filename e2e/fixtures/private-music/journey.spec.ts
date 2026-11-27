@@ -152,22 +152,18 @@ test('synthetic transport observations require advancement, paused seek and queu
 });
 
 test('synthetic play and seek meter one published track by delivered-byte union', () => {
-  const manifest = JSON.parse(readFileSync(new URL('manifest.json', clips), 'utf8')) as {
-    tracks: Array<{ file: string; bytes: number; sha256: string }>;
-  };
-  const file = 'fixture-1.flac';
-  const body = readFileSync(new URL(file, clips));
-  const track = manifest.tracks.find((candidate) => candidate.file === file);
-  expect(track).toEqual({ file, bytes: body.length, sha256: createHash('sha256').update(body).digest('hex') });
+  const audio = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
   const expected = {
     userId: 'fixture-member', trackId: 'fixture-track-0', playId: `private_browser_${'A'.repeat(22)}`,
-    fileBytes: body.length, durationMs: 10_000,
+    fileBytes: audio.body.length, durationMs: 14_000,
   };
   const observed = {
     ...expected,
-    delivered: [{ start: 0, end: 16 }, { start: 8, end: 24 }, { start: 32, end: 48 }],
-    unionBytes: 40,
-    streamSeconds: 8,
+    // The ranges arrive out of order after a backward seek. The last range
+    // overlaps the first seek and must contribute only its new bytes.
+    delivered: [{ start: 65_536, end: 81_920 }, { start: 0, end: 8_192 }, { start: 60_000, end: 70_000 }],
+    unionBytes: 30_112,
+    streamSeconds: 3,
   };
   expect(() => assertPrivateMeteredPlay(expected, observed)).not.toThrow();
   expect(() => assertPrivateMeteredPlay(expected, { ...observed, trackId: 'fixture-track-1' }))
@@ -175,12 +171,20 @@ test('synthetic play and seek meter one published track by delivered-byte union'
   expect(() => assertPrivateMeteredPlay(expected, {
     ...observed, playId: `private_browser_${'B'.repeat(22)}`,
   })).toThrow('published track and browser play');
+  expect(() => assertPrivateMeteredPlay(expected, {
+    ...observed, userId: 'other-member',
+  })).toThrow('published track and browser play');
   expect(() => assertPrivateMeteredPlay(expected, { ...observed, unionBytes: 48 }))
     .toThrow('delivered-byte union');
   expect(() => assertPrivateMeteredPlay(expected, {
-    ...observed, delivered: [{ start: 0, end: body.length + 1 }], unionBytes: body.length + 1,
+    ...observed, delivered: [{ start: 0, end: audio.body.length + 1 }], unionBytes: audio.body.length + 1,
   })).toThrow('non-empty file spans');
-  expect(() => assertPrivateMeteredPlay(expected, { ...observed, streamSeconds: 2 }))
+  expect(() => assertPrivateMeteredPlay(expected, { ...observed, delivered: [] }))
+    .toThrow('bounded media limits');
+  expect(() => assertPrivateMeteredPlay(expected, {
+    ...observed, delivered: Array.from({ length: 33 }, (_, index) => ({ start: index, end: index + 1 })),
+  })).toThrow('bounded media limits');
+  expect(() => assertPrivateMeteredPlay(expected, { ...observed, streamSeconds: observed.streamSeconds + 1 }))
     .toThrow('delivered-byte union');
 });
 
