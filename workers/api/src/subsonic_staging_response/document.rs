@@ -20,6 +20,20 @@ pub struct StagingDocument {
     pub(super) bytes: Vec<u8>,
 }
 
+fn xml_text_is_valid(graph: &Value) -> bool {
+    match graph {
+        Value::Str(text) => text.chars().all(|c| {
+            matches!(
+                c,
+                '\t' | '\n' | '\r' | ' '..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}'
+            )
+        }),
+        Value::List(items) => items.iter().all(xml_text_is_valid),
+        Value::Map(entries) => entries.iter().all(|(_, value)| xml_text_is_valid(value)),
+        _ => true,
+    }
+}
+
 /// Render only a graph already charged during construction. The caller
 /// retains the permit through Worker response preparation.
 pub fn prepare(
@@ -42,11 +56,17 @@ pub fn prepare(
     };
     let len =
         capped_render::encoded_len(graph, format, limit.min(DOCUMENT_BYTES)).map_err(classify)?;
+    let unavailable = DocumentError::Rejected(StagingRejection::Unavailable, rejection_format);
+    if matches!(format, Format::Xml) && !xml_text_is_valid(graph) {
+        return Err(unavailable);
+    }
     let mut bytes = budget
         .allocate_exact(len)
         .map_err(|_| DocumentError::Rejected(StagingRejection::BusyOrCapacity, rejection_format))?;
     bytes.resize(len, 0);
-    capped_render::render_into(graph, format, &mut bytes).map_err(classify)?;
+    if capped_render::render_into(graph, format, &mut bytes).map_err(classify)? != len {
+        return Err(unavailable);
+    }
     Ok(StagingDocument {
         content_type,
         bytes,

@@ -15,6 +15,7 @@ use tokio_postgres::{
 
 type CatalogueRows = (Vec<ArtistDbRow>, Vec<ReleaseDbRow>, Vec<TrackDbRow>);
 const MIRROR_ROWS: i64 = 1_024;
+const MIRROR_TEXT_BYTES: i32 = 256 * 1_024;
 
 /// Borrow already charged, normalized membership from the authenticated app
 /// read. Exact pairs must remain sorted for the occurrence fence.
@@ -22,6 +23,34 @@ pub(crate) struct MirrorSelection<'a> {
     pub releases: &'a [String],
     pub pairs: &'a [(String, String)],
     pub remaining_text_bytes: i32,
+}
+
+impl MirrorSelection<'_> {
+    fn contains_release(&self, release: &str) -> bool {
+        self.releases
+            .binary_search_by(|id| id.as_str().cmp(release))
+            .is_ok()
+    }
+
+    fn validate(&self) -> Result<(), StagingRejection> {
+        let canonical = |id: &str| {
+            catalogue::is_catalogue_mbid(id) && !id.bytes().any(|b| b.is_ascii_uppercase())
+        };
+        if !(0..=MIRROR_TEXT_BYTES).contains(&self.remaining_text_bytes)
+            || self.releases.len() > MIRROR_ROWS as usize
+            || self.pairs.len() > MIRROR_ROWS as usize
+            || !self.releases.iter().all(|id| canonical(id))
+            || !self.releases.windows(2).all(|ids| ids[0] < ids[1])
+            || !self.pairs.windows(2).all(|pairs| pairs[0] < pairs[1])
+            || !self
+                .pairs
+                .iter()
+                .all(|(release, recording)| canonical(recording) && self.contains_release(release))
+        {
+            return Err(StagingRejection::BusyOrCapacity);
+        }
+        Ok(())
+    }
 }
 
 fn join_text(budget: &mut ConstructionBudget, parts: &[&str]) -> Result<String, StoreError> {
@@ -229,6 +258,7 @@ pub(crate) async fn load_staging_mirror<F>(
 where
     F: Future<Output = Result<PgClient, StagingRejection>>,
 {
+    member.validate()?;
     if member.releases.is_empty() && member.pairs.is_empty() {
         return Ok(CatalogueRows::default());
     }
@@ -245,6 +275,65 @@ where
     )
     .await
     .map_err(|_| StagingRejection::BusyOrCapacity)
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn malformed_membership_never_calls_the_isolated_mirror_connector() {
+    let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned();
+    let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_owned();
+    let pair = (a.clone(), b.clone());
+    let releases = [a.clone()];
+    let pairs = [pair.clone()];
+    let valid = MirrorSelection {
+        releases: &releases,
+        pairs: &pairs,
+        remaining_text_bytes: MIRROR_TEXT_BYTES,
+    };
+    assert!(valid.validate().is_ok());
+    let oversized = vec![a.clone(); MIRROR_ROWS as usize + 1];
+    for member in [
+        MirrorSelection {
+            releases: &[],
+            ..valid
+        },
+        MirrorSelection {
+            releases: &[b, a.clone()],
+            ..valid
+        },
+        MirrorSelection {
+            releases: &[a.to_ascii_uppercase()],
+            ..valid
+        },
+        MirrorSelection {
+            releases: &oversized,
+            ..valid
+        },
+        MirrorSelection {
+            pairs: &[(a, "invalid".into())],
+            ..valid
+        },
+        MirrorSelection {
+            pairs: &[pair.clone(), pair],
+            ..valid
+        },
+        MirrorSelection {
+            remaining_text_bytes: -1,
+            ..valid
+        },
+        MirrorSelection {
+            remaining_text_bytes: MIRROR_TEXT_BYTES + 1,
+            ..valid
+        },
+    ] {
+        let mut budget = ConstructionBudget::new(0);
+        let result = load_staging_mirror::<std::future::Ready<_>>(&mut budget, member, || {
+            panic!("invalid membership must fail before mirror connection")
+        })
+        .await;
+        assert!(matches!(result, Err(StagingRejection::BusyOrCapacity)));
+        assert_eq!(budget.charged(), 0);
+    }
 }
 
 #[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]

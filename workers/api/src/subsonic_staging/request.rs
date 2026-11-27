@@ -1,13 +1,24 @@
 //! Bounded collection from the raw Worker request. This does not take a permit.
 
+use worker::js_sys::{Function, JsString};
+use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::web_sys;
 
-use super::{ConstructionBudget, StagingInput, CONSTRUCTION_BYTES};
+use super::{admits_form_media_type, ConstructionBudget, StagingInput, CONSTRUCTION_BYTES};
 use crate::subsonic_http::{StagingBody, StagingBodyError};
 pub use crate::subsonic_request_metadata::InputError;
 use crate::subsonic_request_metadata::{
-    admit_metadata, BodyPlan, RequestMetadata, CAPACITY, TOO_LARGE,
+    admit_metadata, property, BodyPlan, RequestMetadata, CAPACITY, TOO_LARGE,
 };
+
+pub(crate) fn request_header(request: &web_sys::Request, name: &str) -> Option<JsString> {
+    let headers = request.headers();
+    let get: Function = property(headers.as_ref(), "get").ok()?;
+    get.call1(headers.as_ref(), &JsValue::from_str(name))
+        .ok()?
+        .dyn_into()
+        .ok()
+}
 
 impl From<StagingBodyError> for InputError {
     fn from(error: StagingBodyError) -> Self {
@@ -40,6 +51,14 @@ impl StagingInput {
         let (form, budget) = match body {
             BodyPlan::Skip => (String::new(), budget),
             BodyPlan::Form { declared } => {
+                // Metadata identifies candidates by substring. Check the full
+                // media type before interpreting any bytes as credentials.
+                let value =
+                    request_header(request, "content-type").ok_or(InputError::Unreadable)?;
+                let units = (0..value.length()).map(|i| value.char_code_at(i) as u16);
+                if !admits_form_media_type(units) {
+                    return Err(InputError::Unreadable);
+                }
                 StagingBody::new(declared, budget)?
                     .collect_worker(request, Some(&query))
                     .await?
@@ -62,11 +81,44 @@ mod wasm_test {
     use crate::subsonic_staging::StagingConstruction;
     use worker::wasm_bindgen::{self, prelude::*};
 
+    async fn check_form_media_types() -> Result<(), JsValue> {
+        for (content_type, accepted) in [
+            ("text/plain; hint=application/x-www-form-urlencoded", false),
+            ("application/x-www-form-urlencoded, text/plain", false),
+            (
+                r#"application/x-www-form-urlencoded; name=one",two""#,
+                false,
+            ),
+            (r#"application/x-www-form-urlencoded; name="one,two""#, true),
+        ] {
+            let headers = web_sys::Headers::new()?;
+            headers.set("content-type", content_type)?;
+            let init = web_sys::RequestInit::new();
+            init.set_method("POST");
+            init.set_headers(headers.as_ref());
+            init.set_body(&JsValue::from_str("u=fixture"));
+            let request = web_sys::Request::new_with_str_and_init(
+                "https://fixture.example/rest/ping",
+                &init,
+            )?;
+            let result = StagingInput::collect(&request).await;
+            if accepted {
+                assert_eq!(result.unwrap().form, "u=fixture");
+            } else {
+                assert_eq!(result.err(), Some(InputError::Unreadable));
+            }
+            assert_eq!(request.body_used(), accepted);
+        }
+        Ok(())
+    }
+
     #[wasm_bindgen]
     pub async fn staging_input_test(
         request: web_sys::Request,
         limit: Option<u32>,
     ) -> Result<u32, JsValue> {
+        // The Node suite reaches the raw Worker collector through this adapter.
+        check_form_media_types().await?;
         let input = if let Some(limit) = limit {
             StagingInput::collect_with_budget(&request, ConstructionBudget::new(limit as usize))
                 .await

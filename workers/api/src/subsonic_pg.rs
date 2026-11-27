@@ -145,17 +145,14 @@ fn record(
 async fn compat_table_present(client: &mut impl PgConnect) -> Result<bool, StoreError> {
     // Unqualified like the queries below: the probe must resolve the same
     // table the compat queries reach through the active search_path.
-    let rows = client
-        .query_typed(
+    let row = client
+        .query_typed_one(
             "SELECT to_regclass('subsonic_credentials') IS NOT NULL",
             &[],
         )
         .await
         .map_err(|_| StoreError)?;
-    Ok(rows
-        .first()
-        .map(|row| row.get::<_, bool>(0))
-        .unwrap_or(false))
+    row.try_get::<_, bool>(0).map_err(|_| StoreError)
 }
 
 async fn transaction(client: &mut impl PgConnect) -> Result<PgTransaction<'_>, StoreError> {
@@ -570,7 +567,21 @@ impl CredentialStore for PgStore {
     }
 }
 
-const MAX_ACTIVE_CREDENTIALS: i64 = 32;
+const MAX_ACTIVE_CREDENTIALS: u64 = 32;
+
+fn credential_slot_available(count: i64) -> Result<bool, StoreError> {
+    Ok(u64::try_from(count).map_err(|_| StoreError)? < MAX_ACTIVE_CREDENTIALS)
+}
+
+#[cfg(test)]
+#[test]
+fn credential_issuance_requires_a_nonnegative_count_below_the_cap() {
+    assert!(credential_slot_available(-1).is_err());
+    assert!(credential_slot_available(0).unwrap());
+    assert!(credential_slot_available(31).unwrap());
+    assert!(!credential_slot_available(32).unwrap());
+    assert!(!credential_slot_available(i64::MAX).unwrap());
+}
 
 pub(super) async fn insert(
     client: &mut impl PgConnect,
@@ -622,11 +633,15 @@ pub(super) async fn insert(
     if sessions.len() != 1 {
         return Ok(false);
     }
-    let count: i64 = tx.query_typed(
-        "SELECT count(*)::bigint FROM subsonic_credentials WHERE user_id = $1 AND revoked_at IS NULL",
-        &[(&s.user_id, Type::TEXT)],
-    ).await.map_err(|_| StoreError)?[0].try_get(0).map_err(|_| StoreError)?;
-    if count >= MAX_ACTIVE_CREDENTIALS {
+    let row = tx
+        .query_typed_one(
+            "SELECT count(*)::bigint FROM subsonic_credentials WHERE user_id = $1 AND revoked_at IS NULL",
+            &[(&s.user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let count: i64 = row.try_get(0).map_err(|_| StoreError)?;
+    if !credential_slot_available(count)? {
         return Ok(false);
     }
     let mode = match s.auth_mode {
