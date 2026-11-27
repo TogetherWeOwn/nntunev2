@@ -81,12 +81,14 @@ def require_already_cleared(evidence, sha, run_id, number, scope_sha256):
             "prior retirement dispatch is unverified")
     retired = job(jobs, RETIREMENT, "success")
     require_steps(retired, (CONTAINMENT, RETIRE), "protected retirement steps did not pass")
-    starts = {step["name"]: timestamp(step.get("started_at"))
-              for step in retired["steps"] if step["name"] in (CONTAINMENT, RETIRE)}
+    times = {step["name"]: (timestamp(step.get("started_at")), timestamp(step.get("completed_at")))
+             for step in retired["steps"] if step["name"] in (CONTAINMENT, RETIRE)}
+    containment_start, containment_end = times[CONTAINMENT]
+    retire_start, retire_end = times[RETIRE]
+    require(containment_start <= containment_end <= retire_start <= retire_end
+            <= timestamp(retired.get("completed_at")) <= min(deploy_starts), "invalid retirement timing")
     require(decimal(retired.get("id")) == decimal(receipt.get("job_id"))
-            and receipt.get("verdict") == CONFIRMED
-            and starts[CONTAINMENT] <= starts[RETIRE] <= timestamp(retired.get("completed_at")) <= min(deploy_starts),
-            "prior confirmation is missing, mismatched or too late")
+            and receipt.get("verdict") == CONFIRMED, "prior confirmation is missing or mismatched")
 
 
 def main():

@@ -189,7 +189,7 @@ class StagingRetirementReadbackTests(unittest.TestCase):
 
         def step(name, number=1, started=-10):
             return {"name": name, "number": number, "status": "completed",
-                    "conclusion": "success", "started_at": iso(started)}
+                    "conclusion": "success", "started_at": iso(started), "completed_at": iso(started + 1)}
 
         def job(run, job_id, name, conclusion, *steps):
             return {"id": job_id, "name": name, "status": "completed", "conclusion": conclusion,
@@ -238,6 +238,11 @@ class StagingRetirementReadbackTests(unittest.TestCase):
         def receipt_changed(**fields):
             return clean | {"retirement": clean["retirement"] | fields}
 
+        def step_completion_changed(index, completed_at):
+            changed = copy.deepcopy(clean)
+            changed["actions"][f"{prior}/jobs"]["jobs"][0]["steps"][index]["completed_at"] = completed_at
+            return changed
+
         cmd = [sys.executable, "-I", "-B", str(HERE / "staging_retirement_readback.py"),
                SHA, "100", "2", scope]
         for label, evidence, expected in (
@@ -249,6 +254,10 @@ class StagingRetirementReadbackTests(unittest.TestCase):
             ("foreign workflow ref", wrong_ref, 1),
             ("cleanup completed after deployment started", late, 1),
             ("cleanup completed before its protected steps started", impossible, 1),
+            ("containment overlaps retirement", step_completion_changed(0, iso(-13)), 1),
+            ("retirement step ends after its job", step_completion_changed(1, iso(-10)), 1),
+            ("retirement step ends before it starts", step_completion_changed(1, iso(-15)), 1),
+            ("containment completion missing", step_completion_changed(0, None), 1),
             ("incomplete prior jobs page", truncated, 1),
             ("missing prior receipt", {"actions": clean["actions"]}, 1),
             ("different scope bytes", receipt_changed(scope_sha256="c" * 64), 1),
