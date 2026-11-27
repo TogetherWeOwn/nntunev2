@@ -29,20 +29,12 @@ impl TargetKind {
 
 /// Checks the common identifier shape, not kind-specific requirements.
 pub fn valid_target_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_TARGET_ID_LEN
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    crate::ledger::is_valid_key_field(value, MAX_TARGET_ID_LEN)
 }
 
 /// Lowercases catalogue MBIDs while preserving opaque identifiers.
 pub fn canonical_target_id(value: &str) -> String {
-    if crate::catalogue::is_catalogue_mbid(value) {
-        value.to_ascii_lowercase()
-    } else {
-        value.to_string()
-    }
+    crate::catalogue::enrichment_key(value).unwrap_or_else(|| value.to_owned())
 }
 
 #[cfg(test)]

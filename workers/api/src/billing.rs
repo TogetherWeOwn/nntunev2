@@ -43,6 +43,7 @@
 //! binding for the creation path, and the plans/ever reads serve the
 //! `GET /v1/plans` + `GET /v1/me/subscription` display DTOs.
 
+use crate::billing_reconcile::RENEWAL_GRACE_SECS;
 use crate::plan_limits::{resolve_or_free, PlanId};
 
 /// Fixed renewal-settlement allowance past the last confirmed paid end
@@ -148,10 +149,14 @@ pub fn resolve_effective_plan(
             // Renewal-only grace: a stored deadline plus a previous paid end
             // (first-payment failures carry none and get no grace).
             match (sub.paid_through_at_unix, sub.grace_until_unix) {
-                (Some(_), Some(grace)) if now_unix < grace => EffectivePlan {
-                    plan,
-                    entitled: true,
-                },
+                (Some(paid), Some(grace))
+                    if now_unix < grace.min(paid.saturating_add(RENEWAL_GRACE_SECS)) =>
+                {
+                    EffectivePlan {
+                        plan,
+                        entitled: true,
+                    }
+                }
                 _ => closed(),
             }
         }

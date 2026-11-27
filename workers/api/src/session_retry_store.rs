@@ -16,6 +16,17 @@ fn valid_token_times(claims: &SessionClaims) -> bool {
         && claims.expires_at <= claims.created_at.saturating_add(MAX_SESSION_SECS)
 }
 
+fn valid_retry_request(previous: &SessionClaims, next: &SessionClaims, retry_hash: &str) -> bool {
+    valid_token_times(previous)
+        && valid_token_times(next)
+        && next.session_id == previous.session_id
+        && next.user_id == previous.user_id
+        && next.created_at == previous.created_at
+        && previous.rotation_counter.checked_add(1) == Some(next.rotation_counter)
+        // The production SHA-256 digest is at most 43 base64url characters.
+        && crate::ledger::is_valid_key_field(retry_hash, 43)
+}
+
 /// Serialize before sampling time. Evaluating a volatile clock in an UPDATE's
 /// WHERE clause is not enough: PostgreSQL can evaluate it before a row-lock wait.
 /// The lock, clock, parameter binding, row decoding and commit live here so the
@@ -28,19 +39,19 @@ pub async fn rotate_with_retry(
 ) -> Result<Option<SessionClaims>, StoreError> {
     // A receipt clock may differ from the Worker's clock. Persist the candidate's
     // already-validated token issuance, never the database receipt timestamp.
-    if !valid_token_times(next)
-        || next.session_id != previous.session_id
-        || next.user_id != previous.user_id
-        || next.created_at != previous.created_at
-        || previous.rotation_counter.checked_add(1) != Some(next.rotation_counter)
-    {
+    if !valid_retry_request(previous, next, retry_hash) {
         return Err(StoreError);
     }
-    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    let transaction = client.read_committed().await.map_err(|_| StoreError)?;
+    let created_at = i64::try_from(previous.created_at).map_err(|_| StoreError)?;
     if transaction
         .query_typed_opt(
-            "SELECT id FROM sessions WHERE id = $1 FOR UPDATE",
-            &[(&previous.session_id, Type::TEXT)],
+            "SELECT id FROM sessions WHERE id = $1 AND user_id = $2 AND created_at = $3 FOR UPDATE",
+            &[
+                (&previous.session_id, Type::TEXT),
+                (&previous.user_id, Type::TEXT),
+                (&created_at, Type::INT8),
+            ],
         )
         .await
         .map_err(|_| StoreError)?
@@ -65,10 +76,7 @@ pub async fn rotate_with_retry(
             &[
                 (&previous.session_id, Type::TEXT),
                 (&previous.user_id, Type::TEXT),
-                (
-                    &i64::try_from(previous.created_at).map_err(|_| StoreError)?,
-                    Type::INT8,
-                ),
+                (&created_at, Type::INT8),
                 (
                     &i32::try_from(previous.rotation_counter).map_err(|_| StoreError)?,
                     Type::INT4,
@@ -124,4 +132,32 @@ pub async fn rotate_with_retry(
     }
     transaction.commit().await.map_err(|_| StoreError)?;
     Ok(claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_requires_a_valid_predecessor_and_bounded_digest() {
+        let mut previous = SessionClaims {
+            session_id: "session".into(),
+            user_id: "member".into(),
+            created_at: 10,
+            issued_at: 20,
+            expires_at: 40,
+            rotation_counter: 0,
+        };
+        let next = SessionClaims {
+            rotation_counter: 1,
+            ..previous.clone()
+        };
+        let digest = crate::b64::encode(&[0; 32]);
+        assert!(valid_retry_request(&previous, &next, &digest));
+        for invalid in ["", "spaced digest", &"a".repeat(44)] {
+            assert!(!valid_retry_request(&previous, &next, invalid));
+        }
+        previous.issued_at = previous.expires_at;
+        assert!(!valid_retry_request(&previous, &next, &digest));
+    }
 }

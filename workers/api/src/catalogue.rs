@@ -123,13 +123,9 @@ pub fn is_catalogue_mbid(raw: &str) -> bool {
     true
 }
 
-/// Own-origin art path for a release. Reserved by (not served in) this
-/// slice: the art-serving card owns the reader, and until then the path
-/// 404s like every unbuilt surface. The scope map already serves
-/// `GET /v1/releases/*` under `library:read`, so no map change is needed
-/// when the reader lands.
-pub fn release_art_path(release_mbid: &str) -> String {
-    format!("/v1/releases/{release_mbid}/art")
+/// Reserved own-origin art path for a release with a valid MBID.
+pub fn release_art_path(release_mbid: &str) -> Option<String> {
+    is_catalogue_mbid(release_mbid).then(|| format!("/v1/releases/{release_mbid}/art"))
 }
 
 /// One `mb_artist` row as the store returns it. The HTTP layer maps this
@@ -340,8 +336,7 @@ pub fn artist_response(row: &ArtistDbRow) -> ArtistResponse {
     }
 }
 
-/// Map one release row to its response. The MBID comes from the mirror, so
-/// the own-origin art path is always well-formed here.
+/// Map one release row to its response.
 pub fn release_response(row: &ReleaseDbRow) -> ReleaseResponse {
     ReleaseResponse {
         mbid: row.mbid.clone(),
@@ -350,12 +345,11 @@ pub fn release_response(row: &ReleaseDbRow) -> ReleaseResponse {
         year: row.year,
         artist_mbid: row.artist_mbid.clone(),
         artist: row.artist_name.clone(),
-        art_url: Some(release_art_path(&row.mbid)),
+        art_url: release_art_path(&row.mbid),
     }
 }
 
-/// Map one track occurrence row to its response. Both MBIDs come from the
-/// mirror, so the art path is always well-formed here.
+/// Map one track occurrence row to its response.
 pub fn track_response(row: &TrackDbRow) -> TrackResponse {
     TrackResponse {
         mbid: row.recording_mbid.clone(),
@@ -367,7 +361,7 @@ pub fn track_response(row: &TrackDbRow) -> TrackResponse {
         duration_ms: row.duration_ms,
         track_no: row.track_no,
         medium_no: row.medium_no,
-        art_url: Some(release_art_path(&row.release_mbid)),
+        art_url: release_art_path(&row.release_mbid),
     }
 }
 
@@ -395,10 +389,7 @@ pub fn library_entry(row: &LibraryDbRow) -> LibraryEntry {
         duration_ms: row.duration_ms,
         track_no: row.track_no,
         medium_no: row.medium_no,
-        art_url: row
-            .release_mbid
-            .as_deref()
-            .and_then(|mbid| is_catalogue_mbid(mbid).then(|| release_art_path(mbid))),
+        art_url: row.release_mbid.as_deref().and_then(release_art_path),
     }
 }
 
@@ -411,7 +402,6 @@ pub fn assemble_release_detail(
     tracks: &[ReleaseTrackDbRow],
 ) -> ReleaseDetail {
     let detail = release_response(release);
-    let art_url = Some(release_art_path(&release.mbid));
     ReleaseDetail {
         tracks: tracks
             .iter()
@@ -425,22 +415,21 @@ pub fn assemble_release_detail(
                 duration_ms: track.duration_ms,
                 track_no: track.track_no,
                 medium_no: track.medium_no,
-                art_url: art_url.clone(),
+                art_url: detail.art_url.clone(),
             })
             .collect(),
         release: detail,
     }
 }
 
-/// Normalize a stored MBID for enrichment lookup: lowercase, then the
-/// catalogue shape check. `None` for anything malformed — poisoned stored
+/// Check the catalogue shape, then lowercase a stored MBID for lookup.
+/// `None` for anything malformed — poisoned stored
 /// values never reach a mirror probe and degrade that field to `None`,
 /// while uppercase hex (accepted by the `uuid` cast) still enriches. The
 /// store applies this to page MBIDs before binding the enrichment probes
 /// and assembly applies it on lookup, so both sides meet on one key shape.
 pub fn enrichment_key(raw: &str) -> Option<String> {
-    let normalized = raw.to_ascii_lowercase();
-    is_catalogue_mbid(&normalized).then_some(normalized)
+    is_catalogue_mbid(raw).then(|| raw.to_ascii_lowercase())
 }
 
 /// Join one library page with its mirror enrichment into the assembled rows
@@ -963,7 +952,7 @@ mod tests {
     #[test]
     fn art_path_is_own_origin_release_art() {
         assert_eq!(
-            release_art_path(GOOD_RELEASE),
+            release_art_path(GOOD_RELEASE).unwrap(),
             format!("/v1/releases/{GOOD_RELEASE}/art")
         );
     }

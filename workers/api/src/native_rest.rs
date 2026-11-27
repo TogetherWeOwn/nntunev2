@@ -322,10 +322,9 @@ impl From<crate::random::CryptoError> for CredentialError {
 /// Every credential-validity failure maps to `Unauthenticated`
 /// (unknown/tampered secret, unknown pepper version, owner mismatch,
 /// revoked, expired — no oracle distinguishes them); a valid credential
-/// lacking `required` maps to `Forbidden`. Expiry boundary: `now >
-/// expires_at` is expired, `now == expires_at` still passes. Owner
-/// mismatch is `Unauthenticated`, never `Forbidden`, so a non-owner probe
-/// cannot learn the key was otherwise valid.
+/// lacking `required` maps to `Forbidden`. The credential must cover
+/// `now` within its bounded lifetime, including at `expires_at`.
+/// Owner mismatches also return `Unauthenticated`.
 ///
 /// Dual-pepper transition: a record whose version matches ANY entry in
 /// `peppers` authorizes; an empty slice or an unlisted version fails
@@ -340,13 +339,14 @@ pub fn authorize(
     peppers: &[Pepper<'_>],
 ) -> Result<(), CredentialError> {
     use subtle::ConstantTimeEq as _;
-    if record.user_id != caller_user_id {
-        return Err(CredentialError::Unauthenticated);
-    }
-    if record.revoked_at.is_some() {
-        return Err(CredentialError::Unauthenticated);
-    }
-    if now > record.expires_at {
+    if caller_user_id.is_empty()
+        || record.user_id != caller_user_id
+        || record.revoked_at.is_some()
+        || now < record.created_at
+        || now > record.expires_at
+        || record.expires_at > record.created_at.saturating_add(MAX_CREDENTIAL_TTL_SECS)
+        || !is_plausible_credential_shape(presented_secret)
+    {
         return Err(CredentialError::Unauthenticated);
     }
     let Some(pepper) = peppers.iter().find(|p| p.version == record.pepper_version) else {
@@ -535,6 +535,10 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
         path.strip_prefix(prefix)
             .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
     }
+    fn target_after(prefix: &str, path: &str) -> bool {
+        path.strip_prefix(prefix)
+            .is_some_and(crate::target_identity::valid_target_id)
+    }
     match method {
         "GET" => {
             // Catalog reads → library:read (roots and subpaths). The
@@ -547,15 +551,15 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/library"
                 || path == "/v1/artists"
                 || path == "/v1/releases"
-                || one_segment_after("/v1/releases/", path)
+                || target_after("/v1/releases/", path)
                 || path == "/v1/tracks"
                 || path == "/v1/search"
                 || path == "/v1/playlists"
-                || path.starts_with("/v1/playlists/")
+                || target_after("/v1/playlists/", path)
             {
                 return Bearer(Scope::LibraryRead);
             }
-            if path == "/v1/stream" || path.starts_with("/v1/stream/") {
+            if path == "/v1/stream" || target_after("/v1/stream/", path) {
                 return Bearer(Scope::StreamRead);
             }
             // Session-only reads (never reachable by bearer).
@@ -641,7 +645,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/playlists" {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/ingest" || path.starts_with("/v1/ingest/") {
+            if matches!(path, "/v1/ingest" | "/v1/ingest/jobs") {
                 return Bearer(Scope::IngestSubmit);
             }
             // Session-only writes (never reachable by bearer).
@@ -685,7 +689,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             // Single-segment item shapes only: nested, trailing-slash or
             // empty-segment shapes deny here, before any bearer lookup or
             // rate-limit spend downstream.
-            if one_segment_after("/v1/playlists/", path) {
+            if target_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
             if path == "/v1/me" {
@@ -707,14 +711,14 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
         }
         "PATCH" => {
             // Single-segment item shapes only (see PUT).
-            if one_segment_after("/v1/playlists/", path) {
+            if target_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
             Deny
         }
         "DELETE" => {
             // Single-segment item shapes only (see PUT).
-            if one_segment_after("/v1/playlists/", path) {
+            if target_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
             if one_segment_after("/v1/libraries/", path) {
@@ -726,7 +730,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/subsonic-credentials/", path) {
                 return SessionOnly;
             }
-            if path.starts_with("/v1/credentials/") && path.len() > "/v1/credentials/".len() {
+            if target_after("/v1/credentials/", path) {
                 return SessionOnly;
             }
             Deny

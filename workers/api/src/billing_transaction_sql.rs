@@ -9,6 +9,20 @@
 
 use tokio_postgres::types::{ToSql, Type};
 
+use crate::billing_reconcile::PaidInvoiceRow;
+
+fn valid_history_coverage(history: &PaidInvoiceRow) -> bool {
+    history.covered_periods.is_empty()
+        || (history.amount_cents > 0
+            && !history.stripe_invoice_id.trim().is_empty()
+            && history.currency.len() == 3
+            && history.currency.bytes().all(|b| b.is_ascii_lowercase())
+            && history
+                .covered_periods
+                .iter()
+                .all(|(start, end)| start < end))
+}
+
 /// Excludes subscription DML until the enclosing transaction ends.
 pub const LOCK_SUBSCRIPTIONS: &str = "LOCK TABLE public.subscriptions IN SHARE ROW EXCLUSIVE MODE";
 
@@ -168,6 +182,11 @@ pub(crate) async fn reconcile_transaction<B: crate::postgres::PgBilling>(
             return Err(StoreError);
         }
         let outcome = observe(transaction).await?;
+        crate::billing_store_classification::validate_history_target(&outcome)
+            .map_err(|_| StoreError)?;
+        if !outcome.history.iter().all(valid_history_coverage) {
+            return Err(StoreError);
+        }
         let row = &outcome.row;
         transaction
             .query_typed(crate::billing_transaction_sql::LOCK_SUBSCRIPTIONS, &[])
@@ -217,8 +236,6 @@ pub(crate) async fn reconcile_transaction<B: crate::postgres::PgBilling>(
             }
             StoreError
         })?;
-        crate::billing_store_classification::validate_history_target(&outcome)
-            .map_err(|_| StoreError)?;
         if outcome.explicit_stale {
             classify_explicit_stale(&target, outcome.history.is_empty()).map_err(|_| {
                 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
@@ -394,6 +411,29 @@ pub(crate) async fn reconcile_transaction<B: crate::postgres::PgBilling>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_history_coverage_requires_paid_invoice_evidence() {
+        let mut history = PaidInvoiceRow {
+            stripe_invoice_id: "in_synthetic".into(),
+            stripe_subscription_id: "sub_synthetic".into(),
+            plan_id: "plus".into(),
+            period_start_unix: 10,
+            period_end_unix: 20,
+            amount_cents: 1,
+            currency: "usd".into(),
+            paid_at_unix: 10,
+            covered_periods: vec![(10, 20)],
+        };
+        assert!(valid_history_coverage(&history));
+        history.covered_periods.push((30, 30));
+        assert!(!valid_history_coverage(&history));
+        history.covered_periods.pop();
+        history.amount_cents = 0;
+        assert!(!valid_history_coverage(&history));
+        history.covered_periods.clear();
+        assert!(valid_history_coverage(&history));
+    }
 
     #[test]
     fn fixed_relation_and_global_lookup_are_pinned() {

@@ -94,14 +94,19 @@ impl SocketGuard {
     /// does not establish backend teardown.
     #[cfg_attr(not(feature = "billing-owned-wasm-test"), allow(dead_code))]
     pub(crate) async fn close_confirmed(&self) -> Result<(), JsValue> {
-        let active = self.0.borrow().sockets.last().cloned();
+        let active = {
+            let mut registry = self.0.borrow_mut();
+            if registry.closed && !registry.sockets.is_empty() {
+                return Err(JsValue::from_str("socket owner closing"));
+            }
+            registry.closed = true;
+            registry.sockets.last().cloned()
+        };
         if let Some(socket) = active {
             worker::wasm_bindgen_futures::JsFuture::from(socket.close()?).await?;
             worker::wasm_bindgen_futures::JsFuture::from(socket.closed()?).await?;
         }
-        let mut registry = self.0.borrow_mut();
-        registry.closed = true;
-        registry.sockets.clear();
+        self.0.borrow_mut().sockets.clear();
         Ok(())
     }
 }
@@ -314,6 +319,19 @@ pub(crate) async fn test_tracked_socket() -> Result<(), &'static str> {
     if count(&fixture, "replacementCloses") != 1.0 || count(&fixture, "originalCloses") != 0.0 {
         return Err("confirmed active socket close repeated on drop");
     }
+
+    let fixture = socket_fixture(false);
+    let owner = SocketGuard::default();
+    let socket = tracked(&owner, &fixture);
+    let mut closing = std::pin::pin!(owner.close_confirmed());
+    let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+    if closing.as_mut().poll(&mut cx).is_ready()
+        || owner.tls().connect(socket).await.is_ok()
+        || count(&fixture, "upgrades") != 0.0
+    {
+        return Err("closing socket owner allowed an upgrade");
+    }
+    let _ = closing.await;
     Ok(())
 }
 
