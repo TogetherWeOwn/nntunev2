@@ -61,6 +61,122 @@ pub(super) async fn protect_completed(
         ));
     }
     let obj = &expected.object;
+    let fence_is = async |expr: &str| {
+        let sql = format!("SELECT upload_until = {expr} FROM public.storage_validated_digest_winners WHERE object_id = $1::text::uuid");
+        observer
+            .query_one(&sql, &[obj])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    };
+    // Unauthorized and cross-owner reuse claims must fail closed before reaching
+    // the authority reader or extending the winner's reuse fence.
+    let upload_only = Grant {
+        actions: vec![Action::Create, Action::Upload],
+        ..auth.grant.clone()
+    };
+    let mut revoked = auth.record.clone();
+    revoked.revoked_at = Some(auth.record.created_at);
+    let mut stranger = auth.record.clone();
+    stranger.user_id = "foreign-reuse-principal".into();
+    let stranger_auth = Authorization {
+        record: &stranger,
+        ..auth
+    };
+    for denied in [
+        Authorization {
+            grant: &upload_only,
+            ..auth
+        },
+        Authorization {
+            record: &revoked,
+            ..auth
+        },
+        stranger_auth,
+    ] {
+        let res = reuse(writer, denied, &scope, job, async |_, _| {
+            panic!("pre-lock reuse denial reached reader")
+        })
+        .await;
+        assert!(matches!(res, Err(Refused)));
+    }
+    // Self-consistent cross-owner grant, job and scope targeting the owner's
+    // completed session must be refused by `outcome_lock.sql`'s principal fence.
+    let stranger_job = Job {
+        owner_id: "foreign-reuse-principal",
+        ..*job
+    };
+    let stranger_scope = CompletionScope {
+        principal: stranger_job.owner_id,
+        ..scope
+    };
+    let res = reuse(
+        writer,
+        stranger_auth,
+        &stranger_scope,
+        &stranger_job,
+        async |_, _| panic!("cross-owner reuse bypassed the SQL principal fence"),
+    )
+    .await;
+    assert!(matches!(res, Err(Refused)));
+    // A second uncompleted session with the exact same plaintext SHA-256 and
+    // checkpoint coordinates in the same scope must pass `outcome_lock.sql` and
+    // still be refused by `reuse_lock.sql`, never claiming the first winner by digest.
+    let dup_sid = fresh_id().unwrap();
+    let inserted_dup: String = writer
+        .query_one(
+            "SELECT pg_temp.reserve($1::text::uuid, $2::text::uuid, $3, $4, $5, $6::text::uuid)::text",
+            &[&uuid_text(scope.environment), &uuid_text(scope.library), &scope.principal, &"duplicate-digest-reuse", &scope.fingerprint.as_slice(), &dup_sid],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(inserted_dup.replace('-', ""), dup_sid);
+    assert_eq!(
+        observer
+            .execute(
+                "UPDATE public.ingest_session_reservations SET checkpoint_generation = $2::text::uuid, checkpoint_revision = $3, checkpoint_offset = $4 WHERE id = $1::text::uuid",
+                &[&dup_sid, &uuid_text(scope.seal), &scope.revision, &scope.offset],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let dup_job = Job {
+        id: &dup_sid,
+        ..*job
+    };
+    let dup_scope = CompletionScope {
+        session: &dup_sid,
+        ..scope
+    };
+    let dup_prepared = PreparedUpload {
+        scope: CompletionScope {
+            session: &dup_sid,
+            ..prepared.scope
+        },
+        job: &dup_job,
+        ..prepared
+    };
+    // Prove `outcome_lock.sql` accepts `dup_scope` (returning `Ok(None)` while
+    // uncompleted), isolating the `reuse` refusal to `reuse_lock.sql`.
+    assert!(read(writer, auth, dup_prepared, reload)
+        .await
+        .unwrap()
+        .is_none());
+    let res = reuse(writer, auth, &dup_scope, &dup_job, async |_, _| {
+        panic!("uncompleted duplicate-digest session claimed another session's winner")
+    })
+    .await;
+    assert!(matches!(res, Err(Refused)));
+    observer
+        .batch_execute(&format!(
+            "BEGIN; DELETE FROM public.ingest_session_cleanup_intents WHERE session_id = '{dup_sid}'::uuid; DELETE FROM public.ingest_session_reservations WHERE id = '{dup_sid}'::uuid; COMMIT;"
+        ))
+        .await
+        .unwrap();
+    assert!(fence_is("'-infinity'").await);
+
     let mut cleaner = connect(DB).await;
     let cleaner_pid = backend_pid(&cleaner).await;
     let writer_pid = backend_pid(writer).await;
@@ -81,6 +197,7 @@ pub(super) async fn protect_completed(
         assert!(matches!(attempt.await, Err(Refused)));
         set_reuse_grant(observer, &auth.record.id, true).await;
     }
+    assert!(fence_is("'-infinity'").await);
     assert!(matches!(
         open_or_reuse(
             writer,
@@ -93,6 +210,7 @@ pub(super) async fn protect_completed(
         .await,
         Err(Unconfirmed)
     ));
+    assert!(fence_is("'-infinity'").await);
     // The credential initially limits the protection. Once restored, a retry
     // can extend the durable fence to its own deadline.
     let cutoff: SystemTime = observer
@@ -188,6 +306,76 @@ pub(super) async fn protect_completed(
         .await
         .unwrap()
         .get::<_, bool>(0));
+
+    // A commit failure after `reuse_protect.sql` updates `upload_until` must
+    // roll back the fence extension, release locks, and return no pins.
+    observer
+        .batch_execute(&format!(
+            "CREATE SEQUENCE public.fixture_reuse_commit_attempts;
+             CREATE FUNCTION public.fixture_reject_reuse_commit() RETURNS trigger
+             LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+             BEGIN
+                 PERFORM nextval('public.fixture_reuse_commit_attempts');
+                 RAISE EXCEPTION 'synthetic reuse commit refusal';
+             END $$;
+             REVOKE ALL ON FUNCTION public.fixture_reject_reuse_commit() FROM PUBLIC;
+             CREATE CONSTRAINT TRIGGER fixture_reject_reuse_commit AFTER UPDATE
+             ON public.storage_validated_digest_winners DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW WHEN (NEW.object_id = '{obj}'::uuid)
+             EXECUTE FUNCTION public.fixture_reject_reuse_commit();"
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        reuse(writer, auth, &scope, job, reload).await,
+        Err(Unconfirmed)
+    ));
+    assert!(matches!(
+        open_or_reuse(writer, auth, prepared, until, reload, no_start).await,
+        Err(Unconfirmed)
+    ));
+    let attempts: i64 = observer
+        .query_one(
+            "SELECT last_value FROM public.fixture_reuse_commit_attempts",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(attempts, 2, "both reuse paths must reach the commit gate");
+    assert!(observer
+        .query_one(
+            "SELECT upload_until = $2 FROM public.storage_validated_digest_winners WHERE object_id = $1::text::uuid",
+            &[obj, &cutoff],
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    for (table, column, id) in [
+        ("ingest_session_reservations", "id", scope.session),
+        (
+            "storage_validated_digest_winners",
+            "object_id",
+            obj.as_str(),
+        ),
+    ] {
+        observer
+            .query_one(
+                &format!("SELECT 1 FROM public.{table} WHERE {column} = $1::text::uuid FOR UPDATE NOWAIT"),
+                &[&id],
+            )
+            .await
+            .expect("rolled-back reuse must release its row lock");
+    }
+    observer
+        .batch_execute(
+            "DROP TRIGGER fixture_reject_reuse_commit ON public.storage_validated_digest_winners;
+             DROP FUNCTION public.fixture_reject_reuse_commit();
+             DROP SEQUENCE public.fixture_reuse_commit_attempts;",
+        )
+        .await
+        .unwrap();
+
     let extended = reuse(writer, auth, &scope, job, reload).await.unwrap();
     assert_pins(extended.outcome(), expected);
     assert!(extended.usable_until() > cutoff);

@@ -174,13 +174,65 @@ BEGIN
         RAISE EXCEPTION 'delete bypassed live read protection after last reference removal';
     END IF;
 END $$;
--- Require the runner's pinned disposable connection for session fixtures.
+-- Require the runner's pinned disposable connection for private claim and session fixtures.
 \if :{?hosted_ingest_session_fixture}
 \else
-\echo 'skip: ingest session fixtures require the hosted disposable database'
+\echo 'skip: private claim and ingest session fixtures require the hosted disposable database'
 ROLLBACK;
 \quit
 \endif
+
+-- Cross-owner private libraries with identical plaintext SHA-256 and size must
+-- stay isolated: neither owner may claim the other's winner or leak references.
+DO $$
+DECLARE
+    owner_env CONSTANT uuid := 'aa000000-0000-4000-8000-000000000002';
+    lib_a CONSTANT uuid := 'ba000000-0000-4000-8000-000000000011';
+    lib_b CONSTANT uuid := 'ba000000-0000-4000-8000-000000000012';
+    obj_a CONSTANT uuid := 'ca000000-0000-4000-8000-000000000011';
+    obj_b CONSTANT uuid := 'ca000000-0000-4000-8000-000000000012';
+    gen_a CONSTANT uuid := 'da000000-0000-4000-8000-000000000011';
+    gen_b CONSTANT uuid := 'da000000-0000-4000-8000-000000000012';
+    map_a CONSTANT uuid := 'fa000000-0000-4000-8000-000000000011';
+    map_b CONSTANT uuid := 'fa000000-0000-4000-8000-000000000012';
+    prov CONSTANT uuid := 'ea000000-0000-4000-8000-000000000001';
+    root CONSTANT uuid := 'ea000000-0000-4000-8000-000000000002';
+    sha CONSTANT bytea := decode(repeat('fe', 32), 'hex');
+    ref CONSTANT uuid := 'ab000000-0000-4000-8000-000000000011';
+    pin_a record; pin_b record;
+BEGIN
+    INSERT INTO public.users (id, email, created_at) VALUES ('digest-claim-owner-a', 'digest-claim-owner-a@example.invalid', 1), ('digest-claim-owner-b', 'digest-claim-owner-b@example.invalid', 1);
+    INSERT INTO public.storage_environments VALUES (owner_env);
+    INSERT INTO public.storage_library_namespaces VALUES (lib_a, owner_env, 'digest-claim-owner-a'), (lib_b, owner_env, 'digest-claim-owner-b');
+    INSERT INTO public.storage_object_intents VALUES
+        (obj_a, gen_a, owner_env, lib_a, prov, 1, 65, decode(repeat('ab', 48), 'hex')),
+        (obj_b, gen_b, owner_env, lib_b, prov, 1, 65, decode(repeat('ab', 48), 'hex'));
+    INSERT INTO public.storage_plaintext_digest_claim_intents VALUES (obj_a, owner_env, lib_a, 1, sha), (obj_b, owner_env, lib_b, 1, sha);
+    INSERT INTO public.storage_digest_map_intents (map_id, object_id, environment_id, library_id, plaintext_bytes) VALUES (map_a, obj_a, owner_env, lib_a, 1), (map_b, obj_b, owner_env, lib_b, 1);
+    INSERT INTO public.storage_digest_map_page_intents (map_id, chunk_count, page_index, expected_hash) VALUES (map_a, 1, 0, decode(repeat('cd', 32), 'hex')), (map_b, 1, 0, decode(repeat('cd', 32), 'hex'));
+    INSERT INTO public.storage_digest_inventory_intents VALUES (map_a, 'media-owner-a', ARRAY['page-owner-a']), (map_b, 'media-owner-b', ARRAY['page-owner-b']);
+    INSERT INTO public.storage_object_envelope_intents
+    SELECT i.object_id, root, decode('4e4e544d454430310002','hex') || uuid_send(root) || uuid_send(i.environment_id) || uuid_send(i.library_id)
+           || uuid_send(i.object_id) || uuid_send(i.generation_id) || uuid_send(i.provider_configuration_version_id)
+           || int8send(i.plaintext_bytes) || int8send(i.envelope_bytes) || i.header_tag || decode(repeat('00',60),'hex')
+    FROM public.storage_object_intents i WHERE i.object_id IN (obj_a, obj_b);
+    INSERT INTO public.storage_validated_digest_winners (object_id, environment_id, library_id, plaintext_bytes, plaintext_sha256, root_version_id, retain_until)
+    VALUES (obj_a, owner_env, lib_a, 1, sha, root, '-infinity'), (obj_b, owner_env, lib_b, 1, sha, root, '-infinity');
+    IF EXISTS (SELECT FROM pg_temp.claim_lookup(owner_env, lib_b, sha, 1, obj_a, gen_a, root, ref, 'infinity', prov))
+       OR EXISTS (SELECT FROM pg_temp.claim_lookup(owner_env, lib_a, sha, 1, obj_b, gen_b, root, ref, 'infinity', prov)) THEN
+        RAISE EXCEPTION 'cross-owner claim lookup returned a binding';
+    END IF;
+    IF EXISTS (SELECT FROM public.storage_validated_digest_references WHERE environment_id = owner_env) THEN
+        RAISE EXCEPTION 'cross-owner refusal wrote a reference';
+    END IF;
+    SELECT * INTO STRICT pin_a FROM pg_temp.claim_lookup(owner_env, lib_a, sha, 1, obj_a, gen_a, root, ref, 'infinity', prov);
+    SELECT * INTO STRICT pin_b FROM pg_temp.claim_lookup(owner_env, lib_b, sha, 1, obj_b, gen_b, root, ref, 'infinity', prov);
+    IF (pin_a.object_id, pin_a.media_version, pin_a.page_versions) IS DISTINCT FROM (obj_a, 'media-owner-a'::text, ARRAY['page-owner-a'])
+       OR (pin_b.object_id, pin_b.media_version, pin_b.page_versions) IS DISTINCT FROM (obj_b, 'media-owner-b'::text, ARRAY['page-owner-b']) THEN
+        RAISE EXCEPTION 'owner-scoped claim lookup returned wrong pins';
+    END IF;
+END $$;
+
 \ir ../fixtures/ingest_session_reserve.sql
 \ir ../fixtures/ingest_session_terminate.sql
 \ir ../fixtures/ingest_session_advance_checkpoint.sql

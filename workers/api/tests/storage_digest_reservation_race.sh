@@ -116,9 +116,10 @@ tests_dir="$(dirname -- "${BASH_SOURCE[0]}")"
 psql_run -v storage_digest_claim_lookup_sql="$(<"$tests_dir/../src/storage_digest_claim_lookup.sql")" \
   -v storage_digest_read_lookup_sql="$(<"$tests_dir/../src/storage_digest_read_lookup.sql")" \
   -f "$tests_dir/fixtures/storage_digest_reference.sql"
-# Keep the reference-key expiry cases and both claim/delete lock orders.
+# Keep the reference-key commit/rollback/expiry cases and both claim/delete lock orders.
 # Then use the committed references on 9 and 12 for the read/detach controls.
-for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false COMMIT f false' '10 true COMMIT f true' \
+for scenario in '11 false COMMIT f - 11' '11 false COMMIT f - 12' \
+  '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false COMMIT f false' '10 true COMMIT f true' \
   '11 false ROLLBACK t true' '12 true ROLLBACK t false' '9 detach COMMIT f false' '12 detach ROLLBACK t false'; do
   read -r id deleting finish expected tombstone other <<<"$scenario"
   object="$(printf '21000000-0000-4000-8000-%012d' "$id")"
@@ -129,7 +130,7 @@ for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false C
   holder_expected=t; contender_expected="$expected"; deadline=infinity
   if [[ -n "$other" ]]; then
     holder_query="SELECT public.digest_ref_fixture($id, false)"
-    duration='1 minute'; [[ "$expected" != f ]] || duration='8 seconds'
+    duration='1 minute'; [[ "$finish" != ROLLBACK || "$expected" != f ]] || duration='8 seconds'
     deadline="$(psql_run -Atc "SELECT clock_timestamp() + interval '$duration'")"
     query="SELECT public.digest_ref_fixture($other, false, '', '$object', '$deadline')"
   elif [[ "$deleting" == detach ]]; then
@@ -171,17 +172,21 @@ for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false C
                         WHERE reference_id='$object' AND object_id='$object' RETURNING 1)
       SELECT count(*) FROM detached;" >&3
   fi
-  if [[ -n "$other" && "$expected" == f ]]; then psql_run -c "SELECT pg_sleep_until('$deadline')" >/dev/null; fi
+  if [[ -n "$other" && "$finish" == ROLLBACK && "$expected" == f ]]; then psql_run -c "SELECT pg_sleep_until('$deadline')" >/dev/null; fi
   printf '%s;\n\\q\n' "$finish" >&3; exec 3>&-
   wait "$holder"; wait "$contender"
   [[ "$(<"$dir/ref-holder")" == "$holder_expected" && "$(<"$dir/ref-contender")" == "$contender_expected" ]] || { printf 'unexpected reference race result: %s\n' "$scenario" >&2; exit 1; }
   if [[ -n "$other" ]]; then
     target=none
-    if [[ "$expected" == t ]]; then target="$(printf '21000000-0000-4000-8000-%012d' "$other")"; fi
+    if [[ "$finish" == COMMIT ]]; then
+      target="$object"
+    elif [[ "$expected" == t ]]; then
+      target="$(printf '21000000-0000-4000-8000-%012d' "$other")"
+    fi
     [[ "$(psql_run -Atc "SELECT coalesce(string_agg(object_id::text, ','), 'none') FROM public.storage_validated_digest_references WHERE reference_id='$object'")" == "$target" ]] || exit 1
     # Remove the verified synthetic reference so the winner-lock cases can reuse the objects.
     psql_run -c "DELETE FROM public.storage_validated_digest_references WHERE reference_id='$object'"
-    printf 'reference-key lock case passed: holder rolled back; contender=%s committed reference target=%s\n' "$expected" "$target"
+    printf 'reference-key lock case passed: holder=%s contender=%s committed reference target=%s\n' "$finish" "$expected" "$target"
   elif [[ "$deleting" == detach ]]; then
     [[ "$(psql_run -Atc "SELECT deleting_at IS NULL, read_until > clock_timestamp(), EXISTS (SELECT FROM public.storage_validated_digest_references WHERE reference_id='$object' AND object_id='$object') FROM public.storage_validated_digest_winners WHERE object_id='$object'")" == "t|$expected|$expected" ]] || exit 1
     if [[ "$expected" == f ]]; then
