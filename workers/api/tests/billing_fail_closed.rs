@@ -136,14 +136,6 @@ fn cancel_and_replay_require_the_bound_paid_anchor() {
     assert!(!canceled.explicit_stale && canceled.fail_closed.is_none());
     assert_eq!(canceled.row.status, "canceled");
     assert_eq!(canceled.row.grace_until_unix, None);
-    let mut malformed = complete.clone();
-    malformed.subscription.items.as_mut().unwrap().data[0]
-        .id
-        .clear();
-    let refused = reconcile_subscription(&local, &malformed, NOW);
-    assert_eq!(refused.fail_closed, Some(FailClosedReason::AmbiguousItems));
-    assert!(refused.explicit_stale && refused.history.is_empty());
-
     let committed = local.live.as_mut().unwrap();
     committed.status = canceled.row.status.clone();
     committed.grace_until_unix = canceled.row.grace_until_unix;
@@ -161,11 +153,13 @@ fn reversed_period_and_blank_invoice_id_confer_nothing() {
 
 #[test]
 fn sweep_rejects_non_integer_and_out_of_range_milliseconds() {
-    for input in [f64::MAX, 3_599_999.5, 8_640_000_000_000_001.0] {
+    let max = 8_640_000_000_000_000.0;
+    for input in [f64::MAX, 3_599_999.5, max + 1.0] {
         assert_eq!(scheduled_hour(CRON, input), None);
     }
     assert_eq!(scheduled_hour(CRON, 3_599_999.0), Some(0));
     assert_eq!(scheduled_hour(CRON, 3_600_000.0), Some(1));
+    assert_eq!(scheduled_hour(CRON, max), Some(2_400_000_000));
 }
 
 #[test]

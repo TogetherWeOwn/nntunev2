@@ -29,8 +29,8 @@
 //!   invoices whose lines resolve through `plan_prices` to the subscription
 //!   item's plan, bound to the known customer + subscription + item. Any
 //!   other line (one-off, credit, free-price, unknown price, another plan,
-//!   non-positive amount, open-ended or reversed period) confers nothing
-//!   and is skipped for coverage; the applied item price MUST resolve or the whole
+//!   non-positive amount, open-ended) confers nothing and is skipped for
+//!   coverage; the applied item price itself MUST resolve or the whole
 //!   pass fails closed.
 //! - Only `active` and `past_due` advance. `incomplete`, `unpaid` and
 //!   `paused` are known non-entitling states: recorded verbatim with no
@@ -73,8 +73,6 @@
 //!   collected independently from validated lines across all plans. Anchored on
 //!   `status_transitions.paid_at`; invoices without it are skipped: no
 //!   anchor, no coverage, no history row.
-//! - A missing or unfinished line page on a bound paid invoice makes the
-//!   snapshot retryable before any subscription or history write.
 //!
 //! New purchases disable on fail-closed only (the stored verbatim row is
 //! nonterminal and unresolvable, so the purchase path cannot proceed past
@@ -296,10 +294,7 @@ fn qualify_line(
     let period = period?;
     let end = period.end?;
     let start = period.start.unwrap_or(end);
-    if start > end {
-        return None;
-    }
-    Some(QualifiedLine { plan, start, end })
+    (start <= end).then_some(QualifiedLine { plan, start, end })
 }
 
 /// Fold a reconciliation snapshot without borrowing state from another subscription.
