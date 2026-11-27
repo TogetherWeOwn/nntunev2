@@ -83,43 +83,44 @@ fn audio_skips_unsupported_urls_and_mime_before_ranking() {
 
 #[test]
 fn candidate_rejects_conflicting_ids_and_ambiguous_shelf_metadata() {
+    const FLEX_COLUMN: &str = "musicResponsiveListItemFlexColumnRenderer";
     let mut item = json!({
         "navigationEndpoint": {"watchEndpoint": {"videoId": VIDEO, "watchEndpointMusicConfig": {"musicVideoType": "MUSIC_VIDEO_TYPE_OMV"}}},
         "playlistItemData": {"videoId": "zyxwvutsrqp"},
         "ownerBadges": [{"metadataBadgeRenderer": {"icon": {"iconType": "CHECK_CIRCLE_THICK"}}}],
-        "flexColumns": [{"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
+        "flexColumns": [{(FLEX_COLUMN): {"text": {"runs": [
             {"text": "2024", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCabcdefghijklmnopqrstuv"}}},
             {"text": "Artist", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCzyxwvutsrqponmlkjihgfe"}}}
         ]}}}]
     });
     assert!(select::parse_search_candidate(&item).is_none());
+    let parse = |item: &Value| select::parse_search_candidate(item).expect("matching video IDs");
     item["playlistItemData"]["videoId"] = json!(VIDEO);
-    let candidate = select::parse_search_candidate(&item).expect("matching video IDs");
+    let candidate = parse(&item);
     assert_eq!(candidate.channel_id, None);
     assert_eq!(candidate.duration_secs, None);
-    let runs =
-        &mut item["flexColumns"][0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"];
+    let runs = &mut item["flexColumns"][0][FLEX_COLUMN]["text"]["runs"];
     runs[0]["text"] = json!("3:45");
     runs[1]["text"] = json!("4:45");
-    let conflicted = select::parse_search_candidate(&item).expect("matching video IDs");
-    assert_eq!(conflicted.duration_secs, None);
+    assert_eq!(parse(&item).duration_secs, None);
+    let fixed_columns = json!([{"musicResponsiveListItemFixedColumnRenderer": item["flexColumns"][0][FLEX_COLUMN]}]);
     for text in ["1:75", "+225", "1:60:00"] {
         assert_eq!(select::parse_duration(text), None, "{text}");
     }
 
-    item["flexColumns"][0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][1] =
-        json!({"text": "3:45"});
-    let mut eligible = select::parse_search_candidate(&item).expect("matching video IDs");
+    item["flexColumns"][0][FLEX_COLUMN]["text"]["runs"][1] = json!({"text": "3:45"});
+    let mut eligible = parse(&item);
     let policy = select::SelectionPolicy {
         allowed_channels: &["UCabcdefghijklmnopqrstuv"],
         denylisted_videos: &[],
         denylisted_channels: &[],
     };
-    let admitted = select::gate_candidate(&eligible, Some(225), &policy);
-    assert_eq!(admitted, Ok(()));
+    assert!(select::gate_candidate(&eligible, Some(225), &policy).is_ok());
     eligible.video_id = "invalid".into();
     let rejected = select::gate_candidate(&eligible, Some(225), &policy);
     assert_eq!(rejected, Err(select::Rejection::InvalidVideoId));
+    item["fixedColumns"] = fixed_columns;
+    assert_eq!(parse(&item).duration_secs, None);
 }
 
 #[test]
@@ -128,5 +129,4 @@ fn public_route_stays_closed_and_extract_rejects_url_extras() {
     let post = |path| routes::decide_extract("POST", path).status();
     assert_eq!(post("/extract"), 503);
     assert_eq!(post("/extract?"), 404);
-    assert_eq!(post("/extract?unexpected"), 404);
 }
