@@ -72,13 +72,28 @@ pub(super) async fn receipt_retries(
         .await
         .unwrap()
         .is_none());
-    let wrong_scope = BrowserScope {
-        root_version: [255; 16],
-        ..scope
-    };
-    assert!(open(reader, claims, &input, wrong_scope).await.is_none());
     let before = mark_count().await;
     set_private(&input.session_id).await;
+    for unavailable in [
+        BrowserScope {
+            publication: crate::private_catalogue_read::PublicationScope {
+                bucket: "unpublished-fixture-bucket",
+                ..scope.publication
+            },
+            ..scope
+        },
+        BrowserScope {
+            root_version: [255; 16],
+            ..scope
+        },
+    ] {
+        assert!(open(reader, claims, &input, unavailable).await.is_none());
+    }
+    assert_eq!(mark_count().await, before);
+    assert_eq!(
+        query_playback_lease_row(writer, MEMBER).await.unwrap(),
+        Some(incumbent.clone())
+    );
     let started = SystemTime::now();
     let browser = service
         .open_browser(reader, claims, &input, scope, || started)

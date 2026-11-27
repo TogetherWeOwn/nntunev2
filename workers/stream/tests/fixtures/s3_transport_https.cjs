@@ -385,6 +385,65 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   assert.equal(fetches.length, 4);
   revokeAt = Infinity;
 
+  await t.test('closed or partial encryption metadata never falls back to AUDIO_CACHE and reopens cleanly', { timeout: 5_000 }, async (t) => {
+    const firstFetch = fetches.length, firstReport = reports.length;
+    const cacheReads = [];
+    const AUDIO_CACHE = new class R2Bucket {
+      async get(key) { cacheReads.push(key); return null; }
+      async head(key) { cacheReads.push(key); return null; }
+    }();
+    const legacyPayload = Buffer.from(`member|track|legacy-play|42|${expires}`).toString('base64url');
+    const legacy = `v2.${legacyPayload}.${mac(grantKey, legacyPayload).toString('base64url')}`;
+    assert.equal(await status({ AUDIO_CACHE }, '/play/track', legacy), 404);
+    assert.equal(cacheReads[0], 'track/track');
+    cacheReads.length = 0;
+
+    const closedPaths = [];
+    const closedApi = new class Fetcher {
+      async fetch(req) {
+        closedPaths.push(new URL(req.url).pathname);
+        return new Response(null, { status: 404 });
+      }
+    }();
+    t.after(() => { snapshot = original; });
+
+    assert.equal(await status({ PRIVATE_PLAYBACK_ENABLED: 'false', AUDIO_CACHE }), 404);
+    assert.equal(await status({ API: closedApi, AUDIO_CACHE }), 404);
+    assert.deepEqual(closedPaths, ['/internal/v1/private-playback/resolve']);
+    for (const partial of [
+      { header: [] }, { header: original.header.map((x, i) => i === 0 ? x ^ 1 : x) },
+      { envelope_record: [] }, { envelope_record: original.envelope_record.slice(0, 229) },
+      { page_hashes: [] },
+      { media_version: '' }, { media_version: 'null' },
+      { key: '' }, { plaintext_len: 0 },
+    ]) {
+      snapshot = { ...original, ...partial };
+      assert.equal(await status({ AUDIO_CACHE }), 404, JSON.stringify(Object.keys(partial)));
+    }
+    assert.deepEqual(cacheReads, []);
+    assert.deepEqual(fetches.slice(firstFetch), []);
+    assert.deepEqual(reports.slice(firstReport), []);
+
+    snapshot = { ...original, page_hashes: [original.page_hashes[0].map((x, i) => i === 0 ? x ^ 1 : x)] };
+    const refused = await request({ AUDIO_CACHE });
+    assert.equal(refused.response.status, 502);
+    assert.equal(refused.response.headers.get('content-range'), null);
+    assert.equal(JSON.parse(refused.bytes).code, 'upstream_unavailable');
+    assert.deepEqual(fetches.slice(firstFetch), ['media', 'page']);
+    assert.deepEqual(reports.slice(firstReport), []);
+
+    snapshot = original;
+    const reopened = await request({ AUDIO_CACHE });
+    assert.equal(reopened.response.status, 206);
+    assert.equal(reopened.response.headers.get('content-range'), 'bytes 65536-65536/65537');
+    assert.deepEqual(reopened.bytes, plaintext.subarray(65_536));
+    assert.deepEqual(cacheReads, []);
+    assert.deepEqual(fetches.slice(firstFetch), ['media', 'page', 'media', 'page']);
+    assert.deepEqual(reports.slice(firstReport), [{
+      user_id: 'member', play_id: play, track_id: 'track', start: 65_536, end: 65_537, file_bytes: 65_537,
+    }]);
+  });
+
   await t.test('a mismatched media version delivers and counts no media', async (t) => {
     const fetchStart = fetches.length;
     const reportStart = reports.length;
@@ -825,44 +884,4 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     assert.deepEqual(reports.slice(firstReport), [prefix, tail]);
   });
 
-  await t.test('closed or partial encryption metadata never falls back to AUDIO_CACHE and reopens cleanly', { timeout: 5_000 }, async (t) => {
-    const firstFetch = fetches.length, firstReport = reports.length;
-    let audioCacheHits = 0;
-    const AUDIO_CACHE = {
-      async get() { audioCacheHits++; throw new Error('v4 must never read AUDIO_CACHE'); },
-      async head() { audioCacheHits++; throw new Error('v4 must never probe AUDIO_CACHE'); },
-    };
-    const closedApi = new class Fetcher {
-      async fetch(req) {
-        assert.equal(new URL(req.url).pathname, '/internal/v1/private-playback/resolve');
-        return new Response(null, { status: 404 });
-      }
-    }();
-    t.after(() => { snapshot = original; });
-
-    assert.equal(await status({ PRIVATE_PLAYBACK_ENABLED: 'false', AUDIO_CACHE }), 404);
-    assert.equal(await status({ API: closedApi, AUDIO_CACHE }), 404);
-    for (const partial of [
-      { header: [] }, { header: original.header.map((x, i) => i === 0 ? x ^ 1 : x) },
-      { envelope_record: [] }, { envelope_record: original.envelope_record.slice(0, 229) },
-      { page_hashes: [] }, { page_hashes: [original.page_hashes[0].map((x, i) => i === 0 ? x ^ 1 : x)] },
-      { media_version: '' }, { media_version: 'null' },
-      { key: 'media/not-a-valid-key' }, { plaintext_len: 0 },
-    ]) {
-      snapshot = { ...original, ...partial };
-      assert.equal(await status({ AUDIO_CACHE }), 404, JSON.stringify(Object.keys(partial)));
-    }
-    assert.deepEqual([audioCacheHits, fetches.length, reports.length], [0, firstFetch, firstReport]);
-
-    snapshot = original;
-    const reopened = await request({ AUDIO_CACHE });
-    assert.equal(reopened.response.status, 206);
-    assert.equal(reopened.response.headers.get('content-range'), 'bytes 65536-65536/65537');
-    assert.deepEqual(reopened.bytes, plaintext.subarray(65_536));
-    assert.equal(audioCacheHits, 0);
-    assert.deepEqual(fetches.slice(firstFetch), ['media', 'page']);
-    assert.deepEqual(reports.slice(firstReport), [{
-      user_id: 'member', play_id: play, track_id: 'track', start: 65_536, end: 65_537, file_bytes: 65_537,
-    }]);
-  });
 });

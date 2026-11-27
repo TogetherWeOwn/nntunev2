@@ -133,5 +133,7 @@ test('existing track stays closed without synthetic fallback until verified gran
 	await play(0);
 	const expectedSrc = `/v1/plays/media/first/${sessionTab}/play-1`;
 	expect([src(), media.audio?.getAttribute('src')]).toEqual([expectedSrc, expectedSrc]);
+	expect(media.audio?.play).toHaveBeenCalledTimes(1);
+	expect(media.audio?.paused).toBe(false);
 	expect(requests().every((body) => body.track_id === 'first' && body.session_id === sessionTab)).toBe(true);
 });
