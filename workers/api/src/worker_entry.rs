@@ -10704,6 +10704,37 @@ mod tests {
     }
 
     #[test]
+    fn worker_paid_config_stays_closed_under_private_listening_or_open_signup() {
+        let cohort = crate::private_listening::PrivateListening::parse(
+            r#"{"owner_user_id":"owner","invite_ids":[1],"expires_at":1800000000}"#,
+        );
+        for (invites_required, private_listening) in [(false, None), (true, cohort)] {
+            let mut config = Config::new(
+                "example.com",
+                "https://example.com",
+                vec![0; 32],
+                [0; 32],
+                1,
+                60,
+                invites_required,
+                false,
+                None,
+            )
+            .unwrap()
+            .with_stripe(Some("sk_test_fixture".into()), Some("whsec_fixture".into()));
+            config.private_listening = private_listening;
+            let config = apply_paid_billing_config(config, |name| match name {
+                "PAID_INVITE_BILLING" => Some("1".into()),
+                "STRIPE_PORTAL_CONFIGURATION" => Some("bpc_fixture".into()),
+                _ => None,
+            });
+            assert!(!config.paid_billing_enabled());
+            assert!(config.stripe_portal_configuration.is_none());
+            assert!(!config.billing_purchase_configured());
+        }
+    }
+
+    #[test]
     fn config_from_env_refuses_non_test_stripe_keys_at_load() {
         // The bearer gate (`valid_secret_key`) is unit-tested pure, but the
         // load path that enforces it needs a wasm Env — so pin the call

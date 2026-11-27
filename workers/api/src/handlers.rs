@@ -13776,6 +13776,303 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn disabled_paid_routes_fail_closed_without_altering_personal_invite_entitlements() {
+        use serde_json::{json, Value};
+
+        let mut h = play_harness();
+        let stripe_cfg = h
+            .config
+            .with_stripe(Some("sk_test_s".into()), Some("whsec_synthetic".into()));
+        h.config = stripe_cfg;
+        h.config.invites_required = true;
+        h.config.stripe_portal_configuration = Some("bpc_fixture".into());
+        h.store.billing_bindings.replace(test_bindings());
+        let owner = seed_admin(&h, "owner", "owner@example.test");
+        seed_user(&h, "outsider", "outsider@example.test");
+        let outsider = cookie_of(&block_on(h.ctx().start_session("outsider")).unwrap());
+        let invited = "personal-friend@example.test";
+        let inv_body = Some(json!({"email": invited}).to_string());
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            inv_body,
+            Some(owner),
+            Some(ORIGIN),
+        );
+        assert_eq!(issued.status, 201, "{}", issued.body);
+        let invite: Value = serde_json::from_str(&issued.body).unwrap();
+        let expires_at = NOW + 60;
+        let cohort = json!({"owner_user_id": "owner", "invite_ids": [invite["invite"]["id"]], "expires_at": expires_at});
+        h.config.private_listening =
+            crate::private_listening::PrivateListening::parse(&cohort.to_string());
+        assert!(!h.config.paid_invite_billing && !h.config.paid_billing_enabled());
+
+        let (finish, friend_id) = signup_with_invite(
+            &h,
+            invited,
+            b"personal-invite-cred",
+            43,
+            invite["code"].as_str(),
+        );
+        assert_eq!(finish.status, 200);
+        assert_eq!(finish.body, r#"{"ok":true,"private_listening":true}"#);
+        let friend = cookie_of(&finish);
+        seed_library(&h, &friend_id);
+        let (st, sr) = (&h.store, &h.stripe);
+        st.billing_customers
+            .borrow_mut()
+            .insert(friend_id.clone(), "cus_test_1".into());
+        sr.portal_reply.replace(Some(crate::stripe::PortalSession {
+            customer: "cus_test_1".into(),
+            livemode: false,
+            url: "https://billing.stripe.com/p/session_fixture".into(),
+        }));
+
+        let play = json!({"track_id": CAT_REC_A, "session_id": "tab-personal"});
+        let initial = play_call(&h, &friend, play.clone());
+        assert_eq!(initial.status, 200);
+        let lease: Value = serde_json::from_str(&initial.body).unwrap();
+        assert_eq!(lease["expires_at"], expires_at);
+        let co_evt = checkout_completed_body("evt_disabled_co", "cs_test_1", false);
+        let in_obj =
+            json!({"id": "in_test_1", "customer": "cus_test_1", "subscription": "sub_test_1"});
+        let in_evt = paid_invite_event_body("evt_disabled_in", "invoice.paid", BILLING_NOW, in_obj);
+        let post = |h: &Harness, path, body: &str| {
+            let ck = Some(friend.clone());
+            h.call_full("POST", path, Some(body.into()), ck, Some(ORIGIN))
+                .status
+        };
+        let get = |h: &Harness, path, ck: &str| {
+            h.call_full("GET", path, None, Some(ck.into()), None).status
+        };
+        let wh = |h: &Harness, body: &[u8]| {
+            let req = Request {
+                method: "POST".into(),
+                path: BILLING_WEBHOOK_PATH.into(),
+                cookie: None,
+                origin: None,
+                authorization: None,
+                stripe_signature: Some(sign(body, BILLING_NOW)),
+                body: body.to_vec(),
+            };
+            block_on(handle(&h.ctx(), &req)).status
+        };
+
+        // Both default-off and paid_invite_billing=true stay closed under private_listening.
+        for paid_flag in [false, true] {
+            h.config.paid_invite_billing = paid_flag;
+            assert!(!h.config.paid_billing_enabled());
+            assert_eq!(
+                post(&h, paid_invite_billing::CHECKOUT, r#"{"planId":"plus"}"#),
+                404
+            );
+            assert_eq!(post(&h, paid_invite_billing::PORTAL, "{}"), 404);
+            assert_eq!(wh(&h, &co_evt), 404);
+            assert_eq!(wh(&h, &in_evt), 404);
+            let due = vec![
+                (friend_id.as_str(), Some("sub_test_1")),
+                (friend_id.as_str(), None),
+            ];
+            block_on(reconcile_paid_targets(&h.ctx(), due)).unwrap();
+            let (st, sr) = (&h.store, &h.stripe);
+            assert!(sr.customers_created.borrow().is_empty() && *sr.sessions_created.borrow() == 0);
+            assert!(sr.portal_reply.borrow().is_some());
+            assert!(st.billing_rows.borrow().is_empty() && st.checkout_ops.borrow().is_empty());
+            assert!(
+                st.invoice_history.borrow().is_empty() && st.webhook_events.borrow().is_empty()
+            );
+
+            // Personal-invite entitlements stay intact and outsiders remain fenced.
+            for path in ["/api/library", "/v1/library"] {
+                assert_eq!(get(&h, path, &friend), 200);
+                assert_eq!(get(&h, path, &outsider), 403);
+            }
+            assert_eq!(play_call(&h, &outsider, play.clone()).status, 403);
+            let beat = json!({"session_id": "tab-personal", "play_id": lease["play_id"], "lease_epoch": lease["lease_epoch"]});
+            assert_eq!(post(&h, "/v1/plays/heartbeat", &beat.to_string()), 200);
+            let sub_resp = billing_get(&h, "/v1/me/subscription", Some(friend.clone()));
+            let sub: Value = serde_json::from_str(&sub_resp.body).unwrap();
+            assert_eq!(sub["state"], "no_subscription");
+            assert!(sub.get("canChangePlan").is_none());
+        }
+        // Without private listening, checkout, portal and webhook stay closed unless all gates hold.
+        h.config.private_listening = None;
+        for (paid, invites, portal, expected) in [
+            (false, true, Some("bpc_fixture"), 404),
+            (true, false, Some("bpc_fixture"), 404),
+            (true, true, None, 503),
+        ] {
+            h.config.paid_invite_billing = paid;
+            h.config.invites_required = invites;
+            h.config.stripe_portal_configuration = portal.map(str::to_string);
+            let co = post(&h, paid_invite_billing::CHECKOUT, r#"{"planId":"plus"}"#);
+            assert_eq!(
+                (co, post(&h, paid_invite_billing::PORTAL, "{}")),
+                (expected, expected)
+            );
+            if expected == 404 {
+                assert_eq!((wh(&h, &co_evt), wh(&h, &in_evt)), (404, 404));
+            }
+            assert!(h.stripe.portal_reply.borrow().is_some());
+            assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+        }
+    }
+
+    #[test]
+    fn paid_invite_reconciliation_refuses_mismatched_account_and_non_test_mode_events() {
+        use serde_json::json;
+
+        let mut h = stripe_harness();
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        seed_user(&h, "u2", "u2@example.com");
+        deliver_first_period(&h, "evt_u1_initial");
+        let (first_end, ren_end) = (
+            BILLING_NOW + BILLING_PERIOD,
+            BILLING_NOW + 2 * BILLING_PERIOD,
+        );
+        let (c1, c2, s1, s2) = ("cus_test_1", "cus_test_2", "sub_test_1", "sub_test_2");
+        let inv = |id, c, s, a, b| test_invoice(id, c, s, PRICE_PLUS, a, b, a + 60);
+        let deliver = |h: &Harness, b: &[u8]| h.call_webhook(b, Some(sign(b, BILLING_NOW)));
+        let inv_evt = |id, inv_id, c, s| {
+            let obj = json!({"id": inv_id, "customer": c, "subscription": s});
+            paid_invite_event_body(id, "invoice.paid", BILLING_NOW, obj)
+        };
+
+        // Establish a second independent test-mode account (u2 / cus_test_2 / sub_test_2).
+        let u2_sess = test_session(
+            "cs_test_2",
+            "complete",
+            "paid",
+            Some(c2),
+            Some(s2),
+            Some("op_2"),
+        );
+        h.stripe
+            .sessions
+            .borrow_mut()
+            .insert("cs_test_2".into(), u2_sess);
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .insert(s2.into(), test_subscription(s2, c2, "active", PRICE_PLUS));
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_2".into(),
+            inv("in_test_2", c2, s2, BILLING_NOW, first_end),
+        );
+        block_on(
+            h.store
+                .create_checkout_operation("op_2", "u2", PRICE_PLUS, Some(c2)),
+        )
+        .unwrap();
+        let u2_evt = checkout_completed_body("evt_u2_initial", "cs_test_2", false);
+        webhook_ok(&deliver(&h, &u2_evt));
+
+        let (u1_before, u2_before) = (live_for(&h, "u1").unwrap(), live_for(&h, "u2").unwrap());
+        let history_before = h.store.invoice_history.borrow().clone();
+        let claims_before = h.store.webhook_events.borrow().clone();
+        let attempts_before = h.store.paid_reconcile_attempts.get();
+        let unchanged = |h: &Harness| {
+            assert_eq!(live_for(h, "u1"), Some(u1_before.clone()));
+            assert_eq!(live_for(h, "u2"), Some(u2_before.clone()));
+            assert_eq!(*h.store.invoice_history.borrow(), history_before);
+        };
+
+        // 1. Non-test-mode (livemode: true) or missing-livemode webhook events fail closed.
+        h.stripe.forbid_invoice_reads = true;
+        for (id, kind, obj) in [
+            (
+                "evt_l_co",
+                "checkout.session.completed",
+                json!({"id": "cs_test_1", "customer": c1, "subscription": s1}),
+            ),
+            (
+                "evt_l_in",
+                "invoice.paid",
+                json!({"id": "in_live_1", "customer": c1, "subscription": s1}),
+            ),
+            (
+                "evt_l_su",
+                "customer.subscription.updated",
+                json!({"id": s1, "customer": c1, "status": "active"}),
+            ),
+        ] {
+            let b = json!({"id": id, "type": kind, "livemode": true, "data": {"object": obj}})
+                .to_string();
+            webhook_ok(&deliver(&h, b.as_bytes()));
+        }
+        let no_mode = json!({"id": "evt_nm", "type": "invoice.paid", "data": {"object": {"id": "in_m", "customer": c1, "subscription": s1}}}).to_string();
+        assert_eq!(deliver(&h, no_mode.as_bytes()).status, 400);
+        assert_eq!(*h.store.webhook_events.borrow(), claims_before);
+        assert_eq!(h.store.paid_reconcile_attempts.get(), attempts_before);
+        unchanged(&h);
+        // 2. Cross-account and unknown-account invoice.paid webhooks reconcile nothing.
+        for (id, c, s) in [
+            ("evt_x1", c2, s1),
+            ("evt_x2", c1, s2),
+            ("evt_unk", "cus_unknown", s1),
+        ] {
+            webhook_ok(&deliver(&h, &inv_evt(id, "in_x", c, s)));
+        }
+        assert_eq!(h.store.paid_reconcile_attempts.get(), attempts_before);
+        unchanged(&h);
+        // 3. Retrieved subscription reporting another account's customer or livemode=true fails closed.
+        let u1_sub = h.stripe.subscriptions.borrow()[s1].clone();
+        let u1_evt = inv_evt("evt_u1_guard", "in_ren", c1, s1);
+        for bad in [
+            crate::stripe::Subscription {
+                customer: Some(c2.into()),
+                ..u1_sub.clone()
+            },
+            crate::stripe::Subscription {
+                livemode: true,
+                ..u1_sub.clone()
+            },
+        ] {
+            h.stripe.subscriptions.borrow_mut().insert(s1.into(), bad);
+            assert_eq!(deliver(&h, &u1_evt).status, 500);
+            assert!(!h.store.webhook_events.borrow().contains("evt_u1_guard"));
+            assert_eq!(h.store.paid_reconcile_attempts.get(), attempts_before);
+            unchanged(&h);
+        }
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .insert(s1.into(), u1_sub);
+        h.stripe.forbid_invoice_reads = false;
+        // 4. Renewal invoice listing carrying another account's customer never advances u1.
+        let scope = crate::stripe::ListInvoices {
+            customer_id: Some(c1.into()),
+            subscription_id: Some(s1.into()),
+            paid_only: true,
+            limit: 100,
+            starting_after: None,
+        };
+        let foreign = inv("in_foreign_cus", c2, s1, first_end, ren_end);
+        h.stripe
+            .scripted_invoice_list
+            .replace(Some((scope, foreign)));
+        webhook_ok(&deliver(&h, &u1_evt));
+        assert!(h.stripe.scripted_invoice_list.borrow().is_none());
+        unchanged(&h);
+        // 5. Renewal invoice listing carrying livemode=true fails closed on webhook and hourly sweep.
+        let mut live_inv = inv("in_live_ren", c1, s1, first_end, ren_end);
+        live_inv.livemode = true;
+        h.stripe
+            .invoices
+            .borrow_mut()
+            .insert("in_live_ren".into(), live_inv);
+        let live_evt = inv_evt("evt_u1_live_inv", "in_live_ren", c1, s1);
+        assert_eq!(deliver(&h, &live_evt).status, 500);
+        assert!(!h.store.webhook_events.borrow().contains("evt_u1_live_inv"));
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
+        unchanged(&h);
+        assert!(block_on(reconcile_paid_targets(&h.ctx(), vec![("u1", Some(s1))])).is_err());
+        unchanged(&h);
+    }
+
+    #[test]
     fn paid_invite_webhook_replays_only_the_verified_bound_target() {
         let mut h = stripe_harness();
         let body = checkout_completed_body("evt_closed", "cs_test_1", false);
