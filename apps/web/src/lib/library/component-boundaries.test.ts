@@ -1,3 +1,4 @@
+import { parse } from 'svelte/compiler';
 import ts from 'typescript';
 import { expect, test, vi } from 'vitest';
 import * as ingest from '../admin-ingest/requests.js';
@@ -10,12 +11,10 @@ const observe = () => ({ capture: async () => owner, prepare: vi.fn(), dispose: 
 
 // Run the real handlers with injected I/O. Tests drive effect callbacks and derived values explicitly.
 function component(path: string, overrides: Record<string, unknown>, expose: string) {
-	const script = (sources[path] as string).match(/<script[^>]*>([\s\S]*?)<\/script>/)![1];
-	const parsed = ts.createSourceFile('component.ts', script, ts.ScriptTarget.Latest, true);
-	const body = parsed.statements.filter((node) => !ts.isImportDeclaration(node)).map((node) => node.getText(parsed)).join('\n');
-	const { outputText } = ts.transpileModule(body.replace('const selectionKey =', 'let selectionKey ='), {
-		compilerOptions: { target: ts.ScriptTarget.ES2022 }
-	});
+	const source = sources[path] as string;
+	const statements = parse(source, { modern: true }).instance!.content.body as { type: string; start: number; end: number }[];
+	const body = statements.filter((node) => node.type !== 'ImportDeclaration').map(({ start, end }) => source.slice(start, end)).join('\n');
+	const outputText = ts.transpile(body.replace('const selectionKey =', 'let selectionKey ='), { target: ts.ScriptTarget.ES2022 });
 	const bindings = {
 		$props: () => ({}), $state: Object.assign(identity, { raw: identity }), $derived: identity,
 		$effect: vi.fn(), onMount: vi.fn(), onDestroy: vi.fn(), untrack: (work: () => unknown) => work(),
