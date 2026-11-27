@@ -807,6 +807,7 @@ class PrivateEvidenceMapTests(unittest.TestCase):
         self.assertIn(f"`{sa.PRIVATE_TRACK_FILE}`", table)
         for phase in sa.IDENTITY_PHASES:
             self.assertIn(f"`{phase}`", text)
+        self.assertIn("Ciphertext-at-rest verification requires protected storage evidence.", rows[2][3])
         self.assertIn("Rank 77c must supply protected proof of encrypted upload", rows[2][4])
         self.assertIn("synthetic test data only", text)
         self.assertIn("`jq`", text)
