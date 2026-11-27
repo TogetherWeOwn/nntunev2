@@ -374,9 +374,11 @@ mod tests {
             let absence = outcome_with("sub-a", status, false, None, None);
             assert_eq!(validate_read_provenance(&absence, true), Err(Refused));
             assert_eq!(validate_read_provenance(&absence, false), Ok(()));
-            let owned = outcome_with("sub-a", status, false, Some("plus"), Some("in-a"));
-            assert_eq!(validate_read_provenance(&owned, true), Ok(()));
-            assert_eq!(validate_read_provenance(&owned, false), Ok(()));
+            for read_anchor in [Some("in-a"), None] {
+                let owned = outcome_with("sub-a", status, false, Some("plus"), read_anchor);
+                assert_eq!(validate_read_provenance(&owned, true), Ok(()));
+                assert_eq!(validate_read_provenance(&owned, false), Ok(()));
+            }
             let stale = outcome_with("sub-a", status, true, None, None);
             assert_eq!(validate_read_provenance(&stale, true), Ok(()));
         }
@@ -429,13 +431,15 @@ mod tests {
         let req = identity("user-a", "sub-a");
         let occupied = owned_target(false, true, false, false);
         for status in ["incomplete", "active", "past_due", "unpaid", "paused"] {
-            let owned = outcome_with("sub-a", status, false, Some("plus"), Some("in-a"));
-            let proof = has_slot_suppression_proof(&owned);
-            assert!(proof);
-            assert_eq!(
-                classify_write(&req, &occupied, &[], proof),
-                Ok(Accepted::LiveSlotSuppressedOwned)
-            );
+            for read_anchor in [Some("in-a"), None] {
+                let owned = outcome_with("sub-a", status, false, Some("plus"), read_anchor);
+                let proof = has_slot_suppression_proof(&owned);
+                assert!(proof);
+                assert_eq!(
+                    classify_write(&req, &occupied, &[], proof),
+                    Ok(Accepted::LiveSlotSuppressedOwned)
+                );
+            }
             let absence = outcome_with("sub-a", status, false, None, None);
             let proof = has_slot_suppression_proof(&absence);
             assert!(!proof);

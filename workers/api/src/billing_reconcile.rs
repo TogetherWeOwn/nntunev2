@@ -2360,6 +2360,8 @@ mod tests {
         }
     }
 
+    // Pure offline fold-to-classification contract; `apply_reconcile_transaction`
+    // SQL ordering is verified by the disposable-PostgreSQL suites in CI.
     #[test]
     fn exact_target_fold_to_classification_enforces_identity_isolation_and_release_ordering() {
         use crate::billing_store_classification::{
