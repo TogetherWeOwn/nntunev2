@@ -155,9 +155,8 @@ pub struct TrackDerivation<'a> {
 /// subsequent pair.
 ///
 /// `Ok` with `matched: false` is the unmatched outcome (zero rows, zero
-/// skips). `Err` is a caller bug only: a `Some` release MBID that is not
-/// canonical hex (`pick_release_mbid` only returns validated MBIDs, so the
-/// wire-up never hits this on the honest path).
+/// skips). A matched input must carry a valid release MBID, bounded slices
+/// and unique file ordinals so each row routes to exactly one backing file.
 pub fn derive_track_rows<'a>(
     release_mbid: Option<&'a str>,
     files: &'a [File],
@@ -172,6 +171,18 @@ pub fn derive_track_rows<'a>(
     };
     if !validate_mbid(release_mbid) {
         return Err("release mbid must be canonical 8-4-4-4-12 hex");
+    }
+    if files.len() > nntune_core::nzb::MAX_FILES
+        || recordings.len() > crate::matching::MAX_RECORDING_MBIDS
+    {
+        return Err("track derivation input exceeds file or recording limit");
+    }
+    let mut ordinals = std::collections::HashSet::with_capacity(files.len());
+    if files
+        .iter()
+        .any(|f| f.ordinal >= nntune_core::nzb::MAX_FILES || !ordinals.insert(f.ordinal))
+    {
+        return Err("file ordinals must be unique and within the NZB file limit");
     }
     let mut audio: Vec<&File> = files
         .iter()
@@ -323,14 +334,7 @@ pub fn original_source_for_track(
     decoded_file_size: u64,
     range_hint: Option<RangeHint>,
 ) -> Result<OriginalSource, SourceError> {
-    if !validate_job_id(persisted_job_id) || files.len() > nntune_core::nzb::MAX_FILES {
-        return Err(SourceError::Binding);
-    }
-    let mut ordinals = std::collections::HashSet::new();
-    if files
-        .iter()
-        .any(|f| f.ordinal >= nntune_core::nzb::MAX_FILES || !ordinals.insert(f.ordinal))
-    {
+    if !validate_job_id(persisted_job_id) {
         return Err(SourceError::Binding);
     }
     let derived =
