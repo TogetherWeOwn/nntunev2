@@ -17,6 +17,7 @@ class TestExtractBoundaries(ExtractCase):
             self.fails(self.write_input(packed + tail, "corrupt.json.bz2"))
         self.fails(self.write_input(b"", "empty.jsonl.bz2"), "--format", "jsonl")
         self.ok(self.write_input(packed, "valid.json.bz2"))
+        self.ok(self.write_input(bz2.compress(b""), "valid.jsonl.bz2"), "--format", "jsonl")
 
     def test_empty_gzip_file_has_no_valid_envelope(self):
         self.fails(self.write_input(b"", "empty.jsonl.gz"), "--format", "jsonl")
