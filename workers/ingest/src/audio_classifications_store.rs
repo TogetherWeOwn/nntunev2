@@ -57,6 +57,7 @@ fn supported_encoding(raw: &str) -> bool {
 
 fn valid_entries(checkpoint: &ClassificationCheckpoint) -> bool {
     let entries = checkpoint.entries();
+    let mut survivors = std::collections::HashSet::new();
     !entries.is_empty()
         && entries.len() <= MAX_AUDIO_ENTRIES
         && entries.iter().enumerate().all(|(index, entry)| {
@@ -65,6 +66,8 @@ fn valid_entries(checkpoint: &ClassificationCheckpoint) -> bool {
                 && entry.medium_no > 0
                 && entry.track_no > 0
                 && (1..=ordinal).contains(&entry.release_group_ref)
+                && (entry.duplicate_of.is_some()
+                    || survivors.insert((entry.release_group_ref, entry.medium_no, entry.track_no)))
                 && {
                     let anchor = &entries[(entry.release_group_ref - 1) as usize];
                     anchor.release_group_ref == entry.release_group_ref && anchor.kind == entry.kind
@@ -280,6 +283,9 @@ mod tests {
             );
         }
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let first = &value["entries"][0];
+        let mut second = first.clone();
+        second["audio_ordinal"] = 2.into();
         for (pointer, replacement) in [
             ("/version", 2.into()),
             ("/entries", serde_json::json!([])),
@@ -287,6 +293,7 @@ mod tests {
             ("/entries/0/audio_ordinal", 2.into()),
             ("/entries/0/release_group_ref", 0.into()),
             ("/entries/0/duplicate_of", 1.into()),
+            ("/entries", serde_json::json!([first, second])),
         ] {
             let mut bad = value.clone();
             *bad.pointer_mut(pointer).unwrap() = replacement;

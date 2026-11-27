@@ -108,17 +108,11 @@ async fn producer_refuses_pending_multi_set_repair_with_zero_counters() {
     let mut progress = VerifyProgress::new(1);
     progress.staged.insert(
         0,
-        StagedFile {
-            key: VerifyProgress::file_key(JOB, 1, 0, "one.flac"),
-            size: 100,
-            sha256: "b".repeat(64),
-            missing_blocks: 0,
-            size_refused_blocks: 0,
-            par2_set_id: None,
-            spool: vec![],
-            crc32: 0,
-            missing: false,
-        },
+        serde_json::from_value(json!({
+            "key": VerifyProgress::file_key(JOB, 1, 0, "one.flac"),
+            "size": 100, "sha256": "b".repeat(64),
+        }))
+        .unwrap(),
     );
     progress.repair_set_ids = vec!["a".repeat(32), "b".repeat(32)];
     let input = VerifiedCandidateInput {

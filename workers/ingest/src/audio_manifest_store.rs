@@ -227,6 +227,10 @@ mod tests {
         frozen["effective_discs"] = json!([1]);
         let frozen = AcceptedAudioManifest::parse(&frozen.to_string()).unwrap();
         assert!(encode_candidate(&frozen).is_ok());
+        assert!(include_str!("audio_manifest_store.rs").contains(concat!(
+            "let raw = encode_candidate(manifest)?;\n",
+            "    crate::library::with_db_deadline("
+        )));
     }
 
     #[test]

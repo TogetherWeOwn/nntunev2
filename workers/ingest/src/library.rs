@@ -167,8 +167,11 @@ pub enum UpsertOutcome {
 
 /// Classify a library upsert by its affected-row count.
 ///
-/// A same-owner replay affects one row. A closed owner fence or an owner
-/// conflict affects zero rows and preserves the permanent refusal.
+/// The statement affects 0 rows through a closed fence or an owner conflict.
+/// The same-owner conflict path is `DO UPDATE` (a converged replay still reports 1),
+/// and `$2` is the already-validated job owner, so a missing fence row
+/// means `deleting_at` is set (or the account was erased between job
+/// acceptance and write). Both are the same permanent outcome.
 pub const fn upsert_outcome(affected_rows: u64) -> UpsertOutcome {
     if affected_rows == 0 {
         UpsertOutcome::AccountDeleting
