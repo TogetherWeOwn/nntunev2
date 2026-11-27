@@ -13,7 +13,7 @@
  * and library stay fully usable in every state (spec §2.2/§4).
  */
 
-import { nextPlan, streamCapSeconds, type Plan } from './plans';
+import { nextPlan, parseBillingDate, streamCapSeconds, type Plan } from './plans';
 
 export interface UsageSnapshot {
 	/** Seconds streamed this UTC calendar month (SUM over the stream-play ledger). */
@@ -37,6 +37,19 @@ export interface LimitStatus {
 }
 
 const SOFT_AT = 0.8;
+const USAGE_PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+export function isUsagePeriod(value: unknown): value is string {
+	return typeof value === 'string' && USAGE_PERIOD_RE.test(value);
+}
+
+export function isNonNegativeFiniteNumber(value: unknown): value is number {
+	return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function hasValidUsageInputs(cap: number, usedSeconds: number): boolean {
+	return Number.isSafeInteger(cap) && cap >= 0 && isNonNegativeFiniteNumber(usedSeconds);
+}
 
 function pct(fraction: number): string {
 	return `${Math.min(999, Math.round(fraction * 100))}%`;
@@ -44,6 +57,16 @@ function pct(fraction: number): string {
 
 export function evaluateUsage(plan: Plan, usage: UsageSnapshot): LimitStatus {
 	const cap = streamCapSeconds(plan);
+	if (!hasValidUsageInputs(cap, usage.streamSecondsMonth)) {
+		return {
+			state: 'hard',
+			streamFraction: 0,
+			streamHardCapped: true,
+			upgradeTo: null,
+			headline: 'Listening usage is unavailable.',
+			detail: ''
+		};
+	}
 	const streamFraction = cap > 0 ? usage.streamSecondsMonth / cap : 0;
 	// A 0-hour plan (the reserved `free` row) is at cap by definition, so
 	// never-subscribed display never reports headroom it does not have.
@@ -91,7 +114,9 @@ export function evaluateUsage(plan: Plan, usage: UsageSnapshot): LimitStatus {
 
 /** Remaining whole stream-minutes for meter display. Never negative. */
 export function remainingStreamMinutes(plan: Plan, usedSeconds: number): number {
-	return Math.max(0, Math.floor((streamCapSeconds(plan) - usedSeconds) / 60));
+	const cap = streamCapSeconds(plan);
+	if (!hasValidUsageInputs(cap, usedSeconds)) return 0;
+	return Math.max(0, Math.floor((cap - usedSeconds) / 60));
 }
 
 const MONTH_NAMES_SHORT = [
@@ -107,9 +132,9 @@ const MONTH_NAMES_SHORT = [
  * rendering a wrong date.
  */
 export function formatResetInstant(resetsAt: string | null | undefined): string {
-	if (!resetsAt) return '';
-	const at = new Date(resetsAt);
-	if (Number.isNaN(at.getTime())) return '';
+	const instant = parseBillingDate(resetsAt);
+	if (instant === null) return '';
+	const at = new Date(instant);
 	const day = at.getUTCDate();
 	const month = MONTH_NAMES_SHORT[at.getUTCMonth()];
 	const hh = String(at.getUTCHours()).padStart(2, '0');

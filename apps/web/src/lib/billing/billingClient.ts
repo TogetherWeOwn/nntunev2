@@ -19,16 +19,10 @@ import { paywallFromResponse, type PaywallModel } from './planLimit.js';
 import type { AccountSession } from '../auth-fence.js';
 import { isJsonBodyTooLarge, readCappedJson } from '../api/cappedJson.js';
 import { parseErrorBody } from '../api/errors.js';
-import type { UsageSnapshot } from './usage';
+import { isValidPlanRow, parseBillingDate, type PlanDTO } from './plans';
+import { isNonNegativeFiniteNumber, isUsagePeriod, type UsageSnapshot } from './usage';
 
-export interface PlanDTO {
-	id: string;
-	priceCents: number;
-	streamHoursMonth: number;
-	maxConcurrentStreams: number;
-	/** Whether this tier is available for a new checkout. */
-	selectable: boolean;
-}
+export type { PlanDTO } from './plans';
 
 /** Server-derived account states (spec §4); a missing row is a state, not an error. */
 export type SubscriptionState = 'no_subscription' | 'active' | 'lapsed';
@@ -104,29 +98,23 @@ export class BillingApiError extends Error {
 /**
  * Successful GET /v1/me/usage DTO guard. `period` follows the existing
  * `YYYY-MM` contract (month 01–12); `streamSecondsMonth` is a required
- * finite nonnegative number; `resetsAt` (spec §3.2) is a required real
- * date string so the UI can render the reset instant. Unknown extra
+ * finite nonnegative number; `resetsAt` must be the start of the next UTC
+ * month (spec §3.2). Unknown extra
  * fields are allowed; valid zero usage is preserved. Anything else
  * rejects into the existing recoverable loader path instead of reaching
  * usage evaluation/rendering.
  */
-const USAGE_PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
-
-function isFiniteNonNegativeNumber(value: unknown): value is number {
-	return typeof value === 'number' && Number.isFinite(value) && value >= 0;
-}
-
 function isValidUsagePayload(
 	data: unknown
 ): data is UsageSnapshot & { period: string; resetsAt: string } {
 	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
 	const record = data as Record<string, unknown>;
-	if (typeof record.period !== 'string' || !USAGE_PERIOD_RE.test(record.period)) return false;
-	if (!isFiniteNonNegativeNumber(record.streamSecondsMonth)) return false;
-	// isParseableDateString is hoisted (declared below, next to the
-	// subscription guard that shares it).
-	if (!isParseableDateString(record.resetsAt)) return false;
-	return true;
+	if (!isUsagePeriod(record.period) || !isNonNegativeFiniteNumber(record.streamSecondsMonth)) {
+		return false;
+	}
+	const nextMonth = new Date(0);
+	nextMonth.setUTCFullYear(Number(record.period.slice(0, 4)), Number(record.period.slice(5)), 1);
+	return parseBillingDate(record.resetsAt) === nextMonth.getTime();
 }
 
 /**
@@ -160,34 +148,6 @@ const SUBSCRIPTION_STATUSES = [
 
 const SUBSCRIPTION_STATES = ['no_subscription', 'active', 'lapsed'] as const;
 
-/**
- * ISO-8601 date/datetime with bounded fields (month 01–12, day 01–31,
- * hour 00–23), so loose strings `Date.parse` accepts (`'1'`, `'garbage'`)
- * never pass. A UTC round-trip on the calendar date rejects impossible
- * dates the parser would roll over (`2026-02-30` -> March 2).
- */
-const SUBSCRIPTION_DATE_RE =
-	/^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?:T([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,9})?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d))?$/;
-
-function isParseableDateString(value: unknown): value is string {
-	if (typeof value !== 'string' || value.length === 0) return false;
-	const match = SUBSCRIPTION_DATE_RE.exec(value);
-	if (!match) return false;
-	const year = Number(match[1]);
-	const month = Number(match[2]);
-	const day = Number(match[3]);
-	// Date.UTC(year, ...) treats 00–99 as 1900–1999; preserve the literal ISO year.
-	const probe = new Date(0);
-	probe.setUTCFullYear(year, month - 1, day);
-	if (
-		probe.getUTCFullYear() !== year ||
-		probe.getUTCMonth() !== month - 1 ||
-		probe.getUTCDate() !== day
-	)
-		return false;
-	return !Number.isNaN(Date.parse(value));
-}
-
 function isValidSubscriptionPayload(data: unknown): data is SubscriptionDTO {
 	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
 	const record = data as Record<string, unknown>;
@@ -207,11 +167,11 @@ function isValidSubscriptionPayload(data: unknown): data is SubscriptionDTO {
 			!(SUBSCRIPTION_STATUSES as readonly string[]).includes(record.status))
 	)
 		return false;
-	if (record.currentPeriodEnd !== null && !isParseableDateString(record.currentPeriodEnd))
+	if (record.currentPeriodEnd !== null && parseBillingDate(record.currentPeriodEnd) === null)
 		return false;
 	if ('graceUntil' in record) {
 		const graceUntil = record.graceUntil;
-		if (graceUntil !== undefined && graceUntil !== null && !isParseableDateString(graceUntil))
+		if (graceUntil !== undefined && graceUntil !== null && parseBillingDate(graceUntil) === null)
 			return false;
 	}
 	if (typeof record.cancelAtPeriodEnd !== 'boolean') return false;
@@ -220,30 +180,23 @@ function isValidSubscriptionPayload(data: unknown): data is SubscriptionDTO {
 
 /**
  * Successful GET /v1/plans DTO guard. The body must be an object whose
- * `plans` field is an array (possibly empty), and every row must carry
- * the full display shape: a non-empty string `id`, finite non-negative
- * `priceCents`/`streamHoursMonth`/`maxConcurrentStreams`, and a boolean
- * `selectable`. Unknown extra fields (envelope or row) are allowed.
+ * `plans` field is an array (possibly empty) of valid rows with unique IDs.
+ * Unknown extra fields (envelope or row) are allowed.
  * Anything else — including one malformed row among good ones — rejects
  * the whole payload into the existing recoverable loader path, so a
  * partial row can never hydrate over the pricing fallback and render
  * `$NaN/mo` in place of every plan.
  */
-function isValidPlanRow(row: unknown): row is PlanDTO {
-	if (typeof row !== 'object' || row === null || Array.isArray(row)) return false;
-	const record = row as Record<string, unknown>;
-	if (typeof record.id !== 'string' || record.id.length === 0) return false;
-	if (!isFiniteNonNegativeNumber(record.priceCents)) return false;
-	if (!isFiniteNonNegativeNumber(record.streamHoursMonth)) return false;
-	if (!isFiniteNonNegativeNumber(record.maxConcurrentStreams)) return false;
-	if (typeof record.selectable !== 'boolean') return false;
-	return true;
-}
-
 function isValidPlansPayload(data: unknown): data is { plans: PlanDTO[] } {
 	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
 	const plans = (data as Record<string, unknown>).plans;
-	return Array.isArray(plans) && plans.every(isValidPlanRow);
+	if (!Array.isArray(plans)) return false;
+	const ids = new Set<string>();
+	for (const row of plans) {
+		if (!isValidPlanRow(row) || ids.has(row.id)) return false;
+		ids.add(row.id);
+	}
+	return true;
 }
 
 /** One budget for dispatch, headers and JSON consumption, including error bodies. */
@@ -319,7 +272,9 @@ async function requestJson<T>(
 					const hint = parsed.message ? `: ${parsed.message}` : '';
 					throw new BillingApiError(res.status, label, hint, parsed.code, false, null);
 				}
-				/* non-JSON error body: use status-based defaults */
+				// A complete non-JSON response can use status defaults. An
+				// interrupted read must propagate as a transport failure.
+				if (!(error instanceof SyntaxError)) throw error;
 			}
 			assertCurrent();
 			const parsed = parseErrorBody(body, res.status);
@@ -386,39 +341,38 @@ export async function fetchSubscription(fetchFn: typeof fetch = fetch, owner?: A
 }
 
 /**
- * Authorized Stripe redirect hosts for checkout/portal 2xx bodies. Any
- * allowlisted `https:` target resolves verbatim; everything else rejects
+ * Stripe destinations are pinned to the origin for the billing action.
+ * A valid target resolves verbatim; everything else rejects
  * with the typed client error so an off-allowlist or malformed target never
  * reaches a `window.location.href` assignment (open-redirect guard).
  */
-const STRIPE_REDIRECT_HOSTS = new Set(['checkout.stripe.com', 'billing.stripe.com']);
-
-function isAllowlistedRedirectUrl(value: unknown): value is string {
-	if (typeof value !== 'string' || value.trim() === '') return false;
+function isAllowedRedirectUrl(value: unknown, origin: string): value is string {
+	if (typeof value !== 'string') return false;
 	// WHATWG URL parsing recovers an allowlisted host from a scheme without
 	// an explicit authority (`https:checkout.stripe.com/...` parses with
 	// hostname checkout.stripe.com), but a `window.location.href` assignment
 	// of that same string resolves against the app origin instead — so the
 	// raw string must carry the explicit `https://` authority up front.
-	if (!value.startsWith('https://')) return false;
+	if (!/^https:\/\/[^/\\?#@\s]+(?=[/?#]|$)/.test(value)) return false;
 	let parsed: URL;
 	try {
 		parsed = new URL(value);
 	} catch {
 		return false;
 	}
-	return parsed.protocol === 'https:' && STRIPE_REDIRECT_HOSTS.has(parsed.hostname.toLowerCase());
+	return parsed.origin === origin;
 }
 
 function redirectUrlOrThrow(
 	data: unknown,
 	status: number,
 	label: string,
-	hint: string
+	hint: string,
+	origin: string
 ): string {
 	if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
 		const url = (data as Record<string, unknown>).url;
-		if (isAllowlistedRedirectUrl(url)) return url;
+		if (isAllowedRedirectUrl(url, origin)) return url;
 	}
 	throw new BillingApiError(status, label, hint);
 }
@@ -431,10 +385,11 @@ export async function startCheckout(
 	if (!planId || /[^a-z0-9-]/.test(planId)) throw new Error('Invalid plan');
 	const { data, status } = await requestJson<unknown>('/v1/billing/checkout', 'Start checkout', fetchFn, {
 		method: 'POST',
+		redirect: 'error',
 		headers: { 'content-type': 'application/json' },
 		body: JSON.stringify({ planId })
 	}, owner);
-	return redirectUrlOrThrow(data, status, 'Start checkout', ': Invalid checkout URL');
+	return redirectUrlOrThrow(data, status, 'Start checkout', ': Invalid checkout URL', 'https://checkout.stripe.com');
 }
 
 /**
@@ -452,8 +407,9 @@ export function signupUrlForCheckoutFailure(planId: string, err: unknown): strin
 export async function openPortal(fetchFn: typeof fetch = fetch, owner?: AccountSession): Promise<string> {
 	const { data, status } = await requestJson<unknown>('/v1/billing/portal', 'Open billing portal', fetchFn, {
 		method: 'POST',
+		redirect: 'error',
 		headers: { 'content-type': 'application/json' },
 		body: '{}'
 	}, owner);
-	return redirectUrlOrThrow(data, status, 'Open billing portal', ': Invalid portal URL');
+	return redirectUrlOrThrow(data, status, 'Open billing portal', ': Invalid portal URL', 'https://billing.stripe.com');
 }

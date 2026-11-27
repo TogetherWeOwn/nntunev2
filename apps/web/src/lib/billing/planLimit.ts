@@ -1,5 +1,5 @@
 import { KNOWN_ERROR_CODES } from '../api/errors.js';
-import { formatResetInstant } from './usage';
+import { formatResetInstant, isNonNegativeFiniteNumber } from './usage';
 
 /**
  * Plan-limit (402/429) handling: turn a limit response into a paywall model
@@ -32,7 +32,7 @@ import { formatResetInstant } from './usage';
  *   so that model explains the other device and omits the upgrade CTA.
  *
  * The wire shape of the limit headers is `x-plan-limit: <dimension>=<cap>`
- * (server `Denial::headers`); only the dimension before `=` is matched.
+ * (server `Denial::headers`); the cap is validated before matching the dimension.
  *
  * Analytics: when the paywall is displayed, `trackPaywallShown` fires the
  * event {@link PAYWALL_SHOWN_EVENT} (`usage_limit_paywall_shown`) exactly
@@ -96,20 +96,18 @@ export interface LimitResponseLike {
 export type TrackFn = (name: string, props: Record<string, unknown>) => void;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
-	return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : null;
+	return typeof value === 'object' && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: null;
 }
 
-/** First finite number among `keys` on `record` (or its `usage`/`data` nest). */
+/** Look for usage counts on the body or in one of the supported direct wrappers. */
 function pickNumber(record: Record<string, unknown>, keys: string[]): number | null {
-	for (const key of keys) {
-		const value = record[key];
-		if (typeof value === 'number' && Number.isFinite(value)) return value;
-	}
-	for (const nest of ['usage', 'data']) {
-		const inner = asRecord(record[nest]);
-		if (inner) {
-			const found = pickNumber(inner, keys);
-			if (found !== null) return found;
+	for (const source of [record, asRecord(record.usage), asRecord(record.data)]) {
+		if (!source) continue;
+		for (const key of keys) {
+			const value = source[key];
+			if (isNonNegativeFiniteNumber(value)) return value;
 		}
 	}
 	return null;
@@ -156,8 +154,7 @@ function bodyField(body: unknown, key: string): string | null {
 function limitDimension(headers: Headers): string | null {
 	const raw = headers.get('x-plan-limit');
 	if (raw === null) return null;
-	const dimension = raw.split('=')[0]?.trim();
-	return dimension ? dimension : null;
+	return /^([a-z_]+)(?:=\d+)?$/.exec(raw.trim())?.[1] ?? null;
 }
 
 /**
@@ -227,6 +224,15 @@ function usageDetail(body: unknown, terminal: boolean): string {
  */
 export const MAX_RETRY_AFTER_SECONDS = 3600;
 
+// HTTP-date uses IMF-fixdate or one of the two obsolete HTTP date forms.
+// Each pattern captures the day so we can detect a calendar rollover.
+const IMF_FIXDATE =
+	/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+const RFC850_DATE =
+	/^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-[A-Z][a-z]{2}-\d{2} \d{2}:\d{2}:\d{2} GMT$/;
+const ASCTIME_DATE =
+	/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} ([ \d]\d) \d{2}:\d{2}:\d{2} \d{4}$/;
+
 /**
  * Parse `Retry-After` (delta-seconds or HTTP-date) into whole seconds from
  * `nowMs`. Returns null when the header is absent or unparseable; a date in
@@ -235,13 +241,16 @@ export const MAX_RETRY_AFTER_SECONDS = 3600;
  * finite and the per-second timer always terminates.
  */
 export function parseRetryAfter(headers: Headers, nowMs: number = Date.now()): number | null {
-	const raw = headers.get('Retry-After') ?? headers.get('retry-after');
+	const raw = headers.get('Retry-After');
 	if (raw === null) return null;
 	const trimmed = raw.trim();
 	if (/^\d+$/.test(trimmed)) return Math.min(Number.parseInt(trimmed, 10), MAX_RETRY_AFTER_SECONDS);
-	const at = Date.parse(trimmed);
-	if (Number.isNaN(at)) return null;
-	return Math.min(MAX_RETRY_AFTER_SECONDS, Math.max(0, Math.ceil((at - nowMs) / 1000)));
+	const asctime = ASCTIME_DATE.exec(trimmed);
+	const date = asctime ?? IMF_FIXDATE.exec(trimmed) ?? RFC850_DATE.exec(trimmed);
+	if (!date || !Number.isFinite(nowMs)) return null;
+	const at = new Date(asctime ? `${trimmed} GMT` : trimmed);
+	if (at.getUTCDate() !== Number(date[1])) return null;
+	return Math.min(MAX_RETRY_AFTER_SECONDS, Math.max(0, Math.ceil((at.getTime() - nowMs) / 1000)));
 }
 
 /** `45` -> "Try again in 45 seconds."; `125` -> minutes + seconds; `0` -> now. */
@@ -286,7 +295,7 @@ export function toPaywallModel(res: LimitResponseLike): PaywallModel | null {
 		countdownText: retryAfterSeconds === null ? null : formatCountdown(retryAfterSeconds)
 	};
 
-	if (code === 'subscription_required') {
+	if (terminal && code === 'subscription_required') {
 		if (bodyField(res.body, 'reason') === 'lapsed') {
 			return {
 				...base,
@@ -312,7 +321,7 @@ export function toPaywallModel(res: LimitResponseLike): PaywallModel | null {
 
 	const dimension = limitDimension(res.headers);
 
-	if (code === 'plan_limit_exceeded' && dimension === 'stream_hours_month') {
+	if (terminal && code === 'plan_limit_exceeded' && dimension === 'stream_hours_month') {
 		return {
 			...base,
 			ctaHref: PRICING_HREF,

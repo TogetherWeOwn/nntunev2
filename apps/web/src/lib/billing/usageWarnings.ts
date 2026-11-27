@@ -14,6 +14,8 @@
  * gap (the server refuses at the cap regardless).
  */
 
+import { isNonNegativeFiniteNumber, isUsagePeriod } from './usage';
+
 export const WARNING_THRESHOLDS = [80, 95] as const;
 
 export type WarningThreshold = (typeof WARNING_THRESHOLDS)[number];
@@ -56,11 +58,10 @@ export function pendingUsageWarnings(
 	streamFraction: number,
 	storage: WarningStorage | null = defaultStorage()
 ): WarningThreshold[] {
-	if (!storage || !period) return [];
-	const pct = streamFraction * 100;
+	if (!isUsagePeriod(period) || !isNonNegativeFiniteNumber(streamFraction) || !storage) return [];
 	const pending: WarningThreshold[] = [];
 	for (const threshold of WARNING_THRESHOLDS) {
-		if (pct < threshold) continue;
+		if (streamFraction < threshold / 100) continue;
 		try {
 			if (storage.getItem(keyFor(period, threshold)) === null) pending.push(threshold);
 		} catch {
@@ -98,8 +99,9 @@ export function markUsageWarningsShown(
 	thresholds: readonly WarningThreshold[],
 	storage: WarningStorage | null = defaultStorage()
 ): void {
-	if (!storage || !period) return;
+	if (!isUsagePeriod(period) || !storage) return;
 	for (const threshold of thresholds) {
+		if (!WARNING_THRESHOLDS.includes(threshold)) continue;
 		try {
 			storage.setItem(keyFor(period, threshold), '1');
 		} catch {
