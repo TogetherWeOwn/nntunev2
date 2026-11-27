@@ -100,7 +100,7 @@ impl SealedFixture {
             plaintext_len,
             map_id,
             header: context.header,
-            reservation_generation: 1,
+            reservation_generation: 0,
         };
         Ok(Self {
             context,
@@ -141,6 +141,8 @@ impl SealedFixture {
             || prepared.context.plaintext_len != self.context.plaintext_len
             || prepared.intent.map_id != self.intent.map_id
             || prepared.intent.reservation_generation != self.intent.reservation_generation
+            || self.intent.reservation_generation <= 0
+            || &prepared.request.content_sha256 != self.origin.plaintext_sha256()
             || !sender.matches_storage(configuration, bucket)
         {
             return Err(Refused);
@@ -165,7 +167,7 @@ impl SealedFixture {
         let upload = opened.durable_target();
         let until = upload.usable_until();
         let target = upload.target();
-        if target.bucket != bucket {
+        if (target.bucket, target.key) != (bucket, key.as_str()) {
             return Err(Unconfirmed);
         }
         let plan =

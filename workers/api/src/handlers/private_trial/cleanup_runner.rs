@@ -6,6 +6,7 @@ use nntune_core::s3_locator::{S3Binding, S3Locator};
 use nntune_ingest::multipart::s3_completion::FixtureVersionRemover;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio_postgres::{
     config::{Host, SslMode},
     types::Type,
@@ -17,14 +18,19 @@ use zeroize::Zeroizing;
 use super::{
     caller::FIXTURE_DIGEST,
     cleanup::{cleanup_with_s3, Fixture},
+    parse_object,
     TrialError::{self, Refused, Unconfirmed},
+    FIXTURE_BUCKET as BUCKET,
 };
 use crate::{
     storage_digest_read::uuid_text,
-    worker_entry::{now_millis, private_browser_worker::hex, with_deadline},
+    worker_entry::{
+        now_millis,
+        private_browser_worker::{hex, uuid_v4},
+        with_deadline,
+    },
 };
 
-const BUCKET: &str = "nntunev2-private-fixtures-staging";
 const DATABASE: &str = "nntunev2_staging";
 
 #[derive(Deserialize)]
@@ -83,25 +89,15 @@ fn secret(env: &Env, name: &str, limit: usize) -> Result<Zeroizing<String>, Tria
         .ok_or(Refused)
 }
 
-fn parse<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T, TrialError> {
-    serde_json::from_str(raw).map_err(|_| Refused)
-}
-
 fn match_sha256(raw: &str, expected: &str) -> Result<(), TrialError> {
     let expected = hex::<32>(expected).ok_or(Refused)?;
-    (Sha256::digest(raw.as_bytes())[..] == expected)
+    bool::from(Sha256::digest(raw.as_bytes())[..].ct_eq(&expected))
         .then_some(())
         .ok_or(Refused)
 }
 
 fn uuid(raw: &str) -> Result<[u8; 16], TrialError> {
-    if !crate::meter_sink::is_uuid_shaped(raw) {
-        return Err(Refused);
-    }
-    let id = hex::<16>(&raw.replace('-', "")).ok_or(Refused)?;
-    (id[6] >> 4 == 4 && id[8] >> 6 == 2)
-        .then_some(id)
-        .ok_or(Refused)
+    uuid_v4(raw).ok_or(Refused)
 }
 
 async fn connect(scope: &Scope, dsn: &str) -> Result<Client, TrialError> {
@@ -113,6 +109,9 @@ async fn connect(scope: &Scope, dsn: &str) -> Result<Client, TrialError> {
         || !cfg.get_hostaddrs().is_empty()
         || cfg.get_options().is_some()
         || cfg.get_password().is_none_or(|pw| pw.is_empty())
+        || scope.database_host.is_empty()
+        || scope.database_port == 0
+        || scope.database_role.is_empty()
         || scope.database_role_oid == 0
         || cfg.get_ssl_mode() != SslMode::Require
     {
@@ -158,21 +157,22 @@ async fn run(env: &Env) -> Result<bool, TrialError> {
         return Err(Refused);
     }
     let raw = secret(env, "CLEANUP_SCOPE", 8_192)?;
-    let approval: Approval = parse(&secret(env, "CLEANUP_APPROVAL", 2_048)?)?;
+    let approval: Approval = parse_object(&secret(env, "CLEANUP_APPROVAL", 2_048)?, 2_048)?;
     let dispatch_scope = secret(env, "CLEANUP_SCOPE_SHA256", 64)?;
     if approval.scope_sha256.as_str() != dispatch_scope.as_str() {
         return Err(Refused);
     }
     match_sha256(&raw, &approval.scope_sha256)?;
-    let scope: Scope = parse(&raw)?;
+    let scope: Scope = parse_object(&raw, 8_192)?;
     let provider = approval.provider;
     if scope.provider != provider
         || provider.bucket != BUCKET
         || scope.invite <= 0
         || scope.cutoff <= 0
         || scope.cutoff as u64 > now_millis() / 1_000
-        || !(1..=128).contains(&scope.job.len())
+        || !nntune_ingest::jobs::validate_job_id(&scope.job)
         || !(1..=128).contains(&scope.issuer.len())
+        || scope.issuer.chars().any(char::is_control)
     {
         return Err(Refused);
     }
@@ -211,7 +211,7 @@ async fn run(env: &Env) -> Result<bool, TrialError> {
     }
     let credential = secret(env, "CLEANUP_S3", 2_048)?;
     match_sha256(&credential, &scope.s3_credential_sha256)?;
-    let keys: S3Credential = parse(&credential)?;
+    let keys: S3Credential = parse_object(&credential, 2_048)?;
     match_sha256(&keys.access_key, &approval.s3_access_key_sha256)?;
     let remover = FixtureVersionRemover::new(
         uuid(&provider.configuration)?,
@@ -260,7 +260,8 @@ pub async fn cleanup_entry(req: Request, env: Env, _: worker::Context) -> worker
             .headers()
             .get("x-cleanup-invocation")?
             .is_none_or(|token| {
-                !secret(&env, "CLEANUP_INVOCATION", 64).is_ok_and(|pin| *pin == token)
+                !secret(&env, "CLEANUP_INVOCATION", 64)
+                    .is_ok_and(|pin| bool::from(pin.as_bytes().ct_eq(token.as_bytes())))
             })
     {
         return Response::error("refused", 403);

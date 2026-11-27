@@ -135,21 +135,21 @@ fn plan(
         return Err(BudgetExceeded);
     }
 
-    // All validation precedes charging. Charges are cumulative, including any
-    // prior owners; discard the ledger if any charge fails. No allocation occurs.
-    charge_rows::<ArtistDbRow>(budget, fixture.artists)?;
-    charge_rows::<ReleaseDbRow>(budget, fixture.releases)?;
-    charge_rows::<TrackDbRow>(budget, fixture.tracks)?;
+    // Stage the complete charge without allocating or modifying the prior balance.
+    let mut staged = ConstructionBudget::new(usize::MAX);
+    charge_rows::<ArtistDbRow>(&mut staged, fixture.artists)?;
+    charge_rows::<ReleaseDbRow>(&mut staged, fixture.releases)?;
+    charge_rows::<TrackDbRow>(&mut staged, fixture.tracks)?;
     for (count, fields) in groups {
         for _ in 0..count {
             for value in fields.iter().flatten() {
                 if !value.is_empty() {
-                    budget.charge(value.len(), 1, 1)?;
+                    staged.charge(value.len(), 1, 1)?;
                 }
             }
         }
     }
-    Ok(())
+    budget.charge_payload_bytes(staged.charged())
 }
 
 #[cfg(test)]
@@ -205,7 +205,9 @@ mod tests {
         assert_eq!(exact.charged(), total);
         let mut below = ConstructionBudget::new(total - 1);
         below.charge(1, 1, 1).unwrap();
+        let prior = below.charged();
         assert_eq!(plan(&mut below, f, limits()), Err(BudgetExceeded));
+        assert_eq!(below.charged(), prior);
         let mut higher = ConstructionBudget::new(total + 1);
         higher.charge(1, 1, 1).unwrap();
         assert_eq!(plan(&mut higher, f, limits()), Ok(()));

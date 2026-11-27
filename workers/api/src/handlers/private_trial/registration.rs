@@ -10,6 +10,7 @@ use crate::{
     native_rest::{self, Pepper, Scope},
     storage_digest_read::uuid_text,
     worker_entry::native_credential_from_row,
+    worker_entry::private_browser_worker::{hex, is_uuid_v4, uuid_v4},
 };
 use nntune_ingest::multipart::{session_outcome::CompletionScope, session_upload::begin};
 
@@ -35,6 +36,14 @@ impl Enrollment<'_> {
         root_key: &[u8; 32],
     ) -> Result<SealedFixture, TrialError> {
         use TrialError::{Refused, Unconfirmed};
+        let session = uuid_v4(self.session).or_else(|| hex::<16>(self.session).filter(is_uuid_v4));
+        if session.is_none()
+            || !nntune_ingest::jobs::validate_job_id(self.job)
+            || !(1..=128).contains(&self.actor.len())
+            || self.actor.chars().any(char::is_control)
+        {
+            return Err(Refused);
+        }
         let [environment, library, object, generation, configuration] = identities.map(uuid_text);
         let tx = begin(registrar).await.map_err(|_| Unconfirmed)?;
         let scope = tx
@@ -136,6 +145,7 @@ impl Enrollment<'_> {
             .map_err(|_| Unconfirmed)?
             .try_get::<_, Option<i64>>(0)
             .map_err(|_| Unconfirmed)?
+            .filter(|generation| *generation > 0)
             .ok_or(Refused)?;
         tx.query_typed_one(
             "SELECT public.store_storage_digest_candidate(
@@ -262,7 +272,10 @@ pub(crate) async fn connect_stage_role(
                 .connection_string()
                 .parse()
                 .map_err(|_| Unconfirmed)?;
-            if config.get_dbname() != Some("nntunev2_staging") || config.get_user() != Some(role) {
+            if config.get_dbname() != Some("nntunev2_staging")
+                || config.get_user() != Some(role)
+                || config.get_options().is_some()
+            {
                 return Err(Refused);
             }
             let socket = Socket::builder()
@@ -279,7 +292,11 @@ pub(crate) async fn connect_stage_role(
             });
             let identity = client
                 .query_typed_one(
-                    "SELECT current_user::text = $1 AND current_database() = 'nntunev2_staging'",
+                    "SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r
+                     WHERE session_user = current_user AND r.rolname = current_user
+                       AND r.rolname::text = $1 AND current_database() = 'nntunev2_staging'
+                       AND r.rolcanlogin AND NOT (r.rolsuper OR r.rolbypassrls OR r.rolcreatedb
+                                                 OR r.rolcreaterole OR r.rolreplication))",
                     &[(&role, Type::TEXT)],
                 )
                 .await
