@@ -1655,15 +1655,19 @@ test.describe('generated staging API Tail config (offline)', () => {
     return JSON.parse(result.stdout) as Record<string, unknown>;
   }
 
-  // Dummy shared-mirror inventory: the same id in both environments, for the
-  // api worker (the generator's mirror pin reads it) and the mb worker.
+  // Both staging Workers use the replacement config. Production stays pinned
+  // to its own inventory entry.
   const MB_INVENTORY = `[[worker.binding]]
 binding = "MB_DB"
 staging = "dummy-mb-mirror"
-prod = "dummy-mb-mirror"
+prod = "dummy-prod-mirror"
 `;
 
-  function generateConfig(overrides: Record<string, string> = {}, manifestMb: string | null = MB_INVENTORY) {
+  function generateConfig(
+    overrides: Record<string, string> = {},
+    apiMirror: string | null = MB_INVENTORY,
+    mbMirror = MB_INVENTORY,
+  ) {
     const probe = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'staging-api-config-'));
     try {
       const apiDir = join(probe, 'workers/api');
@@ -1680,10 +1684,10 @@ name = "api"
 [[worker.binding]]
 binding = "HYPERDRIVE"
 staging = "dummy-hyperdrive-staging"
-${manifestMb ?? ''}
+${apiMirror ?? ''}
 [[worker]]
 name = "mb"
-${MB_INVENTORY}`);
+${mbMirror}`);
       const section = jobSection(deployWorkflow, 'staging-api');
       const parts = section.split('      - name: Generate staging wrangler.toml\n');
       expect(parts, 'exactly one staging API config generator').toHaveLength(2);
@@ -1820,10 +1824,17 @@ ${MB_INVENTORY}`);
     expect(result.toml).toBeUndefined();
   });
 
-  test('generator rejects a non-shared api MB_DB inventory before writing deploy config', () => {
-    const result = generateConfig({}, MB_INVENTORY.replace('prod = "dummy-mb-mirror"', 'prod = "dummy-prod-mirror"'));
+  test('generator rejects different staging mirror pins before writing deploy config', () => {
+    const result = generateConfig({}, MB_INVENTORY.replace('staging = "dummy-mb-mirror"', 'staging = "different-staging-mirror"'));
     expect(result.status).not.toBe(0);
-    expect(result.output).toContain('api MB_DB must name the shared mirror id in both environments');
+    expect(result.output).toContain('api and mb must use the same MB_DB staging inventory id');
+    expect(result.toml).toBeUndefined();
+  });
+
+  test('generator names the missing MB Worker mirror pin before writing deploy config', () => {
+    const result = generateConfig({}, MB_INVENTORY, '');
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('api and mb must use the same MB_DB staging inventory id');
     expect(result.toml).toBeUndefined();
   });
 
@@ -2090,7 +2101,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     expect(section).toMatch(
       /^(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/v1\/\*"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/library"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-codes"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-accounts"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/healthz"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/ingest"\n[ \t]+zone_name = "nntune\.com"\n/m,
     );
-    // Optional shared mirror binding: generated only when HYPERDRIVE_ID_MB is
+    // Optional staging mirror binding: generated only when HYPERDRIVE_ID_MB is
     // non-empty, and then pinned to the api MB_DB manifest inventory id.
     expect(section).toContain('HYPERDRIVE_ID_MB must equal the api MB_DB inventory id');
     expect(section).toContain('mirror: absent (no-enrichment mode)');
@@ -2121,7 +2132,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
   // HYPERDRIVE_ID_MB to the committed mb MB_DB staging inventory id, the
   // generated staging worker name, and Workers Logs observability at full
   // head sampling (the build_sha evidence is read there). The MB mirror
-  // Hyperdrive config is a shared read mirror and may stay cached, so this
+  // Hyperdrive config is a read-only mirror and may stay cached, so this
   // lane carries no cache-disabled gate (unlike the app Hyperdrive lanes).
   const assertStagingMb = (body: string) => {
     const section = jobSection(body, 'staging-mb');

@@ -152,8 +152,8 @@ lane skips until they are.
 
 The staging API can deploy without `HYPERDRIVE_ID_MB`. An unset or empty
 variable omits the generated `MB_DB` Hyperdrive block and reports
-`mirror: absent (no-enrichment mode)`. A nonempty variable must still match
-the shared mirror ID in the binding manifest. The app Hyperdrive cache-disabled
+`mirror: absent (no-enrichment mode)`. A nonempty variable must match the
+mirror ID pinned for both staging Workers. The app Hyperdrive cache-disabled
 attestation, read-only schema gate and deployment-outcome records remain required.
 
 `PgStore` checks binding presence once per request; absence is not a caught

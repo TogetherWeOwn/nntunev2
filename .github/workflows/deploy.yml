@@ -422,13 +422,17 @@ jobs:
               "HYPERDRIVE_ID_STAGING must equal the api staging inventory id"
           # Mirror pin: the generated config binds HYPERDRIVE_ID_MB for the
           # catalogue slice-1 mirror probes (`MB_DB` in src/worker_entry.rs),
-          # likewise bypassing binding-parity. The mirror is shared, so the
-          # manifest must name the same id in both environments. The var is
-          # optional: absent or empty omits the MB_DB block (no-enrichment
-          # mode); a present id must equal the manifest id exactly.
+          # likewise bypassing binding-parity. The API and MB Workers use
+          # the same staging mirror connection. An unset or empty var omits
+          # MB_DB (no enrichment); a set var must match the staging manifest.
           mb = next(b for b in api["binding"] if b["binding"] == "MB_DB")
-          assert mb["staging"] == mb["prod"], \
-              "api MB_DB must name the shared mirror id in both environments"
+          mb_worker = next((w for w in manifest["worker"] if w["name"] == "mb"), {})
+          mb_worker_staging = next(
+              (b.get("staging") for b in mb_worker.get("binding", []) if b["binding"] == "MB_DB"),
+              None,
+          )
+          assert mb_worker_staging and mb["staging"] == mb_worker_staging, \
+              "api and mb must use the same MB_DB staging inventory id"
           mirror_id = os.environ.get("HYPERDRIVE_ID_MB", "")
           if mirror_id:
               assert mirror_id == mb["staging"], \
@@ -536,7 +540,7 @@ jobs:
           EOF
           python3 -I ../../.github/scripts/staging_stream_config.py --trial-db-bindings >> wrangler.toml
           if [ -n "${HYPERDRIVE_ID_MB:-}" ]; then
-            # Shared MusicBrainz read mirror for the catalogue slice-1 probes.
+            # Staging MusicBrainz read mirror for the catalogue slice-1 probes.
             cat >> wrangler.toml <<EOF
 
           [[env.staging.hyperdrive]]
@@ -719,7 +723,7 @@ jobs:
   # no HTTP surface to serve. Passes the public BUILD_SHA var so worker log
   # records carry the deploy SHA (never a secret); secrets live only in
   # Cloudflare and are never written here. The MB mirror Hyperdrive config is
-  # a shared read mirror and may stay cached, so there is no cache-disabled
+  # a read-only mirror and may stay cached, so there is no cache-disabled
   # gate here (unlike the app Hyperdrive lanes). Skips with a notice until
   # the Operator wires HYPERDRIVE_ID_MB (a skip is not evidence). Production
   # is never touched: the generated config has no production env table and

@@ -40,9 +40,8 @@ type = "hyperdrive"
 staging = "61c87403f119430bbc3a7f571df47002"
 prod = "d38a229748f6452bb417c6d33d277a8d"
 
-# The catalogue slice-1 reads reach the shared MusicBrainz read mirror
-# through the api Worker too (`MB_DB`, src/worker_entry.rs
-# `connect_mirror`): same shared id in both environments (docs/ops.md).
+# The catalogue slice-1 reads reach the MusicBrainz mirror through the
+# API Worker too. Its staging id must match the MB Worker's staging id.
 [[worker.binding]]
 binding = "MB_DB"
 type = "hyperdrive"
@@ -134,8 +133,8 @@ type = "service"
 name = "mb"
 config = "workers/mb/wrangler.toml"
 
-# The MusicBrainz Hyperdrive config is one shared read mirror for both
-# environments (docs/ops.md), so staging and prod expect the same id.
+# The repeated id below records the retired mirror. The verified replacement
+# staging id goes here and in the API binding above (docs/ops.md).
 [[worker.binding]]
 binding = "MB_DB"
 type = "hyperdrive"
