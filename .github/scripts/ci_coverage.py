@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 
+from migrations_base import BaseError, event_sha, require_commit
 
 WEB = {"web-checks", "web-build", "web-e2e", "web-a11y", "history-fixture"}
 BROWSER = {"web-build", "web-e2e"}
@@ -22,7 +23,6 @@ BACKEND = {
 SELECTABLE = WEB | BACKEND
 COMPONENT = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
 PATH = rf"(?:{COMPONENT}/)*{COMPONENT}"
-SHA = re.compile(r"(?!0{40}$)[0-9a-f]{40}")
 
 
 def consumers(path):
@@ -42,8 +42,8 @@ def consumers(path):
 
 
 def changed_paths(base, tested, root):
-    if not SHA.fullmatch(base) or not SHA.fullmatch(tested):
-        raise ValueError("missing or invalid comparison commits")
+    base = require_commit(root or ".", event_sha(base, "comparison base"))
+    tested = require_commit(root or ".", event_sha(tested, "tested commit"))
     raw = subprocess.run(
         ["git", "--no-replace-objects", "diff", "--raw", "-z", "--no-renames", "--no-ext-diff",
          "--no-textconv", "--ignore-submodules=none", base, tested, "--"],
@@ -97,7 +97,7 @@ def plan(event, base, tested, root=None):
                 prose.append(path)
         if jobs != SELECTABLE and prose and referenced_prose(prose, base, tested, root):
             return True, areas | {"referenced documentation (full)"}, []
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (BaseError, OSError, ValueError, subprocess.SubprocessError):
         return False, {"incomplete (full coverage required)"}, []
     return True, areas, sorted(SELECTABLE - jobs)
 

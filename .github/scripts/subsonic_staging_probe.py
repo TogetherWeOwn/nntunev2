@@ -17,14 +17,23 @@ ACCESS_ID = "SUBSONIC_PROBE_ACCESS_CLIENT_ID"
 ACCESS_SECRET = "SUBSONIC_PROBE_ACCESS_CLIENT_SECRET"
 
 
+def verified_readback(env, *, require_headroom=False):
+    try:
+        return readback(env, require_headroom=require_headroom) == CleanupResult.VERIFIED
+    except Exception:
+        return False
+
+
 def probe(env, transport, cancel):
     client_id, secret = env.get(ACCESS_ID), env.get(ACCESS_SECRET)
     if not client_id or not secret:
         return "access-config-unavailable"
     if cancel.is_set():
         return "cancelled"
-    if readback(env, require_headroom=True) != CleanupResult.VERIFIED:
+    if not verified_readback(env, require_headroom=True):
         return "preflight-unverified"
+    if cancel.is_set():
+        return "cancelled"
 
     result = "request-failed"
     try:
@@ -33,12 +42,13 @@ def probe(env, transport, cancel):
             deadline=deadline, cancel=cancel,
             access_client_id=client_id, access_client_secret=secret,
         )
-        result = "verified"
+        if time.monotonic() < deadline:
+            result = "verified"
     except Exception:
         pass  # Do not publish transport exceptions or response content.
     finally:
         # A failed or interrupted client does not establish backend drain.
-        drained = readback(env) == CleanupResult.VERIFIED
+        drained = verified_readback(env)
     if not drained:
         return "postflight-unverified"
     return "cancelled" if cancel.is_set() else result

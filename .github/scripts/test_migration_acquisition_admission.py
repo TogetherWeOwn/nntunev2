@@ -137,6 +137,17 @@ class SyntheticTransportPolicy(unittest.TestCase):
 
 
 class SyntheticBaseSelection(GitCase):
+    def test_invalid_tree_object_id_stops_before_blob_read(self):
+        def git(*args, limit):
+            if args[:2] == ("cat-file", "-t"):
+                return b"commit\n"
+            if args[0] == "ls-tree":
+                return b"100644 blob HEAD\tdeclaration.json\0"
+            self.fail("invalid tree entry reached blob read")
+
+        with self.assertRaisesRegex(history.HistoryError, "invalid synthetic base declaration"):
+            admission.check_synthetic_base_declaration(git, sha(1), None)
+
     def test_selected_declaration_with_loopback_git_observation(self):
         # A local HTTP fixture only: no authenticated origin or HTTPS guarantee.
         ref = "refs/heads/fence"

@@ -7,6 +7,7 @@ validated event/API snapshot; matching caller-supplied values proves neither.
 Transport, resource and offline isolation remain separate, unqualified gates.
 """
 from dataclasses import dataclass
+import re
 
 from migration_history import COMMIT_RE, HistoryError
 from migration_snapshot import REPO_RE, decode
@@ -69,12 +70,11 @@ def check_synthetic_base_declaration(git, fixture_base, proposed_declaration):
     tree = git("ls-tree", "-z", fixture_base, "--", SYNTHETIC_DECLARATION_PATH,
                limit=1024)
     parts = tree.split(b"\t", 1)
+    entry = re.fullmatch(rb"100644 blob ([0-9a-f]{40})", parts[0])
     if (len(parts) != 2 or parts[1] != SYNTHETIC_DECLARATION_PATH.encode() + b"\0"
-            or len(parts[0].split()) != 3
-            or parts[0].split()[:2] != [b"100644", b"blob"]):
+            or not entry):
         raise HistoryError("missing or invalid synthetic base declaration")
-    raw = git("cat-file", "blob", f"{fixture_base}:{SYNTHETIC_DECLARATION_PATH}",
-              limit=MAX_DECLARATION_BYTES)
+    raw = git("cat-file", "blob", entry[1].decode("ascii"), limit=MAX_DECLARATION_BYTES)
     try:
         data = decode(raw.decode("utf-8"))
         declaration = Declaration(**data)

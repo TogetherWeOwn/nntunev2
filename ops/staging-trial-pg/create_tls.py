@@ -6,15 +6,24 @@ from pathlib import Path
 import secrets
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github/scripts"))
 from staging_trial_isolated import FIXTURE_HOSTS, HOSTS
 
 
 def create_tls(output, *, fixture=False):
-    # Refuse existing paths, including symlinks. OpenSSL writes only beneath
-    # the new directory. The CA private key is kept apart from the mounts.
+    # Reserve a fresh directory. Failed generation leaves no key material in
+    # it, and the CA is kept apart from the server mount on success.
     output.mkdir(mode=0o700)
+    with TemporaryDirectory(dir=output) as staging:
+        scratch = Path(staging)
+        generate_tls(scratch, fixture=fixture)
+        for name in ("ca", "server"):
+            (scratch / name).rename(output / name)
+
+
+def generate_tls(output, *, fixture):
     previous = os.umask(0o077)
     try:
         hosts = FIXTURE_HOSTS if fixture else HOSTS

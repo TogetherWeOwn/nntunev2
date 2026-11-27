@@ -57,6 +57,7 @@ class AcceptanceTest(unittest.TestCase):
         }
         self.env = ENV.copy()
         self.late_responses = {}
+        self.framing = []
         self.connected = []
         self.requests = []
         fixture = self
@@ -70,6 +71,8 @@ class AcceptanceTest(unittest.TestCase):
                 self.send_response(reply if isinstance(reply, int) else 200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Location", "https://outside.invalid/privateRedirect")
+                for name, value in fixture.framing:
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(json.dumps(reply).encode())
 
@@ -106,6 +109,24 @@ class AcceptanceTest(unittest.TestCase):
         self.evidence = self.admission
         self.run_case("admitted", "admit")
         self.assertEqual([path for path, _ in self.requests], list(self.routes)[:4])
+
+    def test_admit_refuses_ambiguous_or_incomplete_json_framing(self):
+        self.evidence = self.admission
+        length = str(len(json.dumps(self.routes["/api/build"]).encode()))
+        for framing in (
+                [("Content-Length", "1000")],
+                [("Content-Length", length), ("Content-Length", "1000")],
+                [("Content-Length", length), ("Transfer-Encoding", "identity")]):
+            with self.subTest(framing=framing):
+                self.framing = framing
+                self.requests.clear()
+                self.run_case("invalid_response", "admit")
+                self.assertEqual([path for path, _ in self.requests], ["/api/build"])
+
+    def test_admit_refuses_non_json_constants_in_provider_response(self):
+        self.evidence = self.admission
+        self.routes["/v1/balance"]["extra"] = float("nan")
+        self.run_case("invalid_json", "admit")
 
     def test_finish_verifies_payment_and_teardown_with_redacted_output(self):
         self.run_case("accepted")

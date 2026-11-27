@@ -59,6 +59,17 @@ class ChangedLinesTest(unittest.TestCase):
                 self.assertEqual((self.root / SOURCE).read_text(encoding="utf-8"), source)
                 print(f"Fixture passed: {case['name']}")
 
+    def test_mutation_offsets_refuse_mismatched_source_encodings(self):
+        for source in (b"# coding: latin-1\nlen('\xe9') < 1\n",
+                       b"\xef\xbb\xbflen('x') < 1\n"):
+            with self.subTest(source=source), self.assertRaisesRegex(gate.GateError, "must use UTF-8"):
+                gate.select_mutants(b"", source, [range(1, 3)])
+        _, candidates, _, unsupported = gate.select_mutants(
+            b"", "len('é') < 1\n".encode(), [range(1, 2)])
+        self.assertEqual((len(candidates), unsupported), (1, 0))
+        with self.assertRaisesRegex(gate.GateError, "line endings"):
+            gate.select_mutants(b"", b"x = 1\rx < 2\r", [range(1, 2)])
+
     def test_rollout_uses_main_anchor_and_enforces_at_one_week(self):
         tested = self.commit({OUTSIDE: "changed away from main"})
         self.assertFalse(gate.rollout(None, 0)[0])

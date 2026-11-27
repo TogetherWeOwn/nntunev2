@@ -2,9 +2,11 @@
 """Run bounded comparison-boundary mutants against the tested PR diff."""
 
 import ast
+from codecs import lookup
 from collections import Counter
 from datetime import datetime, timezone
 import importlib
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,7 @@ import re
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from tokenize import detect_encoding
 import unittest
 
 
@@ -34,7 +37,8 @@ class GateError(Exception):
 
 
 def git(root, *args):
-    return subprocess.check_output(["git", *args], cwd=root, stderr=subprocess.DEVNULL, timeout=30)
+    return subprocess.check_output(["git", "--no-replace-objects", *args],
+                                   cwd=root, stderr=subprocess.DEVNULL, timeout=30)
 
 
 def blob(root, sha, path, *, optional=False):
@@ -61,6 +65,13 @@ def comparisons(source):
 
 
 def select_mutants(before, after, ranges):
+    # AST columns use UTF-8 bytes and Git diff lines are LF-delimited.
+    # Refuse layouts where source coordinates cannot be reused verbatim.
+    encoding, _ = detect_encoding(BytesIO(after).readline)
+    if lookup(encoding).name not in ("utf-8", "ascii"):
+        raise GateError("changed source must use UTF-8 or ASCII without a BOM")
+    if b"\r" in after.replace(b"\r\n", b"\n"):
+        raise GateError("changed source must use LF or CRLF line endings")
     existing = Counter(key for key, _ in comparisons(before))
     unchanged = Counter()
     changed = []

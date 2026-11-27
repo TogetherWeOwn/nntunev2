@@ -2,6 +2,7 @@
 """Reject added direct PR SHA reads in workflow YAML against the resolved base."""
 import argparse
 from collections import Counter
+from itertools import count
 import re
 import sys
 
@@ -20,26 +21,46 @@ RAW_SHA = re.compile(r"\bgithub" + "".join(
 ), re.IGNORECASE)
 
 
-def scalar_fields(node, location, seen):
-    if id(node) in seen:  # A YAML alias is a reference to an already visited node.
-        return
-    seen.add(id(node))
+def mapping_fields(node):
+    fields = {}
+    for key, value in node.value:
+        if not isinstance(key, yaml.ScalarNode) or key.value in fields:
+            raise yaml.YAMLError("workflow keys must be unique scalars")
+        fields[key.value] = value
+    return fields
+
+
+def step_scalar(fields, key):
+    node = fields.get(key)
+    if node is None:
+        return ""
+    if not isinstance(node, yaml.ScalarNode):
+        raise yaml.YAMLError("workflow step identity must use scalar fields")
+    return node.value
+
+
+def scalar_fields(node, location, ancestors, visits):
+    # An alias can add a consumer at a new location. Bound the expanded
+    # traversal and reject cycles before counting references.
+    if next(visits) >= 100_000 or id(node) in ancestors:
+        raise yaml.YAMLError("workflow aliases exceed traversal bounds")
+    ancestors = ancestors | {id(node)}
     if isinstance(node, yaml.ScalarNode):
         yield location, node.value
     elif isinstance(node, yaml.MappingNode):
-        for key, child in node.value:
-            if not isinstance(key, yaml.ScalarNode):
-                raise yaml.YAMLError("workflow keys must be scalars")
-            yield from scalar_fields(child, (*location, key.value), seen)
+        for key, child in mapping_fields(node).items():
+            yield from scalar_fields(child, (*location, key), ancestors, visits)
     elif isinstance(node, yaml.SequenceNode):
         for child in node.value:
-            fields = {key.value: value for key, value in child.value} if isinstance(child, yaml.MappingNode) else {}
-            role = next((fields[key].value.partition("@")[0] if key == "uses" else fields[key].value
-                         for key in ("id", "uses", "working-directory") if key in fields), "")
+            fields = mapping_fields(child) if isinstance(child, yaml.MappingNode) else {}
             inputs = fields.get("with")
-            destination = next((value.value for key, value in inputs.value if key.value == "path"),
-                               "") if isinstance(inputs, yaml.MappingNode) else ""
-            yield from scalar_fields(child, (*location, repr((role, destination))), seen)
+            destination = step_scalar(mapping_fields(inputs), "path") if isinstance(inputs, yaml.MappingNode) else ""
+            step_id = step_scalar(fields, "id")
+            action = step_scalar(fields, "uses").partition("@")[0]
+            directory = step_scalar(fields, "working-directory")
+            role = step_id if "id" in fields else action if "uses" in fields else directory
+            step = repr((role, destination))
+            yield from scalar_fields(child, (*location, step), ancestors, visits)
 
 
 def workflow_reads(root, commit):
@@ -49,9 +70,13 @@ def workflow_reads(root, commit):
         header, path = entry.split("\t", 1)
         if not path.endswith((".yml", ".yaml")):
             continue
-        _, _, oid = header.split()
+        mode, kind, oid = header.split()
+        if mode not in ("100644", "100755") or kind != "blob":
+            raise yaml.YAMLError("workflow path must contain a regular file")
         tree = yaml.compose(git(root, "cat-file", "blob", oid), Loader=yaml.SafeLoader)
-        for location, scalar in scalar_fields(tree, (), set()):
+        if not isinstance(tree, yaml.MappingNode):
+            raise yaml.YAMLError("workflow must contain a mapping")
+        for location, scalar in scalar_fields(tree, (), set(), count()):
             reads.update((path, location, match) for match in RAW_SHA.findall(scalar))
     return reads
 
@@ -65,7 +90,7 @@ def main():
         base = require_commit(".", event_sha(args.base, "comparison base"))
         tested = require_commit(".", event_sha(args.tested, "tested commit"))
         added = workflow_reads(".", tested) - workflow_reads(".", base)
-    except (BaseError, RecursionError, UnicodeError, yaml.YAMLError) as exc:
+    except (BaseError, RecursionError, ValueError, yaml.YAMLError) as exc:
         print(f"workflow-pr-shas: unable to compare pinned workflow trees ({type(exc).__name__})", file=sys.stderr)
         return 2
     for (path, _, match), count in sorted(added.items()):

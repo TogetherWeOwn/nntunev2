@@ -5,6 +5,7 @@ from io import StringIO
 import json
 import os
 import subprocess
+import unittest
 from unittest.mock import patch
 
 import billing_history_preflight as preflight
@@ -168,6 +169,21 @@ def invoke(environment):
     return status, out.getvalue(), err.getvalue()
 
 
+class OfflineAdmission(unittest.TestCase):
+    def test_invalid_host_and_scope_never_dispatch(self):
+        env = {
+            "NNTUNE_INVOICE_PREFLIGHT": "1", "BILLING_PREFLIGHT_ROLE": ROLE,
+            "BILLING_PREFLIGHT_PASSWORD": "fixture", "BILLING_PREFLIGHT_SCOPE_COUNT": "3",
+        }
+        with patch.object(subprocess, "run") as psql:
+            for host in ("-staging.example.test", "staging-.example.test", "x" * 64 + ".test"):
+                self.assertEqual(invoke({**env, "BILLING_PREFLIGHT_HOST": host}), (3, "", "refused\n"))
+            for expected in (True, 3.0, "3"):
+                with self.assertRaisesRegex(ValueError, "invalid comparison pins"):
+                    run(ROLE, expected, {})
+            psql.assert_not_called()
+
+
 def exercise_entrypoint():
     env = {
         "NNTUNE_INVOICE_PREFLIGHT": "1", "BILLING_PREFLIGHT_HOST": "staging.example.test",
@@ -197,6 +213,9 @@ def exercise_entrypoint():
 
 
 def main():
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(OfflineAdmission)
+    if not unittest.TextTestRunner().run(suite).wasSuccessful():
+        raise SystemExit(1)
     assert invoke({}) == (3, "", "disabled\n")
     sql(f"CREATE DATABASE {DATABASE} TEMPLATE template0;", "postgres")
     try:

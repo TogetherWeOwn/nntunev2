@@ -13,6 +13,7 @@ SCRIPTS = Path(__file__).resolve().parent
 API = SCRIPTS.parents[1] / "workers/api/src"
 DATABASE = "nntunev2_staging"
 MAX_SCOPE = 10_000
+HOST_LABEL = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
 COUNTS = ("total", "exact", "eligible_hydration", "collision", "incomplete", "fresh")
 BINDINGS = ("user_id", "stripe_invoice_id", "stripe_subscription_id", "plan_id",
             "start_s", "end_s", "amount_cents", "currency", "paid_s", "starts", "ends")
@@ -47,7 +48,8 @@ def comparison_sql():
 
 
 def run(role, expected, connection):
-    if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,63}", role) or not 1 <= expected <= MAX_SCOPE:
+    if (not isinstance(role, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]{1,63}", role)
+            or type(expected) is not int or not 1 <= expected <= MAX_SCOPE):
         raise ValueError("invalid comparison pins")
     result = subprocess.run(
         ["psql", "-XqAtw", "-v", "ON_ERROR_STOP=1", "-v", f"database={DATABASE}",
@@ -88,7 +90,7 @@ def main():
         role = os.environ["BILLING_PREFLIGHT_ROLE"]
         password = os.environ["BILLING_PREFLIGHT_PASSWORD"]
         expected = int(os.environ["BILLING_PREFLIGHT_SCOPE_COUNT"])
-        if (len(host) > 253 or not re.fullmatch(r"[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+", host)
+        if (len(host) > 253 or not re.fullmatch(rf"{HOST_LABEL}(?:\.{HOST_LABEL})+", host)
                 or not password):
             raise ValueError("invalid staging connection")
         status, counts = run(role, expected, {

@@ -47,3 +47,20 @@ class WorkflowReadRatchet(unittest.TestCase):
             self.assertIn(".base.sha", rejected.stderr)
             self.assertNotIn("github.event.pull_request.base.sha", rejected.stderr)
             self.assertEqual(2, compare("1" * 40, tested).returncode)
+
+            raw_read = "env:\n  REF: &pinned '${{ github.event.pull_request.head.sha }}'\n"
+            workflow.write_text(raw_read)
+            git("commit", "-qam", "Existing raw read")
+            anchor = git("rev-parse", "HEAD")
+            for content, expected in (
+                    (raw_read + "jobs:\n  new:\n    env:\n      REF: *pinned\n", 1),
+                    ("env: {}\nenv: {}\n", 2),
+                    ("jobs: &cycle\n  loop: *cycle\n", 2),
+                    ("jobs:\n  sample:\n    steps:\n      - id: {invalid: value}\n", 2),
+                    ("# Empty workflow\n", 2)):
+                with self.subTest(content=content):
+                    workflow.write_text(content)
+                    git("commit", "-qam", "Change workflow shape")
+                    result = compare(anchor, git("rev-parse", "HEAD"))
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)

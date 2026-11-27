@@ -3,7 +3,7 @@
 import json
 from time import monotonic
 
-from production_backend_identity import WorkerPin, readback
+from production_backend_identity import WorkerPin, readback, valid_pin
 from staging_api_identity import SHA, valid
 
 READBACK_SECONDS = 15
@@ -21,8 +21,8 @@ def report(*, candidate_sha: str, account: str, api: WorkerPin, stream: WorkerPi
     """
     if not (
         valid(SHA, candidate_sha)
-        and type(api) is WorkerPin
-        and type(stream) is WorkerPin
+        and valid_pin(api, "nntune-api")
+        and valid_pin(stream, "nntune-stream")
         and api.build_sha == stream.build_sha == candidate_sha
     ):
         result = {"identity": "unavailable", "reason": "invalid-pins"}

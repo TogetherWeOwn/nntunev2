@@ -30,10 +30,10 @@ def provider_results():
 
 
 class ReleaseReadbackTests(unittest.TestCase):
-    def report(self, read, expected_status, expected_result, *, candidate_sha=SHA):
+    def report(self, read, expected_status, expected_result, *, candidate_sha=SHA, api=API):
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
-            status = caller.report(candidate_sha=candidate_sha, account=ACCOUNT, api=API, stream=STREAM, read=read)
+            status = caller.report(candidate_sha=candidate_sha, account=ACCOUNT, api=api, stream=STREAM, read=read)
         self.assertEqual(status, expected_status)
         self.assertEqual(json.loads(stdout.getvalue()), expected_result)
         self.assertEqual(stderr.getvalue(), "")
@@ -64,6 +64,16 @@ class ReleaseReadbackTests(unittest.TestCase):
     def test_refuses_paired_pins_for_a_different_candidate_before_reading(self):
         reader = Mock()
         self.report(reader, 1, {"identity": "unavailable", "reason": "invalid-pins"}, candidate_sha="c" * 40)
+        reader.assert_not_called()
+
+    def test_refuses_malformed_pin_before_comparing_candidate(self):
+        class BadSHA:
+            def __eq__(self, other):
+                raise AssertionError("malformed SHA reached equality")
+
+        reader = Mock()
+        self.report(reader, 1, {"identity": "unavailable", "reason": "invalid-pins"},
+                    api=API._replace(build_sha=BadSHA()))
         reader.assert_not_called()
 
     def test_refuses_result_at_deadline_and_stops_further_reads(self):

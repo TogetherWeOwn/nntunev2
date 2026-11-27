@@ -10,7 +10,7 @@ import sys
 REPO = "github.com/TogetherWeOwn/nntunev2"
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 JOB_URL = re.compile(
-    rf"https://{re.escape(REPO)}/actions/runs/([0-9]+)/job/([0-9]+)(?:\?pr=[0-9]+)?",
+    rf"https://{re.escape(REPO)}/actions/runs/([1-9][0-9]*)/job/([1-9][0-9]*)(?:\?pr=([1-9][0-9]*))?",
     re.I | re.ASCII,
 )
 CONCLUSIONS = {"action_required", "cancelled", "failure", "neutral", "skipped", "stale",
@@ -32,12 +32,18 @@ def main(argv=None):
     if not FULL_SHA.fullmatch(args.head_sha):
         parser.error("head_sha must be the full lowercase PR head SHA")
     evidence = []
+    jobs = set()
     for conclusion, url, tested_sha in args.job:
         match = JOB_URL.fullmatch(url)
         if conclusion not in CONCLUSIONS or match is None or not FULL_SHA.fullmatch(tested_sha):
             parser.error("each --job requires an Actions conclusion, a job URL in this repository, "
                          "and the full lowercase tested SHA")
-        run_id, job_id = match.groups()
+        run_id, job_id, number = match.groups()
+        if number is not None and number != str(args.number):
+            parser.error("job URL refers to a different pull request")
+        if (run_id, job_id) in jobs:
+            parser.error("duplicate Actions job evidence")
+        jobs.add((run_id, job_id))
         run_url = f"https://{REPO}/actions/runs/{run_id}"
         evidence.append(f"- [Actions run {run_id}]({run_url}) · [job {job_id}]({run_url}/job/{job_id})"
                         f" · `{conclusion}` · tested `{tested_sha}`")
@@ -52,7 +58,7 @@ def main(argv=None):
     try:
         current = subprocess.run(
             ["gh", "pr", "view", *target, "--json", "headRefOid", "--jq", ".headRefOid"],
-            stdout=subprocess.PIPE, text=True, check=True,
+            capture_output=True, text=True, check=True, timeout=30,
         ).stdout.strip()
         if current != args.head_sha:
             parser.error("current PR head differs from the supplied evidence SHA")
@@ -61,10 +67,10 @@ def main(argv=None):
         comment = f"## Verification for `{args.head_sha}`\n\n" + "\n".join(evidence) + "\n"
         subprocess.run(
             ["gh", "pr", "comment", *target, "--body-file", "-"],
-            input=comment, text=True, check=True,
+            input=comment, text=True, stderr=subprocess.PIPE, check=True, timeout=30,
         )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        print(f"Could not post PR evidence ({exc}).", file=sys.stderr)
+    except (OSError, UnicodeError, subprocess.SubprocessError) as exc:
+        print(f"Could not post PR evidence ({type(exc).__name__}).", file=sys.stderr)
         return 1
     return 0
 

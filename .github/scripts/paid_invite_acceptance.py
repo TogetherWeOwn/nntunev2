@@ -40,10 +40,15 @@ def unique_object(pairs):
     return obj
 
 
+def reject_constant(_):
+    raise Refused("invalid_json")
+
+
 def read_json(source):
     raw = source.read(MAX_BYTES + 1)
     require(len(raw) <= MAX_BYTES, "input_too_large")
-    return json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object,
+                      parse_constant=reject_constant)
 
 
 def get_json(host, path, headers):
@@ -57,8 +62,14 @@ def get_json(host, path, headers):
             require(response.status == 200, "upstream_refused")
             media_type = response.getheader("Content-Type", "").split(";", 1)[0]
             require(media_type.strip().lower() == "application/json", "invalid_response")
+            length = response.getheader("Content-Length")
+            transfer = response.getheader("Transfer-Encoding")
+            if transfer is not None:
+                require(transfer.lower() == "chunked" and length is None, "invalid_response")
+            elif length is not None:
+                require(matches(length, r"[0-9]+"), "invalid_response")
             payload = read_json(response)
-            require(isinstance(payload, dict), "invalid_response")
+            require(response.length in (None, 0) and isinstance(payload, dict), "invalid_response")
             return payload
     finally:
         connection.close()

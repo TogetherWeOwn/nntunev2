@@ -60,6 +60,7 @@ class PostPrEvidence(unittest.TestCase):
                 ("success", JOB + "?pr=42&note=" + marker, TESTED_SHA, marker),
                 ("success", JOB.replace("github.com", "example.com"), TESTED_SHA, "example.com"),
                 ("success", JOB.replace("nntunev2", "other-repo"), TESTED_SHA, "other-repo"),
+                ("success", RUN + "/job/0", TESTED_SHA, "/job/0"),
                 ("success", JOB, marker, marker)):
             with self.subTest(rejected=rejected), contextlib.redirect_stderr(io.StringIO()) as stderr:
                 with self.assertRaises(SystemExit):
@@ -68,11 +69,25 @@ class PostPrEvidence(unittest.TestCase):
                 self.assertNotIn(rejected, stderr.getvalue())
         self.run_gh.assert_not_called()
 
+    def test_mismatched_pr_and_duplicate_job_are_refused(self):
+        for args in (ARGS[:-2] + [JOB + "?pr=43", TESTED_SHA],
+                     ARGS + ["--job", "failure", JOB, TESTED_SHA]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                post_pr_evidence.main(args)
+        self.run_gh.assert_not_called()
+
     def test_failed_post_returns_failure_without_retrying_or_editing(self):
         self.run_gh.side_effect = [self.run_gh.return_value, subprocess.CalledProcessError(1, COMMENT)]
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(post_pr_evidence.main(ARGS), 1)
         self.assertEqual([call.args[0] for call in self.run_gh.call_args_list], [VIEW, COMMENT])
+
+    def test_command_timeout_is_bounded_and_redacted(self):
+        self.run_gh.side_effect = subprocess.TimeoutExpired("private fixture diagnostic", 30)
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(post_pr_evidence.main(ARGS), 1)
+        self.assertEqual(stderr.getvalue(), "Could not post PR evidence (TimeoutExpired).\n")
+        self.assertEqual(self.run_gh.call_args.kwargs["timeout"], 30)
 
 
 if __name__ == "__main__":

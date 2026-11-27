@@ -29,6 +29,7 @@ class CoverageTests(unittest.TestCase):
             git("add", ".")
             git("commit", "-qm", "Base")
             base = git("rev-parse", "HEAD")
+            base_tree = git("rev-parse", "HEAD^{tree}")
             for files, includes, excludes in (
                 (["docs/safe.md", "LICENSE"], [], SELECTABLE),
                 (["workers/stream/src/api_error.rs"], ["rust-wasm", "rust-test", "rust-mb"], ["web-checks"]),
@@ -60,6 +61,9 @@ class CoverageTests(unittest.TestCase):
                     self.assertTrue(set(includes).isdisjoint(skip), skip)
                     self.assertTrue(set(excludes) <= set(skip), skip)
                     self.assertEqual(plan("schedule", base, tested, root), (True, {"full"}, []))
+                    if files == ["docs/safe.md", "LICENSE"]:
+                        self.assertEqual(plan("pull_request", base_tree, tested, root),
+                                         (False, {"incomplete (full coverage required)"}, []))
                     (root / "uncommitted").unlink()
 
             git("reset", "--hard", base)

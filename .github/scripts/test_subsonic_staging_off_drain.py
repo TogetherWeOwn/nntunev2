@@ -11,7 +11,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from threading import Event
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -261,6 +261,29 @@ class ReadbackTests(unittest.TestCase):
 
 
 class ProtectedProbeTests(unittest.TestCase):
+    def test_preflight_failure_or_cancellation_never_dispatches(self):
+        for verdict in ("preflight-unverified", "cancelled"):
+            cancel, transport = Event(), Mock()
+
+            def preflight(*args, **kwargs):
+                if verdict == "preflight-unverified":
+                    raise OSError("private fixture diagnostic")
+                cancel.set()
+                return CleanupResult.VERIFIED
+
+            with self.subTest(verdict=verdict), patch.object(probe, "readback", side_effect=preflight):
+                self.assertEqual(probe.probe(PROBE_ENV, transport, cancel), verdict)
+            transport.probe_off.assert_not_called()
+
+    def test_late_transport_and_postflight_exception_cannot_verify(self):
+        for postflight, verdict in ((CleanupResult.VERIFIED, "request-failed"),
+                                     (OSError("private fixture diagnostic"), "postflight-unverified")):
+            with (self.subTest(verdict=verdict),
+                  patch.object(probe, "readback", side_effect=[CleanupResult.VERIFIED, postflight]) as read,
+                  patch.object(probe.time, "monotonic", side_effect=[10, 20])):
+                self.assertEqual(probe.probe(PROBE_ENV, Mock(), Event()), verdict)
+                self.assertEqual(read.call_count, 2)
+
     def test_probe_is_opt_in_and_secrets_are_bound_only_to_its_protected_step(self):
         path = Path(__file__).parents[1] / "workflows/subsonic-staging-off-drain.yml"
         default, opted_in = path.read_text().split("\n  off-probe:\n")
