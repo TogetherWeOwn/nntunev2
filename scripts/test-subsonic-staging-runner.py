@@ -685,7 +685,8 @@ class FixtureCheckerTests(unittest.TestCase):
         checker = runpy.run_path(str(Path(__file__).with_name("check-subsonic-fixtures.py")))
         source, check = checker["FIX"], checker["main"]
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "fixtures"
+            parent = Path(tmp).resolve()
+            root = parent / "fixtures"
             root.mkdir()
             for name in ("README.md", "ping.xml", "ping.json", "ping-jsonp.txt",
                          "error-auth-required.xml", "routes-table.json"):
@@ -700,6 +701,10 @@ class FixtureCheckerTests(unittest.TestCase):
                      (source / "ping.json").read_bytes().split(b":", 1)[1]),
                     ("ping.xml", b'<?xml version="1.0" encoding="UTF-8"?>'
                      b'<other><subsonic-response status="ok" version="1.16.1"/></other/>'),
+                    ("ping.xml", b'<?xml version="1.0" encoding="UTF-8"?>'
+                     b'<!-- <subsonic-response --> <other status="ok" version="1.16.1"/>'),
+                    ("ping.xml", (source / "ping.xml").read_bytes() + b"<!-- trailing -->"),
+                    ("ping.xml", (source / "ping.xml").read_bytes() + b"<?trailing instruction?>"),
                     ("ping.xml", b'<?xml version="1.0" encoding="UTF-8"?>'
                      b'<!DOCTYPE subsonic-response><subsonic-response status="ok" version="1.16.1"/>'),
                     ("ping-jsonp.txt", b'/* subsonic-response */'),
@@ -717,14 +722,19 @@ class FixtureCheckerTests(unittest.TestCase):
                         self.assertEqual(check(), 1)
                         path.write_bytes((source / name).read_bytes())
                         self.assertEqual(check(), 0)
+                jsonp = root / "ping-jsonp.txt"
+                jsonp.unlink()
+                self.assertEqual(check(), 1)
+                jsonp.write_bytes((source / jsonp.name).read_bytes())
+                self.assertEqual(check(), 0)
                 path = root / "ping.json"
-                outside = Path(tmp) / "outside.json"
+                outside = parent / "outside.json"
                 path.rename(outside)
                 path.symlink_to(outside)
                 self.assertEqual(check(), 1)
                 path.unlink()
                 outside.rename(path)
-                outside_root = Path(tmp) / "outside"
+                outside_root = parent / "outside"
                 root.rename(outside_root)
                 root.symlink_to(outside_root, target_is_directory=True)
                 self.assertEqual(check(), 1)

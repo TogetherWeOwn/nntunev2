@@ -64,6 +64,8 @@ def valid_fixture(path):
     if path.suffix == ".xml":
         if not text.startswith(PROLOG) or "<!DOCTYPE" in text:
             return False
+        if not text.rstrip().endswith((f"</{ENVELOPE}>", "/>")):
+            return False
         root = ElementTree.fromstring(text)
         return root.tag == ENVELOPE and valid_envelope(root.attrib)
     if path.name == "ping-jsonp.txt":
