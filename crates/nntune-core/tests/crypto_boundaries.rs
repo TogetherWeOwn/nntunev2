@@ -49,40 +49,23 @@ fn canonical_s3_signature_matches_independent_vector_without_debug_leakage() {
 fn s3_signer_refuses_noncanonical_targets_and_headers() {
     let (key, canonical) = signing_fixture(DATE);
     let cases = [
-        (
-            "encoded query order",
-            "a=A%2BB&versionId=%2F",
-            "versionId=%2F&a=A%2BB",
-        ),
-        ("noncanonical escape", "media%20file", "media%20%66ile"),
-        ("URL-normalized path", "/bucket/media", "/bucket/../media"),
-        ("raw query delimiter", "a=A%2BB", "a=A+B"),
-        (
-            "presigned expiry",
-            "a=A%2BB&versionId=%2F",
-            "X-Amz-Expires=60&a=A%2BB&versionId=%2F",
-        ),
-        (
-            "header carriage return",
-            "fixtures.invalid",
-            "fixtures.invalid\r",
-        ),
-        ("header whitespace", "bytes=0-9", " bytes=0-9"),
-        (
-            "header duplication",
-            "range:bytes=0-9",
-            "range:bytes=0-9\nrange:bytes=9-9",
-        ),
-        ("date mismatch", DATE, "20261124T074001Z"),
+        ("a=A%2BB&versionId=%2F", "versionId=%2F&a=A%2BB"),
+        ("media%20file", "media%20%66ile"),
+        ("/bucket/media", "/bucket/../media"),
+        ("a=A%2BB", "a=A+B"),
+        ("a=A%2BB", "X-Amz-Expires=60&a=A%2BB"),
+        ("fixtures.invalid", "fixtures.invalid\r"),
+        ("bytes=0-9", " bytes=0-9"),
+        ("range:bytes=0-9", "range:bytes=0-9\nrange:bytes=9-9"),
+        (DATE, "20261124T074001Z"),
     ];
-    let accepted: Vec<_> = cases
-        .into_iter()
-        .filter_map(|(case, from, to)| {
-            key.authorization(DATE, &canonical.replace(from, to), NAMES)
-                .map(|_| case)
-        })
-        .collect();
-    assert!(accepted.is_empty(), "signed malformed input: {accepted:?}");
+    for (from, to) in cases {
+        let malformed = canonical.replace(from, to);
+        assert!(
+            key.authorization(DATE, &malformed, NAMES).is_none(),
+            "accepted {to:?}"
+        );
+    }
     for names in ["host", "host;host", "host\r\nX-Test: bad"] {
         assert!(key.authorization(DATE, &canonical, names).is_none());
     }
@@ -144,35 +127,29 @@ fn custody_fixture() -> CustodySnapshot {
 
 #[test]
 fn custody_pins_refuse_inconsistent_binding_metadata() {
-    let pins = custody_fixture();
-    assert!(pins.pins().is_some());
+    let mut snapshot = custody_fixture();
+    assert!(snapshot.pins().is_some());
+    snapshot.page_hashes.clear(); // The stream moves these into its manifest.
+    assert!(snapshot.pins().is_some());
     let cases: [fn(&mut CustodySnapshot); 10] = [
         |s| s.catalogue_reference[0] ^= 1,
         |s| s.key.push('/'),
         |s| s.bucket.push('/'),
         |s| s.header[0] ^= 1,
         |s| s.identities[0][0] ^= 1,
+        |s| s.map_id[6] = 0,
         |s| {
             s.envelope_record.pop();
         },
         |s| s.media_version = "null".into(),
         |s| s.page_versions[0].push('\r'),
         |s| s.page_versions.clear(),
-        |s| s.page_hashes.clear(),
     ];
-    let accepted: Vec<_> = cases
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, change)| {
-            let mut snapshot = custody_fixture();
-            change(&mut snapshot);
-            snapshot.pins().map(|_| i)
-        })
-        .collect();
-    assert!(
-        accepted.is_empty(),
-        "accepted malformed custody cases {accepted:?}"
-    );
+    for (i, change) in cases.into_iter().enumerate() {
+        let mut snapshot = custody_fixture();
+        change(&mut snapshot);
+        assert!(snapshot.pins().is_none(), "accepted custody case {i}");
+    }
 }
 
 #[test]
@@ -207,12 +184,8 @@ fn origin_output_requires_exact_authenticated_wire_length() {
     let header = origin.header();
     assert_eq!(format!("{:?}", origin.key()), "FileKey(<redacted>)");
     let mut wire = header.to_bytes().to_vec();
-    wire.extend(
-        origin
-            .seal_chunk(&vec![7; PLAIN_CHUNK_SIZE as usize])
-            .unwrap()
-            .bytes,
-    );
+    let first = vec![7; PLAIN_CHUNK_SIZE as usize];
+    wire.extend(origin.seal_chunk(&first).unwrap().bytes);
     wire.extend(origin.seal_chunk(&[8]).unwrap().bytes);
     let verified =
         VerifiedHeader::verify(&Profile::nntune(), KeyMode::Random, origin.key(), &header).unwrap();

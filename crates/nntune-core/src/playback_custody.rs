@@ -6,7 +6,10 @@ use hkdf::hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+use crate::digest_geometry::DigestGeometry;
 use crate::digest_read_snapshot::DigestReadSnapshot;
+use crate::media_envelope::{matches_scheme2, EnvelopeContext};
+use crate::s3_locator::S3MediaMetadata;
 
 pub const RESOLVE_PATH: &str = "/internal/v1/private-playback/resolve";
 pub const LEASE_PATH: &str = "/internal/v1/private-playback/lease";
@@ -17,7 +20,13 @@ pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Both calls POST the exact v4 bearer as their body. Use an independent key
 /// on both Workers and verify the MAC and the live receipt on every request.
 pub fn signature(secret: &[u8], path: &str, bearer: &str) -> Option<[u8; 32]> {
-    if secret.len() < 32 || bearer.len() > 1800 || !matches!(path, RESOLVE_PATH | LEASE_PATH) {
+    if secret.len() < 32
+        || !(1..=1800).contains(&bearer.len())
+        || !bearer
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        || !matches!(path, RESOLVE_PATH | LEASE_PATH)
+    {
         return None;
     }
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).ok()?;
@@ -51,7 +60,33 @@ pub struct CustodySnapshot {
 }
 
 impl CustodySnapshot {
+    /// Check the snapshot's internal bindings. The caller still authenticates
+    /// the envelope and checks the bearer, live lease and configured provider.
+    /// Manifest construction validates the page hashes after taking ownership.
     pub fn pins(&self) -> Option<DigestReadSnapshot<'_>> {
+        let pages = usize::try_from(DigestGeometry::new(self.plaintext_len)?.pages()).ok()?;
+        let valid_version = |version: &str| {
+            (1..=1024).contains(&version.len())
+                && version != "null"
+                && version.bytes().all(|b| b.is_ascii_graphic() && b != b',')
+        };
+        let context = EnvelopeContext {
+            identities: self.identities,
+            plaintext_len: self.plaintext_len,
+            header: self.header.as_slice().try_into().ok()?,
+        };
+        if self.reference_id != self.catalogue_reference
+            || self.plaintext_len == 0
+            || self.map_id[6] >> 4 != 4
+            || self.map_id[8] >> 6 != 2
+            || self.page_versions.len() != pages
+            || !valid_version(&self.media_version)
+            || !self.page_versions.iter().all(|v| valid_version(v))
+            || !matches_scheme2(&self.envelope_record, &context)
+            || !S3MediaMetadata::matches_target(&self.bucket, &self.key, &context)
+        {
+            return None;
+        }
         let [root_version_id, environment_id, library_id, object_id, generation_id, provider_configuration] =
             self.identities;
         Some(DigestReadSnapshot {
