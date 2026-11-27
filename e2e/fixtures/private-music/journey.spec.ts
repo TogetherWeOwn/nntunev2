@@ -4,6 +4,7 @@ import { expect, test } from '@playwright/test';
 import { freshTrialPublication, parsePrivateStagingFixture, privateStagingAudio } from '../../helpers/private-staging-fixture.js';
 import {
   assertCuratedLibrary,
+  assertPrivateMeteredPlay,
   assertPrivateInvite,
   assertPrivateRefusals,
   assertPrivateTransport,
@@ -148,6 +149,39 @@ test('synthetic transport observations require advancement, paused seek and queu
   expect(() => assertPrivateTransport(order, {
     ...observed, nextTrackId: observed.firstTrackId,
   })).toThrow('Play and Next');
+});
+
+test('synthetic play and seek meter one published track by delivered-byte union', () => {
+  const manifest = JSON.parse(readFileSync(new URL('manifest.json', clips), 'utf8')) as {
+    tracks: Array<{ file: string; bytes: number; sha256: string }>;
+  };
+  const file = 'fixture-1.flac';
+  const body = readFileSync(new URL(file, clips));
+  const track = manifest.tracks.find((candidate) => candidate.file === file);
+  expect(track).toEqual({ file, bytes: body.length, sha256: createHash('sha256').update(body).digest('hex') });
+  const expected = {
+    userId: 'fixture-member', trackId: 'fixture-track-0', playId: `private_browser_${'A'.repeat(22)}`,
+    fileBytes: body.length, durationMs: 10_000,
+  };
+  const observed = {
+    ...expected,
+    delivered: [{ start: 0, end: 16 }, { start: 8, end: 24 }, { start: 32, end: 48 }],
+    unionBytes: 40,
+    streamSeconds: 8,
+  };
+  expect(() => assertPrivateMeteredPlay(expected, observed)).not.toThrow();
+  expect(() => assertPrivateMeteredPlay(expected, { ...observed, trackId: 'fixture-track-1' }))
+    .toThrow('published track and browser play');
+  expect(() => assertPrivateMeteredPlay(expected, {
+    ...observed, playId: `private_browser_${'B'.repeat(22)}`,
+  })).toThrow('published track and browser play');
+  expect(() => assertPrivateMeteredPlay(expected, { ...observed, unionBytes: 48 }))
+    .toThrow('delivered-byte union');
+  expect(() => assertPrivateMeteredPlay(expected, {
+    ...observed, delivered: [{ start: 0, end: body.length + 1 }], unionBytes: body.length + 1,
+  })).toThrow('non-empty file spans');
+  expect(() => assertPrivateMeteredPlay(expected, { ...observed, streamSeconds: 2 }))
+    .toThrow('delivered-byte union');
 });
 
 test('synthetic uninvited and revoked requests require explicit refusal', () => {

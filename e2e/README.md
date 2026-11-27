@@ -180,7 +180,10 @@ The self-test hashes two clips and checks their sizes against the manifest.
 The [ingest readback test](../workers/ingest/tests/multipart_readback_inventory.rs)
 already verifies the clips' whole-frame range handoff against pinned media
 metadata and digest. Each clip is about 93 ms and has one frame. Publication,
-Library, transport and refusal observations here are synthetic. The
+Library, transport, delivered-byte union and refusal observations here are
+synthetic. The metering assertion folds the initial range and overlapping seek
+into one bounded play window and derives stream seconds from the checked-in
+file size and duration. The
 [signup browser test](../apps/web/tests/passkey-dismissal.spec.ts) exercises
 the rendered signup and Library surfaces with intercepted HTTP and passkeys.
 
