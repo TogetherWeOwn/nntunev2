@@ -1663,7 +1663,11 @@ staging = "dummy-mb-mirror"
 prod = "dummy-prod-mirror"
 `;
 
-  function generateConfig(overrides: Record<string, string> = {}, manifestMb: string | null = MB_INVENTORY) {
+  function generateConfig(
+    overrides: Record<string, string> = {},
+    apiMirror: string | null = MB_INVENTORY,
+    mbMirror = MB_INVENTORY,
+  ) {
     const probe = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'staging-api-config-'));
     try {
       const apiDir = join(probe, 'workers/api');
@@ -1680,10 +1684,10 @@ name = "api"
 [[worker.binding]]
 binding = "HYPERDRIVE"
 staging = "dummy-hyperdrive-staging"
-${manifestMb ?? ''}
+${apiMirror ?? ''}
 [[worker]]
 name = "mb"
-${MB_INVENTORY}`);
+${mbMirror}`);
       const section = jobSection(deployWorkflow, 'staging-api');
       const parts = section.split('      - name: Generate staging wrangler.toml\n');
       expect(parts, 'exactly one staging API config generator').toHaveLength(2);
@@ -1822,6 +1826,13 @@ ${MB_INVENTORY}`);
 
   test('generator rejects different staging mirror pins before writing deploy config', () => {
     const result = generateConfig({}, MB_INVENTORY.replace('staging = "dummy-mb-mirror"', 'staging = "different-staging-mirror"'));
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('api and mb must use the same MB_DB staging inventory id');
+    expect(result.toml).toBeUndefined();
+  });
+
+  test('generator names the missing MB Worker mirror pin before writing deploy config', () => {
+    const result = generateConfig({}, MB_INVENTORY, '');
     expect(result.status).not.toBe(0);
     expect(result.output).toContain('api and mb must use the same MB_DB staging inventory id');
     expect(result.toml).toBeUndefined();
