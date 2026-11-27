@@ -18,6 +18,7 @@ pub struct Position {
 pub enum PositionalRefusal {
     CountMismatch,
     EmptyInput,
+    UnprovenRecordingCount,
     InvalidPosition,
     RecordingSequence,
     FileSequence,
@@ -38,6 +39,7 @@ pub enum PositionalEligibility {
 /// in release order. The policy never sorts a swapped sequence into a match.
 /// Recording media must be known and contiguous from 1; tracks must be exactly
 /// 1..N within each medium. Missing recording media cannot prove a single disc.
+/// At the mirror's listing limit, equal counts cannot prove a complete release.
 ///
 /// Files may omit track numbering for a whole medium. When numbering is present,
 /// the whole medium must have the exact 1..N sequence, in pairing order. Partial
@@ -68,6 +70,9 @@ fn check_positions(
     }
     if audio_file_count == 0 {
         return Err(EmptyInput);
+    }
+    if recordings.len() >= super::admin_publish_match::RECORDINGS_LIMIT {
+        return Err(UnprovenRecordingCount);
     }
     if files.iter().chain(recordings).any(|position| {
         position.medium_no.is_some_and(|n| n <= 0) || position.track_no.is_some_and(|n| n <= 0)

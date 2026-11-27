@@ -73,7 +73,7 @@ use worker::{wasm_bindgen::JsValue, Delay, Env, Headers, Method, Request, Reques
 
 use futures_util::StreamExt;
 
-use nntune_core::par2::scratch::{sha256_hex, validate_staging_id};
+use nntune_core::par2::scratch::sha256_hex;
 use nntune_core::transcode::{canonical_sha256_hex, validate_transcode_input_key};
 
 use crate::dispatch::validate_user_id;
@@ -142,11 +142,17 @@ pub struct TranscodeRequest {
 }
 
 /// True only for the round dir the job's verify staging lives in.
-/// The rule is shared with the transcode front parse
-/// (`nntune_core::transcode::validate_transcode_prefix`) so dispatch
-/// and front can never disagree on job containment.
+/// Ingest emits a canonical verify round within the front's job namespace.
 pub fn validate_transcode_prefix(prefix: &str, job_id: &str) -> bool {
-    nntune_core::transcode::validate_transcode_prefix(prefix, job_id)
+    validate_job_id(job_id)
+        && prefix
+            .rsplit('/')
+            .nth(1)
+            .and_then(|dir| dir.strip_prefix('r'))
+            .and_then(|round| round.parse::<u32>().ok())
+            .is_some_and(|round| {
+                round > 0 && prefix == VerifyProgress::scratch_prefix(job_id, round)
+            })
 }
 
 /// Decide one file's transcode dispatch: `Ok` carries the validated
@@ -184,8 +190,8 @@ pub fn decide_transcode(
     if !validate_transcode_prefix(scratch_prefix, job_id) {
         return Err("scratch prefix outside the job round dir");
     }
-    if !validate_staging_id(staging_id) {
-        return Err("staging id outside the content-token alphabet");
+    if staging_id != transcode_staging_id(&source_sha256, input_key, job_id, scratch_prefix) {
+        return Err("staging id does not match the encode input");
     }
     Ok(TranscodeRequest {
         job_id: job_id.to_string(),
@@ -228,35 +234,29 @@ pub enum TranscodeCall {
 /// is ambiguous (transport damage reads the same as a front bug),
 /// and a retry replays the memoised artifact rather than a fresh
 /// encode, so conservatism costs nothing.
+///
+/// The reply must be an object with one status field. A successful
+/// reply must also carry exactly one artifact hash and one byte size.
 pub fn classify_transcode_reply(status: u16, body: &[u8]) -> TranscodeCall {
     if body.len() > MAX_TRANSCODE_REPLY_BYTES {
         return TranscodeCall::Retry;
     }
     match status {
-        200 => {
-            let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-                return TranscodeCall::Retry;
-            };
-            match value.get("status").and_then(|s| s.as_str()) {
-                Some("transcoded") => {
-                    let sha = value.get("artifact_sha256").and_then(|s| s.as_str());
-                    let size = value.get("byte_size").and_then(|s| s.as_u64());
-                    match (sha, size) {
-                        (Some(sha), Some(size))
-                            if canonical_sha256_hex(sha).is_ok()
-                                && (1..=MAX_ARTIFACT_BYTES).contains(&size) =>
-                        {
-                            TranscodeCall::Completed {
-                                // Canonicalised above, so this cannot fail.
-                                artifact_sha256: canonical_sha256_hex(sha)
-                                    .unwrap_or_else(|_| sha.to_string()),
-                                byte_size: size,
-                            }
-                        }
-                        _ => TranscodeCall::Retry,
+        200 if body.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') => {
+            match serde_json::from_slice::<TranscodeReply>(body) {
+                Ok(TranscodeReply::Transcoded {
+                    artifact_sha256,
+                    byte_size,
+                }) if (1..=MAX_ARTIFACT_BYTES).contains(&byte_size) => {
+                    match canonical_sha256_hex(&artifact_sha256) {
+                        Ok(artifact_sha256) => TranscodeCall::Completed {
+                            artifact_sha256,
+                            byte_size,
+                        },
+                        Err(_) => TranscodeCall::Retry,
                     }
                 }
-                Some("untranscodable") => TranscodeCall::Untranscodable,
+                Ok(TranscodeReply::Untranscodable) => TranscodeCall::Untranscodable,
                 _ => TranscodeCall::Retry,
             }
         }
@@ -491,6 +491,16 @@ pub const fn classify_cache_object_rows(affected: u64) -> PublishOutcome {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum TranscodeReply {
+    Transcoded {
+        artifact_sha256: String,
+        byte_size: u64,
+    },
+    Untranscodable,
+}
+
 /// One verified audio input awaiting `Transcoding`, recorded on the
 /// checkpoint by `Verifying` on `Complete`. `key` is the full staged
 /// object key; `sha256` the canonical content hash; `size` the
@@ -538,8 +548,8 @@ pub fn is_audio_name(name: &str) -> bool {
 /// selection is unit-tested without bindings.
 ///
 /// Skips are silent only when they are structurally not audio (par2
-/// files, `.nfo`/`.sfv`/artwork). Everything else fails the job with
-/// a stable reason: a staged index outside the parse, a key outside
+/// files, `.nfo`/`.sfv`/artwork). Missing audio staging or corrupt staged
+/// records fail the job: a staged index outside the parse, a key outside
 /// the derived layout, damage on a supposedly complete round, a
 /// spooled (multi-object) audio file this input cannot consume, a
 /// non-content hash, or an empty audio object are all pipeline bugs
@@ -552,18 +562,21 @@ pub fn select_transcode_inputs(
     job_id: &str,
     round: u32,
 ) -> Result<Vec<TranscodeInput>, &'static str> {
+    if staged.keys().any(|&index| index >= files.len()) {
+        return Err("staged index outside parsed files");
+    }
     let mut inputs = Vec::new();
-    for (index, rec) in staged {
-        let file = files
-            .get(*index)
-            .ok_or("staged index outside parsed files")?;
+    for (index, file) in files.iter().enumerate() {
         if file.is_par2 || !is_audio_name(&file.name) {
             continue;
         }
-        if rec.key != VerifyProgress::file_key(job_id, round, *index, &file.name) {
+        let rec = staged
+            .get(&index)
+            .ok_or("audio file missing from staged inputs")?;
+        if rec.key != VerifyProgress::file_key(job_id, round, index, &file.name) {
             return Err("staged key outside derived layout");
         }
-        if rec.missing || rec.missing_blocks != 0 {
+        if rec.missing || rec.missing_blocks != 0 || rec.size_refused_blocks != 0 {
             return Err("damaged file reached transcode selection");
         }
         if !rec.spool.is_empty() {
@@ -575,7 +588,7 @@ pub fn select_transcode_inputs(
             return Err("empty staged audio file");
         }
         inputs.push(TranscodeInput {
-            file_index: *index,
+            file_index: index,
             key: rec.key.clone(),
             sha256,
             size: rec.size,
@@ -624,9 +637,16 @@ pub fn derive_transcode_staging(
     }
     let sha = canonical_sha256_hex(source_sha256_hex)
         .map_err(|_| "source sha256 must be 64 hex chars")?;
-    Ok(sha256_hex(
-        format!("opus-64:v2:{job_id}:{scratch_prefix}:{sha}:{input_key}").as_bytes(),
+    Ok(transcode_staging_id(
+        &sha,
+        input_key,
+        job_id,
+        scratch_prefix,
     ))
+}
+
+fn transcode_staging_id(sha: &str, input_key: &str, job_id: &str, scratch_prefix: &str) -> String {
+    sha256_hex(format!("opus-64:v2:{job_id}:{scratch_prefix}:{sha}:{input_key}").as_bytes())
 }
 
 /// Verify fetched artifact bytes against a `Completed` reply's claims:
@@ -639,7 +659,7 @@ pub fn verify_transcode_artifact(
     artifact_sha256_hex: &str,
     byte_size: u64,
 ) -> Result<(), &'static str> {
-    if bytes.len() as u64 != byte_size {
+    if bytes.len() as u64 != byte_size || !(1..=MAX_ARTIFACT_BYTES).contains(&byte_size) {
         return Err("artifact size mismatch");
     }
     let claimed =
@@ -696,7 +716,7 @@ mod tests {
     const INPUT: &str = "0007-9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
     const SOURCE_SHA: &str = "1b0b44a2c0f2e9d5b6a7c8d9e0f1a2b31b0b44a2c0f2e9d5b6a7c8d9e0f1a2b3";
     const PREFIX: &str = "ingest-scratch/job_01J9ZQ8K2M/r1/";
-    const STAGING: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
+    const STAGING: &str = "e5471eb2f5864bfdec0674e9c35f39aeb741e29b3329266c526f54d467715e1a";
 
     fn decide() -> Result<TranscodeRequest, &'static str> {
         decide_transcode(JOB, USER, KEY, INPUT, SOURCE_SHA, PREFIX, STAGING)

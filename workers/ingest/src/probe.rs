@@ -48,6 +48,17 @@ pub struct ProbeOutcome {
     pub missing: Vec<String>,
 }
 
+impl ProbeOutcome {
+    fn has_segment_evidence(&self) -> bool {
+        (!self.present.is_empty() || !self.missing.is_empty())
+            && self
+                .present
+                .iter()
+                .chain(&self.missing)
+                .all(|id| validate_message_id(id))
+    }
+}
+
 /// Validate one NZB message-id before it may leave this crate.
 ///
 /// The pool DO interpolates ids into NNTP `STAT`/`ARTICLE <id>` lines on the
@@ -153,15 +164,13 @@ impl ProbeTally {
         }
     }
 
-    /// Fold one batch answer. Returns true when the outcome was new (false
-    /// for a redelivered or out-of-range index, which leaves the tally
-    /// untouched). Missing counts are summed over the per-batch map, so a
-    /// replay can never inflate them.
+    /// Fold a bounded count for an unseen batch index. State transitions
+    /// validate segment evidence before calling this count-only fold.
     pub fn record(&mut self, outcome: &ProbeOutcome) -> bool {
-        if outcome.batch_index >= self.total_batches {
-            return false;
-        }
-        if self.missing_by_batch.contains_key(&outcome.batch_index) {
+        if outcome.batch_index >= self.total_batches
+            || self.missing_by_batch.contains_key(&outcome.batch_index)
+            || outcome.present.len().saturating_add(outcome.missing.len()) > MAX_PROBE_SEGMENTS
+        {
             return false;
         }
         self.missing_by_batch
@@ -171,12 +180,19 @@ impl ProbeTally {
 
     /// Total missing segments reported so far (one entry per batch at most).
     pub fn missing_segments(&self) -> u32 {
-        self.missing_by_batch.values().sum()
+        self.missing_by_batch
+            .values()
+            .copied()
+            .fold(0, u32::saturating_add)
     }
 
     /// Complete only when every index in `0..total_batches` has reported.
     pub fn is_complete(&self) -> bool {
-        self.missing_by_batch.len() == self.total_batches
+        self.total_batches != 0
+            && self.missing_by_batch.len() == self.total_batches
+            && self.missing_by_batch.iter().all(|(&index, &missing)| {
+                index < self.total_batches && missing as usize <= MAX_PROBE_SEGMENTS
+            })
     }
 }
 
@@ -185,17 +201,20 @@ impl ProbeTally {
 /// backwards.
 ///
 /// This is the single-batch (or fully merged) mapping: the outcome covers
-/// the whole parse, so the job always leaves `Probing` for `Verifying`,
+/// the whole parse, so valid evidence moves `Probing` to `Verifying`,
 /// carrying the total missing-*segment* count. Use [`apply_probe_batch`]
 /// while batches are still in flight.
 ///
 /// The count is missing *articles*, not par2 blocks: `Verifying` translates
 /// it through the par2 metadata before [`decide_repair`](crate::repair::decide_repair).
 pub fn apply_probe(state: JobState, outcome: &ProbeOutcome) -> (JobState, u32) {
-    if state != JobState::Probing {
+    if state != JobState::Probing || !outcome.has_segment_evidence() {
         return (state, 0);
     }
-    (JobState::Verifying, outcome.missing.len() as u32)
+    (
+        JobState::Verifying,
+        u32::try_from(outcome.missing.len()).unwrap_or(u32::MAX),
+    )
 }
 
 /// Fold one batch outcome into the tally. Until every batch has reported the
@@ -211,11 +230,12 @@ pub fn apply_probe_batch(
     if state != JobState::Probing {
         return (state, 0);
     }
-    tally.record(outcome);
-    if !tally.is_complete() {
-        return (JobState::Probing, tally.missing_segments());
-    }
-    (JobState::Verifying, tally.missing_segments())
+    let next = if outcome.has_segment_evidence() && tally.record(outcome) && tally.is_complete() {
+        JobState::Verifying
+    } else {
+        JobState::Probing
+    };
+    (next, tally.missing_segments())
 }
 
 #[cfg(test)]
@@ -307,7 +327,7 @@ mod tests {
     fn outcome_with_index(batch_index: usize, missing: &[&str]) -> ProbeOutcome {
         ProbeOutcome {
             batch_index,
-            present: vec![],
+            present: vec!["present@synthetic.invalid".into()],
             missing: missing.iter().map(|s| s.to_string()).collect(),
         }
     }
