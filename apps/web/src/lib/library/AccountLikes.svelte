@@ -44,11 +44,11 @@
 		onSessionChanged();
 	}
 
-	function clearShelf(next: 'loading' | 'error' | 'sign-in') {
+	function clearShelf(next: 'loading' | 'error' | 'sign-in', keepFeedback = false) {
 		active?.abort();
 		likes = [];
 		shelfSession = shelfBinding = undefined;
-		feedback = '';
+		if (!keepFeedback) feedback = '';
 		importing = false;
 		phase = next;
 	}
@@ -71,7 +71,8 @@
 			})) throw new Error('No verified account likes');
 		} catch (error) {
 			if (signal.aborted || libraryBinding !== expected) return;
-			clearShelf(error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error');
+			const status = error instanceof ApiError ? error.status : 0;
+			clearShelf(status === 401 ? 'sign-in' : 'error', owner.isCurrent() && ![401, 403, 412].includes(status));
 			if (!owner.isCurrent()) onVerificationSuspended();
 		}
 	}

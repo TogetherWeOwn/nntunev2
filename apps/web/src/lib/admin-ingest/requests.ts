@@ -67,10 +67,8 @@ export function readQueue(value: unknown, query: QueueRequest): ReviewQueue {
 		(query.status !== undefined && !isStatus(query.status))) {
 		throw new Error('Invalid review page');
 	}
-	const rows = Array.from({ length: jobs.length }, (_, index) => {
-		if (!Object.hasOwn(jobs, index)) throw new Error('Missing review job');
-		return readJob(jobs[index]);
-	});
+	const rows = Array.from({ length: jobs.length }, (_, index) =>
+		readJob(Object.hasOwn(jobs, index) ? jobs[index] : undefined));
 	if (new Set(rows.map((job) => job.job_id)).size !== rows.length ||
 		rows.some((job) => query.status && job.status !== query.status)) {
 		throw new Error('Invalid review queue');

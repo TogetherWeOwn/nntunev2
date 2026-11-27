@@ -47,8 +47,7 @@ test('comparison ignores malformed fields and keeps stable IDs literal', () => {
 });
 
 test('tab labels remove control characters and need a usable identity', () => {
-	expect(libraryTabTitle({ id: 't', title: 'Song\nTitle', artist: '\u202e' }))
-		.toBe(`Selected: Song Title — ${LIBRARY_TAB_TITLE}`);
+	expect(libraryTabTitle({ id: 't', title: 'Song\nTitle', artist: '\u202e' })).toBe(`Selected: Song Title — ${LIBRARY_TAB_TITLE}`);
 	expect(libraryTabTitle({ id: '', title: '\u0000', artist: 'Artist' })).toBe(LIBRARY_TAB_TITLE);
 	expect(libraryTabTitle({ id: 't', title: '\u202e', artist: '' })).toBe(`Selected: t — ${LIBRARY_TAB_TITLE}`);
 });

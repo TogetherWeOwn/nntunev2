@@ -24,22 +24,27 @@ function component(path: string, overrides: Record<string, unknown>, expose: str
 	return new Function(...Object.keys(bindings), `${outputText}\nreturn ${expose};`)(...Object.values(bindings));
 }
 
-test('a new binding immediately retires the old liked shelf', async () => {
+test('liked shelf retirement clears feedback and a read failure in the same scope keeps it', async () => {
 	const effect = vi.fn();
 	const observeSession = vi.fn((_clear: () => void) => observe());
 	const items = [{ kind: 'track', targetId: 'old-song' }];
+	const loadLikes = vi.fn().mockResolvedValue({ binding: 'old', items });
 	const view = component('./AccountLikes.svelte', {
 		$props: () => ({ libraryBinding: 'old' }), $effect: effect, observeAccountSession: observeSession,
-		loadLikes: async () => ({ binding: 'old', items }), verifyLibrarySession: async () => true
-	}, "{ read, switchBinding: () => { libraryBinding = 'new'; }, state: () => ({ likes, phase }) }");
+		loadLikes, verifyLibrarySession: async () => true
+	}, "{ read, report: (message) => { feedback = message; }, switchBinding: () => { libraryBinding = 'new'; }, state: () => ({ likes, phase, feedback }) }");
 	await view.read(new AbortController().signal, owner, 'old');
-	expect(view.state()).toEqual({ likes: items, phase: 'ready' });
+	expect(view.state()).toEqual({ likes: items, phase: 'ready', feedback: '' });
+	view.report('Some favorites remain on this device.');
+	loadLikes.mockRejectedValueOnce(new Error('Offline'));
+	await view.read(new AbortController().signal, owner, 'old');
+	expect(view.state()).toEqual({ likes: [], phase: 'error', feedback: 'Some favorites remain on this device.' });
 	observeSession.mock.calls[0][0]();
-	expect(view.state()).toEqual({ likes: [], phase: 'error' });
+	expect(view.state()).toEqual({ likes: [], phase: 'error', feedback: '' });
 	await view.read(new AbortController().signal, owner, 'old');
 	view.switchBinding();
 	effect.mock.calls[0][0]();
-	expect(view.state()).toEqual({ likes: [], phase: 'loading' });
+	expect(view.state()).toEqual({ likes: [], phase: 'loading', feedback: '' });
 });
 
 test.each([403, 412])('catalogue denial %s suppresses confirmed plays', async (status) => {
@@ -108,9 +113,8 @@ test('changing the selection retires a download, and anchor failure reports refu
 	expect(view.message()).toBe('Could not start');
 	expect(release).toHaveBeenCalledOnce();
 	view.downloadSelectedM3U();
-	release.mockClear();
 	view.select();
 	effect.mock.calls[0][0]();
-	expect(release).toHaveBeenCalledOnce();
+	expect(release).toHaveBeenCalledTimes(2);
 	expect(view.message()).toBe('');
 });

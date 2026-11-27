@@ -6,9 +6,7 @@ export function mountLibraryRefresher(refresher: LibraryRefresher): () => void {
 	let mounted = true;
 	window.addEventListener('storage', refresher.handleAuthTransition);
 	const unsubscribe = subscribeLocalAuthTransition(refresher.handleLocalAuthTransition);
-	void refresher.refresh().catch(() => {
-		if (mounted) refresher.suspendVerification();
-	});
+	void refresher.refresh().catch(() => { if (mounted) refresher.suspendVerification(); });
 
 	return () => {
 		if (!mounted) return;

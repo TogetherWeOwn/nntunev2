@@ -14,6 +14,5 @@ export function libraryTabTitle(selected: Pick<Track, 'id' | 'title' | 'artist'>
 	const title = titlePart(displayTitle(selected)) || titlePart(selected.id);
 	if (!title) return LIBRARY_TAB_TITLE;
 	const artist = titlePart(displayArtist(selected));
-	const identity = artist ? `${title} — ${artist}` : title;
-	return `Selected: ${identity} — ${LIBRARY_TAB_TITLE}`;
+	return `Selected: ${title}${artist ? ` — ${artist}` : ''} — ${LIBRARY_TAB_TITLE}`;
 }
