@@ -79,6 +79,9 @@ class AdvisoryExpiryTests(unittest.TestCase):
             "review by 2027-02-17; review by 2028-01-01",
             "review by 2027-02-17; review by",
             "review by\n2027-02-17",
+            "review\nby 2027-02-17",
+            "review by 2027-02-17; review\nby 2028-01-01",
+            "review by 2027-02-17; review\r\nby",
         )
         for reason in bad_reasons:
             with self.subTest(reason=reason), self.assertRaises(ValueError):
@@ -167,14 +170,34 @@ class AdvisoryExpiryTests(unittest.TestCase):
             with self.subTest(policy=policy), self.assertRaises((KeyError, ValueError)):
                 check(policy, HARD_EXPIRY)
 
-    def test_checked_in_deny_toml_enforces_hard_expiry(self):
+    def test_checked_in_deny_toml_enforces_recorded_expiry_when_present(self):
         with REPO_DENY_TOML.open("rb") as policy_file:
             policy = tomllib.load(policy_file)
-        check(policy, HARD_EXPIRY - dt.timedelta(microseconds=1))
-        with self.assertRaisesRegex(ValueError, "expired"):
+        matching_entries = [
+            entry
+            for entry in policy.get("advisories", {}).get("ignore", [])
+            if (isinstance(entry, str) and entry.strip().upper() == ADVISORY)
+            or (
+                isinstance(entry, dict)
+                and isinstance(entry.get("id"), str)
+                and entry["id"].strip().upper() == ADVISORY
+            )
+        ]
+        if not matching_entries:
             check(policy, HARD_EXPIRY)
+            return
+        deadlines = [
+            min(HARD_EXPIRY, parse_review_deadline(entry["reason"]))
+            for entry in matching_entries
+            if isinstance(entry, dict) and isinstance(entry.get("reason"), str)
+        ]
+        self.assertEqual(len(deadlines), len(matching_entries))
+        expected_expiry = min(deadlines)
+        check(policy, expected_expiry - dt.timedelta(microseconds=1))
         with self.assertRaisesRegex(ValueError, "expired"):
-            check(policy, HARD_EXPIRY + dt.timedelta(microseconds=1))
+            check(policy, expected_expiry)
+        with self.assertRaisesRegex(ValueError, "expired"):
+            check(policy, expected_expiry + dt.timedelta(microseconds=1))
 
     def test_main_fails_closed_on_missing_or_malformed_file_and_expiry(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -191,15 +214,39 @@ class AdvisoryExpiryTests(unittest.TestCase):
                 self.assertEqual(main(bad_toml, HARD_EXPIRY - dt.timedelta(days=1)), 1)
             self.assertIn("advisory expiry check failed:", stderr.getvalue())
 
+            active_toml = tmp / "active.toml"
+            active_toml.write_text(
+                '[advisories]\nignore = [\n  { id = "RUSTSEC-2026-0543", '
+                'reason = "owner exception; review by 2027-02-17" },\n]\n',
+                encoding="utf-8",
+            )
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
-                self.assertEqual(main(REPO_DENY_TOML, HARD_EXPIRY - dt.timedelta(seconds=1)), 0)
+                self.assertEqual(main(active_toml, HARD_EXPIRY - dt.timedelta(seconds=1)), 0)
             self.assertEqual(stderr.getvalue(), "")
 
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
-                self.assertEqual(main(REPO_DENY_TOML, HARD_EXPIRY), 1)
+                self.assertEqual(main(active_toml, HARD_EXPIRY), 1)
             self.assertIn("expired", stderr.getvalue())
+
+            extended_toml = tmp / "extended.toml"
+            extended_toml.write_text(
+                '[advisories]\nignore = [\n  { id = "RUSTSEC-2026-0543", '
+                'reason = "owner exception; review by 2027-02-18" },\n]\n',
+                encoding="utf-8",
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(main(extended_toml, HARD_EXPIRY - dt.timedelta(days=30)), 1)
+            self.assertIn("exceeds hard expiry", stderr.getvalue())
+
+            removed_toml = tmp / "removed.toml"
+            removed_toml.write_text("[advisories]\nignore = []\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(main(removed_toml, HARD_EXPIRY), 0)
+            self.assertEqual(stderr.getvalue(), "")
 
 
 if __name__ == "__main__":

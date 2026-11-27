@@ -11,7 +11,7 @@ ADVISORY = "RUSTSEC-2026-0543"
 # Conservative boundary at the start of the recorded review date, UTC.
 EXPIRY = dt.datetime(2027, 2, 17, tzinfo=dt.timezone.utc)
 
-_REVIEW_BY_RE = re.compile(r"\breview[ \t]+by(?:[ \t]+(\S+))?", re.IGNORECASE)
+_REVIEW_BY_RE = re.compile(r"\breview(\s+)by(?:(\s+)(\S+))?", re.IGNORECASE)
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -25,12 +25,21 @@ def _validate_now(now: dt.datetime) -> dt.datetime:
 def parse_review_deadline(reason: str) -> dt.datetime:
     if not isinstance(reason, str):
         raise ValueError(f"{ADVISORY} ignore reason must be a string")
-    matches = _REVIEW_BY_RE.findall(reason)
-    if len(matches) != 1 or not matches[0]:
+    matches = list(_REVIEW_BY_RE.finditer(reason))
+    if len(matches) != 1:
         raise ValueError(
             f"{ADVISORY} ignore reason must declare exactly one 'review by YYYY-MM-DD' deadline"
         )
-    raw = matches[0]
+    between, sep, raw = matches[0].groups()
+    if (
+        not raw
+        or not sep
+        or not all(ch in " \t" for ch in between)
+        or not all(ch in " \t" for ch in sep)
+    ):
+        raise ValueError(
+            f"{ADVISORY} ignore reason must declare a single-line 'review by YYYY-MM-DD' deadline"
+        )
     token = re.sub(r"\)?[.,;]?$", "", raw)
     if _DATE_RE.fullmatch(token):
         parsed_date = dt.date.fromisoformat(token)
