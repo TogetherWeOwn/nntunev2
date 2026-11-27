@@ -12,11 +12,9 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use worker::{wasm_bindgen::JsValue, Env, Headers, Method, Request, RequestInit};
 
-use crate::pool_deadline::bounded_deadline_ms;
 use crate::pool_probe::POOL_BINDING;
 use crate::probe::validate_message_id;
 use crate::queue::QueueMsg;
-use crate::retry::pool_retry_after;
 
 /// Body route on the Durable Object. The host is a placeholder: a stub
 /// fetch is delivered to the object and never leaves the runtime.
@@ -26,10 +24,6 @@ pub const POOL_BODY_URL: &str = "https://nntp-pool/body";
 /// (`MAX_BODY_ARTICLE_BYTES` in the stream crate). A longer `200` is a
 /// contract bug, not bytes to buffer.
 pub const MAX_BODY_REPLY_BYTES: usize = 16 << 20;
-
-// Matches the stream Worker's body-envelope cap. Its 413 uses the same
-// code as an oversized article, so refuse oversized requests here.
-const MAX_BODY_REQUEST_BYTES: usize = 64 * 1024;
 
 /// Redelivery delay when the pool gives no `Retry-After`.
 pub const DEFAULT_RETRY_SECS: u32 = 5;
@@ -92,6 +86,8 @@ pub fn classify_body_reply(
     retry_after: Option<&str>,
     body: &[u8],
 ) -> Result<BodyFetch, PoolBodyError> {
+    use crate::retry::pool_retry_after;
+
     match status {
         200 => {
             if body.len() > MAX_BODY_REPLY_BYTES {
@@ -120,6 +116,10 @@ pub fn classify_body_reply(
         }),
     }
 }
+
+// Matches the stream Worker's body-envelope cap. Its 413 uses the same
+// code as an oversized article, so refuse oversized requests here.
+const MAX_BODY_REQUEST_BYTES: usize = 64 * 1024;
 
 /// Longest one pool body stub call may take, headers plus body sharing one
 /// cancellable deadline. Overridable in tests via
@@ -215,6 +215,8 @@ pub async fn call_pool_body_with_deadline(
     req: &BodyRequest,
     deadline_ms: u64,
 ) -> Result<BodyFetch, PoolBodyError> {
+    use crate::pool_deadline::bounded_deadline_ms;
+
     let unavailable = PoolBodyError::Retry {
         after_secs: DEFAULT_RETRY_SECS,
     };

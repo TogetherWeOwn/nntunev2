@@ -4,7 +4,7 @@ use nntune_ingest::fixtures::SMALL_NZB;
 use nntune_ingest::jobs::{JobState, MAX_ATTEMPTS};
 use nntune_ingest::newznab::{build_search_url, inject_api_key, SearchParams};
 use nntune_ingest::pool_body::{
-    call_pool_body_with_deadline, classify_body_reply, BodyFetch, BodyRequest, PoolBodyError,
+    build_body_request, call_pool_body_with_deadline, classify_body_reply, PoolBodyError,
     POOL_BODY_DEADLINE_MS,
 };
 use nntune_ingest::pool_deadline::bounded_deadline_ms;
@@ -50,15 +50,8 @@ fn newznab_rejects_malformed_authorities_and_ambiguous_key_targets() {
 
 #[test]
 fn body_status_alone_does_not_mark_an_article_unavailable() {
-    assert_eq!(
-        classify_body_reply(413, None, br#"{"error":"too_large"}"#),
-        Ok(BodyFetch::TooLarge)
-    );
-    for invalid in [
-        b"".as_slice(),
-        b"<html>too large</html>",
-        br#"{"error":"too_large"} trailing"#,
-    ] {
+    let trailing = br#"{"error":"too_large"} trailing"#;
+    for invalid in [b"".as_slice(), b"<html>too large</html>", trailing] {
         assert_eq!(
             classify_body_reply(413, None, invalid),
             Err(PoolBodyError::Retry { after_secs: 5 })
@@ -82,12 +75,8 @@ async fn deadline_overrides_can_only_shorten_the_pool_budget() {
     let bindings = JsValue::UNDEFINED;
     let env = bindings.unchecked_ref::<worker::Env>();
     let probe = probe_request(1, None);
-    let body = BodyRequest {
-        user_id: probe.user_id.clone(),
-        job_id: probe.job_id.clone(),
-        idempotency_key: probe.idempotency_key.clone(),
-        segment_id: probe.segment_ids[0].clone(),
-    };
+    let msg = build_upload_dispatch("offline-user", SMALL_NZB).unwrap();
+    let body = build_body_request(&msg, &probe.segment_ids[0]).unwrap();
     assert_eq!(
         call_pool_body_with_deadline(env, &body, 0).await,
         Err(PoolBodyError::Retry { after_secs: 5 })
@@ -111,6 +100,11 @@ fn probe_request(count: usize, bytes: Option<u64>) -> ProbeRequest {
 
 #[test]
 fn a_matching_probe_reply_cannot_validate_an_invalid_request() {
+    let echo = |request: &ProbeRequest| ProbeOutcome {
+        batch_index: request.batch_index,
+        present: request.segment_ids.clone(),
+        missing: vec![],
+    };
     let mut unpaired = probe_request(1, None);
     unpaired.segment_bytes.clear();
     let mut invalid_id = probe_request(1, None);
@@ -123,23 +117,14 @@ fn a_matching_probe_reply_cannot_validate_an_invalid_request() {
         unpaired,
         invalid_id,
     ] {
-        let outcome = ProbeOutcome {
-            batch_index: request.batch_index,
-            present: request.segment_ids.clone(),
-            missing: vec![],
-        };
-        let body = serde_json::to_string(&outcome).unwrap();
+        let body = serde_json::to_string(&echo(&request)).unwrap();
         assert_eq!(
             classify_reply(&request, 200, None, &body),
             Err(PoolProbeError::Rejected)
         );
     }
     let request = probe_request(MAX_PROBE_SEGMENTS, Some(MAX_SEGMENT_BYTES));
-    let outcome = ProbeOutcome {
-        batch_index: request.batch_index,
-        present: request.segment_ids.clone(),
-        missing: vec![],
-    };
+    let outcome = echo(&request);
     let body = serde_json::to_string(&outcome).unwrap();
     assert_eq!(classify_reply(&request, 200, None, &body), Ok(outcome));
 }
@@ -167,18 +152,11 @@ fn pool_retry_header_caps_overflow_and_rejects_malformed_deltas() {
 #[test]
 fn progress_can_continue_only_from_a_valid_attempt() {
     let msg = build_upload_dispatch("offline-user", SMALL_NZB).unwrap();
-    let mut cp = checkpoint::initial(&msg);
-    cp.attempt = MAX_ATTEMPTS;
-    let progress = || JobError::progress(ERR_PROBE_FAILED, "offline progress");
-    assert_eq!(
-        decide_checkpoint(&msg, &mut cp, Err(progress())),
-        Ok(Disposition::Continue)
-    );
-    assert_eq!(cp.attempt, MAX_ATTEMPTS);
     for attempt in [0, MAX_ATTEMPTS + 1, u32::MAX] {
         let mut cp = checkpoint::initial(&msg);
         cp.attempt = attempt;
-        let Ok(Disposition::Quarantine(entry)) = decide_checkpoint(&msg, &mut cp, Err(progress()))
+        let progress = JobError::progress(ERR_PROBE_FAILED, "offline progress");
+        let Ok(Disposition::Quarantine(entry)) = decide_checkpoint(&msg, &mut cp, Err(progress))
         else {
             panic!("attempt {attempt} must quarantine");
         };

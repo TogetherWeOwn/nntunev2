@@ -11,10 +11,7 @@
 use futures_util::StreamExt;
 use worker::{wasm_bindgen::JsValue, Env, Headers, Method, Request, RequestInit};
 
-use crate::pool_body::{check_reply_length, declared_reply_length};
-use crate::pool_deadline::bounded_deadline_ms;
-use crate::probe::{validate_message_id, ProbeOutcome, ProbeRequest, MAX_SEGMENT_BYTES};
-use crate::retry::pool_retry_after;
+use crate::probe::{ProbeOutcome, ProbeRequest};
 
 /// Durable Object binding to the stream Worker's `NntpPool` class.
 pub const POOL_BINDING: &str = "NNTP_POOL";
@@ -47,38 +44,20 @@ pub enum PoolProbeError {
     Rejected,
 }
 
-fn check_request(req: &ProbeRequest) -> Result<(), PoolProbeError> {
-    if !(1..=crate::probe::MAX_PROBE_SEGMENTS).contains(&req.segment_ids.len())
-        || req.segment_bytes.len() != req.segment_ids.len()
-        || req.segment_ids.iter().any(|id| !validate_message_id(id))
-        || req
-            .segment_bytes
-            .iter()
-            .flatten()
-            .any(|bytes| !(1..=MAX_SEGMENT_BYTES).contains(bytes))
-    {
-        return Err(PoolProbeError::Rejected);
-    }
-    Ok(())
-}
-
 /// Check a pool answer against its request: the batch index echoes, and
 /// `present` + `missing` are exactly the requested ids (same multiset), so a
 /// short, padded or foreign answer can never move the tally.
+///
+/// Check the batch and count before allocating the lists used for sorting.
 pub fn check_outcome(req: &ProbeRequest, outcome: &ProbeOutcome) -> Result<(), PoolProbeError> {
     check_request(req)?;
-    if outcome.batch_index != req.batch_index
-        || outcome.present.len() + outcome.missing.len() != req.segment_ids.len()
-    {
+    let answered = outcome.present.iter().chain(&outcome.missing);
+    if outcome.batch_index != req.batch_index || answered.clone().count() != req.segment_ids.len() {
         return Err(PoolProbeError::Rejected);
     }
-    let mut answered: Vec<&str> = outcome
-        .present
-        .iter()
-        .chain(&outcome.missing)
-        .map(String::as_str)
-        .collect();
-    let mut asked: Vec<&str> = req.segment_ids.iter().map(String::as_str).collect();
+
+    let mut answered: Vec<_> = answered.collect();
+    let mut asked: Vec<_> = req.segment_ids.iter().collect();
     answered.sort_unstable();
     asked.sort_unstable();
     if answered != asked {
@@ -94,6 +73,8 @@ pub fn classify_reply(
     retry_after: Option<&str>,
     body: &str,
 ) -> Result<ProbeOutcome, PoolProbeError> {
+    use crate::retry::pool_retry_after;
+
     match status {
         200 => {
             if body.len() > MAX_PROBE_REPLY_BYTES {
@@ -115,6 +96,23 @@ pub fn classify_reply(
             after_secs: pool_retry_after(retry_after, DEFAULT_RETRY_SECS, MAX_RETRY_SECS),
         }),
     }
+}
+
+fn check_request(req: &ProbeRequest) -> Result<(), PoolProbeError> {
+    use crate::probe::{validate_message_id, MAX_SEGMENT_BYTES};
+
+    if !(1..=crate::probe::MAX_PROBE_SEGMENTS).contains(&req.segment_ids.len())
+        || req.segment_bytes.len() != req.segment_ids.len()
+        || req.segment_ids.iter().any(|id| !validate_message_id(id))
+        || req
+            .segment_bytes
+            .iter()
+            .flatten()
+            .any(|bytes| !(1..=MAX_SEGMENT_BYTES).contains(bytes))
+    {
+        return Err(PoolProbeError::Rejected);
+    }
+    Ok(())
 }
 
 /// Longest one pool probe stub call may take, headers plus body sharing one
@@ -175,6 +173,9 @@ pub async fn call_pool_probe_with_deadline(
     req: &ProbeRequest,
     deadline_ms: u64,
 ) -> Result<ProbeOutcome, PoolProbeError> {
+    use crate::pool_body::{check_reply_length, declared_reply_length};
+    use crate::pool_deadline::bounded_deadline_ms;
+
     let unavailable = PoolProbeError::Retry {
         after_secs: DEFAULT_RETRY_SECS,
     };
