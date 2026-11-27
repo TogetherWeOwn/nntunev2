@@ -130,8 +130,11 @@ export function createRecentlyPlayedStore({
 
 	/** The current list: the cached visit result once known, else a fresh read. */
 	function current(): RecentEntry[] {
-		cached ??= readStorage();
-		if (cached === null) return [];
+		if (cached === null) {
+			const fresh = readStorage();
+			if (fresh === null) return [];
+			cached = fresh;
+		}
 		return cached;
 	}
 

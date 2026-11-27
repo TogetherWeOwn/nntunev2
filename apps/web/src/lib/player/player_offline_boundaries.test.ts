@@ -55,15 +55,20 @@ test('an invalid pending share seek does not reach resume or native media', () =
 	expect(seek.current).toBeNull();
 });
 
-test('late play outcomes are ignored when the source changes on the same element', async () => {
+test.each(['success', 'failure'])('late play %s is ignored after a same-element source swap', async (outcome) => {
 	let source = '/a';
-	const element = { play: vi.fn(async () => { source = '/b'; }), pause: vi.fn(), load: vi.fn(),
-		getAttribute: () => source };
+	const play = vi.fn(async () => {
+		source = '/b';
+		if (outcome === 'failure') throw new Error('retired source failed');
+	});
+	const element = { play, pause: vi.fn(), load: vi.fn(), getAttribute: () => source };
 	const onPlaybackStarted = vi.fn();
-	const playback = createPlayback({ audio: () => element, flush: async () => {}, onPlaybackStarted });
+	const onPlaybackFailure = vi.fn();
+	const playback = createPlayback({ audio: () => element, flush: async () => {}, onPlaybackStarted, onPlaybackFailure });
 	await playback.play();
-	expect(element.play).toHaveBeenCalledOnce();
+	expect(play).toHaveBeenCalledOnce();
 	expect(onPlaybackStarted).not.toHaveBeenCalled();
+	expect(onPlaybackFailure).not.toHaveBeenCalled();
 });
 
 test('malformed stored speed and non-finite handoff cannot reach the decoder', () => {
