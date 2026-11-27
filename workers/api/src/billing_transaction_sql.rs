@@ -117,12 +117,37 @@ pub(crate) async fn apply_reconcile_transaction(
     require_open_owner: bool,
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))] probe: ReconcileProbe,
 ) -> Result<(), crate::handlers::StoreError> {
+    reconcile_transaction(
+        transaction,
+        &user_id,
+        require_open_owner,
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        probe,
+        async |_| Ok(outcome),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Load and fold the observation after acquiring the per-user lock. Take the
+/// table-wide write lock only after the observation is complete.
+pub(crate) async fn reconcile_transaction<B: crate::postgres::PgBilling>(
+    transaction: &mut B,
+    user_id: &str,
+    require_open_owner: bool,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))] probe: ReconcileProbe,
+    observe: impl AsyncFnOnce(
+        &B,
+    ) -> Result<
+        crate::billing_reconcile::ReconcileOutcome,
+        crate::handlers::StoreError,
+    >,
+) -> Result<crate::billing_reconcile::ReconcileOutcome, crate::handlers::StoreError> {
     use crate::billing_store_classification::{
         classify_explicit_stale, classify_target, classify_write, has_slot_suppression_proof,
         validate_equal_end_provenance, validate_read_provenance, Identity, ObservedTarget, Target,
     };
     use crate::{billing_reconcile::reconcile_lock_statement, handlers::StoreError};
-    let row = &outcome.row;
     let work = async {
         transaction
             .query_typed(reconcile_lock_statement(), &[(&user_id, Type::TEXT)])
@@ -142,6 +167,8 @@ pub(crate) async fn apply_reconcile_transaction(
         {
             return Err(StoreError);
         }
+        let outcome = observe(transaction).await?;
+        let row = &outcome.row;
         transaction
             .query_typed(crate::billing_transaction_sql::LOCK_SUBSCRIPTIONS, &[])
             .await
@@ -180,7 +207,7 @@ pub(crate) async fn apply_reconcile_transaction(
             .collect::<Result<Vec<_>, tokio_postgres::Error>>()
             .map_err(|_| StoreError)?;
         let requested = Identity {
-            user_id: &user_id,
+            user_id,
             subscription_id: &row.stripe_subscription_id,
         };
         let target = classify_target(&requested, &observed).map_err(|_| {
@@ -350,14 +377,18 @@ pub(crate) async fn apply_reconcile_transaction(
                 .map_err(|_| StoreError)?;
             std::future::pending::<()>().await;
         }
-        Ok::<(), StoreError>(())
+        Ok::<_, StoreError>(outcome)
     };
     // A failed COMMIT acknowledgement remains an unknown outcome.
-    if let Err(error) = work.await {
-        let _ = transaction.rollback_billing().await;
-        return Err(error);
-    }
-    transaction.commit_billing().await.map_err(|_| StoreError)
+    let outcome = match work.await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = transaction.rollback_billing().await;
+            return Err(error);
+        }
+    };
+    transaction.commit_billing().await.map_err(|_| StoreError)?;
+    Ok(outcome)
 }
 
 #[cfg(test)]

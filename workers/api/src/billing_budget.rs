@@ -191,7 +191,7 @@ pub(super) async fn with_owned_connection<T: 'static>(
         || Ok((host.to_owned(), port, connection_string.to_owned())),
         std::convert::identity,
         bootstrap,
-        work,
+        async move |client| work(client).await,
         work_finished,
     )
     .await
@@ -205,9 +205,7 @@ pub(super) async fn with_owned_connection_from<T: 'static>(
     bootstrap: impl for<'a> FnOnce(
         &'a mut PgClient,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + 'a>>,
-    work: impl for<'a> FnOnce(
-        &'a mut PgClient,
-    ) -> Pin<Box<dyn Future<Output = Result<T, StoreError>> + 'a>>,
+    work: impl AsyncFnOnce(&mut PgClient) -> Result<T, StoreError>,
     #[cfg(feature = "billing-owned-wasm-test")] work_finished: impl FnOnce(bool),
 ) -> Result<T, StoreError> {
     drive_owned_connection(
@@ -228,7 +226,7 @@ async fn drive_owned_connection<T: 'static, C>(
     bootstrap: impl for<'a> FnOnce(
         &'a mut C,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + 'a>>,
-    work: impl for<'a> FnOnce(&'a mut C) -> Pin<Box<dyn Future<Output = Result<T, StoreError>> + 'a>>,
+    work: impl AsyncFnOnce(&mut C) -> Result<T, StoreError>,
     #[cfg(feature = "billing-owned-wasm-test")] work_finished: impl FnOnce(bool),
 ) -> Result<T, StoreError> {
     use crate::billing_owned_socket::SocketGuard;

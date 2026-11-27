@@ -476,7 +476,10 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
     assert_eq!(snapshot(&observer).await, committed);
 
     check_legacy_mixed_plan_history(&observer, seed).await;
-    scheduled_reconciliation_preserves_later_plan_update(&observer).await;
+    Box::pin(scheduled_reconciliation_preserves_later_plan_update(
+        &observer,
+    ))
+    .await;
     drop(observer);
     driver.await.unwrap().unwrap();
 }
@@ -1208,4 +1211,45 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
         true
     );
     assert_eq!(after_cancel.1, committed.1);
+
+    let lock_available = async || {
+        observer
+            .query_one("SELECT pg_try_advisory_xact_lock(hashtext($1))", &[&USER])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    };
+    let mut observation = renewed;
+    observation.subscription.status = "past_due".into();
+    for retrieval_failed in [true, false] {
+        let result = with_store(CALLER_CONNECTION, 1, async |store| {
+            store
+                .reconcile_locked_subscription(
+                    &user,
+                    &target,
+                    async || {
+                        assert!(!lock_available().await);
+                        Ok(observation.subscription.clone())
+                    },
+                    async |_| {
+                        assert!(!lock_available().await);
+                        (!retrieval_failed)
+                            .then(|| observation.invoices.clone())
+                            .ok_or(StoreError)
+                    },
+                    NEW_END,
+                )
+                .await
+        })
+        .await;
+        assert!(lock_available().await);
+        assert_eq!(result.is_err(), retrieval_failed);
+        let after = snapshot(observer).await;
+        if retrieval_failed {
+            assert_eq!(after, after_cancel);
+        } else {
+            assert_eq!(subscription_row(&after.0)["status"], "past_due");
+            assert_eq!(after.1, after_cancel.1);
+        }
+    }
 }
