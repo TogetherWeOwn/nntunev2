@@ -489,8 +489,7 @@ pub fn reconcile_subscription(
     }
 
     // Advance path (`active` / `past_due`): fold every bound paid invoice.
-    // A live invoice fails the pass. Foreign, unpaid and unanchored
-    // invoices and invoices with no qualifying line are skipped.
+    // Reject live invoices. Skip foreign, unpaid or unanchored invoices.
     //
     // Coverage advances ONLY from lines resolving to the subscription
     // item's plan; history rows cover every confirmed paid service invoice

@@ -87,7 +87,7 @@ impl StripeScript {
                         None,
                     )
                     .expect("bound invoice listing"),
-                    json!({"data": [invoice("in_worker_first", "usd"), invoice("in_worker_second", "eur")]}),
+                    json!({"has_more": false, "data": [invoice("in_worker_first", "usd"), invoice("in_worker_second", "eur")]}),
                 ),
             ],
             next: Cell::new(0),

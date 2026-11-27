@@ -174,7 +174,6 @@ fn contradictory_write_receipts_are_opaque_refusals() {
 #[test]
 fn cancellation_observation_requires_a_decoded_true() {
     use billing_cancel_control::require_blocked;
-
     assert_eq!(require_blocked(Ok::<_, &str>(true)), Ok(()));
     assert!(require_blocked(Ok::<_, &str>(false)).is_err());
     assert_eq!(
