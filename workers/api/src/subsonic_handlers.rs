@@ -10,6 +10,16 @@ struct MintBody {
     auth_mode: String,
 }
 
+impl MintBody {
+    fn parse(body: &[u8]) -> Option<Self> {
+        // Serde structs also accept positional arrays.
+        if body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
+            return None;
+        }
+        serde_json::from_slice(body).ok()
+    }
+}
+
 fn default_mode() -> String {
     "apikey".to_string()
 }
@@ -32,7 +42,7 @@ where
         Ok(pair) => pair,
         Err(response) => return private(response),
     };
-    let Some(body) = parse_body::<MintBody>(req) else {
+    let Some(body) = MintBody::parse(&req.body) else {
         return private(validation_failed("invalid request"));
     };
     let mode = match body.auth_mode.as_str() {
@@ -93,6 +103,25 @@ where
             "token_secret": issued.token_secret.as_ref().map(|s| s.as_str()),
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mint_requires_an_exact_json_object() {
+        for invalid in [
+            r#"["client","token"]"#,
+            r#"{"label":"client","auth_mode":"token","auth_mode":"both"}"#,
+            r#"{"label":"client","auth_mode":null}"#,
+            r#"{"label":"client","unknown":true}"#,
+        ] {
+            assert!(MintBody::parse(invalid.as_bytes()).is_none());
+        }
+        let body = MintBody::parse(br#" {"label":"client"}"#).unwrap();
+        assert_eq!(body.auth_mode, "apikey");
+    }
 }
 
 pub(super) async fn list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response

@@ -17,6 +17,7 @@ fn document_headers(content_type: &str) -> WorkerResult<Headers> {
     let headers = Headers::new();
     headers.set("Content-Type", content_type)?;
     headers.set("Cache-Control", "private, no-store")?;
+    headers.set("X-Content-Type-Options", "nosniff")?;
     Ok(headers)
 }
 
@@ -41,7 +42,10 @@ pub fn finish_document(
     document: Result<Option<StagingDocument>, DocumentError>,
 ) -> WorkerResult<Response> {
     match document {
-        Ok(Some(doc)) => build_response(200, doc.content_type, doc.bytes),
+        Ok(Some(doc)) => match doc.validate_response() {
+            Ok(_) => build_response(200, doc.content_type, doc.bytes),
+            Err(error) => finish_document(Err(error)),
+        },
         Ok(None) => build_response(404, XML_CONTENT_TYPE, UNSUPPORTED_ROUTE.to_vec()),
         Err(DocumentError::Rejected(reason, format)) => respond_fixed_rejection(reason, format),
         Err(DocumentError::InvalidCallback) => {
@@ -62,12 +66,11 @@ pub fn finish_streamed_document(
         Ok(doc) => doc,
         Err(error) => return finish_document(Err(error)),
     };
+    let format = match doc.validate_response() {
+        Ok(format) => format,
+        Err(error) => return finish_document(Err(error)),
+    };
     if budget.charge_payload_bytes(doc.bytes.len()).is_err() {
-        let format = if doc.content_type == XML_CONTENT_TYPE {
-            RejectionFormat::Xml
-        } else {
-            RejectionFormat::Json
-        };
         return respond_fixed_rejection(StagingRejection::BusyOrCapacity, format);
     }
     let headers = document_headers(doc.content_type)?;

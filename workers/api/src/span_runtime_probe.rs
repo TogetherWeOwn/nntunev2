@@ -7,7 +7,7 @@ use std::{
 use futures_util::future::join_all;
 use serde_json::{json, Value};
 use worker::observability::{active_span, enter_span_async, in_current_span, start_span};
-use worker::{event, Context, Delay, Env, Request, Response, Result};
+use worker::{event, Context, Delay, Env, Method, Request, Response, Result};
 
 const TASKS: usize = 8;
 static ACTIVE_SCENARIOS: AtomicUsize = AtomicUsize::new(0);
@@ -72,11 +72,18 @@ pub async fn span_probe(req: Request, _env: Env, _ctx: Context) -> Result<Respon
     if url.path() != "/probe" {
         return Response::error("not found", 404);
     }
+    if req.method() != Method::Get {
+        let mut response = Response::error("method not allowed", 405)?;
+        response.headers_mut().set("Allow", "GET")?;
+        return Ok(response);
+    }
     let scoped = match url.query() {
         Some("mode=scoped") => true,
         Some("mode=unscoped") => false,
         _ => return Response::error("bad mode", 400),
     };
     let result = enter_span_async("span-probe-root", |_| scenario(scoped)).await;
-    Response::from_json(&result)
+    let mut response = Response::from_json(&result)?;
+    response.headers_mut().set("Cache-Control", "no-store")?;
+    Ok(response)
 }

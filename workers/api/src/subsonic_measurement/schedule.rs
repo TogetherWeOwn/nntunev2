@@ -29,6 +29,17 @@ const CASE_IDS: [&str; 21] = [
     "large-mixed",
 ];
 
+const _: () = assert!(CASE_IDS.len() <= u32::BITS as usize);
+const MAX_LIST_BYTES: usize = {
+    let mut total = CASE_IDS.len() - 1;
+    let mut i = 0;
+    while i < CASE_IDS.len() {
+        total += CASE_IDS[i].len();
+        i += 1;
+    }
+    total
+};
+
 // wasm32 GET getArtists (JSON), small fixture: raw rows + owned copy +
 // snapshot + Value graph + complete response buffer. See the fixture crosswalk.
 const ARTIST_INDEX_CHARGE: usize = 4_024;
@@ -37,6 +48,9 @@ pub(super) struct Schedule(u32);
 
 impl Schedule {
     pub(super) fn parse(list: &str) -> Option<Self> {
+        if list.len() > MAX_LIST_BYTES {
+            return None;
+        }
         let mut included = 0;
         for id in list.split(',') {
             let bit = 1 << CASE_IDS.iter().position(|known| *known == id)?;

@@ -5,7 +5,7 @@
 //! the registry HTTP status. Error messages on 5xx paths are sealed to fixed
 //! public text, and auth/session failures remain generic.
 
-use serde::Serialize;
+use serde::{ser::SerializeStruct, Serialize, Serializer};
 
 use crate::auth::AuthError;
 use crate::library::LibraryError;
@@ -127,13 +127,30 @@ fn message_for_server_error(code: &str) -> &'static str {
 
 /// A user-facing error ready for the HTTP layer: `status` is the response
 /// status, the serialized body is exactly `{code, message, retryable}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
     pub code: &'static str,
     pub message: String,
     pub retryable: bool,
-    #[serde(skip)]
     pub status: u16,
+}
+
+impl Serialize for ApiError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let spec = spec(self.code);
+        let (spec, message) = if spec.code != self.code || spec.status != self.status {
+            (FALLBACK, message_for_server_error(FALLBACK.code))
+        } else if spec.status >= 500 {
+            (spec, message_for_server_error(spec.code))
+        } else {
+            (spec, self.message.as_str())
+        };
+        let mut body = serializer.serialize_struct("ApiError", 3)?;
+        body.serialize_field("code", spec.code)?;
+        body.serialize_field("message", message)?;
+        body.serialize_field("retryable", &spec.retryable)?;
+        body.end()
+    }
 }
 
 impl ApiError {
@@ -236,9 +253,7 @@ impl From<SessionError> for ApiError {
         match e {
             SessionError::Invalid => Self::unauthorized(e.to_string()),
             SessionError::ReauthRequired => Self::by_code(e.code(), e.to_string()),
-            SessionError::Misconfigured | SessionError::Storage { .. } => {
-                Self::internal_error(e.to_string())
-            }
+            SessionError::Misconfigured | SessionError::Storage { .. } => Self::internal_error(""),
             SessionError::RandomnessUnavailable => Self::service_unavailable(e.to_string()),
         }
     }
@@ -369,6 +384,21 @@ mod tests {
         );
         let unavailable = ApiError::service_unavailable("binding token");
         assert_eq!(unavailable.message, "service unavailable");
+    }
+
+    #[test]
+    fn serialization_checks_the_registry_even_after_field_changes() {
+        let mut err = ApiError::service_unavailable("service unavailable");
+        err.message = "synthetic private detail".into();
+        err.retryable = false;
+        assert_eq!(
+            serde_json::to_value(&err).unwrap(),
+            serde_json::json!({"code":"service_unavailable","message":"service unavailable","retryable":true})
+        );
+        for code in ["validation_failed", "unregistered"] {
+            err.code = code;
+            assert_eq!(body(&err), body(&ApiError::internal_error("")));
+        }
     }
 
     #[test]

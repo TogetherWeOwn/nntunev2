@@ -3,21 +3,28 @@
 //! Extracted from https://github.com/TogetherWeOwn/nntunev2/pull/982
 //! (head ee56314b99f31a0a4d7dee53c450be6c376c16dc).
 
+use crate::ledger::{
+    is_valid_key_field, MAX_IDEMPOTENCY_KEY_LEN, MAX_PLAY_ID_LEN, MAX_TRACK_ID_LEN, MAX_USER_ID_LEN,
+};
+
 /// Extract the play identifier from a canonical `play:{user}:{track}:{play}` key.
 ///
 /// Format validity alone does not establish ownership, delivery, metering truth,
 /// or privacy eligibility.
 pub fn play_id_from_key(idempotency_key: &str) -> Option<String> {
-    let rest = idempotency_key.strip_prefix("play:")?;
-    let mut parts = rest.split(':');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(user), Some(track), Some(play_id), None)
-            if crate::ledger::derive_play_idempotency_key(user, track, play_id).is_ok() =>
-        {
-            Some(play_id.to_string())
-        }
-        _ => None,
+    key_parts(idempotency_key).map(|(_, _, play)| play.to_owned())
+}
+
+fn key_parts(key: &str) -> Option<(&str, &str, &str)> {
+    if key.len() > MAX_IDEMPOTENCY_KEY_LEN {
+        return None;
     }
+    let (user, rest) = key.strip_prefix("play:")?.split_once(':')?;
+    let (track, play) = rest.split_once(':')?;
+    (is_valid_key_field(user, MAX_USER_ID_LEN)
+        && is_valid_key_field(track, MAX_TRACK_ID_LEN)
+        && is_valid_key_field(play, MAX_PLAY_ID_LEN))
+    .then_some((user, track, play))
 }
 
 /// Latest `marked_at` the database accepts (`private_plays` CHECK).
@@ -32,9 +39,7 @@ pub fn valid_mark_time(marked_at: u64) -> bool {
 /// A valid binding alone is not evidence of a play or authority to issue one.
 /// Adapted from PR #982's preserved patch.
 pub fn matches_owner_track(key: &str, user: &str, track: &str) -> bool {
-    play_id_from_key(key)
-        .and_then(|play| crate::ledger::derive_play_idempotency_key(user, track, &play).ok())
-        .is_some_and(|expected| expected == key)
+    key_parts(key).is_some_and(|(owner, target, _)| owner == user && target == track)
 }
 
 #[cfg(test)]
@@ -75,6 +80,7 @@ mod tests {
         ] {
             let key = derive_play_idempotency_key(&user, &track, &play).unwrap();
             assert_eq!(play_id_from_key(&key).as_deref(), Some(play.as_str()));
+            assert!(super::matches_owner_track(&key, &user, &track));
         }
     }
 

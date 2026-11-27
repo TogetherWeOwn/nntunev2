@@ -14,7 +14,7 @@ pub fn encode(bytes: &[u8]) -> String {
 }
 
 /// Decode unpadded base64url. Rejects non-alphabet bytes, padding (`=`)
-/// and malformed trailing quanta; callers map the error to their own
+/// and nonzero unused trailing bits; callers map the error to their own
 /// generic error type (never echo input or crypto details).
 pub fn decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     URL_SAFE_NO_PAD.decode(s)
@@ -58,6 +58,17 @@ mod tests {
             "Zm\n9",
         ] {
             assert!(decode(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_aliases_with_nonzero_unused_trailing_bits() {
+        for (canonical, alias) in [("Zg", "Zh"), ("Zm8", "Zm9"), ("_w", "_x")] {
+            assert!(decode(canonical).is_ok());
+            assert!(matches!(
+                decode(alias),
+                Err(base64::DecodeError::InvalidLastSymbol { .. })
+            ));
         }
     }
 }

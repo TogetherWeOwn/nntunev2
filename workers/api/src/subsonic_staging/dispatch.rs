@@ -104,14 +104,22 @@ where
         return finish_document(Ok(None));
     }
     let credentials = match scope.parse_credentials() {
-        Ok(credentials) => credentials,
-        Err(CredentialParseError::DuplicateCredential) => {
-            return scope.protocol_failure(code::GENERIC, "duplicate credential parameter");
-        }
-        Err(CredentialParseError::MalformedEncoding) => {
-            return scope.protocol_failure(code::GENERIC, "malformed parameter encoding");
-        }
+        Ok(credentials) => Ok(credentials),
+        Err(CredentialParseError::DuplicateCredential) => Err("duplicate credential parameter"),
+        Err(CredentialParseError::MalformedEncoding) => Err("malformed parameter encoding"),
         Err(error) => return InputError::from(error).respond(),
+    };
+    let params = match scope.dispatch_params() {
+        Ok(params) => params,
+        Err(error) => return finish_document(Err(error)),
+    };
+    let (format, refusal) = match request_format(&params) {
+        Ok(formats) => formats,
+        Err(error) => return finish_document(Err(error)),
+    };
+    let credentials = match credentials {
+        Ok(credentials) => credentials,
+        Err(message) => return scope.protocol_failure(refusal, code::GENERIC, message),
     };
     let mut app = match open_app().await {
         Ok(app) => app,
@@ -151,16 +159,27 @@ where
                     return reject_xml(StagingRejection::Unavailable);
                 }
             };
-            return scope.protocol_failure(error.subsonic_code(), message);
+            return scope.protocol_failure(refusal, error.subsonic_code(), message);
         }
     };
     let Some(catalogue) = authorize_catalogue(&principal) else {
-        return scope.protocol_failure(code::NOT_AUTHORIZED, "Not authorized for staging.");
+        return scope.protocol_failure(
+            refusal,
+            code::NOT_AUTHORIZED,
+            "Not authorized for staging.",
+        );
     };
     #[cfg(feature = "staging-body-wasm-test")]
     let retain_document_permit = context.retain_document_permit;
     let document = scope
-        .dispatch_document(&mut app, &principal, catalogue, name, context)
+        .dispatch_document(
+            &mut app,
+            &principal,
+            catalogue,
+            name,
+            context,
+            (&params, format, refusal),
+        )
         .await;
     #[cfg(feature = "staging-body-wasm-test")]
     if retain_document_permit {
@@ -190,19 +209,20 @@ impl StagingConstruction {
             .map_err(|_| DocumentError::Rejected(BusyOrCapacity, RejectionFormat::Xml))
     }
 
-    fn protocol_failure(mut self, err_code: i64, message: &str) -> WorkerResult<Response> {
-        let document = (|| {
-            let params = self.dispatch_params()?;
-            let (_, refusal) = request_format(&params)?;
-            let format = match refusal {
-                RejectionFormat::Json => Format::Json,
-                RejectionFormat::Xml => Format::Xml,
-            };
-            let budget = &mut self.input.budget;
-            let graph = envelope::charged_error_document(budget, err_code, message)
-                .map_err(|_| DocumentError::Rejected(BusyOrCapacity, refusal))?;
-            prepare(budget, &graph, format, 1024)
-        })();
+    fn protocol_failure(
+        mut self,
+        refusal: RejectionFormat,
+        err_code: i64,
+        message: &str,
+    ) -> WorkerResult<Response> {
+        let format = match refusal {
+            RejectionFormat::Json => Format::Json,
+            RejectionFormat::Xml => Format::Xml,
+        };
+        let budget = &mut self.input.budget;
+        let document = envelope::charged_error_document(budget, err_code, message)
+            .map_err(|_| DocumentError::Rejected(BusyOrCapacity, refusal))
+            .and_then(|graph| prepare(budget, &graph, format, 1024));
         finish_document(document.map(Some))
     }
 
@@ -213,9 +233,9 @@ impl StagingConstruction {
         catalogue: CatalogueSource<impl FnOnce() -> F>,
         name: &str,
         context: StagingDispatch,
+        representation: (&Params, Format<'_>, RejectionFormat),
     ) -> Result<StagingDocument, DocumentError> {
-        let params = self.dispatch_params()?;
-        let (format, refusal) = request_format(&params)?;
+        let (params, format, refusal) = representation;
         let reject = |reason| DocumentError::Rejected(reason, refusal);
         if let Some(headroom) = context.construction_headroom {
             if !matches!(&catalogue, CatalogueSource::Synthetic(_))
@@ -262,7 +282,7 @@ impl StagingConstruction {
                 songs: &songs,
                 now_millis: context.now_millis,
             }
-            .document(budget, name, &params, |id| {
+            .document(budget, name, params, |id| {
                 ProductionStore::resolve_song_occurrence(&tracks, &songs, id)
             })
         } else if name == "getLicense" {

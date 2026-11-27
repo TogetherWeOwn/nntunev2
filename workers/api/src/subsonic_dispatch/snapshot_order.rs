@@ -31,7 +31,7 @@ pub fn order_work(artists: usize, albums: usize, songs: usize, rows: usize) -> O
         comparisons: artist_comparisons
             .checked_add(pairs(albums)?)?
             .checked_add(pairs(songs)?)?,
-        artist_row_probes: artist_comparisons.checked_mul(2)?.checked_mul(rows)?,
+        artist_row_probes: artist_comparisons.checked_mul(rows)?.checked_mul(2)?,
     })
 }
 
@@ -86,5 +86,19 @@ fn stable_insertion<T>(items: &mut [T], compare: impl Fn(&T, &T) -> Ordering) {
             items.swap(j, j - 1);
             j -= 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_artist_rows_do_not_inflate_probe_work() {
+        let artists = (1usize << (usize::BITS / 2)) + 1;
+        let work = order_work(artists, 0, 0, 0).unwrap();
+        assert!(work.comparisons > usize::MAX / 2);
+        assert_eq!(work.artist_row_probes, 0);
+        assert!(order_work(artists, 0, 0, 1).is_none());
     }
 }

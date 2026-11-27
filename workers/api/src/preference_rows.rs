@@ -6,12 +6,12 @@ pub fn taste_get_statement() -> &'static str {
 }
 
 pub fn taste_list_statement() -> &'static str {
-    "SELECT kind, target_id, signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND (signal <> 'snooze' OR snooze_until > $2) ORDER BY updated_at DESC LIMIT 500"
+    "SELECT kind, target_id, signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND (signal <> 'snooze' OR snooze_until > $2) ORDER BY updated_at DESC, kind COLLATE \"C\", target_id COLLATE \"C\" LIMIT 500"
 }
 
 /// Bounded owner-scoped likes collection.
 pub fn likes_list_statement() -> &'static str {
-    "SELECT kind, target_id, signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND signal = 'love' ORDER BY created_at DESC LIMIT 500"
+    "SELECT kind, target_id, signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND signal = 'love' ORDER BY created_at DESC, kind COLLATE \"C\", target_id COLLATE \"C\" LIMIT 500"
 }
 
 /// Upsert under the account deletion fence, preserving a replayed love's timestamp.
@@ -88,6 +88,18 @@ pub struct HistoryDbRow {
 #[cfg(test)]
 mod tests {
     use crate::preference_rows::{HistoryDbRow, TasteDbRow};
+
+    #[test]
+    fn bounded_preference_queries_break_timestamp_ties_by_identity() {
+        for (query, timestamp) in [
+            (super::taste_list_statement(), "updated_at"),
+            (super::likes_list_statement(), "created_at"),
+        ] {
+            assert!(query.ends_with(&format!(
+                "ORDER BY {timestamp} DESC, kind COLLATE \"C\", target_id COLLATE \"C\" LIMIT 500"
+            )));
+        }
+    }
 
     #[test]
     fn taste_row_preserves_fields_and_optional_snooze() {
