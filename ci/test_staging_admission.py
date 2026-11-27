@@ -9,6 +9,7 @@ import json
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -2453,6 +2454,19 @@ class ArchiveTests(Base):
                 entry.external_attr = (mode | 0o644) << 16
                 entry.compress_type = compression
                 self.refused("invalid receipt archive member", sa.read_archive, make_zip([(entry, "{}")]))
+
+    def test_refuses_inconsistent_uncompressed_size(self):
+        archive = bytearray(make_zip([("staging-admission.json", "{}")]))
+        central_header = archive.index(b"PK\x01\x02")
+        struct.pack_into("<I", archive, central_header + 24, 3)
+        self.refused("receipt length mismatch", sa.read_archive, archive)
+
+    def test_refuses_corrupt_deflate_stream(self):
+        entry = zipfile.ZipInfo("staging-admission.json")
+        entry.compress_type = zipfile.ZIP_DEFLATED
+        archive = bytearray(make_zip([(entry, "{}")]))
+        archive[30 + len(entry.filename)] |= 0b110  # Reserved DEFLATE block type.
+        self.refused("unreadable receipt archive", sa.read_archive, archive)
 
     def test_refuses_nonfinite_json(self):
         for token in ("NaN", "Infinity", "-Infinity", "1e999"):

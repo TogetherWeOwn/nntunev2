@@ -64,7 +64,8 @@ class GuardFixtures(unittest.TestCase):
 
     def test_malformed_filters_fail_closed(self):
         for trigger in (
-            "[]", "[push, push]", "{push: {paths: src/**}}", "{push: {paths: [[], src/**]}}",
+            "[]", "[push, push]", '{"": {}, push: {paths: [src/**]}}',
+            "{push: {paths: src/**}}", "{push: {paths: [[], src/**]}}",
             "{push: {branches: [main], branches-ignore: [main], paths: [src/**]}}",
             "{pull_request: {types: {opened: yes}, paths: [src/**]}}",
         ):
