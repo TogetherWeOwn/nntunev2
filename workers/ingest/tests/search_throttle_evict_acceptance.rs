@@ -105,13 +105,21 @@ fn overflow_preserves_spent_buckets_until_refill() {
 fn pruning_reclaims_only_fully_refilled_buckets() {
     let cfg = one_shot_cfg();
     let mut store = SearchThrottleStore::new();
-    assert!(is_allow(&store.check(&key_for(0), &cfg, NOW - 1)));
-    for i in 1..CAP {
-        assert!(is_allow(&store.check(&key_for(i), &cfg, NOW)));
+    for i in 0..CAP {
+        let now = if i < 2 { NOW - 1 } else { NOW };
+        assert!(is_allow(&store.check(&key_for(i), &cfg, now)));
     }
     let first_refill = NOW + cfg.window_secs - 1;
     assert!(is_allow(&store.check(&key_for(CAP), &cfg, first_refill)));
-    assert!(!is_allow(&store.check(&key_for(1), &cfg, first_refill)));
+    // Reclaiming two slots leaves room to pair either spent key with a fresh one.
+    let spent = key_for(2);
+    let fresh = key_for(CAP + 1);
+    for probe in [
+        SearchThrottleKey::new(spent.ip(), fresh.account()),
+        SearchThrottleKey::new(fresh.ip(), spent.account()),
+    ] {
+        assert!(!is_allow(&store.check(&probe, &cfg, first_refill)));
+    }
 }
 
 #[test]
