@@ -477,6 +477,8 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
 
     check_legacy_mixed_plan_history(&observer, seed).await;
     scheduled_reconciliation_preserves_later_plan_update(&observer).await;
+    concurrent_collision_and_target_identity_preserve_entitlement_and_release_locks(&observer)
+        .await;
     drop(observer);
     driver.await.unwrap().unwrap();
 }
@@ -1208,4 +1210,316 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
         true
     );
     assert_eq!(after_cancel.1, committed.1);
+}
+
+async fn entitlement_of(user: &str, at: i64) -> crate::billing::EffectivePlan {
+    let live = with_store(CALLER_CONNECTION, 1, async |store| {
+        super::Store::live_subscription(store, user).await
+    })
+    .await
+    .unwrap();
+    crate::billing::resolve_effective_plan(live.as_ref().map(|row| row.as_view()), at)
+}
+
+async fn assert_no_billing_locks(observer: &Client, users: &[&str]) {
+    let sql = "SELECT NOT EXISTS (SELECT 1 FROM pg_catalog.pg_locks
+        WHERE database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())
+          AND pid <> pg_backend_pid()
+          AND (relation IN ('public.subscriptions'::regclass, 'public.paid_invoice_history'::regclass, 'public.users'::regclass) OR locktype = 'advisory'))";
+    let clear: bool = observer.query_one(sql, &[]).await.unwrap().get(0);
+    assert!(clear, "billing locks remained held after transaction end");
+    for user in users {
+        let q = "SELECT pg_try_advisory_xact_lock(hashtext($1))";
+        let free: bool = observer.query_one(q, &[user]).await.unwrap().get(0);
+        assert!(free, "per-user advisory lock remained held for {user}");
+    }
+}
+
+async fn poll_lock_pid(observer: &Client, sql: &str, blocker: Option<i32>) -> Result<i32, ()> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let row = match blocker {
+                Some(pid) => observer.query_opt(sql, &[&pid]).await.unwrap(),
+                None => observer.query_opt(sql, &[]).await.unwrap(),
+            };
+            if let Some(row) = row {
+                return row.get::<_, i32>(0);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| ())
+}
+
+fn assert_snapshot_added_one(
+    before: &(Value, Value),
+    after: &(Value, Value),
+    (owner, sub, inv): (&str, &str, &str),
+    (gone_sub, gone_inv): (Option<&str>, &str),
+) {
+    let (bs, bh) = (before.0.as_array().unwrap(), before.1.as_array().unwrap());
+    let (subs, hist) = (after.0.as_array().unwrap(), after.1.as_array().unwrap());
+    assert_eq!((subs.len(), hist.len()), (bs.len() + 1, bh.len() + 1));
+    assert!(bs.iter().all(|r| subs.contains(r)) && bh.iter().all(|r| hist.contains(r)));
+    let has_sub = |r: &Value| r["stripe_subscription_id"] == sub && r["user_id"] == owner;
+    assert!(subs
+        .iter()
+        .any(|r| has_sub(r) && r["paid_invoice_id"] == inv));
+    assert!(gone_sub.is_none_or(|g| !subs.iter().any(|r| r["stripe_subscription_id"] == g)));
+    assert!(hist
+        .iter()
+        .any(|r| has_sub(r) && r["stripe_invoice_id"] == inv));
+    assert!(!hist.iter().any(|r| r["stripe_invoice_id"] == gone_inv));
+}
+
+const COLLISION_GATE_KEY: i64 = 781_349_099;
+
+async fn run_gated_collision(
+    observer: &Client,
+    winner: (&str, &ReconcileOutcome),
+    loser: (&str, &ReconcileOutcome),
+    table_lock: bool,
+    during_check: (&str, i64, crate::billing::EffectivePlan),
+) -> (Result<(), StoreError>, Result<(), StoreError>) {
+    let q_lock = "SELECT pg_try_advisory_lock($1)";
+    let q_unlock = "SELECT pg_advisory_unlock($1)";
+    assert!(observer
+        .query_one(q_lock, &[&COLLISION_GATE_KEY])
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    let mut unlocked = false;
+    let outcome = async {
+        let winner_fut = dispatch(winner.0, winner.1);
+        tokio::pin!(winner_fut);
+        let gate_sql = "SELECT l.pid FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_locks w ON w.pid = l.pid
+            WHERE l.database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())
+              AND l.relation = 'public.subscriptions'::regclass AND l.mode = 'ShareRowExclusiveLock' AND l.granted
+              AND w.locktype = 'advisory' AND NOT w.granted AND pg_backend_pid() = ANY(pg_blocking_pids(l.pid))";
+        let winner_pid = tokio::select! {
+            res = &mut winner_fut => return Err(format!("winner finished before gate: {res:?}")),
+            pid = poll_lock_pid(observer, gate_sql, None) => pid.map_err(|_| "winner never reached gate".to_string())?,
+        };
+        let loser_fut = dispatch(loser.0, loser.1);
+        tokio::pin!(loser_fut);
+        let pred = if table_lock {
+            "l.relation = 'public.subscriptions'::regclass AND l.mode = 'ShareRowExclusiveLock'"
+        } else {
+            "l.locktype = 'advisory'"
+        };
+        let wait_sql = format!(
+            "SELECT l.pid FROM pg_catalog.pg_locks l WHERE l.database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()) AND {pred} AND NOT l.granted AND $1 = ANY(pg_blocking_pids(l.pid))"
+        );
+        let loser_pid = tokio::select! {
+            res = &mut winner_fut => return Err(format!("winner finished early: {res:?}")),
+            res = &mut loser_fut => return Err(format!("contender finished before blocking: {res:?}")),
+            pid = poll_lock_pid(observer, &wait_sql, Some(winner_pid)) => pid.map_err(|_| "contender never blocked".to_string())?,
+        };
+        if loser_pid == winner_pid {
+            return Err("contender and winner shared backend pid".to_string());
+        }
+        let during = entitlement_of(during_check.0, during_check.1).await;
+        if during != during_check.2 {
+            return Err(format!("entitlement changed before commit: {during:?}"));
+        }
+        unlocked = observer.query_one(q_unlock, &[&COLLISION_GATE_KEY]).await.unwrap().get(0);
+        if !unlocked {
+            return Err("failed to unlock collision gate".to_string());
+        }
+        Ok(tokio::join!(winner_fut, loser_fut))
+    }
+    .await;
+    if !unlocked {
+        let _ = observer.query_one(q_unlock, &[&COLLISION_GATE_KEY]).await;
+    }
+    outcome.expect("gated collision phases must complete cleanly")
+}
+
+async fn concurrent_collision_and_target_identity_preserve_entitlement_and_release_locks(
+    observer: &Client,
+) {
+    use crate::billing::EffectivePlan;
+    use crate::plan_limits::PlanId;
+
+    const WINNER: &str = "native_billing_race_winner";
+    const LOSER: &str = "native_billing_race_loser";
+    const SLOT_A: &str = "sub_native_slot_race_a";
+    let mk = |sub: &str, pro: bool, inv: &str, end: i64| {
+        let (price, plan, amt) = if pro {
+            (PRO, "pro", 1500)
+        } else {
+            (PLUS, "plus", 800)
+        };
+        ReconcileOutcome {
+            row: ReconciledRow {
+                stripe_subscription_id: sub.into(),
+                stripe_customer_id: format!("cus_{inv}"),
+                stripe_item_id: format!("si_{sub}"),
+                stripe_price_id: price.into(),
+                plan_id: plan.into(),
+                status: "active".into(),
+                current_period_end_unix: Some(end),
+                cancel_at_period_end: false,
+                paid_through_unix: Some(end),
+                paid_invoice_id: Some(inv.into()),
+                grace_until_unix: None,
+            },
+            history: vec![PaidInvoiceRow {
+                stripe_invoice_id: inv.into(),
+                stripe_subscription_id: sub.into(),
+                plan_id: plan.into(),
+                period_start_unix: NOW,
+                period_end_unix: end,
+                amount_cents: amt,
+                currency: "usd".into(),
+                paid_at_unix: NOW,
+                covered_periods: vec![(NOW, end)],
+            }],
+            fail_closed: None,
+            explicit_stale: false,
+            read_plan: None,
+            read_anchor: None,
+        }
+    };
+    let ep = |plan, entitled| EffectivePlan { plan, entitled };
+    let (pro, plus, closed) = (
+        ep(PlanId::Pro, true),
+        ep(PlanId::Plus, true),
+        ep(PlanId::Free, false),
+    );
+    let check_base = async || {
+        assert_eq!(entitlement_of(USER, NOW + 299).await, pro);
+        assert_eq!(entitlement_of(USER, NOW + 300).await, closed);
+        assert_eq!(entitlement_of(OTHER_USER, NOW + 60).await, plus);
+    };
+    check_base().await;
+    let before = snapshot(observer).await;
+
+    // 1. Conflicting target identities against existing entitled accounts.
+    for (sub, is_pro, inv) in [
+        (
+            "sub_native_slot_collision",
+            false,
+            "in_native_slot_collision",
+        ),
+        ("sub_native_mixed_plan", true, "in_native_foreign_target"),
+    ] {
+        assert!(dispatch(USER, &mk(sub, is_pro, inv, NOW + 600))
+            .await
+            .is_err());
+        assert_eq!(snapshot(observer).await, before);
+        check_base().await;
+        assert_no_billing_locks(observer, &[USER, OTHER_USER]).await;
+    }
+
+    let mut bad_hist = mk(SUBSCRIPTION, true, "in_native_wrong_history", NOW + 600);
+    bad_hist.read_plan = Some("pro".into());
+    bad_hist.read_anchor = Some("in_native_renewal_with_cancel_race".into());
+    bad_hist.history[0].stripe_subscription_id = "sub_native_wrong_history".into();
+    let pre_err = with_store(CONNECTION, 0, async |store| {
+        super::Store::store_paid_reconcile_outcome(store, USER, &bad_hist).await
+    })
+    .await;
+    assert!(pre_err.is_err());
+    let (mut c, conn) = tokio_postgres::connect(CONNECTION, NoTls).await.unwrap();
+    let driver = tokio::spawn(conn);
+    super::billing_budget::bootstrap_transaction(&mut c)
+        .await
+        .unwrap();
+    c.batch_execute("SELECT pg_current_xact_id()")
+        .await
+        .unwrap();
+    let tx_err = crate::billing_transaction_sql::apply_reconcile_transaction(
+        &mut c,
+        USER.into(),
+        bad_hist,
+        true,
+    )
+    .await;
+    assert!(tx_err.is_err());
+    let xid_sql = "SELECT pg_current_xact_id_if_assigned() IS NULL";
+    assert!(c.query_one(xid_sql, &[]).await.unwrap().get::<_, bool>(0));
+    drop(c);
+    driver.await.unwrap().unwrap();
+    assert_eq!(snapshot(observer).await, before);
+    check_base().await;
+    assert_no_billing_locks(observer, &[USER, OTHER_USER]).await;
+
+    // 2. Concurrent cross-user global target-identity and same-user live-slot collisions.
+    observer.execute(
+        "INSERT INTO public.users (id, email, created_at) VALUES ($1, 'race-winner@example.test', $3), ($2, 'race-loser@example.test', $3)",
+        &[&WINNER, &LOSER, &NOW],
+    ).await.unwrap();
+    observer.batch_execute(
+        "CREATE FUNCTION public.native_billing_collision_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(781349099); RETURN NEW; END $$;
+         CREATE TRIGGER native_billing_collision_gate BEFORE INSERT ON public.paid_invoice_history FOR EACH ROW
+         WHEN (NEW.stripe_invoice_id IN ('in_native_concurrent_winner', 'in_native_slot_race_a'))
+         EXECUTE FUNCTION public.native_billing_collision_gate();",
+    ).await.unwrap();
+    let all = [USER, OTHER_USER, WINNER, LOSER];
+    let mut prev = before;
+    let races = [
+        (
+            WINNER,
+            LOSER,
+            "sub_native_concurrent_global",
+            "sub_native_concurrent_global",
+            "in_native_concurrent_winner",
+            "in_native_concurrent_loser",
+            true,
+            (USER, NOW + 299, pro),
+            (plus, closed),
+        ),
+        (
+            LOSER,
+            LOSER,
+            SLOT_A,
+            "sub_native_slot_race_b",
+            "in_native_slot_race_a",
+            "in_native_slot_race_b",
+            false,
+            (LOSER, NOW + 499, closed),
+            (plus, plus),
+        ),
+    ];
+    for (w_u, l_u, w_s, l_s, w_i, l_i, tlock, during, expected) in races {
+        let (w_out, l_out) = (
+            mk(w_s, false, w_i, NOW + 500),
+            mk(l_s, true, l_i, NOW + 600),
+        );
+        let (w_res, l_res) =
+            run_gated_collision(observer, (w_u, &w_out), (l_u, &l_out), tlock, during).await;
+        w_res.expect("first concurrent claimant commits");
+        assert!(l_res.is_err(), "concurrent contender must roll back");
+        let after = snapshot(observer).await;
+        assert_snapshot_added_one(
+            &prev,
+            &after,
+            (w_u, w_s, w_i),
+            ((l_s != w_s).then_some(l_s), l_i),
+        );
+        check_base().await;
+        assert_eq!(
+            (
+                entitlement_of(WINNER, NOW + 499).await,
+                entitlement_of(LOSER, NOW + 499).await
+            ),
+            expected
+        );
+        assert_no_billing_locks(observer, &all).await;
+        prev = after;
+    }
+    let drop_sql = "DROP TRIGGER IF EXISTS native_billing_collision_gate ON public.paid_invoice_history; DROP FUNCTION IF EXISTS public.native_billing_collision_gate();";
+    observer.batch_execute(drop_sql).await.unwrap();
+
+    // 3. Follow-up fold succeeds immediately, proving no pending fold or lock lingers.
+    let mut follow_up = mk(SLOT_A, false, "in_native_slot_race_a_2", NOW + 900);
+    follow_up.read_plan = Some("plus".into());
+    follow_up.read_anchor = Some("in_native_slot_race_a".into());
+    dispatch(LOSER, &follow_up)
+        .await
+        .expect("follow-up fold commits cleanly");
+    assert_eq!(entitlement_of(LOSER, NOW + 899).await, plus);
+    assert_no_billing_locks(observer, &all).await;
 }
