@@ -293,8 +293,8 @@ impl AuthStore for ProductionStore {
         None
     }
 
-    fn verify_token(&self, _username: &str, _token: &str, _salt: &str) -> Option<Identity> {
-        Some(self.identity.clone())
+    fn verify_token(&self, username: &str, _token: &str, _salt: &str) -> Option<Identity> {
+        (username == self.identity.username).then(|| self.identity.clone())
     }
 }
 
@@ -694,22 +694,15 @@ pub fn compat_session_id(user_id: &str, credential_id: &str) -> String {
 }
 
 // True when the request asks for transcoding this FLAC-only surface cannot
-// honour: a `format` other than `flac` or `raw` (case-insensitive), or a
-// positive `maxBitRate` cap. `raw` requests original bytes; `maxBitRate=0`
-// means "no cap", and an absent parameter also passes through.
+// honour. Every supplied `format` must allow original FLAC bytes and
+// every supplied `maxBitRate` must be zero (no cap).
 pub fn rejects_transcode(params: &Params) -> bool {
-    if let Some(format) = params.get("format") {
-        if !format.eq_ignore_ascii_case(FLAC_SUFFIX) && !format.eq_ignore_ascii_case("raw") {
-            return true;
-        }
-    }
-    if let Some(max_bit_rate) = params.get("maxBitRate") {
-        match max_bit_rate.parse::<i64>() {
-            Ok(value) => return value > 0,
-            Err(_) => return true,
-        }
-    }
-    false
+    params.get_all("format").into_iter().any(|format| {
+        !format.eq_ignore_ascii_case(FLAC_SUFFIX) && !format.eq_ignore_ascii_case("raw")
+    }) || params
+        .get_all("maxBitRate")
+        .into_iter()
+        .any(|cap| cap.parse::<u64>() != Ok(0))
 }
 
 pub fn transcode_refusal_response(query: &str) -> HttpResponse {

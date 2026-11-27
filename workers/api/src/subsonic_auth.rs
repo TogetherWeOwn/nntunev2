@@ -9,7 +9,12 @@ use nntune_subsonic::construction_budget::ConstructionBudget;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::{field_envelope::FieldEnvelope, native_rest::Pepper, rotation::KekSource};
+use crate::{
+    field_envelope::FieldEnvelope,
+    native_rest::Pepper,
+    rotation::KekSource,
+    subsonic_config::{MAX_KEY_BYTES, MIN_KEY_BYTES},
+};
 
 #[path = "subsonic_auth_verify.rs"]
 mod verify;
@@ -32,6 +37,27 @@ pub enum AuthMode {
     Both,
 }
 
+pub(super) fn valid_version(version: u32) -> bool {
+    (1..=i32::MAX as u32).contains(&version)
+}
+
+fn valid_pepper(pepper: &Pepper<'_>) -> bool {
+    valid_version(pepper.version) && (MIN_KEY_BYTES..=MAX_KEY_BYTES).contains(&pepper.bytes.len())
+}
+
+pub(crate) fn same_index_pepper(left: &[u8], right: &[u8]) -> bool {
+    // Valid peppers fit in one SHA-256 block. HMAC zero-pads shorter keys,
+    // so trailing zero bytes do not make the two versions independent.
+    let (short, long) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let (prefix, padding) = long.split_at(short.len());
+    let padding_bits = padding.iter().fold(0, |bits, &byte| bits | byte);
+    (short.ct_eq(prefix) & padding_bits.ct_eq(&0)).into()
+}
+
 /// A separate keyring must be loaded from SUBSONIC_INDEX_PEPPER, never
 /// from the native REST pepper secret. At most two exact versions are used.
 /// Deliberately no Debug: even configuration failures must not expose keys.
@@ -42,14 +68,13 @@ pub struct IndexKeyring<'a> {
 
 impl<'a> IndexKeyring<'a> {
     pub fn new(current: Pepper<'a>, previous: Option<Pepper<'a>>) -> Result<Self, AuthError> {
-        if current.version == 0 || current.bytes.len() < 32 {
+        if !valid_pepper(&current) {
             return Err(AuthError::Unavailable);
         }
         if let Some(p) = &previous {
-            if p.version == 0
+            if !valid_pepper(p)
                 || p.version == current.version
-                || p.bytes.len() < 32
-                || p.bytes == current.bytes
+                || same_index_pepper(p.bytes, current.bytes)
             {
                 return Err(AuthError::Unavailable);
             }
