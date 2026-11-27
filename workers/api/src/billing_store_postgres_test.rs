@@ -1209,16 +1209,15 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
     );
     assert_eq!(after_cancel.1, committed.1);
     let lock_probe = "SELECT pg_try_advisory_xact_lock(hashtext($1)), NOT EXISTS (
-                    SELECT FROM pg_locks WHERE relation = 'public.subscriptions'::regclass
-                      AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-                      AND mode = 'ShareRowExclusiveLock' AND granted)";
+        SELECT FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database())
+          AND relation = 'public.subscriptions'::regclass AND mode = 'ShareRowExclusiveLock' AND granted)";
     let locks_available = async || {
         let row = observer.query_one(lock_probe, &[&USER]).await.unwrap();
         (row.get::<_, bool>(0), row.get::<_, bool>(1))
     };
-    renewed.subscription.status = "past_due".into();
-    for invoices in [None, Some(renewed.invoices)] {
-        let retrieval_failed = invoices.is_none();
+    let item_id = "si_native_locked_observation";
+    cancel.subscription.items.as_mut().unwrap().data[0].id = item_id.into();
+    for (retrieval_failed, invoices) in [(true, None), (false, Some(cancel.invoices))] {
         let result = with_store(CALLER_CONNECTION, 1, async |store| {
             store
                 .reconcile_locked_subscription(
@@ -1226,7 +1225,7 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
                     &target,
                     async || {
                         assert_eq!(locks_available().await, (false, true));
-                        Ok(renewed.subscription.clone())
+                        Ok(cancel.subscription.clone())
                     },
                     async |_| {
                         assert_eq!(locks_available().await, (false, true));
@@ -1239,12 +1238,13 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
         .await;
         assert_eq!(locks_available().await, (true, true));
         assert_eq!(result.is_err(), retrieval_failed);
-        let after = snapshot(observer).await;
+        let (rows, history) = snapshot(observer).await;
+        assert_eq!(history, after_cancel.1);
         if retrieval_failed {
-            assert_eq!(after, after_cancel);
+            assert_eq!(rows, after_cancel.0);
         } else {
-            assert_eq!(subscription_row(&after.0)["status"], "past_due");
-            assert_eq!(after.1, after_cancel.1);
+            let row = subscription_row(&rows);
+            assert_eq!(row["stripe_subscription_item_id"], item_id);
         }
     }
 }
