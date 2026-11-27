@@ -91,9 +91,8 @@ const ALLOWED_FETCH_PORT: u16 = 443;
 pub(crate) const MAX_FETCH_URL_BYTES: usize = 8 * 1024;
 
 pub(crate) fn valid_url_text(url: &str) -> bool {
-    url.len() <= MAX_FETCH_URL_BYTES
-        && !url.contains('\\')
-        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+    let invalid_char = |c: char| c == '\\' || c.is_whitespace() || c.is_control();
+    url.len() <= MAX_FETCH_URL_BYTES && !url.chars().any(invalid_char)
 }
 
 /// Injected address lookup for library policy checks; no runtime DNS adapter
@@ -561,7 +560,7 @@ mod tests {
     #[test]
     fn explicit_non_443_port_is_malformed() {
         let cfg = FetchConfig {
-            allowed_hosts: vec!["nzb.example".to_string()],
+            allowed_hosts: FetchConfig::allowlist_from_env("nzb.example,nzb..example"),
             ..FetchConfig::default()
         };
         // A fetch URL naming any other explicit port is not an NZB-fetch
@@ -574,14 +573,14 @@ mod tests {
             validate_fetch_url("https://nzb.example:65536/x.nzb", &cfg, &NoDns),
             Err(FetchRejection::MalformedUrl)
         );
-        assert_eq!(
-            validate_fetch_url("https://nzb.example:+443/x.nzb", &cfg, &NoDns),
-            Err(FetchRejection::MalformedUrl)
-        );
-        assert_eq!(
-            validate_fetch_url("https://[nzb.example]/x.nzb", &cfg, &PublicDns),
-            Err(FetchRejection::MalformedUrl)
-        );
+        for url in [
+            "https://nzb.example:+443/x.nzb",
+            "https://[nzb.example]/x.nzb",
+            "https://nzb..example/x.nzb",
+        ] {
+            let result = validate_fetch_url(url, &cfg, &PublicDns);
+            assert_eq!(result, Err(FetchRejection::MalformedUrl));
+        }
     }
 
     struct PublicDns;

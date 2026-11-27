@@ -766,7 +766,7 @@ mod tests {
             other => panic!("expected too-large, got {other:?}"),
         }
         assert_eq!(
-            estimate_nzb("<html><body>hi</body></html>").unwrap_err(),
+            estimate_nzb("<nzb-lookalike/>").unwrap_err(),
             IntakeRejection::NotNzb
         );
         assert_eq!(
@@ -777,14 +777,14 @@ mod tests {
 
     #[test]
     fn malformed_shapes_all_fail_well_formedness() {
-        assert_eq!(
-            estimate_nzb("<nzb-lookalike/>"),
-            Err(IntakeRejection::NotNzb)
-        );
         for doc in [
             "<nzb/><file/>",
             "<nzb/>trailing text",
             "<nzb/><![CDATA[trailing text]]>",
+            "<nzb attr='<'/>",
+            "<nzb a='1'b='2'/>",
+            "<nzb></ nzb>",
+            "<nzb\u{c}/>",
             "<nzb><segment bytes/></nzb>",
             "<nzb><segment bytes='1' bytes='2'/></nzb>",
         ] {

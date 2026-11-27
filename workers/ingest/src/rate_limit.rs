@@ -294,8 +294,7 @@ impl SearchThrottleStore {
         cfg: &SearchRateLimitConfig,
         now_s: u64,
     ) -> SearchDecision {
-        // Reclaimed balances were observed at the last prune, so any new
-        // buckets must start at or after that time even on clock rollback.
+        // Fresh buckets start at or after the last prune, even on clock rollback.
         let now_s = now_s.max(self.last_pruned_s.unwrap_or_default());
         let fresh = || TokenBucket::per_window(cfg.max_attempts, cfg.window_secs, now_s);
         // Peek + decide on copies, then write back: a denial must not

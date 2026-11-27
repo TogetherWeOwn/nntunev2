@@ -237,16 +237,13 @@ pub(crate) fn host_shape_ok(host: &str) -> bool {
     }
     // Other URL parsers may interpret numeric final labels as IPv4.
     let last = host.rsplit('.').next().unwrap_or_default();
-    if last.bytes().all(|b| b.is_ascii_digit())
-        || last
-            .strip_prefix("0x")
-            .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        return false;
-    }
+    let decimal = last.bytes().all(|b| b.is_ascii_digit());
+    let hex = last.strip_prefix("0x");
     !host.starts_with('.')
         && !host.ends_with('.')
         && !host.contains("..")
+        && !decimal
+        && !hex.is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
         && host.split('.').all(|label| label.len() <= 63)
         && host
             .bytes()
@@ -508,9 +505,7 @@ pub fn url_host_for_log(url: &str) -> String {
 }
 
 fn parse_log_host(url: &str) -> Option<String> {
-    if !valid_url_text(url) {
-        return None;
-    }
+    valid_url_text(url).then_some(())?;
     let (scheme, rest) = url.split_once("://")?;
     let mut parts = rest.splitn(2, ['/', '?', '#']);
     let authority = parts.next()?;
@@ -645,6 +640,8 @@ mod tests {
             "[indexer.example]",
             "indexer.example:+443",
             "2130706433",
+            "0x7f",
+            &"a".repeat(64),
             r"127.0.0.1\x.evil.example",
             "indexer%2eexample",
             "indexer_example",
