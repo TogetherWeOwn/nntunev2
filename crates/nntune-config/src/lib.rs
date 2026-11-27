@@ -360,7 +360,9 @@ fn parse_config_value(spec: &KeySpec, raw: &str) -> Result<Value, ConfigError> {
         "auth.invite_redemption_max_attempts" => 1..=10,
         "auth.invite_redemption_window_secs" => 300..=300,
         "auth.magic_link_ttl_secs" => 1..=900,
-        "session.ttl_secs" => 1..=86_400,
+        // Schema v1 caps the effective lifetime for positive session TTLs.
+        "session.ttl_secs" if number > 0 => return Ok(Value::U64(number.min(86_400))),
+        "session.ttl_secs" => return Err(ConfigError::InvalidValue(spec.name)),
         "ingest.max_nzb_bytes" => 1..=2 * 1024 * 1024,
         // Retries match the Queue consumer budget. Payloads survive the
         // 15-day replay window and expire within the current 30-day retention.

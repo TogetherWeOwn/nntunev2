@@ -124,7 +124,6 @@ fn rejects_runtime_values_outside_worker_limits() {
         ("mb.max_query_chars", "101"),
         ("mb.search_limit", "26"),
         ("session.ttl_secs", "0"),
-        ("session.ttl_secs", "86401"),
         ("stream.r2_min_part_bytes", "5242879"),
         ("stream.r2_min_part_bytes", "5242881"),
     ] {
@@ -148,6 +147,20 @@ fn accepts_in_range_runtime_tuning() {
     let config = Config::load(&raw).expect("worker limits are inclusive");
     assert_eq!(config.get_u64("ingest.payload_ttl_secs"), Some(1_296_000));
     assert_eq!(config.get_u64("mb.lookup_cache_ttl_s"), Some(60));
+}
+
+#[test]
+fn caps_positive_session_ttl_on_load_and_override() {
+    let mut raw = identity("example.test", "https://example.test");
+    raw.insert("session.ttl_secs".into(), "86401".into());
+    let config = Config::load(&raw).expect("TTL above the cap is valid");
+    assert_eq!(config.get_u64("session.ttl_secs"), Some(86_400));
+    raw.insert("session.ttl_secs".into(), "3600".into());
+    let mut config = Config::load(&raw).expect("short TTL is valid");
+    config
+        .apply_env(&values(&[("SESSION_TTL_SECS", "18446744073709551615")]))
+        .expect("large TTL override is valid");
+    assert_eq!(config.get_u64("session.ttl_secs"), Some(86_400));
 }
 
 #[test]
