@@ -372,16 +372,17 @@ class PaginationAndTransportTests(unittest.TestCase):
             read.side_effect = http.client.IncompleteRead(b"private-canary")
             with self.assertRaisesRegex(guard.GuardError, "^API_GET_FAILED$"):
                 guard.api_get("unused", ACCOUNT, "test-token")
-            read.side_effect = None
-            read.return_value = b"private-canary"
+            read.configure_mock(side_effect=None, return_value=b"private-canary")
             with self.assertRaisesRegex(guard.GuardError, "API_JSON_INVALID"):
+                guard.api_get("unused", ACCOUNT, "test-token")
+            with patch.object(guard.json, "loads", side_effect=RecursionError), \
+                    self.assertRaisesRegex(guard.GuardError, "^API_JSON_INVALID$"):
                 guard.api_get("unused", ACCOUNT, "test-token")
 
     def test_transport_rejects_ambiguous_or_nonstandard_json(self):
         for body in (b'{"success":false,"success":true,"result":{}}',
                      b'{"success":true,"result":{"enabled":true,"enabled":false}}',
-                     b'{"success":true,"result":NaN}',
-                     b'{"success":true,"result":' + b"[" * 10_000 + b"0" + b"]" * 10_000 + b"}"):
+                     b'{"success":true,"result":NaN}'):
             with self.subTest(body=body[:64]), patch.object(guard.urllib.request, "build_opener") as opener:
                 self.stub_response(opener).read.return_value = body
                 with self.assertRaisesRegex(guard.GuardError, "^API_JSON_INVALID$"):

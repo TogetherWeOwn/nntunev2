@@ -265,8 +265,7 @@ def verify(settings, namespaces, subdomain, versions, expected_logs):
     require(isinstance(items, list) and bool(items) and isinstance(items[0], dict),
             "VERSION_EVIDENCE_MISSING")
     version_id = items[0].get("id")
-    require(isinstance(version_id, str) and VERSION_ID.fullmatch(version_id),
-            "VERSION_EVIDENCE_MISSING")
+    require(isinstance(version_id, str) and VERSION_ID.fullmatch(version_id), "VERSION_EVIDENCE_MISSING")
     return {"worker": WORKER, "version_id": version_id,
             "do_namespace_id": mine[0]["id"], "bindings": sorted(by_name)}
 
