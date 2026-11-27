@@ -113,28 +113,6 @@ fn is_well_formed(row: &MediaRow) -> bool {
     hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn malformed_format_does_not_signal_a_cross_profile_source() {
-        let hash = "a".repeat(64);
-        for format in [" ", "opus\n", "flac\0", "ópus"] {
-            let row = MediaRow {
-                format,
-                bitrate: 64,
-                content_hash: &hash,
-                encrypted_s3: None,
-            };
-            assert_eq!(
-                choose_profile_artifact(&[row], StreamProfile::Opus64),
-                Err(ChoiceMiss::NoWellFormedCandidate)
-            );
-        }
-    }
-}
-
 /// Choose the artifact to serve for `profile` from caller-ordered `rows`.
 ///
 /// Decision table for [`StreamProfile::Opus64`], evaluated in order:
@@ -189,4 +167,26 @@ fn choose_opus64<'a>(rows: &[MediaRow<'a>]) -> Result<ChosenArtifact<'a>, Choice
         return Err(ChoiceMiss::CrossProfileRefused);
     }
     Err(ChoiceMiss::NoWellFormedCandidate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_format_does_not_signal_a_cross_profile_source() {
+        let hash = "a".repeat(64);
+        for format in [" ", "opus\n", "flac\0", "ópus"] {
+            let row = MediaRow {
+                format,
+                bitrate: 64,
+                content_hash: &hash,
+                encrypted_s3: None,
+            };
+            assert_eq!(
+                choose_profile_artifact(&[row], StreamProfile::Opus64),
+                Err(ChoiceMiss::NoWellFormedCandidate)
+            );
+        }
+    }
 }

@@ -29,6 +29,23 @@ impl OrderedDelivery {
         Ok(())
     }
 
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn offer_write(
+        &mut self,
+        bytes: &[u8],
+        pending: Option<&[u8]>,
+    ) -> Result<(), SourceError> {
+        match pending {
+            Some(previous) if self.pending() && previous == bytes => Ok(()),
+            None if (1..=nntune_core::original_source::MAX_ARTICLE_BYTES)
+                .contains(&bytes.len()) =>
+            {
+                self.offer(bytes.len())
+            }
+            _ => Err(SourceError::Bounds),
+        }
+    }
+
     pub(crate) fn acknowledge(&mut self, bytes: usize) -> Result<(), SourceError> {
         if bytes == 0 || bytes > self.offered {
             return Err(SourceError::Bounds);
@@ -72,5 +89,28 @@ mod tests {
         assert!(delivery.complete());
         assert!(delivery.acknowledge(1).is_err());
         assert_eq!(delivery.accepted(), 5);
+    }
+
+    #[test]
+    fn fixed_write_rejects_overrun_and_changed_retry_until_exact_completion() {
+        let mut delivery = OrderedDelivery::new(3);
+        assert_eq!(delivery.offer_write(b"", None), Err(SourceError::Bounds));
+        assert_eq!(
+            delivery.offer_write(b"abcd", None),
+            Err(SourceError::Bounds)
+        );
+        delivery.offer_write(b"ab", None).unwrap();
+        assert_eq!(
+            delivery.offer_write(b"ac", Some(b"ab")),
+            Err(SourceError::Bounds)
+        );
+        delivery.offer_write(b"ab", Some(b"ab")).unwrap();
+        assert!(!delivery.complete());
+        delivery.acknowledge(2).unwrap();
+        assert!(!delivery.complete());
+        assert_eq!(delivery.offer_write(b"ab", None), Err(SourceError::Bounds));
+        delivery.offer_write(b"c", None).unwrap();
+        delivery.acknowledge(1).unwrap();
+        assert!(delivery.complete());
     }
 }

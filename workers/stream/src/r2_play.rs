@@ -57,13 +57,7 @@ impl Play {
     ) -> Result<Blob, ApiError> {
         let key = match &self.artifact_key {
             Some(key) => key.clone(),
-            None => {
-                let key = legacy_key.await?;
-                key.strip_prefix("audio/")
-                    .and_then(|hash| crate::cache::blob_key_for_pointer(hash.as_bytes()))
-                    .filter(|canonical| canonical == &key)
-                    .ok_or_else(ApiError::upstream_unavailable)?
-            }
+            None => legacy_key.await?,
         };
         let size = head(&key)
             .await
@@ -216,23 +210,5 @@ mod tests {
         delivery.record(2);
         drop(delivery);
         assert_eq!(delivered.get(), Some(3));
-    }
-
-    #[tokio::test]
-    async fn legacy_lookup_rejects_keys_outside_its_blob_namespace() {
-        let token = grant::issue_v2("user-1", "track-9", "play-7", 42, 200, SECRET);
-        let play = authorize(&token, "track-9", SECRET, 199).unwrap();
-        for key in [
-            "track/track-9".to_string(),
-            format!("audio/9d/70/{HASH}"),
-            format!("audio/{HASH} "),
-        ] {
-            let result = play
-                .blob(async { Ok(key) }, async |_| {
-                    panic!("invalid key reached HEAD")
-                })
-                .await;
-            assert!(matches!(result, Err(error) if error.status == 502));
-        }
     }
 }

@@ -105,9 +105,7 @@ impl<'a> WorkerSource<'a> {
 
     async fn load(&self, grant: &Grant) -> Option<Resolved> {
         let (mut response, abort) = self.request(RESOLVE_PATH, grant).await?;
-        if response.status_code() != 200
-            || response.headers().get("content-type").ok()?.as_deref() != Some("application/json")
-        {
+        if response.status_code() != 200 {
             return None;
         }
         let mut stream = Box::pin(response.stream().ok()?);

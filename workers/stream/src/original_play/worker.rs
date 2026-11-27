@@ -12,7 +12,7 @@ use std::{
 
 use nntune_core::original_source::{
     reader::{AsyncArticleSource, AsyncReadControl, ReadControl},
-    SourceError, MAX_ARTICLE_BYTES,
+    SourceError,
 };
 use worker::{
     js_sys::{BigInt, Uint8Array},
@@ -28,7 +28,10 @@ use super::{
     OriginalAuthorization, OriginalControl, OriginalPlay, OriginalWriter, OwnedOriginalPlay,
     WriterDisconnect,
 };
-use crate::delivered::{DeliveredInterval, DeliveredSink};
+use crate::{
+    delivered::{DeliveredInterval, DeliveredSink},
+    response_delivery::OrderedDelivery,
+};
 
 /// Start only an already-prepared off-route response. The task owns its source,
 /// supplier, request control and writer; the response is returned without waiting
@@ -189,7 +192,7 @@ pub(crate) fn channel(
         raw,
         writing: None,
         closing: None,
-        remaining: body_len,
+        delivery: OrderedDelivery::new(body_len),
         stopped: false,
     };
     let response = Response::from_body(ResponseBody::Stream(stream.readable()))?
@@ -206,7 +209,7 @@ pub struct WorkerOriginalWriter {
     closed: WriterDisconnect<JsFuture>,
     writing: Option<(Box<[u8]>, PendingPromise)>,
     closing: Option<PendingPromise>,
-    remaining: u64,
+    delivery: OrderedDelivery,
     stopped: bool,
 }
 
@@ -227,20 +230,10 @@ impl OriginalWriter for WorkerOriginalWriter {
         if self.stopped || self.closing.is_some() {
             return Poll::Ready(Err(SourceError::Cancelled));
         }
-        if bytes.is_empty()
-            || bytes.len() > MAX_ARTICLE_BYTES
-            || bytes.len() as u64 > self.remaining
-        {
+        let pending = self.writing.as_ref().map(|(pending, _)| pending.as_ref());
+        if let Err(error) = self.delivery.offer_write(bytes, pending) {
             self.abort();
-            return Poll::Ready(Err(SourceError::Bounds));
-        }
-        if self
-            .writing
-            .as_ref()
-            .is_some_and(|(pending, _)| pending.as_ref() != bytes)
-        {
-            self.abort();
-            return Poll::Ready(Err(SourceError::Bounds));
+            return Poll::Ready(Err(error));
         }
         let (_, promise) = self.writing.get_or_insert_with(|| {
             let chunk = Uint8Array::from(bytes);
@@ -253,8 +246,7 @@ impl OriginalWriter for WorkerOriginalWriter {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(_)) => {
                 self.writing = None;
-                self.remaining -= bytes.len() as u64;
-                Poll::Ready(Ok(bytes.len()))
+                Poll::Ready(self.delivery.acknowledge(bytes.len()).map(|()| bytes.len()))
             }
             Poll::Ready(Err(_)) => {
                 self.abort();
@@ -267,7 +259,7 @@ impl OriginalWriter for WorkerOriginalWriter {
         if self.stopped {
             return Poll::Ready(Err(SourceError::Cancelled));
         }
-        if self.writing.is_some() || self.remaining != 0 {
+        if !self.delivery.complete() {
             self.abort();
             return Poll::Ready(Err(SourceError::Bounds));
         }
