@@ -16,12 +16,14 @@
 //! `workers/repair` has no codified registry and the docs carry no repair
 //! rows, so repair is explicitly out of scope: no repair codes are invented
 //! anywhere here, and `repair_has_no_registry_rows_or_module` keeps that
-//! absence explicit. Only test files change for this pin: the four
-//! registries are read as source text via `include_str!` (no new crate
-//! dependencies, so the stream dependency-free constraint is untouched).
+//! absence explicit. The declaration comparison reads the registries as
+//! source text. The MB wire check also runs its mapping against every row.
 
 use std::collections::BTreeMap;
 use std::path::Path;
+
+#[path = "../src/api_error.rs"]
+mod mb_error;
 
 const DOCS: &str = include_str!("../../../docs/api-errors.md");
 const API_SRC: &str = include_str!("../../api/src/api_error.rs");
@@ -268,6 +270,39 @@ fn docs_registry_matches_all_worker_registries() {
         "cross-worker api-errors drift:\n{}",
         errors.join("\n")
     );
+}
+
+#[test]
+fn mb_wire_mapping_redacts_server_and_foreign_errors() {
+    const DETAIL: &str = "synthetic detail with \"quotes\", \\ and a newline\n";
+    for row in parse_docs_table(DOCS) {
+        let mapped = match row.code.as_str() {
+            "invalid_request" => mb_error::ApiError::invalid_request(DETAIL),
+            "not_found" => mb_error::ApiError::not_found(DETAIL),
+            _ => mb_error::ApiError::by_code(&row.code, DETAIL),
+        };
+        let (code, status, retryable, message) = if row.owners.iter().any(|owner| owner == "mb") {
+            (
+                row.code.as_str(),
+                row.status,
+                row.retryable,
+                if row.status >= 500 {
+                    "unexpected error"
+                } else {
+                    DETAIL
+                },
+            )
+        } else {
+            ("internal_error", 500, true, "unexpected error")
+        };
+        assert_eq!(mapped.status, status, "{}", row.code);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&mapped.body_json()).unwrap(),
+            serde_json::json!({"code": code, "message": message, "retryable": retryable}),
+            "{}",
+            row.code
+        );
+    }
 }
 
 #[test]

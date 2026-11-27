@@ -23,8 +23,9 @@ fn record(
 fn repeated_conflicting_writes_yield_exactly_one_breach() {
     let mut ledger = PacketLedger::default();
     record(&mut ledger, "id-A", 5, 1_000, 1_120);
-    // Repeat the conflict with two more distinct identities.
-    record(&mut ledger, "id-B", 5, 2_000, 2_600);
+    // Invalid timestamps must still preserve the identity-conflict signal.
+    record(&mut ledger, "id-B", 5, 2_000, 1_999);
+    assert_eq!(ledger.packet_id_conflicts(), vec![5]);
     record(&mut ledger, "id-B", 5, 2_000, 2_600);
     record(&mut ledger, "id-C", 5, 3_000, 3_600);
 
@@ -95,4 +96,25 @@ fn conflicts_on_two_sequences_come_back_in_sequence_order() {
         "conflict breaches must be in sequence order, got {:?}",
         report.breaches
     );
+}
+
+#[test]
+fn reusing_an_id_at_another_sequence_preserves_pending_and_redacts_identity() {
+    let mut ledger = PacketLedger::default();
+    record(&mut ledger, "id-A", 5, 1_000, 1_120);
+    ledger.record_published(6, 1_200);
+    let records = ledger.records();
+
+    record(&mut ledger, "id-A", 6, 1_200, 1_300);
+    assert_eq!(ledger.records(), records);
+    assert_eq!(ledger.pending_published_at(6), Some(1_200));
+
+    record(&mut ledger, "id-B", 6, 1_200, 1_300);
+    let report = ReplicationSloProbe::default().evaluate(&ledger, 6, 1_300);
+    assert_eq!(report.breach_count, 1);
+    assert_eq!(report.breaches[0].kind, "packet_id_conflict");
+    assert_eq!(report.breaches[0].sequence, Some(6));
+    assert_eq!(report.breaches[0].lag_secs, None);
+    assert!(!report.structured_log.contains("id-A"));
+    assert!(!report.structured_log.contains("id-B"));
 }

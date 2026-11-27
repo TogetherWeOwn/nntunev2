@@ -131,3 +131,51 @@ fn apply_one_pending_packet_clears_only_its_matching_entry() {
     let remaining: Vec<i64> = ledger.pending().iter().map(|p| p.sequence).collect();
     assert_eq!(remaining, vec![20, 22]);
 }
+
+#[test]
+fn invalid_replay_preserves_evidence_and_stays_a_breach() {
+    let mut ledger = PacketLedger::default();
+    ledger.record(0, 0, REPLICATION_LAG_SLO_SECS + 1);
+    ledger.record_published(1, 8_000);
+    let records = ledger.records();
+    let pending = ledger.pending();
+
+    ledger.record(0, 2, 1);
+    ledger.record(0, i64::MIN, i64::MAX);
+    ledger.record_packet("bad\0identity".to_string(), 1, 8_000, 8_005);
+    ledger.record(-1, 0, 0);
+    ledger.record_published(-1, 8_000);
+    assert_eq!(ledger.records(), records);
+    assert_eq!(ledger.pending(), pending);
+
+    ledger.record(1, 8_000, 8_005);
+    let report = ReplicationSloProbe::default().evaluate(&ledger, 1, 8_005);
+    let invalid: Vec<_> = report
+        .breaches
+        .iter()
+        .filter(|b| b.kind == "invalid_packet_record")
+        .map(|b| b.sequence)
+        .collect();
+    assert_eq!(invalid, vec![Some(-1), Some(0), Some(1)]);
+    assert_eq!(report.breaches.last().unwrap().kind, "lag_exceeded");
+    assert!(!report.structured_log.contains("identity"));
+}
+
+#[test]
+fn negative_latest_is_healthy_only_without_packet_evidence() {
+    let mut ledger = PacketLedger::default();
+    let probe = ReplicationSloProbe::default();
+    assert_eq!(probe.evaluate(&ledger, -1, 1).breach_count, 0);
+
+    ledger.record_published(0, 0);
+    assert_eq!(
+        probe.evaluate(&ledger, -1, 1).breaches[0].kind,
+        "empty_ledger"
+    );
+
+    ledger.record(0, 0, 1);
+    assert_eq!(
+        probe.evaluate(&ledger, -1, 1).breaches[0].kind,
+        "invalid_latest_sequence"
+    );
+}

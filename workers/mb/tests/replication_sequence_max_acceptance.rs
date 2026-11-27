@@ -3,10 +3,9 @@
 //! Card title says `u64::MAX`; the store (`migration 0017`
 //! `mb_replication_packet.sequence BIGINT`) and the probe
 //! ([`ReplicationSloProbe::evaluate`]) are `i64`, so `u64::MAX` is
-//! unrepresentable here and `i64::MAX` is the effective maximum. Every test
-//! below uses `i64::MAX` / `i64::MAX - 1` on that reading.
+//! unrepresentable here and `i64::MAX` is the effective maximum.
 //!
-//! What is pinned (current behavior, implementation unchanged):
+//! What is pinned:
 //! - Evaluating through `i64::MAX` terminates: no wrap to 0/MIN, no panic,
 //!   no hang. A wrap would surface as a breach at 0/MIN or as an unbounded
 //!   scan; a hang would time the target out.
@@ -17,12 +16,7 @@
 //!   `pending_count` / `truncated` agree with the report, and an in-budget
 //!   pending packet at `MAX` counts as pending instead of breaching.
 //!
-//! Known edge pinned as-is: a ledger that already contains `MAX` still
-//! reports one `missing_sequence` at `MAX` when `latest_sequence == MAX`
-//! (the post-record `expected` uses `saturating_add`, so it sticks at `MAX`
-//! and the tail gap `MAX..=MAX` re-enumerates the present packet). A future
-//! fix for that off-by-one should update these assertions deliberately; the
-//! termination guarantees above still hold.
+//! An applied `MAX` ends the scan without reporting a gap at that slot.
 //!
 //! Sensitivity: mutate either `checked_add` arm in `workers/mb/src/replication.rs`
 //! (`report_gap`'s pending-cursor advance or `enumerate_unknown`'s step) to a
@@ -30,8 +24,6 @@
 //! turns the single-`MAX` cases into a capped 10_001-breach scan, and a
 //! saturating cursor turns the in-budget pending case into a spurious breach.
 //! Verified 2026-10-18 by local mutation (wrapping step) before restoring.
-//!
-//! Standalone integration target: no existing suite is edited.
 
 use nntune_mb::replication::{
     PacketLedger, ReplicationSloProbe, MAX_MISSING_SEQUENCE_BREACHES, MAX_STRUCTURED_LOG_BREACHES,
@@ -70,26 +62,22 @@ fn max_present_terminates_without_wrap() {
     assert_eq!(report.breach_count, report.breaches.len());
     assert_eq!(report.pending_count, 0);
     assert_no_wrap(&report);
-    // Current behavior (see module docs): the present MAX re-enumerates once.
-    assert_eq!(report.breach_count, 1);
-    assert_eq!(report.breaches[0].kind, "missing_sequence");
-    assert_eq!(report.breaches[0].sequence, Some(MAX));
-    assert_eq!(report.breaches[0].lag_secs, None);
+    assert!(report.breaches.is_empty());
 
     let event = parse_log(&report);
     assert_eq!(event["event"], "mb_replication_slo_breach");
-    assert_eq!(event["breach_count"], 1);
-    assert_eq!(event["missing_count"], 1);
+    assert_eq!(event["breach_count"], 0);
+    assert_eq!(event["missing_count"], 0);
     assert_eq!(event["pending_count"], 0);
     assert_eq!(event["truncated"], false);
-    assert_eq!(event["logged_breach_count"], 1);
+    assert_eq!(event["logged_breach_count"], 0);
 }
 
-/// Two consecutive top-end packets still terminate without wrapping.
+/// An applied `MAX` preserves the preceding gap without adding a tail gap.
 #[test]
-fn consecutive_top_sequences_terminate_without_wrap() {
+fn max_present_preserves_preceding_gap() {
     let mut ledger = PacketLedger::default();
-    ledger.record(MAX_MINUS_ONE, 0, 0);
+    ledger.record(MAX - 2, 0, 0);
     ledger.record(MAX, 0, 0);
 
     let report = ReplicationSloProbe::default().evaluate(&ledger, MAX, 0);
@@ -97,9 +85,9 @@ fn consecutive_top_sequences_terminate_without_wrap() {
     assert_eq!(report.breach_count, report.breaches.len());
     assert_eq!(report.pending_count, 0);
     assert_no_wrap(&report);
-    // Same saturating-tail edge as the single-MAX case: pinned as-is.
     assert_eq!(report.breach_count, 1);
-    assert_eq!(report.breaches[0].sequence, Some(MAX));
+    assert_eq!(report.breaches[0].kind, "missing_sequence");
+    assert_eq!(report.breaches[0].sequence, Some(MAX_MINUS_ONE));
 
     let event = parse_log(&report);
     assert_eq!(event["missing_count"], 1);
