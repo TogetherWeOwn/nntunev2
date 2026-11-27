@@ -1209,15 +1209,19 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
     );
     assert_eq!(after_cancel.1, committed.1);
 
-    let lock_available = async || {
-        observer
-            .query_one("SELECT pg_try_advisory_xact_lock(hashtext($1))", &[&USER])
+    let locks_available = async || {
+        let row = observer
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock(hashtext($1)), NOT EXISTS (
+                    SELECT FROM pg_locks WHERE relation = 'public.subscriptions'::regclass
+                      AND mode = 'ShareRowExclusiveLock' AND granted)",
+                &[&USER],
+            )
             .await
-            .unwrap()
-            .get::<_, bool>(0)
+            .unwrap();
+        (row.get::<_, bool>(0), row.get::<_, bool>(1))
     };
-    let mut observation = renewed;
-    observation.subscription.status = "past_due".into();
+    renewed.subscription.status = "past_due".into();
     for retrieval_failed in [true, false] {
         let result = with_store(CALLER_CONNECTION, 1, async |store| {
             store
@@ -1225,13 +1229,13 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
                     &user,
                     &target,
                     async || {
-                        assert!(!lock_available().await);
-                        Ok(observation.subscription.clone())
+                        assert_eq!(locks_available().await, (false, true));
+                        Ok(renewed.subscription.clone())
                     },
                     async |_| {
-                        assert!(!lock_available().await);
+                        assert_eq!(locks_available().await, (false, true));
                         (!retrieval_failed)
-                            .then(|| observation.invoices.clone())
+                            .then(|| renewed.invoices.clone())
                             .ok_or(StoreError)
                     },
                     NEW_END,
@@ -1239,7 +1243,7 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
                 .await
         })
         .await;
-        assert!(lock_available().await);
+        assert_eq!(locks_available().await, (true, true));
         assert_eq!(result.is_err(), retrieval_failed);
         let after = snapshot(observer).await;
         if retrieval_failed {
