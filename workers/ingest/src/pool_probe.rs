@@ -11,7 +11,7 @@
 use futures_util::StreamExt;
 use worker::{wasm_bindgen::JsValue, Env, Headers, Method, Request, RequestInit};
 
-use crate::pool_body::declared_reply_length;
+use crate::pool_body::{check_reply_length, declared_reply_length};
 use crate::pool_deadline::bounded_deadline_ms;
 use crate::probe::{validate_message_id, ProbeOutcome, ProbeRequest, MAX_SEGMENT_BYTES};
 use crate::retry::pool_retry_after;
@@ -267,9 +267,7 @@ pub async fn call_pool_probe_with_deadline(
         Some(Err(_)) | None => return Err(expired),
     };
     drop(deadline);
-    if declared.is_some_and(|length| length != bytes.len()) {
-        return Err(PoolProbeError::Rejected);
-    }
+    check_reply_length(declared, bytes.len()).map_err(|_| PoolProbeError::Rejected)?;
     let text = String::from_utf8(bytes).map_err(|_| PoolProbeError::Rejected)?;
     classify_reply(req, status, retry_after.as_deref(), &text)
 }

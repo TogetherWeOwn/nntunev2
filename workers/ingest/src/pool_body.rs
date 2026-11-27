@@ -192,6 +192,13 @@ pub(crate) fn declared_reply_length(header: Option<&str>, cap: usize) -> Result<
     Ok(Some(length))
 }
 
+pub(crate) fn check_reply_length(declared: Option<usize>, received: usize) -> Result<(), ()> {
+    if declared.is_some_and(|length| length != received) {
+        return Err(());
+    }
+    Ok(())
+}
+
 /// Send one body request to the user's pool and classify the answer.
 ///
 /// The reply body is never buffered past `MAX_BODY_REPLY_BYTES`. A declared
@@ -302,9 +309,7 @@ pub async fn call_pool_body_with_deadline(
         }
     };
     drop(deadline);
-    if declared.is_some_and(|length| length != bytes.len()) {
-        return Err(PoolBodyError::Rejected);
-    }
+    check_reply_length(declared, bytes.len()).map_err(|_| PoolBodyError::Rejected)?;
     classify_body_reply(status, retry_after.as_deref(), &bytes)
 }
 
@@ -326,6 +331,10 @@ mod reply_chunk_tests {
         for invalid in ["", "+1", "1, 1", "17", "18446744073709551616"] {
             assert_eq!(declared_reply_length(Some(invalid), 16), Err(()));
         }
+        let declared = declared_reply_length(Some("3"), 16).unwrap();
+        assert_eq!(check_reply_length(declared, b"abc".len()), Ok(()));
+        assert_eq!(check_reply_length(declared, b"ab".len()), Err(()));
+        assert_eq!(check_reply_length(declared, b"abcd".len()), Err(()));
     }
 
     fn chunk(n: usize) -> Vec<u8> {
