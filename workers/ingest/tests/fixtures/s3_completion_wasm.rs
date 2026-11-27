@@ -219,6 +219,7 @@ async fn run(
             | "multipart-resume-full"
             | "multipart-resume-inventory-retry"
             | "multipart-resume-timeout"
+            | "multipart-resume-ack"
     );
     let resume_bytes;
     let plaintext: &[u8] = if let Some((source, _)) = file_selection {
@@ -376,7 +377,16 @@ async fn run(
             staged_inventory,
             mode,
             timeout_mode,
-            read_page,
+            if mode == "multipart-resume-ack" {
+                None
+            } else {
+                read_page.clone()
+            },
+            if mode == "multipart-resume-ack" {
+                read_page
+            } else {
+                None
+            },
             observe,
             conflicting_status,
             file_selection.map(|(_, select_file)| (select_file, manifest.plaintext_sha256())),
@@ -538,6 +548,7 @@ async fn resume_multipart<'a>(
     mode: &str,
     timeout_mode: bool,
     read_page: Option<Function>,
+    read_part_ack: Option<Function>,
     observe: Option<&Function>,
     conflicting_status: bool,
     file_selection: Option<(&Function, &[u8; 32])>,
@@ -576,7 +587,7 @@ async fn resume_multipart<'a>(
             .put_part(binding, context, second, &upload, until)
             .await
             .map_err(dispatch_error)?;
-        return resume_from_inventory(
+        let (statuses, completion) = resume_from_inventory(
             &read_page,
             target,
             binding,
@@ -584,9 +595,23 @@ async fn resume_multipart<'a>(
             [first, second],
             initial_status,
             mode == "multipart-resume-inventory-retry",
-        );
+        )?;
+        let manifest = serde_json::json!(completion.manifest().collect::<Vec<_>>());
+        let completed = sender
+            .complete(&upload, completion)
+            .await
+            .map_err(dispatch_error)?;
+        let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {
+            return Err(JsValue::from_str("missing fixture version"));
+        };
+        return Ok(serde_json::json!({
+            "statuses": statuses,
+            "manifest": manifest,
+            "version": version,
+        })
+        .to_string());
     }
-    let interrupt_second = mode == "multipart-resume";
+    let interrupt_second = matches!(mode, "multipart-resume" | "multipart-resume-ack");
     let mut receipts = vec![first];
     if let Some(observe) = observe {
         let report = |stage, part_count: usize| {
@@ -689,6 +714,16 @@ async fn resume_multipart<'a>(
                 .await
                 .map_err(dispatch_error)?,
         };
+        if let Some(read_part_ack) = read_part_ack.as_ref() {
+            let read = || matches_part_ack(read_part_ack, target, &receipt);
+            if !read()? {
+                assert_eq!(initial_saved.len(), 1);
+                assert!(matches_checkpoint(binding, &receipts, &checkpoint));
+                if !read()? {
+                    return Err(JsValue::from_str("unconfirmed part acknowledgement"));
+                }
+            }
+        }
         receipts.push(receipt);
     }
     if timeout_mode {
@@ -741,7 +776,7 @@ fn resume_from_inventory<'a>(
     receipts: [UploadedPart<'a>; 2],
     initial_status: serde_json::Value,
     retry_continuation: bool,
-) -> Result<String, JsValue> {
+) -> Result<(Vec<serde_json::Value>, SessionCompletion<'a>), JsValue> {
     let [first_etag, second_etag] = receipts.each_ref().map(|part| part.etag().to_owned());
     let saved = [
         checkpoint_part(&receipts[0], &first_etag),
@@ -764,10 +799,7 @@ fn resume_from_inventory<'a>(
             let completion =
                 SessionCompletion::prepare(binding, context, receipts.into(), &checkpoint)
                     .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
-            let manifest: Vec<_> = completion.manifest().collect();
-            return Ok(
-                serde_json::json!({ "statuses": statuses, "manifest": manifest }).to_string(),
-            );
+            return Ok((statuses, completion));
         }
     }
     Err(JsValue::from_str("fixture inventory did not recover"))
@@ -890,6 +922,35 @@ async fn wait_for_original_file(
         }
         mismatch = true;
     }
+}
+
+fn matches_part_ack(
+    read_part_ack: &Function,
+    target: UploadTarget<'_>,
+    receipt: &UploadedPart<'_>,
+) -> Result<bool, JsValue> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PartAck {
+        upload_id: String,
+        part_number: u32,
+        etag: String,
+        checksum: String,
+    }
+
+    let reply = read_part_ack.call4(
+        &JsValue::UNDEFINED,
+        &JsValue::from_str(target.bucket),
+        &JsValue::from_str(target.key),
+        &JsValue::from_str(target.upload_id),
+        &JsValue::from(receipt.number),
+    )?;
+    let ack: PartAck = serde_wasm_bindgen::from_value(reply)
+        .map_err(|_| JsValue::from_str("invalid part acknowledgement"))?;
+    Ok(ack.upload_id == target.upload_id
+        && ack.part_number == receipt.number
+        && ack.etag == receipt.etag()
+        && ack.checksum == receipt.checksum)
 }
 
 fn recover_staged_part<'a>(

@@ -145,10 +145,11 @@ only when the reviewed producer source matches, an earlier prerequisite failed,
 and the uniquely identified deployment step explicitly completed as skipped.
 A failed or cancelled deployment step is not proof that no mutation occurred.
 Whole-job completion time alone must not reject a proven pre-deployment failure.
-Conflicting-run jobs and candidate artifact lookups use single-page bounds.
-The selected candidate attempt's job inventory allows up to ten 100-job pages
-at 4 MiB per page under the same deadline. Every page must match the reported
-total and every job ID must be unique before required names are evaluated.
+The selected candidate attempt and each conflicting run's all-attempt job
+inventory allow up to ten 100-job pages at 4 MiB per page under the same shared
+deadline. Every page must match the reported total and every job ID must be
+unique before the verifier evaluates required jobs or conflicts. Candidate
+artifact lookups retain their single-page bound.
 
 The admission point also rereads the existing public web/API identity endpoints
 with the existing staging Access pair, refusing redirects and identity drift.

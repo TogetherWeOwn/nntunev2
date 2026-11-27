@@ -304,88 +304,159 @@ mod tests {
         );
     }
 
-    fn sample_outcome(status: &str) -> ReconcileOutcome {
-        use crate::billing_reconcile::{PaidInvoiceRow, ReconciledRow};
-        let (t0, t1) = (1_786_032_000, 1_786_032_100);
+    fn outcome_with(
+        subscription_id: &str,
+        status: &str,
+        explicit_stale: bool,
+        read_plan: Option<&str>,
+        read_anchor: Option<&str>,
+    ) -> ReconcileOutcome {
         ReconcileOutcome {
-            row: ReconciledRow {
-                stripe_subscription_id: "sub-a".into(),
+            row: crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: subscription_id.into(),
                 stripe_customer_id: "cus-a".into(),
                 stripe_item_id: "si-a".into(),
                 stripe_price_id: "price-plus".into(),
                 plan_id: "plus".into(),
                 status: status.into(),
-                current_period_end_unix: Some(t1),
+                current_period_end_unix: Some(200),
                 cancel_at_period_end: false,
-                paid_through_unix: Some(t1),
+                paid_through_unix: Some(200),
                 paid_invoice_id: Some("in-a".into()),
                 grace_until_unix: None,
             },
-            history: vec![PaidInvoiceRow {
-                stripe_invoice_id: "in-a".into(),
-                stripe_subscription_id: "sub-a".into(),
-                plan_id: "plus".into(),
-                period_start_unix: t0,
-                period_end_unix: t1,
-                amount_cents: 800,
-                currency: "usd".into(),
-                paid_at_unix: t0,
-                covered_periods: vec![(t0, t1)],
-            }],
+            history: Vec::new(),
             fail_closed: None,
-            explicit_stale: false,
-            read_plan: Some("plus".into()),
-            read_anchor: Some("in-a".into()),
+            explicit_stale,
+            read_plan: read_plan.map(str::to_string),
+            read_anchor: read_anchor.map(str::to_string),
+        }
+    }
+
+    fn history_row(
+        invoice_id: &str,
+        subscription_id: &str,
+    ) -> crate::billing_reconcile::PaidInvoiceRow {
+        crate::billing_reconcile::PaidInvoiceRow {
+            stripe_invoice_id: invoice_id.into(),
+            stripe_subscription_id: subscription_id.into(),
+            plan_id: "plus".into(),
+            period_start_unix: 100,
+            period_end_unix: 200,
+            amount_cents: 800,
+            currency: "usd".into(),
+            paid_at_unix: 100,
+            covered_periods: vec![(100, 200)],
         }
     }
 
     #[test]
-    fn exact_target_history_provenance_and_slot_suppression_guards() {
-        let mut o = sample_outcome("active");
-        assert_eq!(validate_history_target(&o), Ok(()));
-        o.history[0].stripe_subscription_id = "sub-b".into();
-        assert_eq!(validate_history_target(&o), Err(Refused));
-        o.history.clear();
-        assert_eq!(validate_history_target(&o), Ok(()));
+    fn validate_history_target_rejects_foreign_subscription_invoices() {
+        let mut outcome = outcome_with("sub-a", "active", false, Some("plus"), Some("in-a"));
+        assert_eq!(validate_history_target(&outcome), Ok(()));
+        outcome.history = vec![history_row("in-1", "sub-a"), history_row("in-2", "sub-a")];
+        assert_eq!(validate_history_target(&outcome), Ok(()));
+        outcome.history.push(history_row("in-foreign", "sub-b"));
+        assert_eq!(validate_history_target(&outcome), Err(Refused));
+        outcome.explicit_stale = true;
+        assert_eq!(validate_history_target(&outcome), Err(Refused));
+    }
 
-        assert_eq!(validate_read_provenance(&o, true), Ok(()));
-        o.read_plan = None;
-        assert_eq!(validate_read_provenance(&o, false), Ok(()));
-        assert_eq!(validate_read_provenance(&o, true), Err(Refused));
-        o.explicit_stale = true;
-        assert_eq!(validate_read_provenance(&o, true), Ok(()));
-
-        let owned = |eq, cc| Target::Owned {
-            predicate_stale: eq,
-            other_live_holder: false,
-            equal_end_provenance_changed: eq,
-            matching_proof_cancel_conflict: cc,
-        };
-        let (changed, conflict, unchanged) =
-            (owned(true, false), owned(true, true), owned(false, true));
-        for status in ["canceled", "incomplete_expired"] {
-            let mut t = sample_outcome(status);
-            assert_eq!(validate_equal_end_provenance(&t, &changed), Err(Refused));
-            assert_eq!(validate_equal_end_provenance(&t, &unchanged), Ok(()));
-            assert_eq!(validate_equal_end_provenance(&t, &Target::Absent), Ok(()));
-            t.explicit_stale = true;
-            assert_eq!(validate_equal_end_provenance(&t, &changed), Ok(()));
+    #[test]
+    fn validate_read_provenance_refuses_delayed_absence_folds_on_existing_targets() {
+        for status in [
+            "active",
+            "past_due",
+            "paused",
+            "canceled",
+            "incomplete_expired",
+        ] {
+            let absence = outcome_with("sub-a", status, false, None, None);
+            assert_eq!(validate_read_provenance(&absence, true), Err(Refused));
+            assert_eq!(validate_read_provenance(&absence, false), Ok(()));
+            for read_anchor in [Some("in-a"), None] {
+                let owned = outcome_with("sub-a", status, false, Some("plus"), read_anchor);
+                assert_eq!(validate_read_provenance(&owned, true), Ok(()));
+                assert_eq!(validate_read_provenance(&owned, false), Ok(()));
+            }
+            let stale = outcome_with("sub-a", status, true, None, None);
+            assert_eq!(validate_read_provenance(&stale, true), Ok(()));
         }
-        let mut a = sample_outcome("active");
-        assert_eq!(validate_equal_end_provenance(&a, &changed), Ok(()));
-        assert_eq!(validate_equal_end_provenance(&a, &conflict), Err(Refused));
-        assert_eq!(validate_equal_end_provenance(&a, &unchanged), Ok(()));
-        a.explicit_stale = true;
-        assert_eq!(validate_equal_end_provenance(&a, &conflict), Ok(()));
+    }
 
-        for live in ["incomplete", "active", "past_due", "unpaid", "paused"] {
-            let mut s = sample_outcome(live);
-            assert!(has_slot_suppression_proof(&s), "{live}");
-            s.read_plan = None;
-            assert!(!has_slot_suppression_proof(&s), "{live}");
+    fn owned_target(stale: bool, holder: bool, changed: bool, cancel: bool) -> Target {
+        Target::Owned {
+            predicate_stale: stale,
+            other_live_holder: holder,
+            equal_end_provenance_changed: changed,
+            matching_proof_cancel_conflict: cancel,
         }
-        for outside in ["canceled", "incomplete_expired", "trialing", "unknown"] {
-            assert!(!has_slot_suppression_proof(&sample_outcome(outside)));
+    }
+
+    #[test]
+    fn validate_equal_end_provenance_refuses_stale_terminal_release_and_cancel_conflicts() {
+        let changed = owned_target(true, false, true, false);
+        let changed_cancel = owned_target(true, false, true, true);
+        let matching_cancel = owned_target(false, false, false, true);
+        let check =
+            |out: &ReconcileOutcome, target: &Target| validate_equal_end_provenance(out, target);
+        for terminal in ["canceled", "incomplete_expired"] {
+            let rel = outcome_with("sub-a", terminal, false, Some("plus"), Some("in-old"));
+            assert_eq!(check(&rel, &changed), Err(Refused));
+            assert_eq!(check(&rel, &changed_cancel), Err(Refused));
+            assert_eq!(check(&rel, &matching_cancel), Ok(()));
+            assert_eq!(check(&rel, &Target::Absent), Ok(()));
+            let stale = outcome_with("sub-a", terminal, true, Some("plus"), Some("in-old"));
+            assert_eq!(check(&stale, &changed_cancel), Ok(()));
+        }
+        for status in [
+            "incomplete",
+            "active",
+            "past_due",
+            "unpaid",
+            "paused",
+            "trialing",
+        ] {
+            let fold = outcome_with("sub-a", status, false, Some("plus"), Some("in-old"));
+            assert_eq!(check(&fold, &changed), Ok(()));
+            assert_eq!(check(&fold, &changed_cancel), Err(Refused));
+            assert_eq!(check(&fold, &matching_cancel), Ok(()));
+            let stale = outcome_with("sub-a", status, true, Some("plus"), Some("in-old"));
+            assert_eq!(check(&stale, &changed_cancel), Ok(()));
+        }
+    }
+
+    #[test]
+    fn slot_suppression_proof_excludes_absence_terminal_and_unknown_folds() {
+        let req = identity("user-a", "sub-a");
+        let occupied = owned_target(false, true, false, false);
+        for status in ["incomplete", "active", "past_due", "unpaid", "paused"] {
+            for read_anchor in [Some("in-a"), None] {
+                let owned = outcome_with("sub-a", status, false, Some("plus"), read_anchor);
+                let proof = has_slot_suppression_proof(&owned);
+                assert!(proof);
+                assert_eq!(
+                    classify_write(&req, &occupied, &[], proof),
+                    Ok(Accepted::LiveSlotSuppressedOwned)
+                );
+            }
+            let absence = outcome_with("sub-a", status, false, None, None);
+            let proof = has_slot_suppression_proof(&absence);
+            assert!(!proof);
+            assert_eq!(classify_write(&req, &occupied, &[], proof), Err(Refused));
+        }
+        for status in [
+            "canceled",
+            "incomplete_expired",
+            "trialing",
+            "unknown_state",
+        ] {
+            for read_plan in [Some("plus"), None] {
+                let out = outcome_with("sub-a", status, false, read_plan, None);
+                let proof = has_slot_suppression_proof(&out);
+                assert!(!proof);
+                assert_eq!(classify_write(&req, &occupied, &[], proof), Err(Refused));
+            }
         }
     }
 }
