@@ -121,6 +121,34 @@ it('bounds transient retries and honors a capped Retry-After', async () => {
 	expect(f.bodies()).toEqual(Array(3).fill({ ...start, context }));
 });
 
+it.each(['grant', 'account'] as const)('drops an offline retry and its terminal when the %s retires', async (boundary) => {
+	vi.useFakeTimers();
+	const fetchFn = contextFetch().mockRejectedValueOnce(new TypeError('offline')).mockImplementation(async () => ack());
+	const f = fixture(fetchFn);
+	await f.sender.ready;
+	await f.openGrant();
+	f.sender.send(start);
+	f.sender.send(complete);
+	await vi.advanceTimersByTimeAsync(499);
+	expect(f.bodies()).toEqual([{ ...start, context }]);
+	if (boundary === 'grant') f.grant.dispose();
+	else f.account.abort();
+	await vi.advanceTimersByTimeAsync(2_500);
+	expect(f.bodies()).toEqual([{ ...start, context }]);
+});
+
+it('drops events when context loading fails offline', async () => {
+	vi.useFakeTimers();
+	const fetchFn = vi.fn<typeof fetch>().mockRejectedValueOnce(new TypeError('offline')).mockImplementation(async () => ack());
+	const f = fixture(fetchFn);
+	await f.sender.ready;
+	await f.openGrant();
+	f.sender.send(start);
+	f.sender.send(complete);
+	await vi.advanceTimersByTimeAsync(2_500);
+	expect(fetchFn.mock.calls.map(([path]) => path)).toEqual(['/v1/plays/events/context']);
+});
+
 it('replays a start with an interrupted acknowledgement before sending its terminal', async () => {
 	vi.useFakeTimers();
 	const interrupted = new Response(new ReadableStream({

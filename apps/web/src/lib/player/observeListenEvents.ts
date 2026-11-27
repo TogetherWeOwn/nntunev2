@@ -4,11 +4,8 @@ export interface ListenEvent {
 	event: 'start' | 'complete' | 'skip';
 }
 
-export interface ListenAudioLike {
-	readonly ended?: boolean;
-	addEventListener(name: string, listener: () => void): void;
-	removeEventListener(name: string, listener: () => void): void;
-}
+export type ListenAudioLike = Pick<HTMLMediaElement,
+	'paused' | 'seeking' | 'ended' | 'error' | 'addEventListener' | 'removeEventListener'>;
 
 export interface ListenObserverOptions {
 	/** Track attached to this keyed media element. */
@@ -53,7 +50,7 @@ export function observeListenEvents(
 
 	function finishAbandoned(): void {
 		let ended = endedSeen;
-		try { ended ||= element.ended === true; } catch { /* Keep the sampled value. */ }
+		try { ended = !element.seeking && (ended || element.ended === true); } catch { /* Keep the sampled value. */ }
 		finish(ended ? 'complete' : 'skip');
 	}
 
@@ -62,6 +59,8 @@ export function observeListenEvents(
 	};
 
 	const onPlaying = safe(() => {
+		// A queued event can arrive after a pause, seek, or decoder failure.
+		if (element.paused !== false || element.seeking !== false || element.ended !== false || element.error !== null) return;
 		endedSeen = false;
 		if (active || canStart?.() === false) return;
 		const id = playbackIdFromGrant(grantPlayId());
@@ -72,12 +71,14 @@ export function observeListenEvents(
 	});
 	// Teardown can clear element.ended before our ended listener runs.
 	const sampleEnded = safe(() => {
-		if (element.ended === true) endedSeen = true;
+		if (!element.seeking && element.ended === true) endedSeen = true;
 	});
 	const onSeeking = safe(() => {
 		endedSeen = false;
 	});
-	const onEnded = safe(() => finish('complete'));
+	const onEnded = safe(() => {
+		if (!element.seeking && element.ended === true) finish('complete');
+	});
 	const finishCurrent = safe(finishAbandoned);
 	const listeners: [string, () => void][] = [
 		['playing', onPlaying],

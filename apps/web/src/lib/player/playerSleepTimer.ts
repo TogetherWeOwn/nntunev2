@@ -10,10 +10,14 @@ export function createPlayerSleepTimer(pause: () => void, canStart: () => boolea
 	const state = writable(off);
 	const timer = createSleepTimer({ now: Date.now, onFire() {
 		const receipt = stopTicking();
-		pause();
-		// A synchronous transport observer may have reset or rearmed us.
-		if (receipt !== generation) return;
-		state.set({ ...off, announcement: 'Sleep timer fired — playback paused' });
+		let announcement = off.announcement;
+		try {
+			pause();
+			announcement = 'Sleep timer fired — playback paused';
+		} finally {
+			// A synchronous transport observer may have reset or rearmed us.
+			if (receipt === generation) state.set({ ...off, announcement });
+		}
 	} });
 
 	function stopTicking(): number {

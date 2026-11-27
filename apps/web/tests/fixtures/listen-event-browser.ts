@@ -47,10 +47,17 @@ export async function mountListenEventFixture(signal: AbortSignal): Promise<List
 	}, { once: true });
 	await sender.ready;
 	if (signal.aborted) return;
+	function media(ended: boolean) {
+		Object.defineProperties(audio, {
+			paused: { configurable: true, value: ended },
+			ended: { configurable: true, value: ended }
+		});
+		audio.dispatchEvent(new Event(ended ? 'ended' : 'playing'));
+	}
 	return {
 		open: (playId) => grant.open({ trackId, playId }, signal, () => true, (issued) => { source = issued; }),
-		playing: () => { audio.dispatchEvent(new Event('playing')); },
-		ended: () => { audio.dispatchEvent(new Event('ended')); },
+		playing: () => media(false),
+		ended: () => media(true),
 		// Wait behind any sender dispatch already queued on the account fence.
 		writesAfterPendingDispatch: () => navigator.locks.request(AUTH_LOCK, () => writes),
 		close() {

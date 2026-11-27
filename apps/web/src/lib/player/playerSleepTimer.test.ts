@@ -55,6 +55,19 @@ test('duration expiry pauses the current owner once without changing selection',
 	expect(vi.getTimerCount()).toBe(0);
 });
 
+test('clears the expired sleep timer if the decoder refuses to pause', async () => {
+	const { audio, sleepTimer, state, playCurrent } = setup();
+	await playCurrent();
+	const failure = new Error('fixture pause failure');
+	audio.pause.mockImplementationOnce(() => { throw failure; });
+	sleepTimer.start(duration(500), 'Sleep soon');
+	expect(() => vi.advanceTimersByTime(500)).toThrow(failure);
+	expect(state()).toEqual({ armed: false, remaining: '', announcement: 'Sleep timer off' });
+	expect(vi.getTimerCount()).toBe(0);
+	vi.advanceTimersByTime(1_000);
+	expect(audio.pause).toHaveBeenCalledOnce();
+});
+
 test('rearming replaces the deadline; manual pause preserves the countdown until canceled', async () => {
 	const { player, audio, sleepTimer, state, playCurrent, pauseCurrent } = setup();
 	await playCurrent();

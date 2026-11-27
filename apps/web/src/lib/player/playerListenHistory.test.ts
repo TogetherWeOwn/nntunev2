@@ -2,8 +2,12 @@ import { expect, it, vi } from 'vitest';
 import { notifyLocalAuthTransition } from '../auth-transition.js';
 import { createPlayerListenHistory } from './playerListenHistory.js';
 
+const playingAudio = () => Object.assign(new EventTarget(), {
+	paused: false, seeking: false, ended: false, error: null
+}) as unknown as HTMLAudioElement;
+
 it('does not restart a consumed grant on the same or a replacement element', () => {
-	const audio = new EventTarget() as HTMLAudioElement;
+	const audio = playingAudio();
 	const scope = { send: vi.fn(), close: vi.fn(), dispose: vi.fn() };
 	const history = createPlayerListenHistory(scope, new EventTarget() as Window);
 	const first = 'A'.repeat(22);
@@ -17,7 +21,7 @@ it('does not restart a consumed grant on the same or a replacement element', () 
 		for (grant of [first, `${first.slice(1)}Q`, first]) playAndFinish(audio);
 		const beforeDetach = scope.send.mock.calls.map(([body]) => body.event);
 		detach();
-		const replacement = new EventTarget() as HTMLAudioElement;
+		const replacement = playingAudio();
 		history.attach(replacement, 'track', () => grant);
 		playAndFinish(replacement);
 		const expected = ['start', 'skip', 'start', 'skip'];
@@ -28,7 +32,7 @@ it('does not restart a consumed grant on the same or a replacement element', () 
 });
 
 it('keeps auth cancellation armed throughout a terminal drain', async () => {
-	const audio = new EventTarget() as HTMLAudioElement;
+	const audio = playingAudio();
 	const lifecycle = new EventTarget() as Window;
 	const { promise, resolve } = Promise.withResolvers<void>();
 	const scope = { send: vi.fn(), close: vi.fn(() => promise), dispose: vi.fn(resolve) };

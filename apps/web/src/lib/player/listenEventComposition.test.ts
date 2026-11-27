@@ -13,6 +13,7 @@ const context = 'B'.repeat(42) + 'E';
 const eventsPath = '/v1/plays/events';
 const contextPath = `${eventsPath}/context`;
 const ack = () => Response.json({ ok: true });
+const listenMedia = () => Object.assign(new EventTarget(), { paused: false, seeking: false, ended: false, error: null });
 
 function listenTransport(fetchFn: typeof fetch) {
 	vi.useFakeTimers();
@@ -50,8 +51,8 @@ it('orders the current grant’s events and refuses the retired grant’s late t
 
 	const startedPlaybacks = new Set<string>();
 	const observerOptions = { trackId, sender, startedPlaybacks, grantPlayId: currentPlayId };
-	const retiredMedia = new EventTarget();
-	const currentMedia = new EventTarget();
+	const retiredMedia = listenMedia();
+	const currentMedia = listenMedia();
 	const retiredObserver = observeListenEvents(retiredMedia, observerOptions);
 	const currentObserver = observeListenEvents(currentMedia, observerOptions);
 	onTestFinished(() => { retiredObserver.dispose(); currentObserver.dispose(); });
@@ -70,6 +71,7 @@ it('orders the current grant’s events and refuses the retired grant’s late t
 	currentMedia.dispatchEvent(new Event('playing'));
 	// Both elements are for the same track. A terminal that re-reads the grant
 	// could preempt the replacement's skip with the retired element's complete.
+	retiredMedia.ended = true;
 	retiredMedia.dispatchEvent(new Event('ended'));
 	currentMedia.dispatchEvent(new Event('emptied'));
 	await vi.advanceTimersByTimeAsync(0);
@@ -85,7 +87,7 @@ it('keeps the listen on pause and posts one skip for abandonment or media error'
 	const writes = () => fetchFn.mock.calls.filter(([path]) => path === eventsPath)
 		.map(([, init]) => JSON.parse(String(init?.body)));
 	const { sender, currentPlayId, open } = listenTransport(fetchFn);
-	const audio = new EventTarget() as HTMLAudioElement;
+	const audio = listenMedia() as unknown as HTMLAudioElement;
 	const history = createPlayerListenHistory(sender, new EventTarget() as Window);
 	onTestFinished(() => history.resetAtAuthBoundary());
 	history.attach(audio, trackId, currentPlayId);
@@ -133,7 +135,7 @@ it('keeps the listen on pause and posts one skip for abandonment or media error'
 it('reuses the listen context on page restore and stays closed after an auth transition', async () => {
 	const fetchFn = vi.fn<typeof fetch>(async (path) => path === contextPath ? Response.json({ context }) : ack());
 	const { sender, currentPlayId, open } = listenTransport(fetchFn);
-	const audio = new EventTarget() as HTMLAudioElement;
+	const audio = listenMedia() as unknown as HTMLAudioElement;
 	const lifecycle = new EventTarget() as Window;
 	const history = createPlayerListenHistory(sender, lifecycle);
 	onTestFinished(() => history.resetAtAuthBoundary());
@@ -272,6 +274,27 @@ async function transitionFixture(onEvent?: (body: { playback_id: string; track_i
 	return { player, play, audio: () => mounted!, grantTracks, eventWrites, delayNextGrant, flushWrites, row, end };
 }
 
+it('requires current playback before consuming a grant', async () => {
+	const f = await transitionFixture();
+	await f.play(0);
+	const audio = f.audio();
+	audio.paused = true;
+	fire(audio, 'play', 'canplay', 'playing');
+	Object.assign(audio, { paused: false, seeking: true });
+	fire(audio, 'seeking', 'playing');
+	Object.assign(audio, { seeking: false, error: { code: 3 } });
+	fire(audio, 'playing', 'error');
+	Object.assign(audio, { error: null, ended: true });
+	fire(audio, 'playing', 'ended');
+	await f.flushWrites();
+	expect(f.eventWrites).toEqual([]);
+
+	audio.ended = false;
+	fire(audio, 'playing', 'playing');
+	await f.flushWrites();
+	expect(f.eventWrites).toEqual([f.row(0, 'track-a', 'start')]);
+});
+
 it('emits one start and complete per track across normal end transitions without double-crediting', async () => {
 	const f = await transitionFixture();
 	await f.play(0);
@@ -327,10 +350,12 @@ it('keeps one listen across seeks and clears sampled end when seeking back befor
 	await f.flushWrites();
 	expect(f.eventWrites).toEqual([f.row(0, 'track-a', 'start')]);
 
-	// Sampled end cleared by seeking back before `ended` (without resuming) must record `skip`, not `complete`.
+	// Seeking back invalidates the sampled end and any queued ended event.
 	firstAudio.ended = true; fire(firstAudio, 'timeupdate');
 	Object.assign(firstAudio, { ended: false, currentTime: 40 });
-	fire(firstAudio, 'seeking', 'seeked');
+	fire(firstAudio, 'seeking', 'seeked', 'ended');
+	await f.flushWrites();
+	expect(f.eventWrites).toEqual([f.row(0, 'track-a', 'start')]);
 	f.player.media.nextFromQueue();
 	await f.flushWrites();
 
@@ -343,6 +368,29 @@ it('keeps one listen across seeks and clears sampled end when seeking back befor
 		f.row(0, 'track-a', 'start'), f.row(0, 'track-a', 'skip'),
 		f.row(1, 'track-b', 'start'), f.row(1, 'track-b', 'complete')
 	]);
+});
+
+it.each(['during a seek', 'after a source reset'] as const)('skips abandonment %s without crediting an in-flight end', async (boundary) => {
+	const fetchFn = vi.fn<typeof fetch>(async (path) => path === contextPath ? Response.json({ context }) : ack());
+	const { sender, currentPlayId, open } = listenTransport(fetchFn);
+	const audio = listenMedia();
+	const observer = observeListenEvents(audio, { trackId, sender, grantPlayId: currentPlayId, startedPlaybacks: new Set() });
+	onTestFinished(() => observer.dispose());
+	const events = () => fetchFn.mock.calls.filter(([path]) => path === eventsPath)
+		.map(([, init]) => JSON.parse(String(init?.body)).event);
+	await sender.ready;
+	expect(await open('A'.repeat(22))).toBe(true);
+	fire(audio, 'playing');
+	await vi.advanceTimersByTimeAsync(0);
+
+	Object.assign(audio, { seeking: true, ended: true });
+	fire(audio, 'seeking', 'timeupdate', 'pause', 'ended');
+	await vi.advanceTimersByTimeAsync(0);
+	expect(events()).toEqual(['start']);
+	if (boundary === 'after a source reset') Object.assign(audio, { seeking: false, ended: false });
+	fire(audio, 'emptied');
+	await vi.advanceTimersByTimeAsync(0);
+	expect(events()).toEqual(['start', 'skip']);
 });
 
 it.each([200, 409] as const)('prevents leaks across rapid skips over an unstarted track (first start %s)', async (firstStatus) => {
