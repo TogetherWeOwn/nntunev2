@@ -150,7 +150,7 @@ impl IntakeRejection {
 pub struct IntakeEstimate {
     pub file_count: usize,
     pub segment_count: usize,
-    /// Summed `bytes="…"` over all `<segment>` elements (saturating).
+    /// Exact sum of the `bytes="…"` attributes on all `<segment>` elements.
     pub declared_bytes: u64,
 }
 
