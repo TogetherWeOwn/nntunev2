@@ -139,8 +139,7 @@ pub fn classify_write(
     returned: &[Identity<'_>],
     slot_suppression_proof: bool,
 ) -> Result<Accepted, Refused> {
-    // The lookup and write use the same predicates under table exclusion.
-    // A returned row contradicts either proven suppression.
+    // A returned row contradicts either suppression under table exclusion.
     let suppressed = match target {
         Target::Owned {
             predicate_stale: true,

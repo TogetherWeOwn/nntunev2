@@ -7569,7 +7569,7 @@ where
     {
         return Err(());
     }
-    let listed = ctx
+    let Ok(listed) = ctx
         .stripe
         .list_invoices(crate::stripe::ListInvoices {
             customer_id: subscription.customer.clone(),
@@ -7581,7 +7581,10 @@ where
             starting_after: None,
         })
         .await
-        .map_err(|_| ())?;
+    else {
+        billing_alert(ctx, user_id, BILLING_FAIL_CLOSED_ACTION).await;
+        return Err(());
+    };
     let mut invoices = Vec::with_capacity(listed.len());
     for mut invoice in listed {
         let mut pages = 0;
@@ -13930,7 +13933,7 @@ pub(crate) mod tests {
         h.config.paid_invite_billing = true;
         seed_billing_user(&h, "u1");
         seed_user(&h, "u2", "u2@example.com");
-        deliver_first_period(&h, "evt_u1_initial");
+        let checkout = deliver_first_period(&h, "evt_u1_initial");
         let (first_end, ren_end) = (
             BILLING_NOW + BILLING_PERIOD,
             BILLING_NOW + 2 * BILLING_PERIOD,
@@ -14060,10 +14063,15 @@ pub(crate) mod tests {
         };
         let mut missing = inv("in_missing_lines", c1, s1, first_end, ren_end);
         missing.lines = None;
-        h.stripe
-            .scripted_invoice_list
-            .replace(Some((scope.clone(), missing)));
-        assert_eq!(deliver(&h, &u1_evt).status, 500);
+        let writes = h.store.reconcile_outcome_attempts.get();
+        for (paid, body) in [(false, &checkout), (true, &u1_evt)] {
+            h.config.paid_invite_billing = paid;
+            h.stripe
+                .scripted_invoice_list
+                .replace(Some((scope.clone(), missing.clone())));
+            assert_eq!(deliver(&h, body).status, 500);
+            assert_eq!(h.store.reconcile_outcome_attempts.get(), writes);
+        }
         assert!(!h.store.webhook_events.borrow().contains("evt_u1_guard"));
         assert_eq!(h.store.paid_reconcile_attempts.get(), attempts_before);
         unchanged(&h);
@@ -14084,7 +14092,9 @@ pub(crate) mod tests {
         let live_evt = inv_evt("evt_u1_live_inv", "in_live_ren", c1, s1);
         assert_eq!(deliver(&h, &live_evt).status, 500);
         assert!(!h.store.webhook_events.borrow().contains("evt_u1_live_inv"));
-        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 3);
+        let alerts = audits_with_action(&h, BILLING_FAIL_CLOSED_ACTION);
+        assert_eq!(alerts.len(), 4);
+        assert!(alerts.iter().all(|event| event.user_id == "u1"));
         unchanged(&h);
         assert!(block_on(reconcile_paid_targets(&h.ctx(), vec![("u1", Some(s1))])).is_err());
         unchanged(&h);

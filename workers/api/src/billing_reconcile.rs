@@ -151,8 +151,8 @@ pub enum FailClosedReason {
     /// The remote status is not a known Checkout-shape state — including
     /// `trialing`, which the reseed card owns elsewhere.
     UnknownStatus,
-    /// A bound paid invoice has missing or unfinished line pagination.
-    IncompleteInvoiceLines,
+    /// Invoice lines are incomplete or a listed invoice contradicts the stored anchor.
+    InvalidInvoiceEvidence,
 }
 
 /// The subscription row to persist (verbatim remote status by design —
@@ -207,8 +207,7 @@ pub struct ReconcileOutcome {
     pub row: ReconciledRow,
     pub history: Vec<PaidInvoiceRow>,
     pub fail_closed: Option<FailClosedReason>,
-    /// Suppresses the subscription write. Refused snapshots also set this
-    /// flag and carry no history.
+    /// Suppresses the subscription write. Refused snapshots also carry no history.
     pub explicit_stale: bool,
     /// The plan the pass read (the stored plan at fold time) and the
     /// anchor it read (the stored anchor at fold time): the write's
@@ -351,21 +350,27 @@ pub fn reconcile_subscription(
         }
     }
     let bound_paid = |invoice: &Invoice| {
-        invoice.status == "paid"
+        !invoice.livemode
+            && invoice.status == "paid"
             && invoice.customer.as_deref() == Some(remote_customer.as_str())
             && invoice.subscription.as_deref() == Some(sub.id.as_str())
     };
+    let valid_anchor = |invoice: &Invoice| bound_paid(invoice) && invoice.paid_at().is_some();
+    let read_anchor = local
+        .live
+        .as_ref()
+        .filter(|row| row.stripe_subscription_id == sub.id)
+        .and_then(|row| row.paid_invoice_id.as_deref());
     if remote.invoices.iter().any(|invoice| {
-        !invoice.livemode
-            && bound_paid(invoice)
-            && invoice.lines.as_ref().is_none_or(|lines| lines.has_more)
+        (read_anchor == Some(invoice.id.as_str()) && !valid_anchor(invoice))
+            || (bound_paid(invoice) && invoice.lines.as_ref().is_none_or(|lines| lines.has_more))
     }) {
         return fail_closed(
             local,
             sub,
             Some(remote_customer),
             None,
-            FailClosedReason::IncompleteInvoiceLines,
+            FailClosedReason::InvalidInvoiceEvidence,
         );
     }
     // Exactly one priced item: zero or several is unresolvable, never
@@ -397,12 +402,10 @@ pub fn reconcile_subscription(
     };
 
     let anchor_invoice_in_snapshot = |anchor: &str| {
-        remote.invoices.iter().find(|invoice| {
-            invoice.id == anchor
-                && !invoice.livemode
-                && bound_paid(invoice)
-                && invoice.paid_at().is_some()
-        })
+        remote
+            .invoices
+            .iter()
+            .find(|invoice| invoice.id == anchor && valid_anchor(invoice))
     };
 
     let status = sub.status.as_str();
@@ -814,10 +817,9 @@ fn fail_closed(
         },
         history: Vec::new(),
         fail_closed: Some(reason),
-        // Invalid evidence cannot release a live slot, even when the remote
-        // status is terminal. A complete, valid snapshot can retry the fold.
+        // Invalid evidence cannot release a live slot on a terminal status.
         explicit_stale: is_terminal_status(&sub.status)
-            || reason == FailClosedReason::IncompleteInvoiceLines,
+            || reason == FailClosedReason::InvalidInvoiceEvidence,
         read_plan: previous.map(|row| row.plan_id.clone()),
         read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
     }
