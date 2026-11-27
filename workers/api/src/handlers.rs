@@ -28430,6 +28430,9 @@ pub(crate) mod tests {
 
     #[test]
     fn playlist_http_surface_remains_unmounted_for_sessions_and_bearers() {
+        // Non-preflight playlist operations remain unmounted (404). OPTIONS
+        // preflight posture is pinned separately by the scope-map tests above
+        // and in `credential_mint_validation_acceptance.rs`.
         let h = peppered_harness();
         seed_user(&h, "u1", "a@example.com");
         let cookie = magic_login(&h, "a@example.com");
@@ -28460,39 +28463,37 @@ pub(crate) mod tests {
         assert_eq!(library.status, 200, "{}", library.body);
 
         let expected = not_found();
-        let handle = "plRepeatedRefs00000000";
-        let track_id = "00000000-0000-0000-0000-000000000001";
         let routes = [
-            ("GET", "/v1/playlists".to_string()),
-            ("HEAD", "/v1/playlists".to_string()),
-            ("POST", "/v1/playlists".to_string()),
-            ("DELETE", "/v1/playlists".to_string()),
-            ("GET", format!("/v1/playlists/{handle}")),
-            ("PUT", format!("/v1/playlists/{handle}")),
-            ("PATCH", format!("/v1/playlists/{handle}")),
-            ("DELETE", format!("/v1/playlists/{handle}")),
-            ("GET", format!("/v1/playlists/{handle}/tracks")),
-            ("POST", format!("/v1/playlists/{handle}/tracks")),
-            ("PUT", format!("/v1/playlists/{handle}/tracks")),
-            ("PATCH", format!("/v1/playlists/{handle}/tracks")),
+            ("GET", "/v1/playlists"),
+            ("HEAD", "/v1/playlists"),
+            ("POST", "/v1/playlists"),
+            ("DELETE", "/v1/playlists"),
+            ("GET", "/v1/playlists/plRepeatedRefs00000000"),
+            ("PUT", "/v1/playlists/plRepeatedRefs00000000"),
+            ("PATCH", "/v1/playlists/plRepeatedRefs00000000"),
+            ("DELETE", "/v1/playlists/plRepeatedRefs00000000"),
+            ("GET", "/v1/playlists/plRepeatedRefs00000000/tracks"),
+            ("POST", "/v1/playlists/plRepeatedRefs00000000/tracks"),
+            ("PUT", "/v1/playlists/plRepeatedRefs00000000/tracks"),
+            ("PATCH", "/v1/playlists/plRepeatedRefs00000000/tracks"),
             (
                 "DELETE",
-                format!("/v1/playlists/{handle}/tracks/{track_id}"),
+                "/v1/playlists/plRepeatedRefs00000000/tracks/00000000-0000-0000-0000-000000000001",
             ),
             (
                 "POST",
-                format!("/v1/playlists/{handle}/entries/{track_id}/restore"),
+                "/v1/playlists/plRepeatedRefs00000000/entries/00000000-0000-0000-0000-000000000001/restore",
             ),
-            ("GET", "/api/playlists".to_string()),
-            ("POST", "/api/playlists".to_string()),
-            ("GET", format!("/api/playlists/{handle}")),
-            ("PUT", format!("/api/playlists/{handle}")),
-            ("PATCH", format!("/api/playlists/{handle}")),
-            ("DELETE", format!("/api/playlists/{handle}")),
+            ("GET", "/api/playlists"),
+            ("POST", "/api/playlists"),
+            ("GET", "/api/playlists/plRepeatedRefs00000000"),
+            ("PUT", "/api/playlists/plRepeatedRefs00000000"),
+            ("PATCH", "/api/playlists/plRepeatedRefs00000000"),
+            ("DELETE", "/api/playlists/plRepeatedRefs00000000"),
         ];
 
-        for (method, path) in &routes {
-            let body = matches!(*method, "POST" | "PUT" | "PATCH")
+        for &(method, path) in &routes {
+            let body = matches!(method, "POST" | "PUT" | "PATCH")
                 .then(|| r#"{"name":"Unmounted"}"#.to_string());
             let session_resp = h.call_full(
                 method,

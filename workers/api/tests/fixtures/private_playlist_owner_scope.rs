@@ -288,9 +288,10 @@ async fn owner_scope_and_fences_via_route() {
         ),
         json!({"items": [], "next_cursor": null})
     );
-    let state: (String, i64, i64) = db
+    let state: (String, i64, i64, i64) = db
         .query_one(
             "SELECT p.name,
+                    (SELECT count(*) FROM public.playlists o WHERE o.owner_user_id = $1),
                     (SELECT count(*) FROM public.playlist_tracks e WHERE e.playlist_id = p.id),
                     (SELECT count(*) FROM public.delete_operations d WHERE d.user_id = $1)
              FROM public.playlists p
@@ -298,7 +299,7 @@ async fn owner_scope_and_fences_via_route() {
             &[&scope_owner, &id],
         )
         .await
-        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
         .unwrap();
-    assert_eq!(state, ("Updated Draft".into(), 1, 0));
+    assert_eq!(state, ("Updated Draft".into(), 1, 1, 0));
 }
