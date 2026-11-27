@@ -10,10 +10,11 @@
 //! boundary against a `>=` regression), and exactly-`MAX` invalid JSON still
 //! 500s via the parser.
 
-use nntune_core::par2::scratch::object_key_for_file_name;
+use nntune_core::par2::scratch::{object_key_for_file_name, MAX_SCRATCH_TOTAL_BYTES};
 use nntune_repair::contract::{
-    manifest_digest, plan, FileRole, OutputFile, Plan, RepairRequest, RepairResult, RepairStatus,
-    ScratchFile, ScratchManifest, MAX_RESULT_BYTES,
+    classify_container_reply, manifest_digest, plan, replay_reply, ContainerOutcome, FileRole,
+    OutputFile, Plan, RepairRequest, RepairResult, RepairStatus, ScratchFile, ScratchManifest,
+    MAX_RESULT_BYTES,
 };
 
 const JOB: &str = "job_0123456789abcdef";
@@ -79,6 +80,12 @@ fn padded_to(base: &[u8], target_len: usize) -> Vec<u8> {
 
 #[test]
 fn stored_result_one_byte_over_cap_is_500_before_parse() {
+    let runtime: String = include_str!("../src/runtime.rs")
+        .split_whitespace()
+        .collect();
+    assert!(runtime.contains(
+        "&result_key(prefix),MAX_RESULT_BYTES,ApiFault::new(500,\"repair_unavailable\"),"
+    ));
     let req = dummy_req();
     let digest = manifest_digest(&manifest());
     let base = valid_result_bytes(&digest);
@@ -150,4 +157,40 @@ fn valid_stored_result_exactly_at_cap_is_already_done() {
         }
         other => panic!("expected AlreadyDone, got {other:?}"),
     }
+}
+
+#[test]
+fn output_budget_rejects_oversize_and_overflow() {
+    let mut result: RepairResult = serde_json::from_slice(&valid_result_bytes("")).unwrap();
+    result.files[0].size = MAX_SCRATCH_TOTAL_BYTES;
+    let classify =
+        |result: &RepairResult| classify_container_reply(200, &serde_json::to_vec(result).unwrap());
+    assert!(matches!(classify(&result), ContainerOutcome::Done(_)));
+    result.files[0].size += 1;
+    let unavailable = ContainerOutcome::Forward(502, "container_unavailable");
+    assert_eq!(classify(&result), unavailable);
+    result.files[0].size = u64::MAX;
+    result.files.push(OutputFile {
+        size: 2,
+        ..result.files[0].clone()
+    });
+    assert_eq!(classify(&result), unavailable);
+}
+
+#[test]
+fn matching_digest_cannot_replay_a_missing_output() {
+    let runtime = include_str!("../src/runtime.rs");
+    assert!(
+        runtime.contains("Plan::AlreadyDone(result) => return replay_reply(&manifest, &result)")
+    );
+    let manifest = manifest();
+    let digest = manifest_digest(&manifest);
+    let mut result: RepairResult = serde_json::from_slice(&valid_result_bytes(&digest)).unwrap();
+    result.files.clear();
+    let body = serde_json::to_vec(&result).unwrap();
+    let Plan::AlreadyDone(result) = plan(&dummy_req(), Some(&body), &digest).unwrap() else {
+        panic!("matching digest must reach the replay validation");
+    };
+    let err = replay_reply(&manifest, &result).unwrap_err();
+    assert_eq!((err.status, err.code), (500, "repair_unavailable"));
 }

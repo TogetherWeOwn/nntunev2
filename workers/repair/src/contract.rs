@@ -8,7 +8,9 @@
 //! three sides.
 
 use std::collections::HashSet;
+use std::future::Future;
 
+use futures_util::lock::Mutex;
 use nntune_core::par2::scratch::{
     object_key_for_file_name, sha256_hex, validate_file_name, validate_object_key,
     validate_scratch_prefix, validate_staging_id, MAX_SCRATCH_FILES, MAX_SCRATCH_TOTAL_BYTES,
@@ -240,11 +242,7 @@ pub fn plan(
     let Some(bytes) = existing_result else {
         return Ok(Plan::Run);
     };
-    if bytes.len() > MAX_RESULT_BYTES {
-        return Err(ApiFault::new(500, "repair_unavailable"));
-    }
-    let result: RepairResult =
-        serde_json::from_slice(bytes).map_err(|_| ApiFault::new(500, "repair_unavailable"))?;
+    let result = parse_result(bytes).ok_or_else(|| ApiFault::new(500, "repair_unavailable"))?;
     if !current_manifest_digest.is_empty() && result.manifest_digest == current_manifest_digest {
         Ok(Plan::AlreadyDone(result))
     } else {
@@ -261,6 +259,35 @@ pub struct RepairReply {
     pub status: RepairStatus,
     pub exit_code: Option<i32>,
     pub file_count: usize,
+}
+
+/// Refuse overlapping DO rounds while a prior round is still doing I/O.
+pub async fn try_run_round<T>(
+    lock: &Mutex<()>,
+    run: impl Future<Output = Result<T, ApiFault>>,
+) -> Result<T, ApiFault> {
+    let _round = lock.try_lock().ok_or_else(repair_unavailable_fault)?;
+    run.await
+}
+
+fn valid_verdict(status: RepairStatus, exit_code: Option<i32>, file_count: usize) -> bool {
+    match (status, exit_code) {
+        (RepairStatus::Repaired, Some(0)) => file_count < MAX_SCRATCH_FILES,
+        (RepairStatus::Unrepairable, Some(1 | 2 | 4 | 6)) => file_count == 0,
+        _ => false,
+    }
+}
+
+fn parse_result(body: &[u8]) -> Option<RepairResult> {
+    let result: RepairResult = decode_result_object(body)?;
+    if !valid_verdict(result.status, result.exit_code, result.files.len()) {
+        return None;
+    }
+    let total = result
+        .files
+        .iter()
+        .try_fold(0u64, |total, file| total.checked_add(file.size))?;
+    (total <= MAX_SCRATCH_TOTAL_BYTES).then_some(result)
 }
 
 /// Validate the set of outputs a `Repaired` result claims against the
@@ -454,6 +481,15 @@ pub fn ingest_reply_body(result: &RepairResult) -> Vec<u8> {
     serde_json::to_vec(&reply).unwrap_or_default()
 }
 
+pub fn replay_reply(
+    manifest: &ScratchManifest,
+    result: &RepairResult,
+) -> Result<Vec<u8>, ApiFault> {
+    validate_repaired_output_set(manifest, result)
+        .map_err(|_| ApiFault::new(500, "repair_unavailable"))?;
+    Ok(ingest_reply_body(result))
+}
+
 // Scratch object keys for one round. `prefix` has already been
 // validated as the canonical `ingest-scratch/{job}/r{round}/`.
 pub fn manifest_key(prefix: &str) -> String {
@@ -500,7 +536,7 @@ pub enum ContainerOutcome {
     /// Terminal result: persist outputs and `result.json`, reply 200.
     Done(RepairResult),
     /// Forward this status + stable code to ingest unchanged.
-    Forward(u16, String),
+    Forward(u16, &'static str),
 }
 
 /// Classify a Container reply. Only a well-formed 200 result is
@@ -508,26 +544,70 @@ pub enum ContainerOutcome {
 /// anything else is a retryable `container_unavailable`.
 pub fn classify_container_reply(status: u16, body: &[u8]) -> ContainerOutcome {
     if status == 200 {
-        if body.len() <= MAX_RESULT_BYTES {
-            if let Ok(result) = serde_json::from_slice::<RepairResult>(body) {
-                return ContainerOutcome::Done(result);
-            }
+        if let Some(result) = parse_result(body) {
+            return ContainerOutcome::Done(result);
         }
-        return ContainerOutcome::Forward(502, "container_unavailable".to_string());
+    } else if let Some(code) = error_code(body).and_then(|code| container_fault_code(status, code))
+    {
+        return ContainerOutcome::Forward(status, code);
     }
-    let code = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
-        .filter(|code| {
-            code.len() <= 64
-                && code
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        });
-    match (status, code) {
-        (400 | 404 | 409 | 413 | 503, Some(code)) => ContainerOutcome::Forward(status, code),
-        _ => ContainerOutcome::Forward(502, "container_unavailable".to_string()),
+    ContainerOutcome::Forward(502, "container_unavailable")
+}
+
+fn error_code(body: &[u8]) -> Option<&str> {
+    #[derive(Deserialize)]
+    struct ErrorReply<'a> {
+        error: &'a str,
     }
+    decode_result_object::<ErrorReply<'_>>(body).map(|reply| reply.error)
+}
+
+fn decode_result_object<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Option<T> {
+    if body.len() > MAX_RESULT_BYTES
+        || body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{')
+    {
+        return None;
+    }
+    serde_json::from_slice(body).ok()
+}
+
+fn container_fault_code(status: u16, code: &str) -> Option<&'static str> {
+    Some(match (status, code) {
+        (400, "invalid_request") => "invalid_request",
+        (400, "invalid_manifest") => "invalid_manifest",
+        (400, "scratch_input_mismatch") => "scratch_input_mismatch",
+        (404, "not_found") => "not_found",
+        (409, "repair_manifest_conflict") => "repair_manifest_conflict",
+        (413, "payload_too_large") => "payload_too_large",
+        (503, "repair_timeout") => "repair_timeout",
+        (503, "repair_resource") => "repair_resource",
+        (503, "repair_failed") => "repair_failed",
+        _ => return None,
+    })
+}
+
+/// Decode the DO's reply so only the status summary or a known fault crosses
+/// the front door. Platform errors and extra diagnostic fields stay internal.
+pub fn parse_do_reply(status: u16, body: &[u8]) -> Result<RepairReply, ApiFault> {
+    if status == 200 {
+        let reply: RepairReply = decode_result_object(body).ok_or_else(repair_unavailable_fault)?;
+        if valid_verdict(reply.status, reply.exit_code, reply.file_count) {
+            return Ok(reply);
+        }
+    } else if let Some(code) = error_code(body) {
+        let stable = match (status, code) {
+            (404, "scratch_missing") => Some("scratch_missing"),
+            (413, "scratch_input_mismatch") => Some("scratch_input_mismatch"),
+            (500 | 503, "repair_unavailable") => Some("repair_unavailable"),
+            (502, "container_unavailable") => Some("container_unavailable"),
+            (503, "scratch_unavailable") => Some("scratch_unavailable"),
+            _ => container_fault_code(status, code),
+        };
+        if let Some(code) = stable {
+            return Err(ApiFault::new(status, code));
+        }
+    }
+    Err(repair_unavailable_fault())
 }
 
 /// Append one response chunk only when it fits under `cap`.
@@ -538,7 +618,7 @@ pub fn classify_container_reply(status: u16, body: &[u8]) -> ContainerOutcome {
 /// stays admissible (`>` rejects, never `>=`). The wasm runtime
 /// streams both container result replies through this.
 pub fn push_chunk_capped(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
-    if body.len() + chunk.len() > cap {
+    if chunk.len() > cap || body.len() > cap - chunk.len() {
         return false;
     }
     body.extend_from_slice(chunk);

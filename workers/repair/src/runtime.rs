@@ -23,10 +23,10 @@ use worker::{
 
 use crate::contract::{
     classify_container_reply, container_repair_body, container_unavailable_fault, in_key,
-    ingest_reply_body, manifest_digest, manifest_key, out_key, parse_manifest, parse_request, plan,
-    push_chunk_capped, repair_unavailable_fault, result_key, settle_do_reply,
-    validate_repaired_output_set, ApiFault, ContainerOutcome, FileRole, Plan, RepairRequest,
-    RepairStatus, MAX_REQUEST_BYTES, MAX_RESULT_BYTES,
+    ingest_reply_body, manifest_digest, manifest_key, out_key, parse_do_reply, parse_manifest,
+    parse_request, plan, push_chunk_capped, repair_unavailable_fault, replay_reply, result_key,
+    settle_do_reply, try_run_round, validate_repaired_output_set, ApiFault, ContainerOutcome,
+    FileRole, Plan, RepairRequest, RepairStatus, MAX_REQUEST_BYTES, MAX_RESULT_BYTES,
 };
 
 /// Durable Object binding + class fronting the Container.
@@ -83,8 +83,7 @@ async fn read_capped(req: &mut Request, cap: usize) -> Result<Vec<u8>, ApiFault>
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| ApiFault::new(400, "invalid_request"))?;
-        body.extend_from_slice(&chunk);
-        if body.len() > cap {
+        if !push_chunk_capped(&mut body, &chunk, cap) {
             return Err(ApiFault::new(413, "payload_too_large"));
         }
     }
@@ -140,8 +139,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
         .and_then(|ns| ns.id_from_name(&parsed.job_id)?.get_stub())
     {
         Ok(stub) => stub,
-        Err(error) => {
-            console_log!("repair DO unavailable: {:?}", error);
+        Err(_) => {
+            console_log!("repair DO unavailable");
             return fault_response(&repair_unavailable_fault());
         }
     };
@@ -159,8 +158,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
     // fetch and owns it through body completion, releasing it on every exit.
     let deadline = Box::pin(Delay::from(Duration::from_millis(DO_REPAIR_DEADLINE_MS)));
     let fetch = Box::pin(async {
-        let mut response = stub.fetch_with_request(request).await.map_err(|error| {
-            console_log!("repair DO call failed job={}: {:?}", parsed.job_id, error);
+        let mut response = stub.fetch_with_request(request).await.map_err(|_| {
+            console_log!("repair DO call failed job={}", parsed.job_id);
         })?;
         let status = response.status_code();
         // The shared reader preserves Empty and materialised bodies, checking
@@ -180,9 +179,12 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
         };
         Ok((status, stream))
     });
-    match settle_do_reply(fetch, deadline).await {
-        Ok((status, bytes)) => json_response(status, bytes),
-        Err(_) => fault_response(&ApiFault::new(503, "repair_unavailable")),
+    match settle_do_reply(fetch, deadline)
+        .await
+        .and_then(|(status, bytes)| parse_do_reply(status, &bytes))
+    {
+        Ok(reply) => json_response(200, serde_json::to_vec(&reply).unwrap_or_default()),
+        Err(fault) => fault_response(&fault),
     }
 }
 
@@ -191,11 +193,16 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
 pub struct RepairContainer {
     state: State,
     env: Env,
+    round_lock: futures_util::lock::Mutex<()>,
 }
 
 impl DurableObject for RepairContainer {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env }
+        Self {
+            state,
+            env,
+            round_lock: futures_util::lock::Mutex::new(()),
+        }
     }
 
     async fn fetch(&self, mut req: Request) -> WorkerResult<Response> {
@@ -215,7 +222,7 @@ impl DurableObject for RepairContainer {
         if self.state.id().name().as_deref() != Some(parsed.job_id.as_str()) {
             return fault_response(&ApiFault::invalid());
         }
-        match self.run(&parsed).await {
+        match try_run_round(&self.round_lock, self.run(&parsed)).await {
             Ok(result_body) => json_response(200, result_body),
             Err(fault) => fault_response(&fault),
         }
@@ -238,14 +245,21 @@ impl RepairContainer {
             &bucket,
             &manifest_key(prefix),
             crate::contract::MAX_MANIFEST_BYTES,
+            ApiFault::new(413, "payload_too_large"),
         )
         .await?
         .ok_or_else(|| ApiFault::new(404, "scratch_missing"))?;
         let manifest = parse_manifest(&manifest_bytes)?;
         let digest = manifest_digest(&manifest);
-        let existing = read_object_capped(&bucket, &result_key(prefix), MAX_RESULT_BYTES).await?;
+        let existing = read_object_capped(
+            &bucket,
+            &result_key(prefix),
+            MAX_RESULT_BYTES,
+            ApiFault::new(500, "repair_unavailable"),
+        )
+        .await?;
         let stale_generation = match plan(req, existing.as_deref(), &digest)? {
-            Plan::AlreadyDone(result) => return Ok(ingest_reply_body(&result)),
+            Plan::AlreadyDone(result) => return replay_reply(&manifest, &result),
             Plan::Rerun => true,
             Plan::Run => false,
         };
@@ -291,7 +305,7 @@ impl RepairContainer {
         let mut result = match classify_container_reply(status, &reply) {
             ContainerOutcome::Done(result) => result,
             ContainerOutcome::Forward(status, code) => {
-                return Err(ApiFault::new(status, leak_code(code)));
+                return Err(ApiFault::new(status, code));
             }
         };
         // Stamp the inputs this verdict belongs to before it becomes
@@ -535,25 +549,6 @@ impl RepairContainer {
     }
 }
 
-/// Codes forwarded from the Container are validated lowercase
-/// identifiers (see `classify_container_reply`); leaking them into the
-/// `'static` fault keeps the reply allocation-free of owned strings.
-/// The set is closed and tiny.
-fn leak_code(code: String) -> &'static str {
-    match code.as_str() {
-        "invalid_request" => "invalid_request",
-        "invalid_manifest" => "invalid_manifest",
-        "not_found" => "not_found",
-        "payload_too_large" => "payload_too_large",
-        "repair_manifest_conflict" => "repair_manifest_conflict",
-        "repair_timeout" => "repair_timeout",
-        "repair_resource" => "repair_resource",
-        "repair_failed" => "repair_failed",
-        "scratch_input_mismatch" => "scratch_input_mismatch",
-        _ => "container_unavailable",
-    }
-}
-
 /// One small JSON exchange with the Container.
 async fn container_json(
     port: &Fetcher,
@@ -635,11 +630,12 @@ async fn container_json(
 }
 
 /// Read one small scratch object (manifest/result) with a size cap
-/// checked against R2 metadata before the body is materialised.
+/// checked against R2 metadata and enforced on the body stream.
 async fn read_object_capped(
     bucket: &Bucket,
     key: &str,
     cap: usize,
+    too_large: ApiFault,
 ) -> Result<Option<Vec<u8>>, ApiFault> {
     let object = bucket
         .get(key)
@@ -650,13 +646,22 @@ async fn read_object_capped(
         return Ok(None);
     };
     if object.size() > cap as u64 {
-        return Err(ApiFault::new(413, "payload_too_large"));
+        return Err(too_large);
     }
-    let body = object
+    let unavailable = || ApiFault::new(503, "scratch_unavailable");
+    let mut stream = object
         .body()
-        .ok_or_else(|| ApiFault::new(503, "scratch_unavailable"))?
-        .bytes()
-        .await
-        .map_err(|_| ApiFault::new(503, "scratch_unavailable"))?;
+        .ok_or_else(unavailable)?
+        .stream()
+        .map_err(|_| unavailable())?;
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        if !push_chunk_capped(&mut body, &chunk.map_err(|_| unavailable())?, cap) {
+            return Err(too_large);
+        }
+    }
+    if body.len() as u64 != object.size() {
+        return Err(unavailable());
+    }
     Ok(Some(body))
 }

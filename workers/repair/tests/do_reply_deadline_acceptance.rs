@@ -125,7 +125,8 @@ use std::task::{Context, Poll};
 use futures_util::stream::{self, Stream};
 use futures_util::StreamExt;
 use nntune_repair::contract::{
-    push_chunk_capped, repair_unavailable_fault, settle_do_reply, ApiFault, MAX_RESULT_BYTES,
+    push_chunk_capped, repair_unavailable_fault, settle_do_reply, try_run_round, ApiFault,
+    MAX_RESULT_BYTES,
 };
 
 // ---------------------------------------------------------------------------
@@ -662,9 +663,6 @@ fn front_route_arms_the_deadline_before_dispatch_and_settles_through_the_seam() 
 
 #[test]
 fn no_new_fault_code_and_no_leaked_timers_on_the_front_hop() {
-    // (`"repair_timeout"` is an existing Container verdict code
-    // relayed by leak_code elsewhere in the file; the front-slice
-    // pin below keeps it out of the front route itself.)
     for code_name in [
         "\"do_timeout\"",
         "\"front_timeout\"",
@@ -691,4 +689,20 @@ fn no_new_fault_code_and_no_leaked_timers_on_the_front_hop() {
             "runtime.rs must not {banned}: deadline futures are owned locals dropped on every exit"
         );
     }
+}
+
+#[test]
+fn timed_out_round_cannot_be_joined_by_a_retry() {
+    assert!(RUNTIME_RS.contains("try_run_round(&self.round_lock, self.run(&parsed)).await"));
+    let lock = futures_util::lock::Mutex::new(());
+    let mut round = Box::pin(try_run_round(
+        &lock,
+        std::future::pending::<Result<(), ApiFault>>(),
+    ));
+    let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+    assert!(round.as_mut().poll(&mut cx).is_pending());
+    let retry = || try_run_round(&lock, std::future::ready(Ok(())));
+    assert_eq!(drive(retry()), Err(repair_unavailable_fault()));
+    drop(round);
+    assert_eq!(drive(retry()), Ok(()));
 }

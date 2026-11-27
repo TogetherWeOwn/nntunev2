@@ -214,9 +214,9 @@ fn container_json_code(code: &str) -> &str {
     )
 }
 
-/// `fetch_output` runs to `leak_code`, the next definition.
+/// `fetch_output` runs to `container_json`, the next definition.
 fn fetch_output_code(code: &str) -> &str {
-    fn_slice(code, "async fn fetch_output", "fn leak_code")
+    fn_slice(code, "async fn fetch_output", "async fn container_json")
 }
 
 /// Collapse every run of whitespace (including newlines) to one
@@ -781,7 +781,12 @@ fn deadline_expiry_yields_none_at_every_race() {
             "async fn read_object_capped",
             2,
         ),
-        ("fetch_output", "async fn fetch_output", "fn leak_code", 2),
+        (
+            "fetch_output",
+            "async fn fetch_output",
+            "async fn container_json",
+            2,
+        ),
     ] {
         let flat = collapse_ws(fn_slice(RUNTIME_RS, start, next));
         assert_eq!(
@@ -856,7 +861,7 @@ fn deadline_expiry_maps_none_to_502_container_unavailable() {
     let output_flat = collapse_ws(fn_slice(
         RUNTIME_RS,
         "async fn fetch_output",
-        "fn leak_code",
+        "async fn container_json",
     ));
     assert_eq!(
         output_flat

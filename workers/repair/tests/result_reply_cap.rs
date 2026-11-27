@@ -414,7 +414,7 @@ fn classify_rejects_valid_result_one_byte_over_cap_as_502() {
     serde_json::from_slice::<RepairResult>(&body).unwrap();
     assert_eq!(
         classify_container_reply(200, &body),
-        ContainerOutcome::Forward(502, "container_unavailable".to_string())
+        ContainerOutcome::Forward(502, "container_unavailable")
     );
 }
 
@@ -426,7 +426,7 @@ fn classify_forwards_known_container_error_code() {
     assert!(body.len() < MAX_RESULT_BYTES);
     assert_eq!(
         classify_container_reply(400, body),
-        ContainerOutcome::Forward(400, "invalid_manifest".to_string())
+        ContainerOutcome::Forward(400, "invalid_manifest")
     );
 }
 
@@ -456,7 +456,7 @@ fn reply_sites_keep_existing_fault_mapping_literals() {
     // `container_unavailable` in `container_json`.
     let front = front_door_region(RUNTIME_RS);
     assert!(
-        front.contains("503") && front.contains("\"repair_unavailable\""),
+        front.contains("settle_do_reply(fetch, deadline)"),
         "front door must keep mapping a bad/oversized DO reply to 503 \
          repair_unavailable"
     );
