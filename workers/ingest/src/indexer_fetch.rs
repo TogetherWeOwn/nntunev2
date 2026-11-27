@@ -161,13 +161,13 @@ pub struct PinnedRequest {
 
 impl fmt::Debug for ValidatedTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ValidatedTarget {{ host: {:?}, .. }}", &self.host)
+        write!(f, "ValidatedTarget {{ host: {:?}, .. }}", self.host)
     }
 }
 
 impl fmt::Debug for PinnedRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PinnedRequest {{ host: {:?}, .. }}", &self.host)
+        write!(f, "PinnedRequest {{ host: {:?}, .. }}", self.host)
     }
 }
 
@@ -197,7 +197,7 @@ pub struct BodyChunk {
 
 impl fmt::Debug for RawResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RawResponse {{ status: {:?}, .. }}", &self.status)
+        write!(f, "RawResponse {{ status: {:?}, .. }}", self.status)
     }
 }
 
