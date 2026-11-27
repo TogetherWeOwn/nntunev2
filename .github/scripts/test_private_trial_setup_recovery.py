@@ -148,8 +148,12 @@ class CleanupScopeTests(unittest.TestCase):
         config = ResourceReadback("config-1", "attempt-1", "account-1", "hyperdrive")
         self.assertEqual(plan_cleanup(scope, [config]).action, "hold")
         conflict = ResourceReadback("config-1", "attempt-2", "account-1", "hyperdrive")
+        foreign = ResourceReadback("config-1", "attempt-1", "account-2", "hyperdrive")
         ca = ResourceReadback("ca-1", "attempt-1", "account-1", "origin-ca")
-        self.assertEqual(plan_cleanup(scope, [config, conflict, ca]).action, "hold")
+        self.assertEqual(plan_cleanup(scope, [conflict, ca]).reason,
+                         "cleanup readback conflicts with the selected scope")
+        self.assertEqual(plan_cleanup(scope, [foreign, ca]).reason,
+                         "cleanup readback conflicts with the selected scope")
         self.assertEqual(plan_cleanup(scope, [config, config,
                                                ResourceReadback("ca-1", "attempt-1", "account-1", "origin-ca")]).action,
                          "hold")
