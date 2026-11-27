@@ -48,19 +48,19 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
             return str(next((value for value in values if value), ""))
 
         groups = {}
-        for event, pr_number, input_number in (
-            ("pull_request", 42, None),
-            ("pull_request_review", 42, None),
-            ("workflow_dispatch", None, "42"),
-        ):
-            context = {
-                "github.workflow": "pr-size",
-                "github.event_name": event,
-                "github.event.pull_request.number": pr_number,
-                "inputs.pr_number": input_number,
-            }
-            rendered = re.sub(r"\$\{\{(.*?)\}\}", lambda match: expand(match, context), group[1])
-            groups[event] = rendered.casefold()
+        for number in (42, 43):
+            for event in ("pull_request", "pull_request_review", "workflow_dispatch"):
+                dispatch = event == "workflow_dispatch"
+                context = {
+                    "github.workflow": "pr-size",
+                    "github.event_name": event,
+                    "github.event.pull_request.number": None if dispatch else number,
+                    "inputs.pr_number": str(number) if dispatch else None,
+                }
+                rendered = re.sub(
+                    r"\$\{\{(.*?)\}\}", lambda match: expand(match, context), group[1]
+                )
+                groups[event, number] = rendered.casefold()
 
         self.assertEqual(len(set(groups.values())), len(groups), groups)
 
