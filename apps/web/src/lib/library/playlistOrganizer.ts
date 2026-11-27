@@ -15,6 +15,9 @@ type OrganizerState = Readonly<{
 }>;
 
 type OrganizerAction =
+	| { type: 'create-folder'; folder: ItemRef; name: string; parent: ItemRef | null }
+	| { type: 'rename-folder'; folder: ItemRef; name: string }
+	| { type: 'delete-folder'; folder: ItemRef }
 	| { type: 'move'; item: ItemRef; destination: ItemRef | null }
 	| { type: 'open-share-sheet'; playlist: ItemRef }
 	| { type: 'cancel-share-sheet' };
@@ -69,8 +72,49 @@ function moveItem(state: OrganizerState, itemRef: ItemRef, destination: ItemRef 
 	};
 }
 
+function normalizeFolderName(name: string): string | null {
+	// Check before trimming so controls and line separators at the edges are rejected too.
+	if (/[\p{Cc}\u2028\u2029]/u.test(name)) return null;
+	const trimmed = name.trim();
+	// Use the Library's 120-code-point name limit.
+	return /^.{1,120}$/u.test(trimmed) ? trimmed : null;
+}
+
+function findOwnedFolder(state: OrganizerState, folder: ItemRef): OrganizerItem | undefined {
+	if (folder.ownerId !== state.ownerId) return undefined;
+	return state.items.find((item) =>
+		item.id === folder.id && item.ownerId === folder.ownerId && item.kind === 'folder'
+	);
+}
+
 export function updatePlaylistOrganizer(state: OrganizerState, action: OrganizerAction): OrganizerState {
 	switch (action.type) {
+		case 'create-folder': {
+			const { folder: { ownerId, id }, parent } = action;
+			if (ownerId !== state.ownerId || state.items.some((item) => item.id === id)) return state;
+			if (parent && !findOwnedFolder(state, parent)) return state;
+			const name = normalizeFolderName(action.name);
+			if (name === null) return state;
+			return {
+				...state,
+				items: [...state.items, { ownerId, id, name, kind: 'folder', parentId: parent?.id ?? null }]
+			};
+		}
+		case 'rename-folder': {
+			const folder = findOwnedFolder(state, action.folder);
+			if (!folder) return state;
+			const name = normalizeFolderName(action.name);
+			if (name === null || name === folder.name) return state;
+			return {
+				...state,
+				items: state.items.map((item) => item === folder ? { ...item, name } : item)
+			};
+		}
+		case 'delete-folder': {
+			const folder = findOwnedFolder(state, action.folder);
+			if (!folder || state.items.some((item) => item.parentId === folder.id)) return state;
+			return { ...state, items: state.items.filter((item) => item !== folder) };
+		}
 		case 'move':
 			return moveItem(state, action.item, action.destination);
 		case 'open-share-sheet': {
