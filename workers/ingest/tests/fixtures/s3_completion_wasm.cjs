@@ -474,6 +474,76 @@ test('rejects a conflicting pre-finalization multipart status reply', { timeout:
   ]);
 });
 
+function mockMultipartAckResume(t) {
+  const partBytes = 5_244_160;
+  const tailBytes = wireHeaderLength + Math.ceil(partBytes / 65_536) * 16;
+  const requests = [];
+  const stored = new Map();
+  let interrupted;
+  t.mock.method(globalThis, 'fetch', async (request) => {
+    const url = new URL(request.url);
+    const query = url.search.slice(1);
+    requests.push(`${request.method} ${query}`);
+    if (request.method === 'PUT') {
+      const number = Number(url.searchParams.get('partNumber'));
+      assert.ok(number === 1 || number === 2);
+      const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
+      assert.equal(body.length, number === 1 ? partBytes : tailBytes);
+      if (number === 2 && !interrupted) {
+        assert.deepEqual([...stored.keys()], [1]);
+        interrupted = body;
+        throw new Error('synthetic interruption before storing part 2');
+      }
+      if (number === 2) assert.deepEqual(body, interrupted);
+      const receipt = { etag: `"fixture-part-${number}"`, 'x-amz-checksum-sha256': checksum(body) };
+      stored.set(number, receipt);
+      return new Response(null, { headers: receipt });
+    }
+    const manifest = (await verifySignedRequest(request, 'POST', uploadQuery)).toString();
+    assert.deepEqual([...stored.keys()], [1, 2]);
+    assert.equal(manifest, multipartManifest(stored));
+    return multipartCompletionReceipt(stored);
+  });
+  return { requests, stored };
+}
+
+const resumedPuts = [
+  `PUT partNumber=1&${uploadQuery}`, `PUT partNumber=2&${uploadQuery}`,
+  `PUT partNumber=2&${uploadQuery}`,
+];
+
+for (const recover of [false, true]) {
+  test(recover ? 'reconciles the pending part after a correctly bound acknowledgement'
+    : 'keeps the part pending after a wrong-part acknowledgement for the same upload', async (t) => {
+    const { requests, stored } = mockMultipartAckResume(t);
+    const uploadId = new URLSearchParams(uploadQuery).get('uploadId');
+    let reads = 0;
+    const readPartAck = (targetBucket, key, id, number) => {
+      assert.deepEqual([targetBucket, key, id, number], [bucket, mediaKey, uploadId, 2]);
+      assert.deepEqual(requests, resumedPuts, 'readback must precede completion');
+      const receipt = stored.get(number);
+      reads += 1;
+      return {
+        uploadId,
+        partNumber: recover && reads === 2 ? number : 3,
+        etag: receipt.etag,
+        checksum: receipt['x-amz-checksum-sha256'],
+      };
+    };
+    if (recover) {
+      assert.equal(await complete('multipart-resume-ack', readPartAck), version);
+      assert.deepEqual(requests, [...resumedPuts, `POST ${uploadQuery}`]);
+    } else {
+      await assert.rejects(
+        complete('multipart-resume-ack', readPartAck),
+        rejectedWith('unconfirmed part acknowledgement'),
+      );
+      assert.deepEqual(requests, resumedPuts);
+    }
+    assert.equal(reads, 2);
+  });
+}
+
 for (const [name, error] of [
   ['completes a matching full multipart inventory', null],
   ['keeps completion pending when the provider refuses part 2', 'CompletionStatus'],
