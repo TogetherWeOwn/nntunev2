@@ -109,3 +109,142 @@ describe('playlist organizer', () => {
 		expect(updatePlaylistOrganizer(reset, { type: 'open-share-sheet', playlist: own('playlist') })).toBe(reset);
 	});
 });
+
+describe('playlist organizer folder actions', () => {
+	it('creates root and nested folders in insertion order with trimmed names', () => {
+		const initial = updatePlaylistOrganizer(setup(), {
+			type: 'open-share-sheet', playlist: own('playlist')
+		});
+		const root = updatePlaylistOrganizer(initial, {
+			type: 'create-folder', folder: own('new-root'), name: '  Late  night  ', parent: null
+		});
+		const nested = updatePlaylistOrganizer(root, {
+			type: 'create-folder', folder: own('foreign-only'), name: '\u00a0Écoute 🎵\u00a0',
+			parent: own('new-root')
+		});
+
+		expect(root.items).toEqual([
+			...items, { ...own('new-root'), kind: 'folder', name: 'Late  night', parentId: null }
+		]);
+		expect(nested.items).toEqual([
+			...root.items,
+			{ ...own('foreign-only'), kind: 'folder', name: 'Écoute 🎵', parentId: 'new-root' }
+		]);
+		for (const [index, item] of root.items.entries()) expect(nested.items[index]).toBe(item);
+		for (const [index, item] of initial.items.entries()) expect(root.items[index]).toBe(item);
+		expect(initial.items).toEqual(items);
+		expect(root.shareSheet).toBe(initial.shareSheet);
+		expect(nested.shareSheet).toBe(initial.shareSheet);
+	});
+
+	it('refuses duplicate IDs, cross-owner creates, and invalid parents atomically', () => {
+		const state = setup();
+		const rejected = [
+			[own('root'), null],
+			[own('playlist'), null],
+			[foreign('new'), null],
+			[own('new'), foreign('root')],
+			[own('new'), own('foreign-only')],
+			[own('new'), own('missing')],
+			[own('new'), own('playlist')],
+			[own('new'), own('new')]
+		] as const;
+		for (const [folder, parent] of rejected) {
+			expect(updatePlaylistOrganizer(state, {
+				type: 'create-folder', folder, parent, name: 'New folder'
+			})).toBe(state);
+		}
+		expect(state.items).toEqual(items);
+	});
+
+	it.each([
+		['empty', ''],
+		['whitespace only', ' \u00a0 '],
+		['above the name limit', '🎵'.repeat(121)],
+		['a NUL', 'Side\0 A'],
+		['a tab', '\tSide A'],
+		['a newline', 'Side A\n'],
+		['a delete control', 'Side\u007f A'],
+		['a C1 control', 'Side\u0085 A'],
+		['a line separator', '\u2028Side A'],
+		['a paragraph separator', 'Side A\u2029']
+	])('rejects %s for both create and rename', (_label, name) => {
+		const state = setup();
+		expect(updatePlaylistOrganizer(state, {
+			type: 'create-folder', folder: own('new'), parent: null, name
+		})).toBe(state);
+		expect(updatePlaylistOrganizer(state, {
+			type: 'rename-folder', folder: own('root'), name
+		})).toBe(state);
+		expect(state.items).toEqual(items);
+	});
+
+	it('accepts 120 Unicode code points after trimming for both create and rename', () => {
+		const state = setup();
+		const name = '🎵'.repeat(120);
+		const created = updatePlaylistOrganizer(state, {
+			type: 'create-folder', folder: own('new'), parent: null, name: ` ${name} `
+		});
+		const renamed = updatePlaylistOrganizer(state, {
+			type: 'rename-folder', folder: own('nested'), name: ` ${name} `
+		});
+		expect(created.items[items.length]?.name).toBe(name);
+		expect(renamed.items[0].name).toBe(name);
+	});
+
+	it('renames a populated folder in place while preserving its children and the private sheet', () => {
+		const state = updatePlaylistOrganizer(setup(), {
+			type: 'open-share-sheet', playlist: own('playlist')
+		});
+		const renamed = updatePlaylistOrganizer(state, {
+			type: 'rename-folder', folder: own('nested'), name: '  Evening  '
+		});
+
+		expect(renamed.items).toEqual([{ ...items[0], name: 'Evening' }, ...items.slice(1)]);
+		expect(renamed.items[0]).not.toBe(state.items[0]);
+		for (const [index, item] of renamed.items.entries()) {
+			if (index !== 0) expect(item).toBe(state.items[index]);
+		}
+		expect(renamed.shareSheet).toBe(state.shareSheet);
+		expect(state.items).toEqual(items);
+	});
+
+	it('refuses missing, non-folder, foreign and unchanged rename targets atomically', () => {
+		const state = setup();
+		for (const folder of [own('missing'), own('playlist'), own('foreign-only'), foreign('root')]) {
+			expect(updatePlaylistOrganizer(state, {
+				type: 'rename-folder', folder, name: 'Renamed'
+			})).toBe(state);
+		}
+		expect(updatePlaylistOrganizer(state, {
+			type: 'rename-folder', folder: own('root'), name: '  Collection  '
+		})).toBe(state);
+		expect(state.items).toEqual(items);
+	});
+
+	it('refuses to delete folders with folder or playlist children and refuses playlists', () => {
+		const state = setup();
+		for (const folder of [own('root'), own('nested'), own('playlist'), own('missing'), own('foreign-only')]) {
+			expect(updatePlaylistOrganizer(state, { type: 'delete-folder', folder })).toBe(state);
+		}
+		expect(state.items).toEqual(items);
+	});
+
+	it('deletes only an owned empty folder and preserves surviving rows and the private sheet', () => {
+		const moved = updatePlaylistOrganizer(setup(), {
+			type: 'move', item: own('playlist'), destination: null
+		});
+		const state = updatePlaylistOrganizer(moved, {
+			type: 'open-share-sheet', playlist: own('playlist')
+		});
+		expect(updatePlaylistOrganizer(state, { type: 'delete-folder', folder: foreign('nested') })).toBe(state);
+		const action = { type: 'delete-folder', folder: own('nested') } as const;
+		const deleted = updatePlaylistOrganizer(state, action);
+
+		expect(deleted.items).toEqual(state.items.slice(1));
+		for (const [index, item] of deleted.items.entries()) expect(item).toBe(state.items[index + 1]);
+		expect(deleted.shareSheet).toBe(state.shareSheet);
+		expect(state.items).toEqual([items[0], { ...items[1], parentId: null }, ...items.slice(2)]);
+		expect(updatePlaylistOrganizer(deleted, action)).toBe(deleted);
+	});
+});
