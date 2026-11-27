@@ -41,16 +41,22 @@ pub(crate) fn confirm_card_payment<'a>(
         return None;
     }
 
+    let currency = invoice.get("currency")?.as_str()?;
     let charge = invoice.get("charge")?;
+    let captured = charge.get("amount_captured")?.as_u64()?;
     stripe_id(charge.get("id")?.as_str()?, "ch_")?;
-    if charge.get("object")?.as_str()? != "charge"
+    if currency.len() != 3
+        || !currency.bytes().all(|b| b.is_ascii_lowercase())
+        || charge.get("currency")?.as_str()? != currency
+        || charge.get("object")?.as_str()? != "charge"
         || reference(charge.get("invoice")?, "invoice", "in_")? != expected_invoice
         || reference(charge.get("customer")?, "customer", "cus_")? != customer
         || charge.get("livemode")?.as_bool()? != livemode
         || charge.get("status")?.as_str()? != "succeeded"
         || !charge.get("paid")?.as_bool()?
         || !charge.get("captured")?.as_bool()?
-        || charge.get("amount_captured")?.as_u64()? == 0
+        || captured == 0
+        || captured > charge.get("amount")?.as_u64()?
         || charge.get("amount_refunded")?.as_u64()? != 0
         || charge.get("refunded")?.as_bool()?
         || charge.get("disputed")?.as_bool()?
@@ -72,7 +78,13 @@ pub(crate) fn confirm_card_payment<'a>(
 fn reference<'a>(value: &'a Value, object: &str, prefix: &str) -> Option<&'a str> {
     let id = match value.as_str() {
         Some(id) => id,
-        None if value.get("object")?.as_str()? == object => value.get("id")?.as_str()?,
+        None if value.get("object")?.as_str()? == object
+            && value
+                .get("deleted")
+                .is_none_or(|v| v.as_bool() == Some(false)) =>
+        {
+            value.get("id")?.as_str()?
+        }
         None => return None,
     };
     stripe_id(id, prefix)
@@ -127,13 +139,14 @@ mod tests {
     fn paid_invoice(customer: &str, id: &str, fingerprint: &str, livemode: bool) -> Value {
         json!({
             "object": "invoice", "id": id, "customer": customer, "livemode": livemode,
-            "status": "paid", "paid_out_of_band": false, "amount_paid": 1200,
+            "status": "paid", "paid_out_of_band": false, "amount_paid": 1200, "currency": "usd",
             "status_transitions": {"paid_at": 1735000000},
             "charge": {
                 "object": "charge", "id": "ch_Synthetic", "invoice": id,
                 "customer": {"object": "customer", "id": customer}, "livemode": livemode,
                 "status": "succeeded", "paid": true, "captured": true,
-                "amount_captured": 1200, "amount_refunded": 0, "refunded": false, "disputed": false,
+                "amount": 1200, "currency": "usd", "amount_captured": 1200,
+                "amount_refunded": 0, "refunded": false, "disputed": false,
                 "payment_method_details": {"type": "card", "card": {"fingerprint": fingerprint}}
             }
         })
@@ -207,6 +220,9 @@ mod tests {
             ("/charge/paid", json!(false)),
             ("/charge/captured", json!(false)),
             ("/charge/amount_captured", json!(0)),
+            ("/charge/amount_captured", json!(1201)),
+            ("/charge/currency", json!("eur")),
+            ("/currency", json!("USD")),
             ("/charge/amount_refunded", json!(1)),
             ("/charge/refunded", json!(true)),
             ("/charge/disputed", json!(true)),
@@ -241,6 +257,10 @@ mod tests {
             ("/charge/customer/id", json!("cus_Other")),
             ("/charge/customer/object", json!("charge")),
             ("/charge/customer", Value::Null),
+            (
+                "/customer",
+                json!({"object": "customer", "id": "cus_Issuer", "deleted": true}),
+            ),
             ("/id", json!("in_Other")),
             ("/charge/invoice", json!("in_Other")),
             ("/livemode", json!(true)),

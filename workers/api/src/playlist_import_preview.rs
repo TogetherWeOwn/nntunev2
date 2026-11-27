@@ -66,7 +66,9 @@ pub fn preview<'a>(
             None
         };
         let valid_label = line.strip_prefix("#EXTINF:-1,").is_some_and(|label| {
-            !label.trim().is_empty()
+            !label
+                .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+                .is_empty()
                 && !label
                     .chars()
                     .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
@@ -167,5 +169,18 @@ mod tests {
         assert_eq!(preview(&input, &ids), Ok(vec![]));
         input.push(b'\xff');
         assert_eq!(preview(&input, &ids), Err(PreviewError::TooManyBytes));
+    }
+
+    #[test]
+    fn rejects_labels_made_entirely_of_export_whitespace() {
+        let input =
+            format!("\u{feff}#EXTM3U\n#EXTINF:-1,\u{feff} \u{feff}\n{A}\n#EXTINF:-1,Visible\n{A}");
+        assert_eq!(
+            preview(input.as_bytes(), &BTreeSet::from([A])),
+            Ok(vec![
+                PreviewRow::Malformed,
+                PreviewRow::Matched { track_id: A }
+            ])
+        );
     }
 }

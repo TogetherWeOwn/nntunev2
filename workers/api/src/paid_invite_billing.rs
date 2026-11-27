@@ -13,6 +13,13 @@ struct Checkout {
     plan_id: String,
 }
 
+fn purchase_payload<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
+    if body.len() > MAX_BODY_BYTES || body.trim_ascii_start().first() != Some(&b'{') {
+        return None;
+    }
+    serde_json::from_slice(body).ok()
+}
+
 // Keep checkout's large future off the shared dispatcher's stack frame.
 #[inline(never)]
 pub(super) fn browser_purchase<'a, S, M, D, N>(
@@ -40,6 +47,12 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    if req.method != "POST"
+        || !matches!(req.path.as_str(), CHECKOUT | PORTAL)
+        || !ctx.cfg.paid_billing_enabled()
+    {
+        return not_found();
+    }
     let (claims, _) = match preference_authenticate(ctx, req, true).await {
         Ok(pair) => pair,
         Err(response) => return response,
@@ -54,7 +67,7 @@ where
     }
     let return_url = format!("{}/account/billing", ctx.cfg.origin);
     if req.path == PORTAL {
-        if serde_json::from_slice::<Portal>(&req.body).is_err() {
+        if purchase_payload::<Portal>(&req.body).is_none() {
             return invalid_request();
         }
         let Some(configuration) = ctx.cfg.stripe_portal_configuration.as_deref() else {
@@ -62,7 +75,7 @@ where
         };
         return portal_for(ctx, &claims.user_id, configuration, &return_url).await;
     }
-    let Ok(Checkout { plan_id }) = serde_json::from_slice(&req.body) else {
+    let Some(Checkout { plan_id }) = purchase_payload(&req.body) else {
         return invalid_request();
     };
     let input = match ctx.store.load_reconcile_input(&claims.user_id, None).await {
@@ -134,7 +147,10 @@ fn redirect_response(url: String, host: &str) -> Response {
 }
 
 fn approved_redirect(value: &str, host: &str) -> bool {
-    value.starts_with("https://")
+    value
+        .strip_prefix("https://")
+        .and_then(|rest| rest.strip_prefix(host))
+        .is_some_and(|path| path.starts_with('/'))
         && !value
             .bytes()
             .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b'\\')
@@ -144,4 +160,37 @@ fn approved_redirect(value: &str, host: &str) -> bool {
                 && url.password().is_none()
                 && url.port().is_none()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purchase_payloads_require_bounded_json_objects() {
+        assert!(purchase_payload::<Portal>(b" {} ").is_some());
+        assert!(purchase_payload::<Checkout>(br#"{"planId":"plus"}"#).is_some());
+        assert!(purchase_payload::<Portal>(b"[]").is_none());
+        assert!(purchase_payload::<Checkout>(br#"["plus"]"#).is_none());
+        let huge = format!("{:width$}{{}}", "", width = MAX_BODY_BYTES);
+        assert!(purchase_payload::<Portal>(huge.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn redirects_require_the_exact_https_authority() {
+        let host = "billing.stripe.com";
+        assert!(approved_redirect(
+            "https://billing.stripe.com/p/session",
+            host
+        ));
+        for url in [
+            "https:////billing.stripe.com/p/session",
+            "https://@billing.stripe.com/p/session",
+            "https://billing.stripe.com:443/p/session",
+            "https://billing%2estripe.com/p/session",
+            "https://billing.stripe.com.example/p/session",
+        ] {
+            assert!(!approved_redirect(url, host));
+        }
+    }
 }

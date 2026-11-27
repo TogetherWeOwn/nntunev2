@@ -14,7 +14,7 @@ use {
     },
     nntune_core::digest_readback::EnrolledReadbackError,
     nntune_ingest::multipart::readback_inventory::CompletedReadbackInventory,
-    std::time::SystemTime,
+    std::time::{Duration, SystemTime, UNIX_EPOCH},
     tokio_postgres::Client,
 };
 #[cfg(target_arch = "wasm32")]
@@ -101,7 +101,7 @@ impl OpenedUpload<'_> {
             EnrolledReadbackError,
         >,
     ) -> Result<CommittedFlacUpload<'inventory, 'receipts>, UploadError> {
-        self.prepared.authorize(auth)?;
+        let expires = self.prepared.authorize(auth)?;
         let target = self.target.target();
         let media = inventory.media();
         if (inventory.bucket(), media.object_key, media.configuration)
@@ -113,10 +113,15 @@ impl OpenedUpload<'_> {
         {
             return Err(Refused);
         }
-        let verified = verify(self.target.usable_until())
-            .await
-            .map_err(|_| Unconfirmed)?;
-        if !verified.has_flac_seek() {
+        let auth_until = UNIX_EPOCH
+            .checked_add(Duration::from_secs(expires as u64))
+            .ok_or(Refused)?;
+        let until = self.target.usable_until().min(auth_until);
+        if UNIX_EPOCH + Duration::from_millis(crate::worker_entry::now_millis()) >= until {
+            return Err(Refused);
+        }
+        let verified = verify(until).await.map_err(|_| Unconfirmed)?;
+        if !std::ptr::eq(verified.inventory(), inventory) || !verified.has_flac_seek() {
             return Err(Refused);
         }
         let outcome = self

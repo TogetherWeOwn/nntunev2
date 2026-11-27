@@ -110,7 +110,8 @@ impl SettingKey {
     /// must satisfy the same bounds as a fresh write, so a hand-edited
     /// row outside the range fails closed instead of being honored.
     pub fn parse_stored(self, stored: &str) -> Option<u32> {
-        if stored.is_empty()
+        // A u32 has at most ten decimal digits.
+        if !(1..=10).contains(&stored.len())
             || !stored.bytes().all(|b| b.is_ascii_digit())
             || (stored.len() > 1 && stored.starts_with('0'))
         {
@@ -217,7 +218,8 @@ mod tests {
         assert_eq!(key.parse_stored(""), None);
         // Out-of-bounds stored values fail closed, like corrupt ones.
         assert_eq!(key.parse_stored("45"), None);
-        assert_eq!(key.parse_stored("99999999999999999999"), None);
+        assert_eq!(key.parse_stored("4294967296"), None);
+        assert_eq!(key.parse_stored(&"9".repeat(4096)), None);
         assert_eq!(key.resolve(Some("junk")), None);
         assert_eq!(key.resolve(Some("14")), Some(14));
     }

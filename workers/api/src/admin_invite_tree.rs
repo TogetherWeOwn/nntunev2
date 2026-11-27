@@ -38,11 +38,11 @@ pub(crate) async fn read_on(
         .query_typed(
             r#"SELECT actor.deleting_at IS NOT NULL OR subject.deleting_at IS NOT NULL AS deleting,
                       subject.id, subject.invited_by, anchor.id AS anchor, page.id AS child
-               FROM users actor
-               LEFT JOIN users subject ON subject.id = $2 AND actor.deleting_at IS NULL
-               LEFT JOIN users anchor ON anchor.id = $3 AND anchor.invited_by = subject.id
+               FROM public.users actor
+               LEFT JOIN public.users subject ON subject.id = $2 AND actor.deleting_at IS NULL
+               LEFT JOIN public.users anchor ON anchor.id = $3 AND anchor.invited_by = subject.id
                LEFT JOIN LATERAL (
-                   SELECT child.id FROM users child
+                   SELECT child.id FROM public.users child
                    WHERE child.invited_by = subject.id AND subject.deleting_at IS NULL
                      AND ($3 IS NULL OR child.id COLLATE "C" > anchor.id COLLATE "C")
                    ORDER BY child.id COLLATE "C" LIMIT $4
@@ -76,7 +76,11 @@ pub(crate) async fn read_on(
             invitee_ids.push(id);
         }
     }
-    let next_cursor = (rows.len() > PAGE_SIZE).then(|| invitee_ids[PAGE_SIZE - 1].clone());
+    let next_cursor = if rows.len() > PAGE_SIZE {
+        Some(invitee_ids.get(PAGE_SIZE - 1).ok_or(StoreError)?.clone())
+    } else {
+        None
+    };
     Ok(Page(InviteTreePage {
         user_id,
         inviter_id: first.try_get("invited_by")?,

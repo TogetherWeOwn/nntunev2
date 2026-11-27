@@ -90,6 +90,9 @@ impl Presence {
             .saturating_add(ONLINE_SECS)
             .min(claims.expires_at);
         if let Some(entry) = self.devices.get_mut(&claims.session_id) {
+            if entry.created_at != claims.created_at {
+                return Err(PresenceError::InvalidSession);
+            }
             if sequence <= entry.sequence {
                 return Err(PresenceError::StaleSequence);
             }
@@ -145,11 +148,12 @@ impl Presence {
                     && row.user_id == self.owner
                     && row.created_at == entry.created_at
                     && !row.revoked
-                    && session.now < row.expires_at)
-                    .then_some(OnlineDevice {
-                        order: entry.order,
-                        is_current,
-                    })
+                    && row.expires_at <= row.created_at.saturating_add(MAX_SESSION_SECS)
+                    && (row.created_at..row.expires_at).contains(&session.now))
+                .then_some(OnlineDevice {
+                    order: entry.order,
+                    is_current,
+                })
             })
             .collect();
         online.sort_unstable_by_key(|device| device.order);
@@ -350,10 +354,13 @@ mod tests {
         revoked.revoked = true;
         let mut foreign = first.row.clone();
         foreign.user_id = "bob".into();
+        let mut overlong = first.row.clone();
+        overlong.expires_at = START + MAX_SESSION_SECS + 1;
         let snapshot = |now, row| presence.online(second.auth(now), |_| row).unwrap();
         assert_eq!(snapshot(START + 9, Some(&first.row)).len(), 1);
         assert!(snapshot(START + 9, Some(&revoked)).is_empty());
         assert!(snapshot(START + 9, Some(&foreign)).is_empty());
+        assert!(snapshot(START + 9, Some(&overlong)).is_empty());
         assert!(snapshot(START + 9, None).is_empty());
         assert!(snapshot(START + 10, Some(&first.row)).is_empty());
     }

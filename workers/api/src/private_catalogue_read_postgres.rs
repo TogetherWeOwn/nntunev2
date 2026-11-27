@@ -127,13 +127,15 @@ async fn resolves_only_the_committed_scoped_publication() {
     publication.commit().await.unwrap();
 
     assert!(pins.accepted_seq > 1, "need a positive stale revision");
-    let mismatches: [fn(&mut PublicationPins<'_>); 6] = [
+    let mismatches: [fn(&mut PublicationPins<'_>); 8] = [
         |pins| pins.environment = [0xff; 16],
         |pins| pins.library = [0xff; 16],
         |pins| pins.accepted_seq -= 1,
         |pins| pins.provider_configuration = [0xff; 16],
         |pins| pins.bucket = "other-bucket",
+        |pins| pins.bucket = "invalid/bucket",
         |pins| pins.version = "other-version",
+        |pins| pins.version = "null",
     ];
     for change in mismatches {
         let mut refused = PublicationPins { ..pins };

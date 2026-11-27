@@ -2,13 +2,13 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nntune_core::s3_locator::{S3Binding, S3Locator};
+use nntune_core::s3_locator::{valid_bucket, S3Binding, S3Locator};
 use tokio_postgres::{types::Type, Row};
 
 use crate::{
     handlers::{browser_playback_relay::BrowserReceipt, StoreError},
-    meter_sink::is_uuid_shaped,
     postgres::{PgConnect, PgQuery},
+    private_library::canonical_uuid,
     storage_digest_read::{uuid_text, DigestReadTarget, ReadUuid},
     worker_entry::query_playback_lease_row,
 };
@@ -107,9 +107,6 @@ pub(crate) async fn lookup(
     pins: &PublicationPins<'_>,
     digest: Option<&str>,
 ) -> Result<Option<(ResolvedMusic, Row)>, StoreError> {
-    if pins.accepted_seq <= 0 || !valid_version(pins.version) {
-        return Ok(None);
-    }
     lookup_scoped(
         db,
         track,
@@ -122,8 +119,16 @@ pub(crate) async fn lookup(
 
 fn valid_version(version: &str) -> bool {
     !version.is_empty()
+        && version != "null"
         && version.len() <= 1024
         && version.bytes().all(|b| b.is_ascii_graphic() && b != b',')
+}
+
+fn valid_lookup(track: &str, bucket: &str, pin: Option<(i64, &str)>, digest: Option<&str>) -> bool {
+    canonical_uuid(track)
+        && valid_bucket(bucket)
+        && pin.is_none_or(|(seq, version)| seq > 0 && valid_version(version))
+        && digest.is_none_or(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 pub(crate) async fn lookup_scoped(
@@ -133,11 +138,7 @@ pub(crate) async fn lookup_scoped(
     pin: Option<(i64, &str)>,
     digest: Option<&str>,
 ) -> Result<Option<(ResolvedMusic, Row)>, StoreError> {
-    if !is_uuid_shaped(track)
-        || track.bytes().any(|b| b.is_ascii_uppercase())
-        || scope.bucket.len() > 63
-        || scope.bucket.contains('\0')
-    {
+    if !valid_lookup(track, scope.bucket, pin, digest) {
         return Ok(None);
     }
     let (seq, version) = pin.unzip();
@@ -195,6 +196,32 @@ pub(crate) async fn lookup_scoped(
         },
         row,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_lookup_rejects_malformed_query_parameters() {
+        let track = "a0000000-0000-4000-8000-000000000001";
+        let bucket = "test-bucket";
+        let digest = "ab".repeat(32);
+        assert!(valid_lookup(
+            track,
+            bucket,
+            Some((1, "v+/=")),
+            Some(&digest)
+        ));
+        assert!(valid_lookup(track, bucket, None, None));
+        assert!(!valid_lookup(track, "not/a/bucket", None, None));
+        for pin in [(0, "v1"), (-1, "v1"), (1, "null"), (1, "v1,v2")] {
+            assert!(!valid_lookup(track, bucket, Some(pin), None));
+        }
+        for digest in [&digest[..63], &"x".repeat(64), "00\0"] {
+            assert!(!valid_lookup(track, bucket, None, Some(digest)));
+        }
+    }
 }
 
 #[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]

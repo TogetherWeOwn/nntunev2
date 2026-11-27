@@ -13,12 +13,12 @@ pub struct PrivateListening {
 
 impl PrivateListening {
     pub fn parse(raw: &str) -> Option<Self> {
-        if raw.len() > 1024 {
+        if raw.len() > 1024 || !raw.trim_ascii_start().starts_with('{') {
             return None;
         }
         let policy: Self = serde_json::from_str(raw).ok()?;
         if !crate::ledger::is_valid_key_field(&policy.owner_user_id, 128)
-            || policy.expires_at == 0
+            || !(1..=i64::MAX as u64).contains(&policy.expires_at)
             || policy.invite_ids.len() > 8
             || policy.invite_ids.iter().any(|id| *id <= 0)
             || policy
@@ -41,3 +41,26 @@ impl PrivateListening {
 }
 
 pub(crate) const ACCESS_SQL: &str = include_str!("private_listening_access.sql");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn policy_requires_objects_and_a_postgres_representable_deadline() {
+        let id = "a0000000-0000-4000-8000-000000000001";
+        let policy = |expires, scope| {
+            json!({
+                "owner_user_id": "owner", "invite_ids": [1],
+                "expires_at": expires, "library_scope": scope
+            })
+            .to_string()
+        };
+        let scope = json!({"environment_id": id, "library_id": id});
+        assert!(PrivateListening::parse(&policy(i64::MAX as u64, scope.clone())).is_some());
+        assert!(PrivateListening::parse(&policy(i64::MAX as u64 + 1, scope)).is_none());
+        assert!(PrivateListening::parse(&policy(100, json!([id, id]))).is_none());
+        assert!(PrivateListening::parse(r#"["owner",[1],100,null]"#).is_none());
+    }
+}
