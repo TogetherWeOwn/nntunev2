@@ -18,6 +18,7 @@ use std::{collections::BTreeMap, fmt};
 use crate::{
     audio_classifications::{ClassKind, ClassificationCheckpoint},
     audio_manifest::{AcceptedAudioManifest, AudioHints, AudioSelector},
+    audio_positions::prepare_all_local_occurrences,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,20 +96,13 @@ pub fn prepare_publication(
     if classified.len() != entries.len() {
         return Err(PublicationError::Mismatch);
     }
-    for (entry, row) in entries.iter().zip(classified.iter()) {
+    for (entry, row) in entries.iter().zip(classified) {
         if row.audio_ordinal != entry.audio_ordinal
             || row.release_group_ref != entry.release_group_ref
-            || row.medium_no <= 0
-            || row.track_no <= 0
         {
-            // Positions <= 0 are publication refusals too, but only after the
-            // identity binding above so a wrong-owner checkpoint never leaks
-            // a position judgement.
-            if row.audio_ordinal != entry.audio_ordinal
-                || row.release_group_ref != entry.release_group_ref
-            {
-                return Err(PublicationError::Mismatch);
-            }
+            return Err(PublicationError::Mismatch);
+        }
+        if row.medium_no <= 0 || row.track_no <= 0 {
             return Err(PublicationError::Positions);
         }
     }
@@ -140,6 +134,20 @@ pub fn prepare_publication(
             .is_some()
         {
             return Err(PublicationError::Positions);
+        }
+    }
+    if classified.iter().any(|row| row.kind == ClassKind::AllLocal) {
+        // Check the durable local decisions against the frozen selection
+        // before a structurally valid loser link can suppress a track.
+        let local =
+            prepare_all_local_occurrences(manifest).map_err(|_| PublicationError::Positions)?;
+        for (row, expected) in classified.iter().zip(local.entries()) {
+            if row.kind == ClassKind::AllLocal
+                && (row.medium_no, row.track_no, row.duplicate_of)
+                    != (expected.medium_no, expected.track_no, expected.duplicate_of)
+            {
+                return Err(PublicationError::Positions);
+            }
         }
     }
     Ok(PublicationPlan(

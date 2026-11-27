@@ -65,12 +65,12 @@ fn same_identity(
         .fingerprint
         .as_deref()
         .zip(b.fingerprint.as_deref())
-        .is_some_and(|(a, b)| !a.is_empty() && a == b);
+        .is_some_and(|(a, b)| !a.trim().is_empty() && a == b);
     let title_duration = a_title.is_some()
         && a_title == b_title
         && a.duration_ms.zip(b.duration_ms).is_some_and(|(a, b)| {
             let delta = u128::from(a.abs_diff(b));
-            delta <= 2000 || delta * 100 <= u128::from(a.max(b))
+            a > 0 && b > 0 && (delta <= 2000 || delta * 100 <= u128::from(a.max(b)))
         });
     recording || fingerprint || title_duration
 }
