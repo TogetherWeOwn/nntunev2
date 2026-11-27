@@ -23,7 +23,14 @@
 //! parallel round of range reads with no per-hit fetch.
 
 use crate::{Artist, Entity, Kind, MbRepo, Recording, Release, RepoError, RepoStage, SearchHit};
-use serde::{Deserialize, Serialize};
+use miniz_oxide::inflate::{
+    core::{
+        decompress, inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF, DecompressorOxide,
+    },
+    TINFLStatus,
+};
+use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -38,6 +45,9 @@ pub const IDX_LEN: usize = BUCKETS * IDX_ENTRY_LEN;
 /// Inflated block cap: a corrupt or hostile block cannot exhaust isolate
 /// memory. The builder refuses to write a block above it.
 pub const MAX_SNAPSHOT_BLOCK_BYTES: usize = 8 << 20;
+// Leave headroom for the builder's raw DEFLATE overhead on incompressible
+// blocks, while bounding the allocation requested by a corrupt index entry.
+const MAX_COMPRESSED_BLOCK_BYTES: u32 = 2 * MAX_SNAPSHOT_BLOCK_BYTES as u32;
 /// `pg_trgm.similarity_threshold` default: the `%` predicate's floor.
 pub const SEARCH_MIN_SCORE: f32 = 0.3;
 /// Word keys fetched per search, longest words first (longer words are
@@ -105,10 +115,13 @@ pub fn encode_idx_entry(block: BlockRef) -> [u8; IDX_ENTRY_LEN] {
     entry
 }
 
-/// The bucket's block, or `None` for an empty bucket or a short index.
+/// The bucket's block, or `None` for an empty bucket or an invalid index or bucket.
 pub fn idx_entry(idx: &[u8], bucket: usize) -> Option<BlockRef> {
-    let start = bucket.checked_mul(IDX_ENTRY_LEN)?;
-    let entry = idx.get(start..start + IDX_ENTRY_LEN)?;
+    if idx.len() != IDX_LEN || bucket >= BUCKETS {
+        return None;
+    }
+    let start = bucket * IDX_ENTRY_LEN;
+    let entry = &idx[start..start + IDX_ENTRY_LEN];
     let word = |range: std::ops::Range<usize>| -> [u8; 4] {
         entry[range].try_into().expect("4-byte slice")
     };
@@ -127,9 +140,37 @@ pub fn deflate_block(plain: &[u8]) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec(plain, 6)
 }
 
-/// Inflate one block, refusing anything above [`MAX_SNAPSHOT_BLOCK_BYTES`].
-pub fn inflate_block(raw: &[u8]) -> Option<Vec<u8>> {
-    miniz_oxide::inflate::decompress_to_vec_with_limit(raw, MAX_SNAPSHOT_BLOCK_BYTES).ok()
+/// Inflate exactly one block, refusing trailing bytes or oversized output.
+pub fn inflate_block(mut raw: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = Box::<DecompressorOxide>::default();
+    let mut plain = vec![
+        0;
+        raw.len()
+            .saturating_mul(2)
+            .clamp(1, MAX_SNAPSHOT_BLOCK_BYTES)
+    ];
+    let mut written = 0;
+    loop {
+        let (status, consumed, produced) = decompress(
+            &mut decoder,
+            raw,
+            &mut plain,
+            written,
+            TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+        );
+        written += produced;
+        match status {
+            TINFLStatus::Done if consumed == raw.len() => {
+                plain.truncate(written);
+                return Some(plain);
+            }
+            TINFLStatus::HasMoreOutput if plain.len() < MAX_SNAPSHOT_BLOCK_BYTES => {
+                raw = raw.get(consumed..)?;
+                plain.resize((2 * plain.len()).min(MAX_SNAPSHOT_BLOCK_BYTES), 0);
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// The value for `key` in an inflated block (`key\tvalue` lines). Blocks are
@@ -295,6 +336,39 @@ pub struct Posting(
     pub Option<String>,
     pub Option<String>,
 );
+
+struct PostingListVisitor(usize);
+
+impl<'de> Visitor<'de> for PostingListVisitor {
+    type Value = Vec<Posting>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "at most {} postings", self.0)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut postings = Vec::new();
+        while postings.len() < self.0 {
+            let Some(posting) = seq.next_element()? else {
+                return Ok(postings);
+            };
+            postings.push(posting);
+        }
+        if seq.next_element::<IgnoredAny>()?.is_some() {
+            return Err(de::Error::invalid_length(self.0 + 1, &self));
+        }
+        Ok(postings)
+    }
+}
+
+fn decode_postings(value: &str, cap: usize) -> Result<Vec<Posting>, RepoError> {
+    let mut decoder = serde_json::Deserializer::from_str(value);
+    let postings = decoder
+        .deserialize_seq(PostingListVisitor(cap))
+        .map_err(|_| decode_failed())?;
+    decoder.end().map_err(|_| decode_failed())?;
+    Ok(postings)
+}
 
 /// Score, filter and page postings the way the Postgres release search
 /// orders rows: similarity desc, then title asc ([`label_sort_key`]), then
@@ -484,6 +558,11 @@ impl<S: RangeSource> SnapshotRepo<S> {
         let Some(block) = idx_entry(&idx, bucket) else {
             return Ok(None);
         };
+        if block.len > MAX_COMPRESSED_BLOCK_BYTES
+            || block.offset > MAX_PART_BYTES - u64::from(block.len)
+        {
+            return Err(decode_failed());
+        }
         self.reads.set(self.reads.get() + 1);
         let raw = self
             .source
@@ -507,6 +586,9 @@ impl<S: RangeSource> SnapshotRepo<S> {
     /// parallel round (one read per distinct bucket).
     pub async fn search_postings(&self, normalized_q: &str) -> Result<Vec<Posting>, RepoError> {
         let keys = search_keys(normalized_q);
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut buckets: Vec<usize> = keys.iter().map(|key| key_bucket(key)).collect();
         buckets.sort_unstable();
         buckets.dedup();
@@ -525,14 +607,17 @@ impl<S: RangeSource> SnapshotRepo<S> {
             }
         }
         let mut postings = Vec::new();
-        for key in &keys {
+        for (i, key) in keys.iter().enumerate() {
             let Some(block) = by_bucket.get(&key_bucket(key)) else {
                 continue;
             };
             if let Some(value) = find_value(block, key) {
-                let list: Vec<Posting> =
-                    serde_json::from_str(value).map_err(|_| decode_failed())?;
-                postings.extend(list);
+                let cap = if i == 0 {
+                    MAX_TITLE_POSTINGS
+                } else {
+                    MAX_WORD_POSTINGS
+                };
+                postings.extend(decode_postings(value, cap)?);
             }
         }
         Ok(postings)
@@ -541,6 +626,9 @@ impl<S: RangeSource> SnapshotRepo<S> {
 
 impl<S: RangeSource> MbRepo for SnapshotRepo<S> {
     async fn lookup(&self, kind: Kind, mbid: &str) -> Result<Option<Entity>, RepoError> {
+        if !crate::is_valid_mbid(mbid) {
+            return Err(query_failed());
+        }
         let mbid = mbid.to_ascii_lowercase();
         let bucket = mbid_bucket(&mbid).ok_or_else(query_failed)?;
         let Some(block) = self.block(kind_stem(kind), bucket).await? else {
@@ -604,6 +692,16 @@ mod worker_entry {
         bucket: Bucket,
     }
 
+    pub(super) async fn read_index_body(
+        size: u64,
+        body: impl std::future::Future<Output = Result<Vec<u8>, RepoError>>,
+    ) -> Result<Vec<u8>, RepoError> {
+        if size != IDX_LEN as u64 {
+            return Err(decode_failed());
+        }
+        body.await
+    }
+
     impl RangeSource for R2Source {
         async fn read_all(&self, key: &str) -> Result<Option<Vec<u8>>, RepoError> {
             let Some(object) = self
@@ -615,8 +713,12 @@ mod worker_entry {
             else {
                 return Ok(None);
             };
-            let body = object.body().ok_or_else(query_failed)?;
-            body.bytes().await.map(Some).map_err(|_| query_failed())
+            read_index_body(object.size(), async {
+                let body = object.body().ok_or_else(query_failed)?;
+                body.bytes().await.map_err(|_| query_failed())
+            })
+            .await
+            .map(Some)
         }
 
         async fn read_range(
@@ -861,8 +963,11 @@ mod tests {
             len: u32,
         ) -> Result<Option<Vec<u8>>, RepoError> {
             Ok(self.objects.get(key).map(|bytes| {
-                let start = offset as usize;
-                bytes[start..start + len as usize].to_vec()
+                let tail = usize::try_from(offset)
+                    .ok()
+                    .and_then(|start| bytes.get(start..))
+                    .unwrap_or_default();
+                tail[..tail.len().min(len as usize)].to_vec()
             }))
         }
     }
@@ -994,12 +1099,18 @@ mod tests {
         assert_eq!(idx_entry(&idx, 1), Some(block));
         assert_eq!(idx_entry(&idx, 0), None);
         assert_eq!(idx_entry(&idx, BUCKETS), None);
+        assert_eq!(idx_entry(&idx, usize::MAX / IDX_ENTRY_LEN), None);
+        assert_eq!(idx_entry(&idx[..IDX_LEN - 1], 1), None);
+        idx.push(0);
+        assert_eq!(idx_entry(&idx, 1), None);
     }
 
     #[test]
     fn inflate_refuses_oversized_blocks() {
         let big = vec![b'a'; MAX_SNAPSHOT_BLOCK_BYTES + 1];
         assert!(inflate_block(&deflate_block(&big)).is_none());
+        let at_limit = &big[..MAX_SNAPSHOT_BLOCK_BYTES];
+        assert_eq!(inflate_block(&deflate_block(at_limit)).unwrap(), at_limit);
         assert_eq!(inflate_block(&deflate_block(b"k\tv\n")).unwrap(), b"k\tv\n");
     }
 
@@ -1157,16 +1268,195 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_short_index_fails_closed() {
+    fn missing_or_wrong_length_index_fails_closed() {
         let repo = SnapshotRepo::new(MemSource::default(), "snap/none/");
         let err = block_on(repo.lookup(Kind::Artist, ARTIST)).unwrap_err();
         assert_eq!(err.stage(), RepoStage::Query);
+        for len in [IDX_LEN - 1, IDX_LEN + 1] {
+            let mut repo = fixture(&format!("snap/index-{len}/"));
+            let key = idx_object(&repo.prefix, "artist");
+            let valid = repo.source.objects[&key].clone();
+            repo.source.objects.get_mut(&key).unwrap().resize(len, 0);
+
+            let err = block_on(repo.lookup(Kind::Artist, ARTIST)).unwrap_err();
+            assert_eq!(err.stage(), RepoStage::Decode, "index length {len}");
+            assert_eq!(repo.reads(), 1, "no block read for an invalid index");
+
+            repo.source.objects.insert(key, valid);
+            assert!(block_on(repo.lookup(Kind::Artist, ARTIST))
+                .unwrap()
+                .is_some());
+            assert_eq!(repo.reads(), 3, "the invalid index was never cached");
+        }
+    }
+
+    #[test]
+    fn r2_index_size_is_checked_before_buffering() {
+        use worker_entry::read_index_body;
+
+        for size in [IDX_LEN as u64 - 1, IDX_LEN as u64 + 1, u64::MAX] {
+            let result = block_on(read_index_body(size, async {
+                panic!("invalid index size reached the body read");
+            }));
+            assert_eq!(result.unwrap_err().stage(), RepoStage::Decode);
+        }
+        let result = block_on(read_index_body(IDX_LEN as u64, async {
+            Ok(vec![0; IDX_LEN])
+        }));
+        assert_eq!(result.unwrap().len(), IDX_LEN);
+    }
+
+    fn artist_block(prefix: &str, offset: u64, len: u32, raw: Vec<u8>) -> SnapshotRepo<MemSource> {
         let mut source = MemSource::default();
-        source
-            .objects
-            .insert(idx_object("snap/short/", "artist"), vec![0u8; 10]);
-        let repo = SnapshotRepo::new(source, "snap/short/");
-        let err = block_on(repo.lookup(Kind::Artist, ARTIST)).unwrap_err();
-        assert_eq!(err.stage(), RepoStage::Decode);
+        let mut idx = vec![0; IDX_LEN];
+        let start = mbid_bucket(ARTIST).unwrap() * IDX_ENTRY_LEN;
+        idx[start..start + IDX_ENTRY_LEN].copy_from_slice(&encode_idx_entry(BlockRef {
+            part: 0,
+            len,
+            offset,
+        }));
+        source.objects.insert(idx_object(prefix, "artist"), idx);
+        source.objects.insert(dat_object(prefix, "artist", 0), raw);
+        SnapshotRepo::new(source, prefix)
+    }
+
+    #[test]
+    fn invalid_block_ranges_fail_closed() {
+        for (case, offset, len, reads) in [
+            ("outside-part", MAX_PART_BYTES + 1, 1, 1),
+            ("crosses-part-end", MAX_PART_BYTES - 1, 2, 1),
+            ("overflow", u64::MAX, 2, 1),
+            ("compressed-cap", 0, MAX_COMPRESSED_BLOCK_BYTES + 1, 1),
+            ("valid-part-end", MAX_PART_BYTES - 1, 1, 2),
+            ("valid-compressed-length", 0, MAX_COMPRESSED_BLOCK_BYTES, 2),
+            ("outside-object", 5, 1, 2),
+            ("short-range", 3, 2, 2),
+        ] {
+            let repo = artist_block(&format!("snap/range-{case}/"), offset, len, vec![0; 4]);
+            let err = block_on(repo.lookup(Kind::Artist, ARTIST)).unwrap_err();
+            assert_eq!(err.stage(), RepoStage::Decode, "{case}");
+            assert_eq!(repo.reads(), reads, "{case}");
+        }
+    }
+
+    #[test]
+    fn corrupt_blocks_fail_closed() {
+        let valid = deflate_block(b"another-key\t{}\n");
+        let mut trailing = valid.clone();
+        trailing.extend(deflate_block(b"trailing data"));
+        for (case, raw) in [
+            ("invalid-deflate", vec![0xff]),
+            ("truncated-deflate", valid[..valid.len() - 1].to_vec()),
+            ("trailing-deflate", trailing),
+            ("invalid-utf8", deflate_block(&[0xff])),
+            (
+                "oversized",
+                deflate_block(&vec![b'a'; MAX_SNAPSHOT_BLOCK_BYTES + 1]),
+            ),
+        ] {
+            let repo = artist_block(&format!("snap/block-{case}/"), 0, raw.len() as u32, raw);
+            let result = block_on(repo.lookup(Kind::Artist, ARTIST))
+                .map(|value| value.is_some())
+                .map_err(|err| err.stage());
+            assert_eq!(result, Err(RepoStage::Decode), "{case}");
+            assert_eq!(repo.reads(), 2, "{case}");
+        }
+    }
+
+    #[test]
+    fn invalid_lookup_mbids_never_read_storage() {
+        let repo = SnapshotRepo::new(MemSource::default(), "snap/invalid-mbid/");
+        for mbid in ["", "abc", "zz00", "aaaé", "１２３４", "0383-garbage"] {
+            let err = block_on(repo.lookup(Kind::Artist, mbid)).unwrap_err();
+            assert_eq!(err.stage(), RepoStage::Query, "{mbid}");
+        }
+        for mbid in ["aaaé", "１２３４"] {
+            assert_eq!(mbid_bucket(mbid), None);
+        }
+        assert_eq!(repo.reads(), 0);
+    }
+
+    #[test]
+    fn search_reads_only_the_exact_title_and_capped_distinct_words() {
+        let repo = SnapshotRepo::new(MemSource::default(), "snap/no-search-words/");
+        for query in ["", " \t", "\u{301}—🎵?!"] {
+            assert!(block_on(repo.search(Kind::Release, query, 25, 0))
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(repo.reads(), 0);
+
+        let query = "ÉCHO echo Lóngest médium álpha z a";
+        let expected = [
+            "t:echo echo longest medium alpha z a",
+            "w:longest",
+            "w:medium",
+            "w:alpha",
+            "w:echo",
+        ];
+        assert_eq!(expected.len(), 1 + MAX_QUERY_WORDS);
+        assert_eq!(search_keys(query), expected);
+        let prefix = "snap/capped-query/";
+        let mut source = MemSource::default();
+        let mut lines: Vec<_> = expected
+            .iter()
+            .map(|&key| (key.into(), "[]".into()))
+            .collect();
+        lines.extend([
+            ("w:z".into(), "invalid".into()),
+            ("w:a".into(), "invalid".into()),
+        ]);
+        write_kind(&mut source, prefix, SEARCH_KIND, &lines, key_bucket);
+        let repo = SnapshotRepo::new(source, prefix);
+        assert!(block_on(repo.search_postings(query)).unwrap().is_empty());
+        assert_eq!(repo.reads(), 1 + expected.len() as u32);
+    }
+
+    #[test]
+    fn search_rejects_excess_or_malformed_postings() {
+        let posting = Posting(RELEASE_A.into(), "Debut".into(), None, None);
+        let sibling_value = serde_json::to_string(std::slice::from_ref(&posting)).unwrap();
+        for (key, sibling_key, cap) in [
+            ("t:debut", "w:debut", MAX_TITLE_POSTINGS),
+            ("w:debut", "t:debut", MAX_WORD_POSTINGS),
+        ] {
+            for (case, value, accepted) in [
+                (
+                    "at-cap",
+                    serde_json::to_string(&vec![posting.clone(); cap]).unwrap(),
+                    true,
+                ),
+                (
+                    "over-cap",
+                    serde_json::to_string(&vec![posting.clone(); cap + 1]).unwrap(),
+                    false,
+                ),
+                ("wrong-shape", r#"[["id"]]"#.into(), false),
+                ("trailing-json", "[] []".into(), false),
+            ] {
+                let prefix = format!("snap/postings-{key}-{case}/");
+                let mut source = MemSource::default();
+                write_kind(
+                    &mut source,
+                    &prefix,
+                    SEARCH_KIND,
+                    &[
+                        (key.into(), value),
+                        (sibling_key.into(), sibling_value.clone()),
+                    ],
+                    key_bucket,
+                );
+                let repo = SnapshotRepo::new(source, prefix);
+                let result = block_on(repo.search_postings("debut"))
+                    .map(|postings| postings.len())
+                    .map_err(|err| err.stage());
+                let expected = if accepted {
+                    Ok(cap + 1)
+                } else {
+                    Err(RepoStage::Decode)
+                };
+                assert_eq!(result, expected, "{key} {case}");
+            }
+        }
     }
 }
