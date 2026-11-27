@@ -988,6 +988,10 @@ for (const [kind, firstAttempt] of [
     [null, firstPartPage],
     [1, ([first, second]) => terminalInventory([{ ...first, etag: '"overlapping-part-1"' }, second])],
   ]],
+  ['a multipart part size mismatch', [
+    [null, firstPartPage],
+    [1, ([, second]) => terminalInventory([{ ...second, len: second.len + 1 }])],
+  ]],
 ]) {
   test(`keeps the checkpoint across ${kind} and resumes on a coherent retry`, async (t) => {
     const { confirmed, readPage, verifyCalls } = mockResumeInventory(t, [
