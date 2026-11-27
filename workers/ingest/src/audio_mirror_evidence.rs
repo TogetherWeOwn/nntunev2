@@ -9,7 +9,7 @@
 //! recording is absent from the hinted release's snapshot, yields `None`
 //! (all-local); the classifier, not this seam, decides positions. An
 //! invalid snapshot (malformed MBIDs, non-positive positions, conflicting
-//! duplicate recordings, digest mismatch, release mismatch) refuses the
+//! recordings or positions, digest mismatch, release mismatch) refuses the
 //! whole derivation rather than guessing. Hinted MBIDs are claims, never
 //! proof: only presence in the digest-bound snapshot counts. This seam
 //! grants no membership, catalogue, KV or playback authority.
@@ -88,6 +88,7 @@ fn validate_snapshot(snapshot: &MirrorSnapshot) -> Result<(), EvidenceError> {
         return Err(EvidenceError::Digest);
     }
     let mut seen = std::collections::BTreeMap::<String, (i32, i32)>::new();
+    let mut positions = std::collections::BTreeMap::<(i32, i32), &str>::new();
     for recording in &snapshot.recordings {
         if !validate_mbid(&recording.recording_mbid)
             || recording.medium_no <= 0
@@ -97,6 +98,12 @@ fn validate_snapshot(snapshot: &MirrorSnapshot) -> Result<(), EvidenceError> {
         }
         let key = recording.recording_mbid.to_ascii_lowercase();
         let at = (recording.medium_no, recording.track_no);
+        if positions
+            .insert(at, &recording.recording_mbid)
+            .is_some_and(|other| !other.eq_ignore_ascii_case(&recording.recording_mbid))
+        {
+            return Err(EvidenceError::Snapshot);
+        }
         match seen.get(&key) {
             Some(&other) if other != at => return Err(EvidenceError::Snapshot),
             _ => {
@@ -110,8 +117,8 @@ fn validate_snapshot(snapshot: &MirrorSnapshot) -> Result<(), EvidenceError> {
 /// Derive one evidence slot per accepted entry, indexed by
 /// `audio_ordinal - 1` and aligned with `classify_entries`. `snapshot_for`
 /// returns the exact mirror snapshot for a hinted release MBID, or `None`
-/// when the mirror has no snapshot for it. Any refusal returns no partial
-/// vector.
+/// when the mirror has no snapshot for it. A release's digest (or absence)
+/// must remain consistent throughout derivation. Any refusal returns no partial vector.
 pub fn derive_evidence<F>(
     manifest: &AcceptedAudioManifest,
     snapshot_for: F,
@@ -120,6 +127,7 @@ where
     F: Fn(&str) -> Option<MirrorSnapshot>,
 {
     let mut slots: Vec<Option<MirrorEvidence>> = Vec::with_capacity(manifest.entries().len());
+    let mut snapshots = std::collections::BTreeMap::new();
     for entry in manifest.entries() {
         let hints = &entry.hints;
         let (Some(recording_mbid), Some(release_mbid)) = (
@@ -129,7 +137,15 @@ where
             slots.push(None);
             continue;
         };
-        let Some(snapshot) = snapshot_for(release_mbid) else {
+        let snapshot = snapshot_for(release_mbid);
+        let digest = snapshot.as_ref().map(|s| s.snapshot_sha256.clone());
+        if snapshots
+            .insert(release_mbid.to_ascii_lowercase(), digest.clone())
+            .is_some_and(|previous| previous != digest)
+        {
+            return Err(EvidenceError::Snapshot);
+        }
+        let Some(snapshot) = snapshot else {
             slots.push(None);
             continue;
         };
