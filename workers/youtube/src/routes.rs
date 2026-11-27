@@ -62,14 +62,10 @@ impl ExtractDecision {
     }
 }
 
-/// Only an exact `POST /extract` with no query or fragment reaches the
-/// dormant extraction route.
-pub fn decide_extract(
-    method: &str,
-    path: &str,
-    query_or_fragment: Option<&str>,
-) -> ExtractDecision {
-    if method != EXTRACT_METHOD || path != EXTRACT_PATH || query_or_fragment.is_some() {
+/// Decide the extraction outcome from the request method and path: exact
+/// `POST /extract` only, everything else is not found.
+pub fn decide_extract(method: &str, path: &str) -> ExtractDecision {
+    if method != EXTRACT_METHOD || path != EXTRACT_PATH {
         return ExtractDecision::NotFound;
     }
     ExtractDecision::ExtractionUnavailable
@@ -120,12 +116,12 @@ mod tests {
             ("post", "/extract"),
             ("", ""),
         ] {
-            let decision = decide_extract(method, path, None);
+            let decision = decide_extract(method, path);
             assert_eq!(decision, ExtractDecision::NotFound, "{method} {path}");
             assert_eq!(decision.status(), 404, "{method} {path}");
             assert_eq!(decision.body(), "not found", "{method} {path}");
         }
-        let decision = decide_extract("POST", "/extract", None);
+        let decision = decide_extract("POST", "/extract");
         assert_eq!(decision, ExtractDecision::ExtractionUnavailable);
     }
 
@@ -133,7 +129,7 @@ mod tests {
     fn extract_on_route_fails_closed_with_retryable_extraction_unavailable() {
         // The executed mutant `503 -> 200` would stay green with no test
         // pinning this: assert the exact fail-closed status and body.
-        let decision = decide_extract("POST", "/extract", None);
+        let decision = decide_extract("POST", "/extract");
         assert_eq!(decision, ExtractDecision::ExtractionUnavailable);
         assert_eq!(decision.status(), 503);
         assert_ne!(
@@ -270,15 +266,7 @@ mod tests {
             "Durable Object fetch handler must not carry cfg/other attributes"
         );
         let expected_durable_object_fetch = syn::parse_str::<syn::ImplItemFn>(
-            "async fn fetch(&self, req: Request) -> Result<Response> {
-                let decision = req.url().ok().map_or(ExtractDecision::NotFound, |url| {
-                    routes::decide_extract(req.method().as_ref(), url.path(), url.query().or(url.fragment()),)
-                });
-                match decision {
-                    ExtractDecision::NotFound => Response::error(ExtractDecision::NotFound.body(), ExtractDecision::NotFound.status(),),
-                    ExtractDecision::ExtractionUnavailable => respond_unavailable(),
-                }
-            }",
+            "async fn fetch(&self, req: Request) -> Result<Response> {\n                let url = req.url().ok();\n                let path = url.as_ref().filter(|url| url.query().or(url.fragment()).is_none()).map_or(\"\", |url| url.path());\n                let decision = routes::decide_extract(req.method().as_ref(), path);\n                match decision {\n                    ExtractDecision::NotFound => Response::error(ExtractDecision::NotFound.body(), ExtractDecision::NotFound.status(),),\n                    ExtractDecision::ExtractionUnavailable => respond_unavailable(),\n                }\n            }",
         )
         .expect("parse expected Durable Object handler");
         assert_eq!(

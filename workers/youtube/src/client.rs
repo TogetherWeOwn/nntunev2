@@ -70,10 +70,8 @@ pub fn player_url(host: &str, api_key: &str) -> Option<String> {
 }
 
 pub(crate) fn is_url_token(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    let valid = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_');
+    !value.is_empty() && value.chars().all(valid)
 }
 
 pub(crate) fn is_video_id(value: &str) -> bool {

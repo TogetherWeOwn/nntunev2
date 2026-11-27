@@ -90,8 +90,8 @@ pub struct SearchCandidate {
 
 /// Parse one YTM search result (a bare renderer or one wrapped in
 /// `musicResponsiveListItemRenderer` / `musicTwoRowItemRenderer`).
-/// Returns `None` for missing, malformed or conflicting video IDs. Other fields degrade
-/// to unknown and fails closed in [`gate_candidate`].
+/// Returns `None` for missing, malformed or conflicting video IDs. Unknown
+/// channel, badge or duration evidence fails closed in [`gate_candidate`].
 pub fn parse_search_candidate(item: &serde_json::Value) -> Option<SearchCandidate> {
     let renderer = item
         .get("musicResponsiveListItemRenderer")
@@ -204,44 +204,45 @@ fn column_texts<'a>(
     texts
 }
 
-/// Shelf duration: the last duration-shaped run in the fixed columns,
-/// falling back to the flex columns only when the fixed columns yield
-/// nothing. In flex columns require a clock value so bare years and
-/// other numeric metadata cannot prove duration.
+/// Use agreeing duration values from the fixed columns, falling back to
+/// clock values from the flex columns when the fixed columns have none.
 fn duration_from_renderer(renderer: &serde_json::Value) -> Option<u64> {
     let fixed = column_texts(
         renderer,
         "fixedColumns",
         "musicResponsiveListItemFixedColumnRenderer",
     );
-    for text in fixed.iter().rev() {
-        if let Some(duration) = parse_duration(text) {
-            return Some(duration);
-        }
+    let mut durations = fixed.into_iter().filter_map(parse_duration);
+    if let Some(first) = durations.next() {
+        return durations.all(|duration| duration == first).then_some(first);
     }
     let flex = column_texts(
         renderer,
         "flexColumns",
         "musicResponsiveListItemFlexColumnRenderer",
     );
-    for text in flex.iter().rev().filter(|text| text.contains(':')) {
-        if let Some(duration) = parse_duration(text) {
-            return Some(duration);
-        }
-    }
-    None
+    let mut clocks = flex
+        .into_iter()
+        .filter(|text| text.contains(':'))
+        .filter_map(parse_duration);
+    let first = clocks.next()?;
+    clocks.all(|duration| duration == first).then_some(first)
 }
 
 /// Parse a shelf duration (`m:ss`, `h:mm:ss` or bare seconds).
 pub fn parse_duration(text: &str) -> Option<u64> {
     let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = text.splitn(4, ':').collect();
+    if parts.len() > 3 {
+        return None;
+    }
     let mut total = 0u64;
-    for (index, part) in text.split(':').enumerate() {
-        if index > 2 || !part.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
+    for (index, part) in parts.iter().enumerate() {
         let unit: u64 = part.parse().ok()?;
-        if index > 0 && (part.len() != 2 || unit >= 60) {
+        if part.starts_with('+') || (index > 0 && (part.len() != 2 || unit >= 60)) {
             return None;
         }
         total = total.checked_mul(60)?.checked_add(unit)?;

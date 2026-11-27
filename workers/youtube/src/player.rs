@@ -99,10 +99,8 @@ pub fn parse_player_response(body: &serde_json::Value) -> PlayerOutcome {
         .map(str::to_string);
     let playability = Playability::from_status(status);
     let mut formats = Vec::new();
-    if let Some(streaming) = body
-        .get("streamingData")
-        .filter(|_| playability == Playability::Ok)
-    {
+    let streaming = body.get("streamingData");
+    if let Some(streaming) = streaming.filter(|_| playability == Playability::Ok) {
         for key in ["formats", "adaptiveFormats"] {
             if let Some(list) = streaming.get(key).and_then(serde_json::Value::as_array) {
                 formats.extend(
@@ -142,7 +140,7 @@ fn parse_format(format: &serde_json::Value) -> StreamFormat {
             .any(|key| format.get(key).is_some_and(|value| !value.is_null())),
         has_n_param: url
             .as_deref()
-            .is_some_and(|u| query_pairs(u).any(|(name, _)| name == "n")),
+            .is_some_and(|u| query_param(u, "n").is_some()),
         has_sabr: url.as_deref().is_some_and(is_sabr_url),
         ip: url.as_deref().and_then(stream_ip),
         url,
@@ -155,16 +153,12 @@ fn stream_path(url: &str) -> Option<&str> {
     }
     let (host, target) = url.strip_prefix("https://")?.split_once('/')?;
     let prefix = host.strip_suffix(".googlevideo.com")?;
-    // Restrict the authority before using any part of the response URL.
-    if host.len() > 253
-        || !prefix.split('.').all(|label| {
-            label.len() <= 63
-                && !label.is_empty()
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-    {
+    let valid_label = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.contains(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+    };
+    if host.len() > 253 || !prefix.split('.').all(valid_label) {
         return None;
     }
     target.split('?').next()
@@ -181,7 +175,8 @@ fn query_pairs(url: &str) -> impl Iterator<Item = (&str, &str)> {
 
 fn stream_ip(url: &str) -> Option<String> {
     let mut ips = query_pairs(url).filter_map(|(name, value)| (name == "ip").then_some(value));
-    let ip = ips.next()?.parse::<std::net::IpAddr>().ok()?;
+    let value = ips.next()?.replace("%3A", ":").replace("%3a", ":");
+    let ip = value.parse::<std::net::IpAddr>().ok()?;
     ips.next().is_none().then(|| ip.to_string())
 }
 

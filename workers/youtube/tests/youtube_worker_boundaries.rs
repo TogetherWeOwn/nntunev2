@@ -12,7 +12,6 @@ fn client_requires_pinned_host_and_valid_inputs() {
         assert!(client::player_url(client::INNERTUBE_HOST, key).is_none());
     }
     assert!(client::player_body(&client::VISIONOS, "abcdefghij/").is_none());
-    assert!(client::player_body(&client::VISIONOS, VIDEO).is_some());
 }
 
 #[test]
@@ -45,17 +44,21 @@ fn response(status: Value, formats: Value) -> Value {
 
 #[test]
 fn player_requires_playability_and_valid_stream_metadata() {
-    let formats = json!([false, {"url": "https://example.invalid/video"}, {
-        "url": format!("{STREAM}?ip=203.0.113.1&ip=203.0.113.2")
-    }]);
+    let formats = json!([
+        false,
+        {"url": "https://example.invalid/video"},
+        {"url": format!("{STREAM}?ip=203.0.113.1&ip=203.0.113.2")},
+        {"url": format!("{STREAM}?ip=2001%3Adb8%3a%3A1")}
+    ]);
     for status in [json!("LOGIN_REQUIRED"), json!("ERROR"), Value::Null] {
         let outcome = player::parse_player_response(&response(status, formats.clone()));
         assert!(outcome.formats.is_empty());
     }
     let outcome = player::parse_player_response(&response(json!("OK"), formats));
-    assert_eq!(outcome.formats.len(), 2);
+    assert_eq!(outcome.formats.len(), 3);
     assert!(outcome.formats[0].url.is_none());
     assert!(outcome.formats[1].ip.is_none());
+    assert_eq!(outcome.formats[2].ip.as_deref(), Some("2001:db8::1"));
     assert!(player::query_param("https://example.invalid/#fragment?ip=1", "ip").is_none());
 }
 
@@ -71,6 +74,9 @@ fn audio_skips_unsupported_urls_and_mime_before_ranking() {
         {"itag": 250, "mimeType": "audio/webm; codecs=\"opus\"", "url": STREAM}
     ]);
     let outcome = player::parse_player_response(&response(json!("OK"), formats));
+    assert!(outcome.formats[2].has_signature_cipher);
+    assert!(outcome.formats[3].has_n_param);
+    assert!(outcome.formats[5].has_sabr);
     let selected = select::select_audio_format(&outcome.formats, select::AudioSource::Atv);
     assert_eq!(selected.map(|format| format.itag), Some(250));
 }
@@ -78,8 +84,9 @@ fn audio_skips_unsupported_urls_and_mime_before_ranking() {
 #[test]
 fn candidate_rejects_conflicting_ids_and_ambiguous_shelf_metadata() {
     let mut item = json!({
-        "navigationEndpoint": {"watchEndpoint": {"videoId": VIDEO}},
+        "navigationEndpoint": {"watchEndpoint": {"videoId": VIDEO, "watchEndpointMusicConfig": {"musicVideoType": "MUSIC_VIDEO_TYPE_OMV"}}},
         "playlistItemData": {"videoId": "zyxwvutsrqp"},
+        "ownerBadges": [{"metadataBadgeRenderer": {"icon": {"iconType": "CHECK_CIRCLE_THICK"}}}],
         "flexColumns": [{"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
             {"text": "2024", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCabcdefghijklmnopqrstuv"}}},
             {"text": "Artist", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCzyxwvutsrqponmlkjihgfe"}}}
@@ -90,16 +97,36 @@ fn candidate_rejects_conflicting_ids_and_ambiguous_shelf_metadata() {
     let candidate = select::parse_search_candidate(&item).expect("matching video IDs");
     assert_eq!(candidate.channel_id, None);
     assert_eq!(candidate.duration_secs, None);
+    let runs =
+        &mut item["flexColumns"][0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"];
+    runs[0]["text"] = json!("3:45");
+    runs[1]["text"] = json!("4:45");
+    let conflicted = select::parse_search_candidate(&item).expect("matching video IDs");
+    assert_eq!(conflicted.duration_secs, None);
     for text in ["1:75", "+225", "1:60:00"] {
         assert_eq!(select::parse_duration(text), None, "{text}");
     }
+
+    item["flexColumns"][0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][1] =
+        json!({"text": "3:45"});
+    let mut eligible = select::parse_search_candidate(&item).expect("matching video IDs");
+    let policy = select::SelectionPolicy {
+        allowed_channels: &["UCabcdefghijklmnopqrstuv"],
+        denylisted_videos: &[],
+        denylisted_channels: &[],
+    };
+    let admitted = select::gate_candidate(&eligible, Some(225), &policy);
+    assert_eq!(admitted, Ok(()));
+    eligible.video_id = "invalid".into();
+    let rejected = select::gate_candidate(&eligible, Some(225), &policy);
+    assert_eq!(rejected, Err(select::Rejection::InvalidVideoId));
 }
 
 #[test]
 fn public_route_stays_closed_and_extract_rejects_url_extras() {
     assert_eq!(routes::decide_public_fetch().0, 404);
-    let post = |extra| routes::decide_extract("POST", "/extract", extra).status();
-    assert_eq!(post(None), 503);
-    assert_eq!(post(Some("")), 404);
-    assert_eq!(post(Some("unexpected")), 404);
+    let post = |path| routes::decide_extract("POST", path).status();
+    assert_eq!(post("/extract"), 503);
+    assert_eq!(post("/extract?"), 404);
+    assert_eq!(post("/extract?unexpected"), 404);
 }

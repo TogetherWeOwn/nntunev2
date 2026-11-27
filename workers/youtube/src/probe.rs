@@ -15,15 +15,11 @@ pub fn head_range() -> String {
 
 /// Center a second 256 KiB range only after a complete head probe proves
 /// the total length. Skip it when it would duplicate the head window.
-pub fn mid_range_from_head(
-    status: u16,
-    content_range: &str,
-    received_bytes: u64,
-) -> Option<String> {
-    if status != 206 || received_bytes != HEAD_BYTES {
+pub fn mid_range_from_head(status: u16, range: &str, bytes: u64) -> Option<String> {
+    if status != 206 || bytes != HEAD_BYTES {
         return None;
     }
-    let (unit, range) = content_range.split_once(' ')?;
+    let (unit, range) = range.split_once(' ')?;
     let (span, total) = range.split_once('/')?;
     if !unit.eq_ignore_ascii_case("bytes")
         || span != format!("0-{}", HEAD_BYTES - 1)
