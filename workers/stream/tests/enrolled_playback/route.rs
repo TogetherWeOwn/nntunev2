@@ -1,14 +1,21 @@
 use super::*;
+use nntune_core::{digest_readback::ReadbackPin, original_source::SourceError};
 use nntune_stream::{
     delivered::DeliveredInterval,
-    enrolled_playback::route::serve,
+    enrolled_playback::{
+        route::{serve, CatalogueMedia, PrivateSource},
+        S3Get, S3GetReply,
+    },
+    grant::Grant,
     meter_sink::{FlushAck, MeterBook},
+    original_play::OriginalWriter,
     play_route::PlayRouteRequest,
 };
 use std::{
     cell::{Cell, RefCell},
+    io,
     rc::Rc,
-    task::Poll,
+    task::{Context, Poll},
 };
 
 #[path = "../fixtures/private_enrolled_source.rs"]
@@ -203,17 +210,194 @@ async fn private_route_authenticates_flac_and_accounts_for_writer_prefixes() {
             "{:?}",
             case.fault
         );
-        assert_eq!(status, case.response_status());
         assert_eq!(
-            aborted.get(),
-            matches!(case.fault, Fault::Writer | Fault::ExpiredAtWrite)
+            status,
+            if case.fault == Fault::ExpiredAtWrite {
+                0
+            } else {
+                case.response_status()
+            }
         );
+        assert_eq!(aborted.get(), case.fault == Fault::Writer);
         let slice = case.delivered;
         assert_eq!(output.into_inner(), FLAC[slice.clone()]);
         assert_eq!(
             report.map(|r| r.start as usize..r.end as usize),
             (!slice.is_empty()).then_some(slice)
         );
+    }
+}
+
+struct DeadlineSource {
+    inner: Source,
+    snapshot_until: SystemTime,
+    expected_cutoff: SystemTime,
+}
+
+impl PrivateSource for DeadlineSource {
+    type Body = <Source as PrivateSource>::Body;
+
+    async fn resolve(&self, grant: &Grant) -> Option<CatalogueMedia<'_>> {
+        let mut resolved = self.inner.resolve(grant).await?;
+        resolved.pins.usable_until = self.snapshot_until;
+        Some(resolved)
+    }
+
+    async fn lease_live(&self, grant: &Grant) -> bool {
+        self.inner.lease_live(grant).await
+    }
+
+    async fn media(&self, get: S3Get<'_>) -> io::Result<S3GetReply<Self::Body>> {
+        assert_eq!(get.usable_until, self.expected_cutoff);
+        self.inner.media(get).await
+    }
+
+    async fn page(
+        &self,
+        bucket: &str,
+        pin: ReadbackPin<'_>,
+        length: u32,
+        until: SystemTime,
+    ) -> io::Result<(String, Vec<u8>)> {
+        assert_eq!(until, self.expected_cutoff);
+        self.inner
+            .page(bucket, pin, length, now() + Duration::from_secs(1))
+            .await
+    }
+}
+
+#[derive(Default)]
+struct Sink {
+    output: RefCell<Vec<u8>>,
+    writable: Cell<bool>,
+    close_polled: Cell<bool>,
+    disconnected: Cell<bool>,
+    aborted: Cell<bool>,
+}
+
+impl OriginalWriter for &Sink {
+    fn poll_cancel(&mut self, _: &mut Context<'_>) -> Poll<SourceError> {
+        if self.disconnected.get() {
+            Poll::Ready(SourceError::Cancelled)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn poll_write(
+        &mut self,
+        _: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<Result<usize, SourceError>> {
+        if self.writable.replace(false) {
+            self.output.borrow_mut().push(bytes[0]);
+            Poll::Ready(Ok(1))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn poll_close(&mut self, _: &mut Context<'_>) -> Poll<Result<(), SourceError>> {
+        self.close_polled.set(true);
+        Poll::Pending
+    }
+
+    fn abort(&mut self) {
+        self.aborted.set(true);
+    }
+}
+
+#[tokio::test]
+async fn pending_writes_credit_only_acknowledged_bytes_on_expiry_or_drop() {
+    let request = PlayRouteRequest {
+        track_id: "track".into(),
+        token: Some(TOKEN.into()),
+        range: Some("bytes=-2".into()),
+        trace_id: None,
+    };
+    // The fixture grant expires at Unix 12. Exercise the earlier cutoff in both orders.
+    for (snapshot_secs, cutoff_secs, expire) in [(1, 1, true), (3, 2, true), (3, 2, false)] {
+        let source = DeadlineSource {
+            inner: Source::new(Fault::None),
+            snapshot_until: now() + Duration::from_secs(snapshot_secs),
+            expected_cutoff: now() + Duration::from_secs(cutoff_secs),
+        };
+        let clock = Cell::new(now());
+        let sink = Sink::default();
+        sink.writable.set(true);
+        let reports = RefCell::new(Vec::new());
+        let mut play = Box::pin(serve(
+            &request,
+            b"test only, not a deployed secret",
+            Some(&source),
+            || clock.get(),
+            |head| {
+                assert_eq!((head.status, head.len), (206, 2));
+                Ok(Some(&sink))
+            },
+            |interval| reports.borrow_mut().push(interval),
+        ));
+        assert!(futures_util::poll!(&mut play).is_pending());
+        assert_eq!(*sink.output.borrow(), FLAC[FLAC.len() - 2..FLAC.len() - 1]);
+        assert!(reports.borrow().is_empty());
+
+        // Make the second write ready. At the exact cutoff it must remain unacknowledged.
+        sink.writable.set(true);
+        if expire {
+            clock.set(source.expected_cutoff);
+            assert!(
+                matches!(futures_util::poll!(&mut play), Poll::Ready(Err(error)) if error.status == 502)
+            );
+            assert!(sink.aborted.get());
+        }
+        drop(play);
+
+        assert!(sink.writable.get());
+        assert!(!sink.close_polled.get());
+        let reports = reports.into_inner();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].start..reports[0].end, 51..52);
+        assert_eq!(reports[0].file_bytes, Some(FLAC.len() as u64));
+    }
+}
+
+#[tokio::test]
+async fn pending_close_aborts_on_disconnect_or_expiry_and_preserves_acknowledgement() {
+    let request = PlayRouteRequest {
+        track_id: "track".into(),
+        token: Some(TOKEN.into()),
+        range: Some("bytes=-1".into()),
+        trace_id: None,
+    };
+    for disconnect in [true, false] {
+        let source = Source::new(Fault::None);
+        let clock = Cell::new(now());
+        let sink = Sink::default();
+        sink.writable.set(true);
+        let mut report = None;
+        let mut play = Box::pin(serve(
+            &request,
+            b"test only, not a deployed secret",
+            Some(&source),
+            || clock.get(),
+            |_| Ok(Some(&sink)),
+            |interval| report = Some(interval),
+        ));
+        assert!(futures_util::poll!(&mut play).is_pending());
+        assert!(sink.close_polled.get());
+        if disconnect {
+            sink.disconnected.set(true);
+        } else {
+            clock.set(now() + Duration::from_secs(1));
+        }
+        assert!(
+            matches!(futures_util::poll!(&mut play), Poll::Ready(Err(error)) if error.status == 502)
+        );
+        assert!(sink.aborted.get());
+        drop(play);
+        assert_eq!(*sink.output.borrow(), FLAC[FLAC.len() - 1..]);
+        let report = report.unwrap();
+        assert_eq!(report.start..report.end, 52..53);
     }
 }
 
