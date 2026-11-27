@@ -673,17 +673,17 @@ mod tests {
     fn counterpart_preferred_when_verified() {
         let top = parse_search_candidate(&omv_item()).expect("parse");
         let mut counterpart = top.clone();
-        counterpart.video_id = "counterpart1".to_string();
+        counterpart.video_id = "counterpart".to_string();
         let ranked = [top];
         let picked = select_omv(Some(&counterpart), &ranked, Some(225), &policy()).expect("select");
-        assert_eq!(picked.video_id, "counterpart1");
+        assert_eq!(picked.video_id, "counterpart");
     }
 
     #[test]
     fn unverified_counterpart_falls_back_to_top_omv() {
         let top = parse_search_candidate(&omv_item()).expect("parse");
         let mut bad_counterpart = top.clone();
-        bad_counterpart.video_id = "counterpart1".to_string();
+        bad_counterpart.video_id = "counterpart".to_string();
         bad_counterpart.music_video_type = MusicVideoType::Atv;
         let picked = select_omv(
             Some(&bad_counterpart),

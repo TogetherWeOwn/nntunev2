@@ -272,7 +272,7 @@ mod tests {
         let expected_durable_object_fetch = syn::parse_str::<syn::ImplItemFn>(
             "async fn fetch(&self, req: Request) -> Result<Response> {
                 let decision = req.url().ok().map_or(ExtractDecision::NotFound, |url| {
-                    routes::decide_extract(req.method().as_ref(), url.path(), url.query().or(url.fragment()))
+                    routes::decide_extract(req.method().as_ref(), url.path(), url.query().or(url.fragment()),)
                 });
                 match decision {
                     ExtractDecision::NotFound => Response::error(ExtractDecision::NotFound.body(), ExtractDecision::NotFound.status(),),

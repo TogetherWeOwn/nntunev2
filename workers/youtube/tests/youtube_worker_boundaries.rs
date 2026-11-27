@@ -32,15 +32,10 @@ fn mid_probe_requires_matching_partial_content_evidence() {
     assert_eq!(range.as_deref(), Some("bytes=131072-393215"));
     assert!(probe::mid_range_from_head(200, valid, head).is_none());
     assert!(probe::mid_range_from_head(206, valid, head - 1).is_none());
-    for range in [
-        "bytes 1-262144/524288",
-        "bytes 0-262143/*",
-        "bytes 0-262143/100",
-    ] {
-        assert!(
-            probe::mid_range_from_head(206, range, head).is_none(),
-            "{range}"
-        );
+    let shifted = "bytes 1-262144/524288";
+    for range in [shifted, "bytes 0-262143/*", "bytes 0-262143/100"] {
+        let planned = probe::mid_range_from_head(206, range, head);
+        assert!(planned.is_none(), "{range}");
     }
 }
 
@@ -105,7 +100,6 @@ fn public_route_stays_closed_and_extract_rejects_url_extras() {
     assert_eq!(routes::decide_public_fetch().0, 404);
     let post = |extra| routes::decide_extract("POST", "/extract", extra).status();
     assert_eq!(post(None), 503);
-    for extra in ["", "unexpected"] {
-        assert_eq!(post(Some(extra)), 404);
-    }
+    assert_eq!(post(Some("")), 404);
+    assert_eq!(post(Some("unexpected")), 404);
 }
