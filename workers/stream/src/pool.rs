@@ -297,13 +297,19 @@ impl<C> Pool<C> {
     /// guard) but never re-parks the connection.
     pub fn release(&mut self, mut lease: Lease, conn: Option<C>) {
         if let Some(guard) = lease.guard.take() {
+            if !matches!(&guard.slots, Some(owner) if Arc::ptr_eq(owner, &self.slots)) {
+                return;
+            }
+            let id = guard.id;
             guard.disarm();
             if let Ok(mut state) = self.slots.lock() {
                 debug_assert!(state.in_use > 0, "released without a matching acquire");
                 state.in_use = state.in_use.saturating_sub(1);
-                if state.probe_in_flight == Some(lease.id) {
+                if state.probe_in_flight == Some(id) {
                     state.probe_in_flight = None;
                 }
+            } else {
+                return;
             }
         }
         if let Some(conn) = conn {
@@ -417,6 +423,9 @@ impl<C> Pool<C> {
     fn reopen_after_probe(&mut self) {
         self.consecutive_errors = self.consecutive_errors.max(CIRCUIT_FAILURE_THRESHOLD);
         self.quarantined_until_ms = Some(self.now_ms.saturating_add(CIRCUIT_OPEN_MS));
+        if let Ok(mut state) = self.slots.lock() {
+            state.probe_in_flight = None;
+        }
     }
 
     fn clear_probe(&self, lease_id: u64) -> bool {

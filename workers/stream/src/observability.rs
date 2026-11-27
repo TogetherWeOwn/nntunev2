@@ -80,7 +80,7 @@ impl CacheStatus {
 ///
 /// Only the hashed user identity is stored — there is no raw-id field to
 /// leak through `Debug`, logs or Analytics Engine columns.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CacheObserveEvent {
     pub request_id: String,
     /// Lowercase hex SHA-256 of the raw user id (see [`hash_user`]).
@@ -107,12 +107,12 @@ impl CacheObserveEvent {
         pool_error_code: Option<String>,
     ) -> Self {
         Self {
-            request_id: request_id.into(),
+            request_id: safe_request_id(&request_id.into(), Some(user_id)).to_owned(),
             user_hash: hash_user(user_id),
             cache_status,
             ttft_ms,
             bytes,
-            pool_error_code,
+            pool_error_code: pool_error_code.filter(|code| valid_pool_error(code)),
         }
     }
 
@@ -144,18 +144,18 @@ impl CacheObserveEvent {
     /// Carries the request id, the hashed (never raw) user identity and the
     /// cache status alongside TTFT, bytes and the pool error code.
     pub fn to_json_log(&self) -> String {
-        let pool_error = match &self.pool_error_code {
+        let pool_error_code = match self.safe_pool_error() {
             Some(code) => format!("\"{}\"", escape_json_str(code)),
             None => "null".to_string(),
         };
         format!(
             "{{\"request_id\":\"{}\",\"user_hash\":\"{}\",\"cache_status\":\"{}\",\"ttft_ms\":{},\"bytes\":{},\"pool_error_code\":{}}}",
-            escape_json_str(&self.request_id),
-            escape_json_str(&self.user_hash),
+            escape_json_str(safe_request_id(&self.request_id, None)),
+            escape_json_str(self.analytics_index()),
             self.cache_status.as_str(),
             self.ttft_ms,
             self.bytes,
-            pool_error,
+            pool_error_code,
         )
     }
 
@@ -166,9 +166,9 @@ impl CacheObserveEvent {
     pub fn analytics_blobs(&self) -> Vec<String> {
         vec![
             self.cache_status.as_str().to_string(),
-            self.user_hash.clone(),
-            self.request_id.clone(),
-            self.pool_error_code.clone().unwrap_or_default(),
+            self.analytics_index().to_owned(),
+            safe_request_id(&self.request_id, None).to_owned(),
+            self.safe_pool_error().unwrap_or_default().to_owned(),
         ]
     }
 
@@ -182,8 +182,39 @@ impl CacheObserveEvent {
     /// per-user hash. Never `cache_status` — a low-cardinality index makes
     /// Analytics Engine sample all hits as a single bucket (see module docs).
     pub fn analytics_index(&self) -> &str {
-        &self.user_hash
+        let hash = &self.user_hash;
+        if hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            hash
+        } else {
+            crate::trace::REDACTED
+        }
     }
+
+    fn safe_pool_error(&self) -> Option<&str> {
+        let code = self.pool_error_code.as_deref()?;
+        valid_pool_error(code).then_some(code)
+    }
+}
+
+impl std::fmt::Debug for CacheObserveEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_json_log())
+    }
+}
+
+/// Check the request label at construction and at each export.
+/// Construction also rejects labels that repeat the raw user ID.
+fn safe_request_id<'a>(id: &'a str, user_id: Option<&str>) -> &'a str {
+    use crate::{meter::is_valid_key_field, trace::check_str_value};
+    if user_id != Some(id) && is_valid_key_field(id, 128) && check_str_value(id).is_ok() {
+        id
+    } else {
+        crate::trace::REDACTED
+    }
+}
+
+fn valid_pool_error(code: &str) -> bool {
+    matches!(code, "POOL_QUARANTINED" | "POOL_EXHAUSTED")
 }
 
 /// Hash a raw user id to lowercase hex SHA-256 (64 chars). Deterministic per
@@ -321,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn json_log_escapes_quote_backslash_newline_and_control_chars() {
+    fn json_log_redacts_freeform_labels() {
         let ev = CacheObserveEvent::new(
             "a\"b\\c\nd\u{0001}e",
             "user-1",
@@ -334,7 +365,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "{{\"request_id\":\"a\\\"b\\\\c\\nd\\u0001e\",\"user_hash\":\"{}\",\"cache_status\":\"hit\",\"ttft_ms\":1,\"bytes\":2,\"pool_error_code\":\"x\\\"y\"}}",
+                "{{\"request_id\":\"[REDACTED]\",\"user_hash\":\"{}\",\"cache_status\":\"hit\",\"ttft_ms\":1,\"bytes\":2,\"pool_error_code\":null}}",
                 ev.user_hash
             )
         );
