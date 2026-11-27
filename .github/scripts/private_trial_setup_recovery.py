@@ -1,12 +1,6 @@
-"""Offline recovery decisions for the dormant private-trial setup rehearsal.
+"""Offline recovery decisions from redacted private-trial readbacks."""
 
-The planner consumes redacted, normalized readbacks. It never connects to a
-database or provider and it never issues a write. A caller can use the
-decision to resume the reviewed apply, skip a create whose result is proven,
-or hold the checkpoint for reconciliation.
-"""
-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 from typing import Iterable
 
@@ -55,19 +49,11 @@ class ConnectionIntent:
     caching_disabled: bool = True
 
 
-@dataclass(frozen=True)
-class ConnectionReadback:
+@dataclass(frozen=True, kw_only=True)
+class ConnectionReadback(ConnectionIntent):
     config_id: str
-    account_id: str
-    request_ref: str
-    binding: str
-    database: tuple[str, int]
-    role: tuple[str, int]
-    origin: str
-    access_client_ref: str
-    origin_ca_ref: str
-    sslmode: str
-    caching_disabled: bool
+    sslmode: str = field()
+    caching_disabled: bool = field()
 
 
 @dataclass(frozen=True)
@@ -108,7 +94,6 @@ def _text(value, field):
 def _digest(value, field):
     if not isinstance(value, str) or not SHA256.fullmatch(value):
         raise RecoveryInputError(f"invalid {field}")
-    return value
 
 
 def _ledger(value):
@@ -121,7 +106,6 @@ def _ledger(value):
         raise RecoveryInputError("invalid migration ledger")
     if len({row[0] for row in value}) != len(value):
         raise RecoveryInputError("duplicate migration ledger row")
-    return value
 
 
 def _check_apply(intent: ApplyIntent, observation: ApplyObservation):
@@ -158,11 +142,17 @@ def decide_apply_recovery(intent: ApplyIntent, observation: ApplyObservation,
     return ApplyDecision("hold", "catalog or ledger state is incomplete or mismatched")
 
 
-def _connection_fields(intent: ConnectionIntent):
-    expected = (intent.account_id, intent.request_ref, intent.binding, intent.database,
-                intent.role, intent.origin, intent.access_client_ref, intent.origin_ca_ref,
-                intent.sslmode, intent.caching_disabled)
-    return expected
+def _connection_fields(connection: ConnectionIntent):
+    return (connection.account_id, connection.request_ref, connection.binding,
+            connection.database, connection.role, connection.origin,
+            connection.access_client_ref, connection.origin_ca_ref, connection.sslmode)
+
+
+def _check_sql_identity(identity, field):
+    if (not isinstance(identity, tuple) or len(identity) != 2
+            or type(identity[1]) is not int or not 0 < identity[1] <= 0xFFFFFFFF):
+        raise RecoveryInputError(f"invalid {field}")
+    _text(identity[0], field)
 
 
 def decide_lost_create(intent: ConnectionIntent,
@@ -174,21 +164,26 @@ def decide_lost_create(intent: ConnectionIntent,
         expected[:3] + expected[5:8], strict=True,
     ):
         _text(value, field)
+    _check_sql_identity(intent.database, "database")
+    _check_sql_identity(intent.role, "role")
     _text(intent.sslmode, "sslmode")
     if intent.sslmode != "verify-full" or intent.caching_disabled is not True:
         return CreateDecision("hold", "connection settings are outside the reviewed contract")
-    matches = []
-    for row in readbacks:
-        values = (row.account_id, row.request_ref, row.binding, row.database, row.role,
-                  row.origin, row.access_client_ref, row.origin_ca_ref,
-                  row.sslmode, row.caching_disabled)
-        if values == expected:
-            if not CONFIG_ID.fullmatch(row.config_id):
-                raise RecoveryInputError("invalid config ID")
-            matches.append(row.config_id)
-    if len(matches) != 1:
-        return CreateDecision("hold", "create result is missing, ambiguous or out of scope")
-    return CreateDecision("skip_create", "one scoped result is bound to the original request", matches[0])
+    pending = CreateDecision("hold", "create result is missing, ambiguous or out of scope")
+    rows = tuple(readbacks)
+    candidates = [row for row in rows if row.request_ref == intent.request_ref]
+    if len(candidates) != 1:
+        return pending
+    row, = candidates
+    if _connection_fields(row) != expected or row.caching_disabled is not True:
+        return pending
+    _check_sql_identity(row.database, "database")
+    _check_sql_identity(row.role, "role")
+    if not isinstance(row.config_id, str) or not CONFIG_ID.fullmatch(row.config_id):
+        raise RecoveryInputError("invalid config ID")
+    if sum(other.config_id == row.config_id for other in rows) != 1:
+        return pending
+    return CreateDecision("skip_create", "one scoped result is bound to the original request", row.config_id)
 
 
 def plan_cleanup(scope: CleanupScope,
@@ -196,10 +191,12 @@ def plan_cleanup(scope: CleanupScope,
     """Return only exact, attempt-owned resources for a cleanup preview."""
     _text(scope.attempt_id, "attempt")
     _text(scope.account_id, "account")
-    if not scope.resource_ids or len(set(scope.resource_ids)) != len(scope.resource_ids):
+    if not isinstance(scope.resource_ids, tuple) or not scope.resource_ids:
         raise RecoveryInputError("invalid cleanup resource IDs")
-    selected = set(scope.resource_ids)
-    matches = {}
+    selected = {_text(resource_id, "cleanup resource IDs") for resource_id in scope.resource_ids}
+    if len(selected) != len(scope.resource_ids):
+        raise RecoveryInputError("invalid cleanup resource IDs")
+    matches = set()
     for row in readbacks:
         _text(row.resource_id, "resource ID")
         _text(row.attempt_id, "resource attempt")
@@ -211,8 +208,8 @@ def plan_cleanup(scope: CleanupScope,
             return CleanupDecision("hold", "cleanup readback repeats a selected resource")
         if row.attempt_id != scope.attempt_id or row.account_id != scope.account_id:
             return CleanupDecision("hold", "cleanup readback conflicts with the selected scope")
-        matches[row.resource_id] = row
-    if set(matches) != selected:
+        matches.add(row.resource_id)
+    if matches != selected:
         return CleanupDecision("hold", "cleanup scope lacks an exact readback")
     return CleanupDecision("cleanup", "all selected resources are exact attempt-owned matches",
                           tuple(scope.resource_ids))
