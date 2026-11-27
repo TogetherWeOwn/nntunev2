@@ -279,14 +279,14 @@ pub struct LedgerRow {
 }
 
 fn check_user_handle(value: &str) -> Result<String, LedgerError> {
-    if value.is_empty() || value.chars().count() > MAX_USER_ID_LEN {
+    if value.is_empty() || value.contains('\0') || value.chars().count() > MAX_USER_ID_LEN {
         return Err(LedgerError::Invalid);
     }
     Ok(value.to_string())
 }
 
 fn check_track_handle(value: &str) -> Result<String, LedgerError> {
-    if value.is_empty() || value.chars().count() > MAX_TRACK_ID_LEN {
+    if value.is_empty() || value.contains('\0') || value.chars().count() > MAX_TRACK_ID_LEN {
         return Err(LedgerError::Invalid);
     }
     Ok(value.to_string())
@@ -444,8 +444,8 @@ pub fn derive_stream_seconds(
 /// metadata hierarchy: the track's own `duration_ms`, then the
 /// MusicBrainz recording's, then a bitrate estimate
 /// (`file_bytes * 8 / bitrate_kbps` milliseconds — `track_media.bitrate`
-/// is kbit/s). Zero/unknown rungs are skipped; `None` leaves the caller
-/// on the nominal-rate fallback.
+/// is kbit/s). Zero/unknown rungs are skipped. A zero or out-of-range
+/// estimate leaves the caller on the nominal-rate fallback.
 pub fn resolve_duration_ms(
     track_duration_ms: Option<u64>,
     mb_duration_ms: Option<u64>,
@@ -462,8 +462,8 @@ pub fn resolve_duration_ms(
     if kbps == 0 || bytes == 0 {
         return None;
     }
-    let estimated = (u128::from(bytes) * 8 / u128::from(kbps)) as u64;
-    (estimated > 0).then_some(estimated)
+    let estimated = i64::try_from(u128::from(bytes) * 8 / u128::from(kbps)).ok()?;
+    (estimated > 0).then_some(estimated as u64)
 }
 
 /// Validated play-window intent for the meter sink: one play's
@@ -494,8 +494,8 @@ pub struct PlayWindow {
 /// play time is never an input. `union_bytes` is the union total so far
 /// (monotonic per play): the upsert converges redeliveries of the same
 /// or an older snapshot to a no-op. Zero union, a zero file size, or a
-/// zero duration are inconsistent inputs and fail closed — resolve
-/// unknowns to `None` (via [`resolve_duration_ms`]) instead.
+/// zero duration are inconsistent inputs. Supplied snapshots must also fit
+/// PostgreSQL BIGINT. Resolve unknowns to `None` instead.
 pub fn prepare_play_window(
     user_id: &str,
     track_id: &str,
@@ -509,7 +509,8 @@ pub fn prepare_play_window(
     if union_bytes == 0 || union_bytes > MAX_BYTES_PER_ROW {
         return Err(LedgerError::Invalid);
     }
-    if file_bytes == Some(0) || duration_ms == Some(0) {
+    let invalid_snapshot = |value| !(1..=i64::MAX as u64).contains(&value);
+    if file_bytes.is_some_and(invalid_snapshot) || duration_ms.is_some_and(invalid_snapshot) {
         return Err(LedgerError::Invalid);
     }
     if recorded_at > MAX_RECORDED_AT {
@@ -564,26 +565,33 @@ pub enum ReplayOutcome {
 
 /// Classify a retried finalize against the stored row.
 ///
-/// `existing = None` (select found no row) is [`ReplayOutcome::Fresh`]. Exact
-/// field-for-field agreement is [`ReplayOutcome::Duplicate`]; any
-/// disagreement in user, track, bytes, seconds, timestamp, or derived month —
-/// or a stored/incoming `play:` key that does not bind its identity — is
-/// [`ReplayOutcome::Conflict`]. First write wins: conflicts never append,
+/// A valid intent with `existing = None` is [`ReplayOutcome::Fresh`].
+/// Exact field-for-field agreement is [`ReplayOutcome::Duplicate`].
+/// Invalid intents and disagreements are [`ReplayOutcome::Conflict`].
+/// First write wins: conflicts never append,
 /// sum into, or overwrite the stored row (that disagreement is the
 /// reconciler's job to flag).
 pub fn classify_replay(existing: Option<&LedgerRow>, incoming: &LedgerRow) -> ReplayOutcome {
-    let Some(stored) = existing else {
-        return ReplayOutcome::Fresh;
-    };
-    if stored != incoming {
+    if existing.is_some_and(|stored| stored != incoming) {
         return ReplayOutcome::Conflict;
     }
-    if stored.idempotency_key.starts_with("play:")
-        && !key_binds_identity(&stored.idempotency_key, &stored.user_id, &stored.track_id)
-    {
+    // LedgerRow's public fields allow callers to bypass preparation.
+    let prepared = prepare_ledger_row(
+        &incoming.user_id,
+        &incoming.track_id,
+        &incoming.idempotency_key,
+        incoming.bytes_served,
+        incoming.stream_seconds,
+        incoming.recorded_at,
+    );
+    if !prepared.is_ok_and(|row| row.period_month == incoming.period_month) {
         return ReplayOutcome::Conflict;
     }
-    ReplayOutcome::Duplicate
+    if existing.is_some() {
+        ReplayOutcome::Duplicate
+    } else {
+        ReplayOutcome::Fresh
+    }
 }
 
 /// Classify a zero-row fenced insert after the `SELECT` + fence probe.
@@ -603,13 +611,10 @@ pub fn classify_fenced_replay(
     incoming: &LedgerRow,
     account_deleting: bool,
 ) -> ReplayOutcome {
-    if existing.is_some() {
-        return classify_replay(existing, incoming);
+    match classify_replay(existing, incoming) {
+        ReplayOutcome::Fresh if account_deleting => ReplayOutcome::AccountDeleting,
+        outcome => outcome,
     }
-    if account_deleting {
-        return ReplayOutcome::AccountDeleting;
-    }
-    ReplayOutcome::Fresh
 }
 
 /// Monthly usage for one user: what the usage endpoint reads.
