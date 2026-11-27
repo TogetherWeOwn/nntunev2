@@ -263,6 +263,7 @@ fn rotation_refuses_malformed_claim_pages_before_rewrapping() {
         (vec![claim("user-a", 1), claim("user-b", 1)], 1),
         (vec![claim("user-a", 1), claim("user-a", 1)], 2),
         (vec![claim("user-a", 1), claim("user-b", 2)], 2),
+        (vec![claim("user-a", 1), claim("", 1)], 2),
         (vec![claim("user-prev", 1)], 2),
     ] {
         let store = RotationStore {
