@@ -384,6 +384,13 @@
 				libraryList ? document.activeElement : null;
 			const focusedTrackControl = active && libraryList?.contains(active) && active instanceof HTMLElement
 				? active : null;
+			// The old listing stays interactive while Refresh is pending. Read focus
+			// at publication, since the listener can tab into a group in the meantime.
+			const focusedRow = authoritative && !authBoundary && !state.loadError && !state.libraryUnavailable &&
+				groupByArtist ? focusedLibraryRow() : null;
+			const focusedGroup = focusedRow?.closest('.nt-artist-group');
+			const focusedKey = focusedGroup ? focusedRow?.getAttribute('data-library-key') ?? null : null;
+			const priorRows = focusedKey === null ? [] : renderedItems.map(libraryItemKey);
 			draggedLibraryItem = null;
 			if (authoritative && !authBoundary && !state.loadError && !state.libraryUnavailable) {
 				preserveTrackFocus(isCurrent);
@@ -484,6 +491,15 @@
 						(document.activeElement === null || document.activeElement === document.body)) {
 						focusedTrackControl.focus();
 					}
+				});
+			}
+			if (focusedGroup && focusedKey !== null) {
+				const { nextId, previousId } = selectedRowRecoveryIds(
+					priorRows, focusedKey, renderedItems.map(libraryItemKey)
+				);
+				focusAfterLibraryRowRemoval(nextId, previousId, {
+					rowAttribute: 'data-library-key',
+					canRecover: () => isCurrent() && showingTracks && groupByArtist && !focusedGroup.isConnected
 				});
 			}
 			// Same-account refresh completion: the panel may have remounted
@@ -1159,11 +1175,14 @@
 		void tick().then(() => clearButton?.focus({ preventScroll: true }));
 	}
 
-	/** ID of the library row holding focus, or null when focus is elsewhere. */
-	function focusedLibraryRowId(): string | null {
+	function focusedLibraryRow(): Element | null {
 		if (typeof document === 'undefined') return null;
-		const holder = document.activeElement?.closest?.('[data-testid="library-item"]');
-		return holder?.getAttribute('data-id') ?? null;
+		return document.activeElement?.closest?.('[data-testid="library-item"]') ?? null;
+	}
+
+	/** Playback ID of the library row holding focus, or null when focus is elsewhere. */
+	function focusedLibraryRowId(): string | null {
+		return focusedLibraryRow()?.getAttribute('data-id') ?? null;
 	}
 
 	function preserveTrackFocus(isCurrent: () => boolean): void {
@@ -1185,24 +1204,26 @@
 	}
 
 	/**
-	 * After a selected row unmounts, land focus on the checkbox of the next
+	 * After a library row unmounts, land focus on the checkbox of the next
 	 * surviving displayed row, else the previous one, else the Show
 	 * control. Runs after rendering and only when the removed control took
 	 * focus with it (active element fell back to the body), so controls
 	 * that remain mounted — including the Clear selection button itself —
 	 * and any focus the user has already moved keep it.
 	 */
-	function focusAfterSelectedRowRemoval(nextId: string | null, previousId: string | null): void {
+	function focusAfterLibraryRowRemoval(nextKey: string | null, previousKey: string | null, {
+		rowAttribute = 'data-id', canRecover
+	}: { rowAttribute?: 'data-id' | 'data-library-key'; canRecover?: () => boolean } = {}): void {
 		void tick().then(() => {
-			if (typeof document === 'undefined') return;
+			if (typeof document === 'undefined' || canRecover?.() === false) return;
 			const active = document.activeElement;
 			if (active && active !== document.body) return;
-			for (const id of [nextId, previousId]) {
-				if (id === null) continue;
+			for (const key of [nextKey, previousKey]) {
+				if (key === null) continue;
 				// Find the row by attribute comparison, never selector
-				// interpolation: track ids are opaque server strings.
+				// interpolation: IDs and occurrence keys are opaque server strings.
 				const rowEl = [...document.querySelectorAll('[data-testid="library-item"]')].find(
-					(element) => element.getAttribute('data-id') === id
+					(element) => element.getAttribute(rowAttribute) === key
 				);
 				const target = rowEl?.querySelector<HTMLElement>(
 					'input[type="checkbox"]:not([disabled]), button:not([disabled])'
@@ -1257,7 +1278,7 @@
 		const displayedIds = renderedItems.map((track) => track.id);
 		selectedIds = toggleSelected(selectedIds, id);
 		const { nextId, previousId } = selectedRowRecoveryIds(displayedIds, id, selectedIds);
-		focusAfterSelectedRowRemoval(nextId, previousId);
+		focusAfterLibraryRowRemoval(nextId, previousId);
 	}
 
 	function selectDisplayedIds(): void {
@@ -1278,7 +1299,7 @@
 		selectedIds = clearSelection(selectedIds);
 		rangeAnchorId = null;
 		if (hadSelection) announceBrowse('Selection cleared');
-		if (focusLeavesWithRows || focusLeavesWithToolbar) focusAfterSelectedRowRemoval(returnId, null);
+		if (focusLeavesWithRows || focusLeavesWithToolbar) focusAfterLibraryRowRemoval(returnId, null);
 	}
 
 	function appendSelectedIds(): void {
@@ -1371,7 +1392,7 @@
 		});
 		const focusedId = focusedLibraryRowId();
 		if (!queued && view === 'favorites' && remove && focusedId !== null && targets.has(focusedId)) {
-			focusAfterSelectedRowRemoval(null, null);
+			focusAfterLibraryRowRemoval(null, null);
 		}
 	}
 
@@ -1474,7 +1495,7 @@
 			const surviving = new Set(renderedItems.map((item) => item.id));
 			const next = displayedIds.slice(index + 1).find((id) => surviving.has(id)) ?? null;
 			const previous = displayedIds.slice(0, index).reverse().find((id) => surviving.has(id)) ?? null;
-			focusAfterSelectedRowRemoval(next, previous);
+			focusAfterLibraryRowRemoval(next, previous);
 		}, ...point };
 	}
 
