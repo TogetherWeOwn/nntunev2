@@ -100,14 +100,39 @@ impl ChoiceMiss {
     }
 }
 
-/// True when the row mirrors the storage constraints: non-empty format,
+/// True for a non-empty ASCII format token,
 /// positive bitrate, and a 64-character lowercase hex content hash.
 fn is_well_formed(row: &MediaRow) -> bool {
-    if row.format.is_empty() || row.bitrate <= 0 {
+    if row.format.is_empty()
+        || !row.format.bytes().all(|byte| byte.is_ascii_graphic())
+        || row.bitrate <= 0
+    {
         return false;
     }
     let hash = row.content_hash;
     hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_format_does_not_signal_a_cross_profile_source() {
+        let hash = "a".repeat(64);
+        for format in [" ", "opus\n", "flac\0", "ópus"] {
+            let row = MediaRow {
+                format,
+                bitrate: 64,
+                content_hash: &hash,
+                encrypted_s3: None,
+            };
+            assert_eq!(
+                choose_profile_artifact(&[row], StreamProfile::Opus64),
+                Err(ChoiceMiss::NoWellFormedCandidate)
+            );
+        }
+    }
 }
 
 /// Choose the artifact to serve for `profile` from caller-ordered `rows`.

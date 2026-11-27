@@ -4,7 +4,10 @@
 //! may never take the last free connection, so the next playback always has
 //! a slot.
 
-use crate::pool::{Lane, Pool};
+use crate::{
+    meter::is_valid_key_field,
+    pool::{Lane, Pool},
+};
 
 /// True when a prefetch may take a connection right now without starving
 /// playback (the pool's lane rules, quarantine included).
@@ -12,9 +15,10 @@ pub fn should_prefetch<C>(pool: &Pool<C>) -> bool {
     pool.can_acquire(Lane::Prefetch)
 }
 
-/// The track after `current` in the play `queue`, if any.
+/// The track after `current`, if it is a valid playback key.
 pub fn next_track(queue: &[String], current: usize) -> Option<&str> {
-    queue.get(current.checked_add(1)?).map(|s| s.as_str())
+    let track = queue.get(current.checked_add(1)?)?;
+    is_valid_key_field(track, 512).then_some(track.as_str())
 }
 
 #[cfg(test)]
@@ -78,5 +82,14 @@ mod tests {
         assert_eq!(next_track(&queue, 1), Some("c"));
         assert_eq!(next_track(&queue, 2), None);
         assert_eq!(next_track(&queue, 9), None);
+    }
+
+    #[test]
+    fn malformed_successor_stops_prefetch() {
+        for invalid in ["", "a/b", "two words", "é", &"a".repeat(513)] {
+            let queue = vec!["current".into(), invalid.into(), "valid-next".into()];
+            assert_eq!(next_track(&queue, 0), None);
+            assert_eq!(next_track(&queue, 1), Some("valid-next"));
+        }
     }
 }

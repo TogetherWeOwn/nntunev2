@@ -30,6 +30,9 @@ pub(crate) async fn serve(
     ) else {
         return api_error_response(&ApiError::unauthorized(), None);
     };
+    if grant.track_id != request.track_id {
+        return api_error_response(&ApiError::forbidden(), None);
+    }
     let mut control = WorkerOriginalControl::until(grant.exp_unix, &req)?;
     let observation = ReadObservation::from_env(&env, &req, &grant.track_id).map(Rc::new);
     let (ready, response) = oneshot::channel();
@@ -68,7 +71,7 @@ pub(crate) async fn serve(
                     .map_err(|_| ApiError::internal_error())?;
                     ready
                         .take()
-                        .expect("response starts once")
+                        .ok_or_else(ApiError::internal_error)?
                         .send(Ok(response))
                         .map_err(|_| ApiError::upstream_unavailable())?;
                     Ok(writer)

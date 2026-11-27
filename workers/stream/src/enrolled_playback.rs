@@ -15,7 +15,9 @@ use nntune_core::{
 use crate::{
     range::{plan_encrypted_range, RangeOutcome},
     response_delivery::OrderedDelivery,
-    s3_range_response::{read_s3_range_chunk, S3RangeResponse, S3RangeResponseError},
+    s3_range_response::{
+        read_s3_range_chunk, valid_version, S3RangeResponse, S3RangeResponseError,
+    },
 };
 
 pub mod route;
@@ -82,7 +84,12 @@ impl<'a> EnrolledPlayback<'a> {
             || !input.media.matches_context(input.context)
             || input.media.ciphertext_len() != geometry.sealed_len()
             || !matches!(locator.binding(), S3Binding::VersionId(v) if v == pins.media_version)
+            || !valid_version(pins.media_version)
             || pins.page_versions.len() != geometry.pages() as usize
+            || !pins
+                .page_versions
+                .iter()
+                .all(|version| valid_version(version))
             || !input.manifest.matches(&pins, input.context)
         {
             return Err(PlaybackError::Binding);
@@ -90,7 +97,9 @@ impl<'a> EnrolledPlayback<'a> {
         let (outcome, plan) = plan_encrypted_range(range, geometry);
         let selection = match outcome {
             RangeOutcome::Full => 0..len,
-            RangeOutcome::Partial(range) => range.start..range.end + 1,
+            RangeOutcome::Partial(range) => {
+                range.start..range.end.checked_add(1).ok_or(PlaybackError::Binding)?
+            }
             RangeOutcome::Unsatisfiable => return Ok((outcome, None)),
         };
         let delivery = OrderedDelivery::new(selection.end - selection.start);
@@ -171,12 +180,10 @@ impl<'a> EnrolledPlayback<'a> {
     }
 
     fn matches_page(&self, index: u32, version: &str) -> bool {
-        !matches!(version, "" | "null")
-            && self
-                .pins
-                .page_versions
-                .get(index as usize)
-                .is_some_and(|v| v == version)
+        self.pins
+            .page_versions
+            .get(index as usize)
+            .is_some_and(|v| v == version)
     }
 
     fn open_part(

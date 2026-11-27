@@ -1,6 +1,6 @@
 use std::cell::OnceCell;
 
-use ::worker::{wasm_bindgen::JsValue, web_sys, Fetcher};
+use ::worker::{wasm_bindgen::JsValue, web_sys, Fetcher, ResponseBody};
 use futures_util::StreamExt;
 use nntune_core::{
     digest_enrollment::{PlaybackManifest, StoredManifest},
@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use super::*;
 use crate::{
-    enrolled_playback::s3_transport::{hex, now, valid_version, Deadline, S3Body, S3Reader},
+    enrolled_playback::s3_transport::{hex, now, Deadline, S3Body, S3Reader},
     runtime::{API_SERVICE_BINDING, POOL_BINDING},
 };
 
@@ -97,6 +97,7 @@ impl<'a> WorkerSource<'a> {
         let req =
             web_sys::Request::new_with_str_and_init(&format!("https://nntune-api{path}"), &init)
                 .ok()?;
+        abort.check().ok()?;
         let response = self.api.fetch_request(Request::from(req)).await.ok()?;
         abort.check().ok()?;
         Some((response, abort))
@@ -104,12 +105,15 @@ impl<'a> WorkerSource<'a> {
 
     async fn load(&self, grant: &Grant) -> Option<Resolved> {
         let (mut response, abort) = self.request(RESOLVE_PATH, grant).await?;
-        if response.status_code() != 200 {
+        if response.status_code() != 200
+            || response.headers().get("content-type").ok()?.as_deref() != Some("application/json")
+        {
             return None;
         }
         let mut stream = Box::pin(response.stream().ok()?);
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
+            abort.check().ok()?;
             let chunk = chunk.ok()?;
             if bytes.len().saturating_add(chunk.len()) > playback_custody::MAX_RESPONSE_BYTES {
                 return None;
@@ -118,17 +122,14 @@ impl<'a> WorkerSource<'a> {
         }
         abort.check().ok()?;
         let mut snapshot: CustodySnapshot = serde_json::from_slice(&bytes).ok()?;
+        let hashes = std::mem::take(&mut snapshot.page_hashes);
         let pins = snapshot.pins()?;
         if snapshot.bearer_sha256 != grant::sha256(self.bearer.as_bytes())
             || pins.root_version_id != self.root_version
+            || now() >= pins.usable_until
             || !self
                 .reader
                 .matches(pins.provider_configuration, &snapshot.bucket)
-            || !valid_version(pins.media_version)
-            || !pins
-                .page_versions
-                .iter()
-                .all(|version| valid_version(version))
         {
             return None;
         }
@@ -138,9 +139,7 @@ impl<'a> WorkerSource<'a> {
             header: snapshot.header.as_slice().try_into().ok()?,
         };
         let record = snapshot.envelope_record.as_slice().try_into().ok()?;
-        let hashes = std::mem::take(&mut snapshot.page_hashes);
-        let manifest =
-            StoredManifest::from_committed_storage(&snapshot.pins()?, context.header, hashes)?;
+        let manifest = StoredManifest::from_committed_storage(&pins, context.header, hashes)?;
         if !manifest.authenticate(&self.root, &context, &record) {
             return None;
         }
@@ -151,6 +150,10 @@ impl<'a> WorkerSource<'a> {
         )
         .ok()?;
         let media = S3MediaMetadata::from_trusted_context(locator, &context)?;
+        abort.check().ok()?;
+        if now() >= pins.usable_until {
+            return None;
+        }
         Some(Resolved {
             snapshot,
             context,
@@ -184,7 +187,9 @@ impl PrivateSource for WorkerSource<'_> {
     async fn lease_live(&self, grant: &Grant) -> bool {
         self.request(LEASE_PATH, grant)
             .await
-            .is_some_and(|(response, _)| response.status_code() == 204)
+            .is_some_and(|(response, _)| {
+                response.status_code() == 204 && matches!(response.body(), ResponseBody::Empty)
+            })
     }
 
     async fn media(&self, get: S3Get<'_>) -> io::Result<S3GetReply<Self::Body>> {

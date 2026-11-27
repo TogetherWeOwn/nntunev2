@@ -18,11 +18,19 @@ use nntune_core::original_source::{
 use super::OriginalControl;
 
 #[cfg(any(target_arch = "wasm32", test))]
-pub(super) fn grant_delay_ms(expiry_unix: u64, now_ms: u64) -> u64 {
-    expiry_unix
-        .saturating_mul(1000)
-        .saturating_sub(now_ms)
-        .min(i32::MAX as u64)
+pub(super) async fn wait_until_grant_expiry(
+    expiry_unix: u64,
+    now_ms: impl Fn() -> u64,
+    mut sleep: impl AsyncFnMut(u64),
+) {
+    let wall_remaining = || (u128::from(expiry_unix) * 1000).saturating_sub(u128::from(now_ms()));
+    let mut remaining = wall_remaining();
+    while remaining != 0 {
+        let delay = remaining.min(i32::MAX as u128) as u64;
+        sleep(delay).await;
+        // Elapsed timer intervals cannot be restored by a wall clock adjustment.
+        remaining = (remaining - u128::from(delay)).min(wall_remaining());
+    }
 }
 
 #[derive(Default)]
@@ -32,10 +40,13 @@ struct RequestWake {
 }
 
 impl RequestWake {
+    fn take_waker(&self) -> Option<Waker> {
+        self.waker.lock().expect("request waker lock").take()
+    }
+
     fn notify(&self) {
         // Never invoke a task while holding the registration lock.
-        let waker = self.waker.lock().expect("request waker lock").take();
-        if let Some(waker) = waker {
+        if let Some(waker) = self.take_waker() {
             waker.wake();
         }
     }
@@ -95,6 +106,7 @@ impl<T: Future<Output = ()>, N: Fn() -> u64> ReadControl for OriginalRequestCont
     fn check(&mut self) -> Result<(), SourceError> {
         self.expired |= self.now_unix() >= self.expiry_unix;
         if self.expired || self.wake.cancelled.load(Ordering::Acquire) {
+            drop(self.wake.take_waker());
             return Err(SourceError::Cancelled);
         }
         Ok(())
@@ -105,7 +117,14 @@ impl<T: Future<Output = ()>, N: Fn() -> u64> AsyncReadControl for OriginalReques
     fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<SourceError> {
         // The SDK timer may retain its first waker. Give it a stable relay,
         // replacing only the actual task registration on every poll.
-        *self.wake.waker.lock().expect("request waker lock") = Some(cx.waker().clone());
+        let waker = cx.waker().clone();
+        let previous = self
+            .wake
+            .waker
+            .lock()
+            .expect("request waker lock")
+            .replace(waker);
+        drop(previous);
         if let Err(error) = self.check() {
             return Poll::Ready(error);
         }
@@ -134,7 +153,7 @@ impl<T: Future<Output = ()>, N: Fn() -> u64> OriginalControl for OriginalRequest
 impl<T, N> Drop for OriginalRequestControl<T, N> {
     fn drop(&mut self) {
         // A retained cancellation handle must not retain or wake a dead task.
-        self.wake.waker.lock().expect("request waker lock").take();
+        drop(self.wake.take_waker());
     }
 }
 
@@ -143,16 +162,31 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    #[test]
-    fn grant_delay_preserves_expiry_and_timer_bounds() {
-        assert_eq!(grant_delay_ms(10, 9_999), 1);
-        assert_eq!(grant_delay_ms(10, 10_000), 0);
-        assert_eq!(grant_delay_ms(10, 10_001), 0);
-        assert_eq!(grant_delay_ms(0, 0), 0);
-        assert_eq!(grant_delay_ms(u64::MAX, 0), i32::MAX as u64);
-        assert_eq!(grant_delay_ms(u64::MAX, u64::MAX - 1), 1);
-        assert_eq!(grant_delay_ms(2_147_484, 0), i32::MAX as u64);
-        assert_eq!(grant_delay_ms(2_147_483, 0), 2_147_483_000);
+    #[tokio::test]
+    async fn grant_timer_preserves_expiry_and_timer_bounds_after_clock_adjustment() {
+        use std::cell::{Cell, RefCell};
+
+        let cap = i32::MAX as u64;
+        for (start, adjusted, expected) in [
+            (10_000, 0, vec![]),
+            (9_999, 0, vec![1]),
+            (0, 0, vec![cap, 353]),
+            (0, 2_147_484_000, vec![cap]),
+        ] {
+            let expiry = if start == 0 { 2_147_484 } else { 10 };
+            let clock = Cell::new(start);
+            let delays = RefCell::new(Vec::new());
+            wait_until_grant_expiry(
+                expiry,
+                || clock.get(),
+                async |delay| {
+                    delays.borrow_mut().push(delay);
+                    clock.set(adjusted);
+                },
+            )
+            .await;
+            assert_eq!(delays.into_inner(), expected);
+        }
     }
 
     #[derive(Default)]
@@ -224,12 +258,14 @@ mod tests {
             }
             assert_eq!(first.0.load(Ordering::Relaxed), 0);
             assert_eq!(latest.0.load(Ordering::Relaxed), 1);
-            let waker = Waker::from(latest);
+            let waker = Waker::from(latest.clone());
             assert_eq!(
                 control.poll_cancel(&mut Context::from_waker(&waker)),
                 Poll::Ready(SourceError::Cancelled)
             );
             assert_eq!(control.check(), Err(SourceError::Cancelled));
+            control.cancellation().cancel();
+            assert_eq!(latest.0.load(Ordering::Relaxed), 1);
         }
     }
 

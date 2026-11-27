@@ -57,7 +57,13 @@ impl Play {
     ) -> Result<Blob, ApiError> {
         let key = match &self.artifact_key {
             Some(key) => key.clone(),
-            None => legacy_key.await?,
+            None => {
+                let key = legacy_key.await?;
+                key.strip_prefix("audio/")
+                    .and_then(|hash| crate::cache::blob_key_for_pointer(hash.as_bytes()))
+                    .filter(|canonical| canonical == &key)
+                    .ok_or_else(ApiError::upstream_unavailable)?
+            }
         };
         let size = head(&key)
             .await
@@ -88,7 +94,7 @@ impl Blob {
 /// Report only the pulled prefix on drop, including a cancelled read.
 pub(crate) struct Delivery<F: FnOnce(u64)> {
     written: u64,
-    expected: u64,
+    remaining: Option<u64>,
     report: Option<F>,
 }
 
@@ -96,19 +102,23 @@ impl<F: FnOnce(u64)> Delivery<F> {
     pub(crate) fn new(expected: u64, report: F) -> Self {
         Self {
             written: 0,
-            expected,
+            remaining: Some(expected),
             report: Some(report),
         }
     }
 
     pub(crate) fn record(&mut self, len: usize) {
-        self.written = self.written.saturating_add(len as u64);
+        let len = len as u64;
+        self.remaining = self.remaining.and_then(|left| left.checked_sub(len));
+        if self.remaining.is_some() {
+            self.written += len;
+        }
     }
 }
 
 impl<F: FnOnce(u64)> Drop for Delivery<F> {
     fn drop(&mut self) {
-        let written = self.written.min(self.expected);
+        let written = self.written;
         if let Some(report) = self.report.take().filter(|_| written > 0) {
             report(written);
         }
@@ -195,5 +205,34 @@ mod tests {
         body.next().now_or_never().unwrap().unwrap().unwrap();
         drop(body);
         assert_eq!(delivered.get(), Some(3));
+    }
+
+    #[test]
+    fn overrun_preserves_only_the_prior_delivery_prefix() {
+        let delivered = Cell::new(None);
+        let mut delivery = Delivery::new(6, |written| delivered.set(Some(written)));
+        delivery.record(3);
+        delivery.record(4);
+        delivery.record(2);
+        drop(delivery);
+        assert_eq!(delivered.get(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn legacy_lookup_rejects_keys_outside_its_blob_namespace() {
+        let token = grant::issue_v2("user-1", "track-9", "play-7", 42, 200, SECRET);
+        let play = authorize(&token, "track-9", SECRET, 199).unwrap();
+        for key in [
+            "track/track-9".to_string(),
+            format!("audio/9d/70/{HASH}"),
+            format!("audio/{HASH} "),
+        ] {
+            let result = play
+                .blob(async { Ok(key) }, async |_| {
+                    panic!("invalid key reached HEAD")
+                })
+                .await;
+            assert!(matches!(result, Err(error) if error.status == 502));
+        }
     }
 }

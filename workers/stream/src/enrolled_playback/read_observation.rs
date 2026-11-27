@@ -52,7 +52,11 @@ impl ReadObservation {
     }
 
     pub(super) fn dropping_pending_read(&self, read: Promise, signal: AbortSignal) {
-        self.cancellation.replace(Some((read, signal)));
+        let mut witness = self.cancellation.borrow_mut();
+        // Keep the first pending read and require that its signal was live on drop.
+        if witness.is_none() && !signal.aborted() {
+            *witness = Some((read, signal));
+        }
     }
 
     pub(super) async fn confirm_abort(&self) {

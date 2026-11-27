@@ -24,8 +24,9 @@ use worker::{
 };
 
 use super::{
-    control::OriginalRequestControl, OriginalAuthorization, OriginalControl, OriginalPlay,
-    OriginalWriter, OwnedOriginalPlay, WriterDisconnect,
+    control::{wait_until_grant_expiry, OriginalRequestControl},
+    OriginalAuthorization, OriginalControl, OriginalPlay, OriginalWriter, OwnedOriginalPlay,
+    WriterDisconnect,
 };
 use crate::delivered::{DeliveredInterval, DeliveredSink};
 
@@ -97,18 +98,11 @@ impl WorkerOriginalControl {
     }
 
     pub(crate) fn until(expiry_unix: u64, request: &Request) -> worker::Result<Self> {
-        let timer: Pin<Box<dyn Future<Output = ()>>> = Box::pin(async move {
-            loop {
-                // Compute on poll, not construction: a delayed first poll must
-                // not extend the grant. Clamp to the SDK's signed timer range.
-                let remaining =
-                    super::control::grant_delay_ms(expiry_unix, Date::now().as_millis());
-                if remaining == 0 {
-                    break;
-                }
-                Delay::from(std::time::Duration::from_millis(remaining)).await;
-            }
-        });
+        let timer: Pin<Box<dyn Future<Output = ()>>> = Box::pin(wait_until_grant_expiry(
+            expiry_unix,
+            || Date::now().as_millis(),
+            async |delay| Delay::from(std::time::Duration::from_millis(delay)).await,
+        ));
         let control = OriginalRequestControl::new(expiry_unix, timer, now_unix as fn() -> u64);
         let cancellation = control.cancellation();
         let signal = request.inner().signal();
@@ -195,6 +189,7 @@ pub(crate) fn channel(
         raw,
         writing: None,
         closing: None,
+        remaining: body_len,
         stopped: false,
     };
     let response = Response::from_body(ResponseBody::Stream(stream.readable()))?
@@ -209,8 +204,9 @@ pub(crate) fn channel(
 pub struct WorkerOriginalWriter {
     raw: WritableStreamDefaultWriter,
     closed: WriterDisconnect<JsFuture>,
-    writing: Option<(usize, PendingPromise)>,
+    writing: Option<(Box<[u8]>, PendingPromise)>,
     closing: Option<PendingPromise>,
+    remaining: u64,
     stopped: bool,
 }
 
@@ -231,39 +227,59 @@ impl OriginalWriter for WorkerOriginalWriter {
         if self.stopped || self.closing.is_some() {
             return Poll::Ready(Err(SourceError::Cancelled));
         }
-        if bytes.is_empty() || bytes.len() > MAX_ARTICLE_BYTES {
+        if bytes.is_empty()
+            || bytes.len() > MAX_ARTICLE_BYTES
+            || bytes.len() as u64 > self.remaining
+        {
+            self.abort();
             return Poll::Ready(Err(SourceError::Bounds));
         }
-        let (length, promise) = self.writing.get_or_insert_with(|| {
+        if self
+            .writing
+            .as_ref()
+            .is_some_and(|(pending, _)| pending.as_ref() != bytes)
+        {
+            self.abort();
+            return Poll::Ready(Err(SourceError::Bounds));
+        }
+        let (_, promise) = self.writing.get_or_insert_with(|| {
             let chunk = Uint8Array::from(bytes);
             (
-                bytes.len(),
+                Box::from(bytes),
                 Box::pin(JsFuture::from(self.raw.write_with_chunk(&chunk))),
             )
         });
-        if *length != bytes.len() {
-            return Poll::Ready(Err(SourceError::Bounds));
-        }
         match promise.as_mut().poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                let length = *length;
+            Poll::Ready(Ok(_)) => {
                 self.writing = None;
-                Poll::Ready(result.map(|_| length).map_err(|_| SourceError::Transport))
+                self.remaining -= bytes.len() as u64;
+                Poll::Ready(Ok(bytes.len()))
+            }
+            Poll::Ready(Err(_)) => {
+                self.abort();
+                Poll::Ready(Err(SourceError::Transport))
             }
         }
     }
 
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SourceError>> {
-        if self.stopped || self.writing.is_some() {
+        if self.stopped {
             return Poll::Ready(Err(SourceError::Cancelled));
+        }
+        if self.writing.is_some() || self.remaining != 0 {
+            self.abort();
+            return Poll::Ready(Err(SourceError::Bounds));
         }
         let closing = self
             .closing
             .get_or_insert_with(|| Box::pin(JsFuture::from(self.raw.close())));
         match closing.as_mut().poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(_)) => Poll::Ready(Err(SourceError::Transport)),
+            Poll::Ready(Err(_)) => {
+                self.abort();
+                Poll::Ready(Err(SourceError::Transport))
+            }
             Poll::Ready(Ok(_)) => {
                 self.stopped = true;
                 self.raw.release_lock();

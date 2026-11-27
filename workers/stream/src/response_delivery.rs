@@ -30,7 +30,7 @@ impl OrderedDelivery {
     }
 
     pub(crate) fn acknowledge(&mut self, bytes: usize) -> Result<(), SourceError> {
-        if bytes > self.offered {
+        if bytes == 0 || bytes > self.offered {
             return Err(SourceError::Bounds);
         }
         self.accepted += bytes as u64;
@@ -54,9 +54,11 @@ mod tests {
     #[test]
     fn only_acknowledged_prefixes_count() {
         let mut delivery = OrderedDelivery::new(5);
+        assert!(delivery.acknowledge(0).is_err());
         assert!(delivery.acknowledge(1).is_err());
         assert!(delivery.offer(6).is_err());
         delivery.offer(3).unwrap();
+        assert!(delivery.acknowledge(0).is_err());
         assert_eq!(delivery.accepted(), 0);
         delivery.acknowledge(1).unwrap();
         assert!(delivery.offer(2).is_err());
