@@ -481,7 +481,7 @@ fn stream_grant_user(secret: &[u8], bearer: &str, now: u64) -> Option<String> {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "../tests/support/private_playback_offline_client.rs"]
-mod offline;
+pub(crate) mod offline;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 use crate::postgres::PgClient;
 

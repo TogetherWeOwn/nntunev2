@@ -209,12 +209,6 @@ impl<'a> FromSql<'a> for ReadUuid {
 #[path = "storage_digest_read_postgres.rs"]
 mod postgres_tests;
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-#[path = "../tests/support/private_playback_offline_client.rs"]
-mod offline;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-use crate::postgres::PgClient;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,10 +233,11 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn custody_rejects_another_objects_locator_before_reading() {
+        use crate::private_playback::browser::offline::offline_client;
         use custody::{resolve_custody, PlaybackRoot};
         use nntune_core::s3_locator::{S3Binding, S3Locator};
 
-        let mut db = offline::offline_client().await;
+        let mut db = offline_client().await;
         let now = UNIX_EPOCH;
         let root = PlaybackRoot {
             version: target().root_version,
