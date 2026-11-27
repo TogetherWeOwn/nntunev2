@@ -51,9 +51,9 @@ pub struct DeliveredInterval {
 }
 
 impl DeliveredInterval {
-    /// Bytes in the span (`end - start`).
+    /// Bytes in the span. An empty or reversed span carries zero bytes.
     pub fn len(&self) -> u64 {
-        self.end - self.start
+        self.end.saturating_sub(self.start)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -135,11 +135,10 @@ pub fn parse_delivered_report(
     if report.is_empty() {
         return Err(ProbeError::BadRequest("empty delivered interval"));
     }
-    // A confirmed size of zero, or one smaller than the span just
-    // written from that file, is a serving bug: refuse it here rather
-    // than let it poison the play's derivation snapshots downstream.
+    // The confirmed size must cover the interval and fit the ledger's
+    // signed BIGINT snapshot before the receipt can be acknowledged.
     if let Some(file_bytes) = report.file_bytes {
-        if file_bytes == 0 || file_bytes < report.end {
+        if file_bytes < report.end || file_bytes > i64::MAX as u64 {
             return Err(ProbeError::BadRequest("impossible file_bytes"));
         }
     }

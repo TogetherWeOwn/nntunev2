@@ -114,12 +114,18 @@ pub fn parse_body_request(body: &[u8], pool_user: &str) -> Result<BodyRequest, P
     if req.user_id != pool_user {
         return Err(ProbeError::BadRequest("request is for another user's pool"));
     }
-    if !valid_probe_id(&req.segment_id) {
-        return Err(ProbeError::BadRequest(
-            "segment id must be a valid message-id",
-        ));
-    }
+    validate_segment_id(&req.segment_id)?;
     Ok(req)
+}
+
+fn validate_segment_id(segment_id: &str) -> Result<(), ProbeError> {
+    if valid_probe_id(segment_id) {
+        Ok(())
+    } else {
+        Err(ProbeError::BadRequest(
+            "segment id must be a valid message-id",
+        ))
+    }
 }
 
 /// Why one fetch on a live connection produced no outcome.
@@ -188,6 +194,7 @@ where
     F: Future<Output = nntune_core::Result<NntpClient<T>>>,
     S: Fn(&mut Pool<NntpClient<T>>),
 {
+    validate_segment_id(&req.segment_id)?;
     let (lease, warm, success_epoch, is_probe) = {
         let mut pool = pool.borrow_mut();
         tick(&mut pool);

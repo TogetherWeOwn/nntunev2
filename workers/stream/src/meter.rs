@@ -221,6 +221,9 @@ impl CompletePlay {
         bytes: u64,
     ) -> Result<Self, &'static str> {
         let idempotency_key = derive_play_idempotency_key(user_id, track_id, play_id)?;
+        if bytes == 0 {
+            return Err("complete play must carry delivered bytes");
+        }
         Ok(Self {
             idempotency_key,
             user_id: user_id.to_string(),
@@ -250,12 +253,10 @@ pub enum RecordOutcome {
     /// (ADR 0002 rule 3). Only [`UsageLedger::record_fenced`] reports
     /// this; the stable wire/job code is `account_deleting`.
     AccountDeleting,
-    /// The play was not converged: either its idempotency key does not
-    /// bind its `(user_id, track_id)` identity fields (the key must be
-    /// exactly `play:{user_id}:{track_id}:{play_id}` with valid fields),
-    /// or a ledger entry already exists for the key with a different
-    /// user, track, or byte count. A conflict never appends, sums into,
-    /// or overwrites the existing entry.
+    /// The play carries no bytes, its key does not bind its identity as
+    /// `play:{user_id}:{track_id}:{play_id}`, or an entry with the same key
+    /// already holds a different user, track, or byte count. A conflict never
+    /// appends, sums into, or overwrites an entry.
     Conflict,
 }
 
@@ -317,12 +318,11 @@ impl UsageLedger {
     ///
     /// First write wins: a duplicate never appends, sums into, or
     /// overwrites the existing entry. A redelivery whose user, track, or
-    /// byte count disagrees with the entry, or a play whose key does not
-    /// bind its identity fields, reports [`RecordOutcome::Conflict`] and
-    /// likewise changes nothing (that disagreement is [`reconcile`]'s
-    /// job to flag).
+    /// byte count disagrees with the entry reports [`RecordOutcome::Conflict`].
+    /// Zero-byte plays and keys that do not bind the play identity also
+    /// report a conflict before changing the ledger.
     pub fn record(&mut self, play: &CompletePlay) -> RecordOutcome {
-        if !key_binds_identity(play) {
+        if play.bytes == 0 || !key_binds_identity(play) {
             return RecordOutcome::Conflict;
         }
         if let Some(existing) = self

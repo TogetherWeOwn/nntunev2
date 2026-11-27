@@ -318,12 +318,7 @@ impl NntpClient {
                 loop {
                     let mut line = Vec::new();
                     self.read_until_with_deadline(b'\n', &mut line, deadline)?;
-                    if line.is_empty() {
-                        return Err(NntpError::UnexpectedResponse("eof inside article".into()));
-                    }
-                    if line.ends_with(b"\n") {
-                        line.pop();
-                    }
+                    line.pop(); // The read only succeeds after consuming LF.
                     if line.ends_with(b"\r") {
                         line.pop();
                     }
@@ -380,8 +375,7 @@ impl NntpClient {
         delimiter: u8,
         output: &mut Vec<u8>,
         deadline: &NntpDeadline,
-    ) -> io::Result<usize> {
-        let mut read = 0;
+    ) -> io::Result<()> {
         loop {
             let remaining = deadline.remaining()?;
             self.reader
@@ -389,7 +383,10 @@ impl NntpClient {
                 .set_read_timeout(Some(self.read_timeout.min(remaining)))?;
             let available = self.reader.fill_buf()?;
             if available.is_empty() {
-                return Ok(read);
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "NNTP connection closed before line terminator",
+                ));
             }
             let count = available
                 .iter()
@@ -406,9 +403,8 @@ impl NntpClient {
             }
             output.extend_from_slice(&available[..count]);
             self.reader.consume(count);
-            read += count;
             if terminated {
-                return Ok(read);
+                return Ok(());
             }
         }
     }

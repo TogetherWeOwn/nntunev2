@@ -13,9 +13,8 @@ pub enum YencError {
     BadEscape,
     /// Missing/inconsistent `=ypart` placement on a multipart article.
     BadPart,
-    /// Duplicate or out-of-order `=ybegin`/`=ypart`/`=yend` framing: one
-    /// article has exactly one framing sequence, and a later record must
-    /// not replace already-accepted size, placement, or checksum state.
+    /// Duplicate or out-of-order control records, or a repeated field
+    /// used for size, placement, or checksum validation.
     BadFraming,
     SizeMismatch {
         expected: u64,
@@ -171,7 +170,7 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
     // A non-empty body line has been decoded; `=ypart` is only valid before it.
     let mut seen_body = false;
     let mut file_size: Option<u64> = None;
-    let mut multipart = false;
+    let mut part = None;
     let mut part_range: Option<(u64, u64)> = None;
     let mut yend_size: Option<u64> = None;
     // `None` = tag absent (optional); `Some(Err(_))` = tag present but
@@ -180,7 +179,9 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
     let mut pcrc: Option<Result<u32, YencError>> = None;
     for raw_line in text.split(|&b| b == b'\n') {
         let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
-        if line.starts_with(b"=ybegin") {
+        // A longer word with the same prefix can be escaped payload.
+        let marker = line.split(|&b| b == b' ' || b == b'\t').next();
+        if marker == Some(&b"=ybegin"[..]) {
             if seen_begin {
                 return Err(YencError::BadFraming);
             }
@@ -194,34 +195,40 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
             // tokens (`part=1`, `size=999`, ...) that must not change the
             // single/multipart interpretation or satisfy missing metadata.
             let fields = before_filename(line);
-            file_size = tag_u64(fields, b"size");
-            // A present but non-numeric `part=` in the real control fields
-            // is malformed multipart metadata, not a single-part article:
-            // only an absent `part=` means single-part.
-            let part = tag_u64(fields, b"part");
-            if part.is_none() && tag_value(fields, b"part").is_some() {
+            file_size = tag_u64(fields, b"size", YencError::Truncated)?;
+            part = tag_u64(fields, b"part", YencError::BadPart)?;
+            let total = tag_u64(fields, b"total", YencError::BadPart)?;
+            if part == Some(0) || total.is_some_and(|total| part.is_none_or(|part| part > total)) {
                 return Err(YencError::BadPart);
             }
-            multipart = part.is_some();
             continue;
         }
-        if line.starts_with(b"=ypart") {
+        if marker == Some(&b"=ypart"[..]) {
             if !seen_begin || seen_trailer || seen_body || part_range.is_some() {
                 return Err(YencError::BadFraming);
             }
-            part_range = match (tag_u64(line, b"begin"), tag_u64(line, b"end")) {
+            if part.is_none() {
+                return Err(YencError::BadPart);
+            }
+            part_range = match (
+                tag_u64(line, b"begin", YencError::BadPart)?,
+                tag_u64(line, b"end", YencError::BadPart)?,
+            ) {
                 (Some(b), Some(e)) if b >= 1 && e >= b => Some((b, e)),
                 _ => return Err(YencError::BadPart),
             };
             continue;
         }
-        if line.starts_with(b"=yend") {
+        if marker == Some(&b"=yend"[..]) {
             if !seen_begin || seen_trailer {
                 return Err(YencError::BadFraming);
             }
             in_body = false;
             seen_trailer = true;
-            yend_size = tag_u64(line, b"size");
+            yend_size = tag_u64(line, b"size", YencError::Truncated)?;
+            if tag_u64(line, b"part", YencError::BadPart)?.is_some_and(|n| Some(n) != part) {
+                return Err(YencError::BadPart);
+            }
             crc = tag_hex_u32(line, b"crc32");
             pcrc = tag_hex_u32(line, b"pcrc32");
             continue;
@@ -256,6 +263,7 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
             actual: out.len() as u64,
         });
     }
+    let multipart = part.is_some();
     let offset = if multipart {
         let (begin, end) = part_range.ok_or(YencError::BadPart)?;
         if end - begin + 1 != out.len() as u64 || end > file_size {
@@ -312,28 +320,45 @@ fn before_filename(line: &[u8]) -> &[u8] {
 }
 
 /// Value of the ASCII `key=` tag on a yEnc header line, parsed from bytes so
-/// a non-UTF-8 `name=` later on the same line cannot break decoding.
-fn tag_value<'a>(line: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-    line.split(|&b| b == b' ' || b == b'\t')
-        .filter_map(|tok| {
-            let (k, v) = tok.split_at_checked(key.len())?;
-            (k == key && v.first() == Some(&b'=')).then(|| &v[1..])
-        })
-        .next()
+/// a non-UTF-8 `name=` later on the same line cannot break decoding. A
+/// repeated tag is ambiguous, even when the first value would validate.
+fn tag_value<'a>(line: &'a [u8], key: &[u8]) -> Option<Result<&'a [u8], YencError>> {
+    let mut values = line.split(|&b| b == b' ' || b == b'\t').filter_map(|tok| {
+        let (k, v) = tok.split_at_checked(key.len())?;
+        if k == key {
+            v.strip_prefix(b"=")
+        } else {
+            None
+        }
+    });
+    let value = values.next()?;
+    Some(match values.next() {
+        Some(_) => Err(YencError::BadFraming),
+        None => Ok(value),
+    })
 }
 
-fn tag_u64(line: &[u8], key: &[u8]) -> Option<u64> {
-    std::str::from_utf8(tag_value(line, key)?)
-        .ok()?
-        .parse()
+fn tag_u64(line: &[u8], key: &[u8], malformed: YencError) -> Result<Option<u64>, YencError> {
+    let Some(raw) = tag_value(line, key).transpose()? else {
+        return Ok(None);
+    };
+    if !raw.iter().all(u8::is_ascii_digit) {
+        return Err(malformed);
+    }
+    std::str::from_utf8(raw)
         .ok()
+        .and_then(|text| text.parse().ok())
+        .map(Some)
+        .ok_or(malformed)
 }
 
-/// Parse a hex `u32` tag strictly enough to tell absence from malformed
-/// presence: `None` only when the tag is absent, `Some(Err(BadChecksum))`
-/// when it is present but empty, non-hex, non-UTF-8, or out of `u32` range.
+/// Parse a hex `u32` tag, preserving the difference between absence and
+/// a malformed or repeated checksum field.
 fn tag_hex_u32(line: &[u8], key: &[u8]) -> Option<Result<u32, YencError>> {
-    let raw = tag_value(line, key)?;
+    let raw = match tag_value(line, key)? {
+        Ok(raw) => raw,
+        Err(error) => return Some(Err(error)),
+    };
     // Pure ASCII hex digits only: rejects non-UTF-8 and empty values, and
     // also the leading `+` that `from_str_radix` would otherwise accept.
     // The radix parse then only fails on `u32` overflow.
