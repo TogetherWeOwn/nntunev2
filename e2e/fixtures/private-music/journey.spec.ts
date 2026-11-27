@@ -161,8 +161,8 @@ test('synthetic play and seek meter one published track by delivered-byte union'
     ...expected,
     // The ranges arrive out of order after a backward seek. The last range
     // overlaps the first seek and must contribute only its new bytes.
-    delivered: [{ start: 65_536, end: 81_920 }, { start: 0, end: 4_096 }, { start: 70_000, end: 80_000 }],
-    unionBytes: 20_480,
+    delivered: [{ start: 65_536, end: 81_920 }, { start: 0, end: 4_096 }, { start: 70_000, end: 84_000 }],
+    unionBytes: 22_560,
     streamSeconds: 2,
   };
   expect(() => assertPrivateMeteredPlay(expected, observed)).not.toThrow();
