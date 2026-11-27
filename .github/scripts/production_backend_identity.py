@@ -21,9 +21,9 @@ def valid_pin(pin: WorkerPin, worker: str) -> bool:
         type(pin) is WorkerPin
         and type(pin.worker) is str
         and pin.worker == worker
-        and all(type(value) is str and valid(pattern, value) for pattern, value in (
-            (SHA, pin.build_sha), (UUID, pin.version_id), (UUID, pin.deployment_id),
-        ))
+        and valid(SHA, pin.build_sha)
+        and valid(UUID, pin.version_id)
+        and valid(UUID, pin.deployment_id)
     )
 
 

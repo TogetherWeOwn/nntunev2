@@ -35,7 +35,8 @@ function moduleDigest(version) {
   const [module, ...extra] = Array.isArray(version.modules) ? version.modules : [];
   const content = module?.content_base64;
   if (extra.length || version.main_module !== 'worker.mjs' || module?.name !== 'worker.mjs' ||
-      module.content_type !== 'application/javascript+module' || typeof content !== 'string' || !content) return null;
+      typeof content !== 'string' || !content ||
+      (module.content_type !== undefined && module.content_type !== 'application/javascript+module')) return null;
   const bytes = Buffer.from(content, 'base64');
   if (bytes.toString('base64') !== content) return null;
   return createHash('sha256').update(bytes).digest('hex');
@@ -119,15 +120,6 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
   }
   const api = cloudflare(account, token, request);
   const pinned = `/workers/${worker}`;
-  async function readHistory() {
-    const history = await api(deployments + page, 'Deployment history');
-    const list = history.result.deployments;
-    requireCompletePage(history, list, list?.length, 'deployments');
-    if (list.length > 100 || !list.every((row, i) => uuid(row?.id) && typeof row.created_on === 'string' &&
-        Number.isFinite(Date.parse(row.created_on)) && (i === 0 || Date.parse(list[i - 1].created_on) > Date.parse(row.created_on))) ||
-        new Set(list.map((row) => row.id)).size !== list.length) throw new Error('Ambiguous deployment history');
-    return list;
-  }
   async function live(phase) {
     const { result } = await api(pinned, 'Worker identity and exposure');
     if (result.id !== worker || result.name !== name || typeof result.deployed_on !== 'string' ||
@@ -148,6 +140,15 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
       throw new MaintenanceModuleMismatchError(maintenance.module_sha256, digest, phase);
     }
     return readHistory();
+  }
+  async function readHistory(read = api) {
+    const history = await read(deployments + page, 'Deployment history');
+    const list = history.result.deployments;
+    requireCompletePage(history, list, list?.length, 'deployments');
+    if (list.length > 100 || !list.every((row, i) => uuid(row?.id) && typeof row.created_on === 'string' &&
+        Number.isFinite(Date.parse(row.created_on)) && (i === 0 || Date.parse(list[i - 1].created_on) > Date.parse(row.created_on))) ||
+        new Set(list.map((row) => row.id)).size !== list.length) throw new Error('Ambiguous deployment history');
+    return list;
   }
 
   const tag = `${sha}-${run}-${attempt}`;
@@ -212,7 +213,15 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
       }
     }
     requireFreshAllocation();
-    const before = final.deployment === null ? await live('preflight') : await readHistory();
+    const before = final.deployment === null ? await live('preflight') :
+      await readHistory(cloudflare(account, token, async (url, options) => {
+        try {
+          return await request(url, options);
+        } catch {
+          requireFreshAllocation();
+          return request(url, { ...options, signal: AbortSignal.timeout(15_000) });
+        }
+      }));
     requireFreshAllocation();
     if (restored(before) && (final.deployment === null || restored(await live('preflight')))) return alreadyVerified;
     if (final.deployment === null || !isFinal(before)) throw new Error('Stale intent or newer or foreign active deployment');

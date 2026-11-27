@@ -34,11 +34,15 @@ test('rollback rejects invalid context and stale or superseded recovery evidence
   const [module] = seed.modules;
   module.content_type = 'text/plain';
   await assert.rejects(run('prepare-recovery', env), /Maintenance version drifted/);
-  module.content_type = 'application/javascript+module';
+  delete module.content_type;
   await run('prepare-recovery', env);
   rows.unshift({ ...rows[0], id: id(8), created_on: new Date(now() + 8_000).toISOString() });
   await assert.rejects(run('recover', { ...env, CLAIM_VERIFIED: 'true' }), /newer or foreign/);
   assert.ok(calls.every((method) => method === 'GET'));
+  rows.shift();
+  transport.fail.nextRead = true;
+  assert.match(await run('recover', { ...env, CLAIM_VERIFIED: 'true' }), /allocation verified/);
+  assert.equal(calls.filter((method) => method === 'POST').length, 1);
 });
 
 test('health windows and alerts reject evidence they cannot represent safely', () => {
