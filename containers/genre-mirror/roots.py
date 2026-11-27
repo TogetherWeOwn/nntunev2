@@ -6,26 +6,24 @@ purely offline and does not load or persist catalogue data.
 
 
 class Roots:
-    def __init__(self, config, graph):
+    def __init__(self, config, graph, present=None):
         self.graph = graph
         active = [root for root in config["roots"] if not root.get("retired", False)]
         self.sort_order = {root["root_id"]: root["sort_order"] for root in active}
         self.anchor_root = {
             anchor: root["root_id"] for root in active for anchor in root["anchors"]
+            if present is None or anchor in present
         }
-        reaches = {}
+        reaches = {root["root_id"]: set() for root in active}
         anchor_reaches = {}
         self.anchors_capped = False
-        for root in active:
-            found = set()
-            for anchor in root["anchors"]:
-                visited, capped, _ = graph.reach(anchor)
-                self.anchors_capped |= capped
-                anchor_reaches[anchor] = {
-                    self.anchor_root[node] for node in visited if node in self.anchor_root
-                }
-                found.update(anchor_reaches[anchor])
-            reaches[root["root_id"]] = found
+        for anchor, rid in self.anchor_root.items():
+            visited, capped, _ = graph.reach(anchor)
+            self.anchors_capped |= capped
+            anchor_reaches[anchor] = {
+                self.anchor_root[node] for node in visited if node in self.anchor_root
+            }
+            reaches[rid].update(anchor_reaches[anchor])
 
         # Compute cycles over the full projected relation, including mutual
         # edges. Multiple anchors can join otherwise separate paths into a cycle.

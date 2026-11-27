@@ -7,8 +7,11 @@ import argparse
 import bz2
 import gzip
 import hashlib
+import io
 import json
 import math
+import os
+from contextlib import nullcontext
 from pathlib import Path
 import re
 import shutil
@@ -33,6 +36,45 @@ class Refused(ValueError):
 class ArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         self.exit(2, "genre-extract: refused (invalid command-line arguments)\n")
+
+
+class BzipReader(io.RawIOBase):
+    """Read every bzip2 member, including any following the final JSON record."""
+
+    def __init__(self, source):
+        self.source = source
+        self.decoder = bz2.BZ2Decompressor()
+
+    def readable(self):
+        return True
+
+    def readinto(self, target):
+        if not target:
+            return 0
+        while True:
+            data = b""
+            if self.decoder.eof or self.decoder.needs_input:
+                data = self.decoder.unused_data or self.source.read(io.DEFAULT_BUFFER_SIZE)
+                if not data:
+                    if self.decoder.eof:
+                        return 0
+                    raise Refused("incomplete bzip2 stream")
+                if self.decoder.eof:
+                    self.decoder = bz2.BZ2Decompressor()
+            chunk = self.decoder.decompress(data, max_length=len(target))
+            if chunk:
+                target[:len(chunk)] = chunk
+                return len(chunk)
+
+
+def decoded_stream(source, suffix):
+    if suffix == ".bz2":
+        return io.BufferedReader(BzipReader(source))
+    if suffix == ".gz":
+        if not source.peek(1):
+            raise Refused("missing gzip stream")
+        return gzip.GzipFile(fileobj=source)
+    return nullcontext(source)
 
 
 def encode(value: object) -> bytes:
@@ -147,8 +189,10 @@ def claims(entity: dict, prop: str, counts: dict):
         value = dv.get("value")
         if prop == "P434":
             if dv.get("type") == "string" and isinstance(value, str) and MBID.fullmatch(value):
-                yield str(uuid.UUID(value))
-                continue
+                mbid = uuid.UUID(value)
+                if mbid.int:
+                    yield str(mbid)
+                    continue
         elif dv.get("type") == "wikibase-entityid" and isinstance(value, dict):
             qid = value.get("id")
             number = value.get("numeric-id")
@@ -226,8 +270,17 @@ def write_rows(path: Path, rows, keys: tuple[str, ...], budget: list[int]) -> di
 
 
 def extract(args) -> None:
-    if not stat.S_ISREG(args.input.stat().st_mode):
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not nonblock and not stat.S_ISREG(args.input.stat().st_mode):
         raise Refused("input must be a local regular file")
+    with open(args.input, "rb", opener=lambda path, flags: os.open(path, flags | nonblock)) as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise Refused("input must be a local regular file")
+        with decoded_stream(source, args.input.suffix) as stream:
+            project(args, stream)
+
+
+def project(args, stream) -> None:
     # Reserving the destination exclusively prevents replacing even an empty directory.
     # Consumers admit it only after manifest.json appears as the final completion marker.
     args.output.mkdir()
@@ -253,9 +306,7 @@ def extract(args) -> None:
                 """)
                 identity = {}
                 counts = {"entities": 0, "invalid_claims": 0}
-                opener = gzip.open if args.input.suffix == ".gz" else bz2.open if args.input.suffix == ".bz2" else open
-                with opener(args.input, "rb") as stream:
-                    load(db, stream, args, identity, counts)
+                load(db, stream, args, identity, counts)
                 select_ancestry(db, args.max_depth)
                 outputs = {}
                 budget = [args.max_output_bytes]

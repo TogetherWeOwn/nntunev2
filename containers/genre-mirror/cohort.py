@@ -27,7 +27,7 @@ def _invalid_constant(_):
 
 
 def _mbid(value):
-    if not isinstance(value, str) or not MBID.fullmatch(value):
+    if type(value) is not str or not MBID.fullmatch(value):
         raise ValueError("invalid artist MBID")
     parsed = uuid.UUID(value)
     if parsed.int == 0:
@@ -37,7 +37,7 @@ def _mbid(value):
 
 def admit_cohort(raw):
     """Validate bounded JSON bytes and return normalized synthetic artist lists."""
-    if not isinstance(raw, bytes) or len(raw) > MAX_BYTES:
+    if type(raw) is not bytes or len(raw) > MAX_BYTES:
         raise ValueError("cohort byte budget exceeded or invalid input")
     try:
         cohort = json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs,

@@ -22,14 +22,16 @@ def resolve(genres, parents, memberships, config):
     present = _present_set(genres)
     if type(parents) is not list or type(memberships) is not list:
         raise ValueError("invalid genre rollup input: rows")
+    known = {row["genre_qid"] for row in genres}
     parent_map = {}
     for row in parents:
         if (type(row) is not dict or not _is_qid(row.get("genre_qid"))
-                or not _is_qid(row.get("parent_qid"))):
+                or not _is_qid(row.get("parent_qid"))
+                or row["genre_qid"] not in present or row["parent_qid"] not in known):
             raise ValueError("invalid genre rollup input: parents")
         parent_map.setdefault(row["genre_qid"], set()).add(row["parent_qid"])
     parent_lists = {qid: sorted(values, key=_qkey) for qid, values in parent_map.items()}
-    universe = {row["genre_qid"] for row in genres}
+    universe = known.copy()
     by_artist = {}
     for row in memberships:
         if (type(row) is not dict or not _is_qid(row.get("genre_qid"))
@@ -42,7 +44,7 @@ def resolve(genres, parents, memberships, config):
     limits = config["limits"]
     graph = Graph(parent_lists, frozenset(config["traversal_barriers"]),
                   limits["max_depth"], limits["max_nodes"])
-    roots = Roots(config, graph)
+    roots = Roots(config, graph, present)
     resolver = Overrides(config, roots, present)
     final, diagnostics = {}, []
     for qid in sorted(universe | set(resolver.actions), key=_qkey):

@@ -63,9 +63,10 @@ def synthetic_refresh_sql(cohort_bytes, memberships, config):
     parents = [{"genre_qid": c, "parent_qid": p} for c, p in FIXTURE_PARENTS]
     result = resolve_synthetic(cohort_bytes, genres, parents, memberships, config)
     admitted = {q for q, _, _ in FIXTURE_GENRES}
+    present = {q for q, _, exists in FIXTURE_GENRES if exists}
     if (not {row["genre_qid"] for row in result["genre_rollup"]} <= admitted
-            or not {row["genre_qid"] for row in config["overrides"]} <= admitted):
-        raise ValueError("roll-up or override genre outside fixture genres")
+            or not {row["genre_qid"] for row in config["overrides"]} <= present):
+        raise ValueError("roll-up or override genre outside admitted fixture scope")
     config = _canonical(config)
     genre_rows = [{"genre_qid": q, "label": label} for q, label, _ in FIXTURE_GENRES]
     selected = sorted({(row["artist_mbid"].lower(), row["genre_qid"]) for row in memberships})
