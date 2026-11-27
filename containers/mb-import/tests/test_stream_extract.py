@@ -201,6 +201,7 @@ class OfflineBoundaryTest(unittest.TestCase):
             (oversized.tobuf(tarfile.GNU_FORMAT), b"archive size limit"),
             (tar_bytes({"TIMESTAMP": b"x" * 4097}), b"metadata size limit"),
             (tar_bytes({"TIMESTAMP": b"\xff"}), b"invalid metadata"),
+            (tarfile.TarInfo("TIMESTAMP").tobuf() + complete, b"TIMESTAMP: invalid metadata"),
             (tar_bytes({"TIMESTAMP": b"first", "./TIMESTAMP": b"second"}), b"duplicate member"),
             (body + b"\0" * block, b"truncated archive"),
             (body + b"x" * block + complete[len(body):], b"invalid header"),

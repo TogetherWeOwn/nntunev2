@@ -114,7 +114,7 @@ def extract(source, out_dir, rollback) -> int:
             if member.size > MAX_META_BYTES:
                 raise ValueError(f"{name}: metadata size limit exceeded")
             text = read_exact(source, member.size).strip().decode("ascii", "replace")
-            if (text or name != "REPLICATION_SEQUENCE") and (not text.isascii() or not text.isprintable()):
+            if not (text or name == "REPLICATION_SEQUENCE") or not text.isascii() or not text.isprintable():
                 raise ValueError(f"{name}: invalid metadata")
             meta[name] = text
             continue

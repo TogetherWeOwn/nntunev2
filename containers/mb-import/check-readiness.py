@@ -123,9 +123,8 @@ def capture_psql(sql):
                     payload.extend(chunk)
                     if len(payload) > MAX_SNAPSHOT_BYTES:
                         raise ValueError
-                status = process.wait(timeout=max(0, deadline - time.monotonic()))
-                if status:
-                    raise subprocess.CalledProcessError(status, argv)
+                if process.wait(timeout=max(0, deadline - time.monotonic())):
+                    raise subprocess.CalledProcessError(process.returncode, argv)
             finally:
                 if process.returncode is None:
                     process.kill()
