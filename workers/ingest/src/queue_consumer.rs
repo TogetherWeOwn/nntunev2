@@ -78,7 +78,8 @@ use futures_util::{Stream, StreamExt};
 use worker::{Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
 
 use crate::dispatch::{
-    make_job_id, validate_user_id, INGEST_QUEUE_BINDING, PAYLOAD_KEY_PREFIX, PAYLOAD_KV_BINDING,
+    content_sha256_hex, make_job_id, validate_user_id, INGEST_QUEUE_BINDING, PAYLOAD_KEY_PREFIX,
+    PAYLOAD_KV_BINDING,
 };
 use crate::jobs::{
     advance_checkpoint, validate_job_id, JobCheckpoint, JobSource, JobState, MAX_ATTEMPTS,
@@ -525,7 +526,12 @@ async fn load_upload_parse(
             return Err(unavailable());
         }
     };
-    if !msg.matches_upload_payload(payload.as_bytes()) {
+    if payload_ref
+        != format!(
+            "{PAYLOAD_KEY_PREFIX}{}",
+            content_sha256_hex(payload.as_bytes())
+        )
+    {
         return Err(JobError::permanent(
             ERR_PARSE_FAILED,
             "upload payload digest mismatch",
