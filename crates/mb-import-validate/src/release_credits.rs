@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{decode_copy_field, is_uuid, reason, FieldKind};
+use super::{decode_required, is_curated_timestamp, is_uuid, reason, FieldKind};
 
 /// Intended for curated fixture slices, not full dumps or compressed input.
 pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -51,11 +51,11 @@ pub fn lookup(bytes: &[u8], release_mbid: &str) -> Result<Vec<ReleaseCredit>, Re
             return Err(invalid(reason::COLUMN_COUNT));
         };
         let release = FieldKind::Uuid.check(release, true).map_err(invalid)?;
-        let position = decode_required(position)
-            .map_err(invalid)?
+        let position_text = decode_required(position).map_err(invalid)?;
+        let position = position_text
             .parse::<i32>()
             .ok()
-            .filter(|&n| n >= 0)
+            .filter(|&n| n >= 0 && position_text == n.to_string())
             .ok_or_else(|| invalid("invalid_credit_position"))?;
         let credit = ReleaseCredit {
             position,
@@ -63,9 +63,7 @@ pub fn lookup(bytes: &[u8], release_mbid: &str) -> Result<Vec<ReleaseCredit>, Re
             credited_name: decode_required(name).map_err(invalid)?,
             join_phrase: decode_required(join).map_err(invalid)?,
         };
-        let timestamp = FieldKind::Timestamp
-            .check(timestamp, true)
-            .map_err(invalid)?;
+        let timestamp = decode_required(timestamp).map_err(invalid)?;
         if !is_curated_timestamp(&timestamp) {
             return Err(invalid(reason::BAD_TIMESTAMP));
         }
@@ -79,28 +77,4 @@ pub fn lookup(bytes: &[u8], release_mbid: &str) -> Result<Vec<ReleaseCredit>, Re
     }
     credits.sort_unstable_by_key(|credit| credit.position);
     Ok(credits)
-}
-
-// The producer emits UTC seconds or UTC seconds with six fractional digits.
-// The shared COPY validator checks calendar ranges but accepts signed components
-// and second 60, which the producer's datetime cannot emit.
-fn is_curated_timestamp(timestamp: &str) -> bool {
-    timestamp.strip_suffix('Z').is_some_and(|utc| {
-        matches!(utc.len(), 19 | 26)
-            && utc.bytes().enumerate().all(|(i, b)| match i {
-                4 | 7 => b == b'-',
-                10 => b == b'T',
-                13 | 16 => b == b':',
-                17 => matches!(b, b'0'..=b'5'),
-                19 => b == b'.',
-                _ => b.is_ascii_digit(),
-            })
-    })
-}
-
-fn decode_required(token: &str) -> Result<String, &'static str> {
-    if token == "\\N" {
-        return Err(reason::NULL_IN_NOT_NULL);
-    }
-    decode_copy_field(token)
 }

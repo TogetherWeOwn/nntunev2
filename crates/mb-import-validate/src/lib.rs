@@ -111,21 +111,21 @@ pub mod reason {
     pub const BAD_ISRC: &str = "bad_isrc";
     pub const BAD_BOOL: &str = "bad_bool";
     pub const INVALID_ENCODING: &str = "invalid_encoding";
+    pub const BAD_LINE_NUMBER: &str = "bad_line_number";
+    pub const BAD_VIDEO_PAIR: &str = "bad_video_pair";
 }
 
 /// Validate one physical dump line.
 ///
-/// `line_no` is the 1-based number in the whole dump file (chunk offset
-/// added by the caller). On success returns the normalized line to feed to
-/// `COPY` — curated fields plus the appended `line_no` — without trailing
-/// newline. On failure returns `(reason, line_no)` for the dead-letter
-/// table.
+/// `line_no` is the 1-based dump line number, including the chunk offset.
+/// Returns normalized COPY fields plus `line_no`, with no trailing newline,
+/// or `(reason, line_no)` for the dead-letter table.
 pub fn validate_line(table: Table, line_no: u64, raw: &str) -> Result<String, (&'static str, u64)> {
     let err = |why: &'static str| Err((why, line_no));
     if raw.is_empty() {
         return err(reason::EMPTY_LINE);
     }
-    let fields: Vec<&str> = raw.split('\t').collect();
+    let fields: Vec<&str> = raw.splitn(table.fields() + 1, '\t').collect();
     if fields.len() != table.fields() {
         return err(reason::COLUMN_COUNT);
     }
@@ -207,7 +207,7 @@ pub fn validate_line(table: Table, line_no: u64, raw: &str) -> Result<String, (&
             Err(why) => return err(why),
         }
     }
-    out.push(line_no.to_string());
+    out.push(copy_line_number(table, line_no, &out).map_err(|why| (why, line_no))?);
     Ok(out.join("\t"))
 }
 
@@ -231,21 +231,21 @@ pub fn escape_poison_field(raw: &str) -> String {
 /// Chunk ranges still pending, as 1-based inclusive `(start, end)` line
 /// spans over the whole dump file. `completed` is the cursor value
 /// (lines already committed); `total` the current file line count.
-pub fn plan_chunks(completed: u64, total: u64, size: u64) -> Vec<(u64, u64)> {
-    if size == 0 || completed >= total {
-        return Vec::new();
+/// The iterator computes each range when the caller requests it.
+pub fn plan_chunks(completed: u64, total: u64, size: u64) -> ChunkPlan {
+    ChunkPlan {
+        completed,
+        total,
+        size,
     }
-    let mut chunks = Vec::new();
-    let mut start = completed + 1;
-    while start <= total {
-        let end = start.saturating_add(size - 1).min(total);
-        chunks.push((start, end));
-        if end == total {
-            break;
-        }
-        start = end + 1;
-    }
-    chunks
+}
+
+/// Allocation-free iterator over the pending chunk ranges.
+#[derive(Clone, Debug)]
+pub struct ChunkPlan {
+    completed: u64,
+    total: u64,
+    size: u64,
 }
 
 /// Column kinds the importer validates before COPY. Every `Ok` value is
@@ -674,6 +674,61 @@ fn is_time(time: &str) -> bool {
         }
     }
     true
+}
+
+impl Iterator for ChunkPlan {
+    type Item = (u64, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.size == 0 || self.completed >= self.total {
+            return None;
+        }
+        let start = self.completed + 1;
+        let end = self.completed.saturating_add(self.size).min(self.total);
+        self.completed = end;
+        Some((start, end))
+    }
+}
+
+impl PartialEq<Vec<(u64, u64)>> for ChunkPlan {
+    fn eq(&self, expected: &Vec<(u64, u64)>) -> bool {
+        Iterator::eq(self.clone(), expected.iter().copied())
+    }
+}
+
+fn copy_line_number(table: Table, line_no: u64, fields: &[String]) -> Result<String, &'static str> {
+    if !(1..=i64::MAX as u64).contains(&line_no) {
+        return Err(reason::BAD_LINE_NUMBER);
+    }
+    // The producer excludes self-pairs. Compare the decoded, canonical UUIDs.
+    if table == Table::RecordingMusicVideo && fields[0] == fields[1] {
+        return Err(reason::BAD_VIDEO_PAIR);
+    }
+    Ok(line_no.to_string())
+}
+
+fn decode_required(token: &str) -> Result<String, &'static str> {
+    if token == "\\N" {
+        return Err(reason::NULL_IN_NOT_NULL);
+    }
+    decode_copy_field(token)
+}
+
+// The producer's UTC datetime omits the fractional part when it is zero.
+fn is_curated_timestamp(timestamp: &str) -> bool {
+    timestamp.strip_suffix('Z').is_some_and(|utc| {
+        matches!(utc.len(), 19 | 26)
+            && utc.bytes().enumerate().all(|(i, b)| match i {
+                4 | 7 => b == b'-',
+                10 => b == b'T',
+                13 | 16 => b == b':',
+                17 => matches!(b, b'0'..=b'5'),
+                19 => b == b'.',
+                _ => b.is_ascii_digit(),
+            })
+            && !utc.ends_with(".000000")
+            && is_timestamp(timestamp)
+    })
 }
 
 pub mod aliases;
