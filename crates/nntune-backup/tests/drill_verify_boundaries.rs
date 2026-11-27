@@ -1,11 +1,10 @@
 use std::fs;
-use std::io::{self, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use nntune_backup::{
     drill::{self, MIN_FIXTURE_BYTES},
-    verify::{self, Keyring, VerifyReport},
+    verify::VerifyReport,
 };
 use nntune_core::original_source::MAX_CIPHERTEXT_BYTES;
 
@@ -21,7 +20,7 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -44,17 +43,23 @@ fn restore_requires_fresh_separate_destination() {
 }
 
 #[test]
-fn streaming_verify_rejects_oversized_or_unreadable_rows() {
-    let keyring = Keyring::default();
-    let overlong = io::repeat(b' ').take(2 * MAX_CIPHERTEXT_BYTES as u64 + 32 * 1024);
-    let input = BufReader::new(b"{}\n".as_slice().chain(overlong));
-    assert_eq!(
-        verify::verify_reader(input, &keyring, "test")
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidData
-    );
-    assert!(verify::verify_reader(&b"{}\n\xff\n"[..], &keyring, "test").is_err());
+fn cli_verify_refuses_oversized_invalid_or_symlinked_exports() {
+    let scratch = Scratch::new("invalid-rows");
+    let rows = scratch.0.join("rows.jsonl");
+    let file = fs::File::create(&rows).unwrap();
+    file.set_len(2 * MAX_CIPHERTEXT_BYTES as u64 + 32 * 1024)
+        .unwrap();
+    let error = b"error: invalid or unreadable rows export";
+    assert_denied(verify_cli(&rows).output().unwrap(), error);
+    fs::write(&rows, b"{}\n\xff").unwrap();
+    assert_denied(verify_cli(&rows).output().unwrap(), error);
+    #[cfg(unix)]
+    {
+        let link = scratch.0.join("link.jsonl");
+        fs::write(&rows, b"{}\n").unwrap();
+        std::os::unix::fs::symlink(&rows, &link).unwrap();
+        assert_denied(verify_cli(&link).output().unwrap(), error);
+    }
 }
 
 fn cli() -> Command {
@@ -63,9 +68,16 @@ fn cli() -> Command {
     cmd
 }
 
-fn assert_usage(output: Output) {
+fn verify_cli(rows: &Path) -> Command {
+    let mut cmd = cli();
+    cmd.args(["verify", "--rows"]).arg(rows);
+    cmd
+}
+
+fn assert_denied(output: Output, message: &[u8]) {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
+    assert!(output.stderr.starts_with(message));
 }
 
 #[test]
@@ -76,13 +88,12 @@ fn cli_rejects_ambiguous_arguments_and_redacts_kek_errors() {
         &["synthetic", "--bytes", "16777217"],
         &["verify", "--rows", "first", "--rows", "second"],
     ] {
-        assert_usage(cli().args(args).output().unwrap());
+        assert_denied(cli().args(args).output().unwrap(), b"usage:");
     }
     let scratch = Scratch::new("verify");
     let rows = scratch.0.join("rows.jsonl");
     fs::write(&rows, b" \n").unwrap();
-    let mut verify = cli();
-    verify.arg("verify").arg("--rows").arg(rows);
+    let mut verify = verify_cli(&rows);
     let output = verify.output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     let report: VerifyReport = serde_json::from_slice(&output.stdout).unwrap();
@@ -92,11 +103,10 @@ fn cli_rejects_ambiguous_arguments_and_redacts_kek_errors() {
         .env("BACKUP_DRILL_KEK_V07", "55".repeat(32))
         .output()
         .unwrap();
-    assert_usage(output);
+    assert_denied(output, b"error: duplicate KEK version\n");
     verify
         .env_remove("BACKUP_DRILL_KEK_V07")
         .env("BACKUP_DRILL_KEK_Vprivate", "fixture");
     let output = verify.output().unwrap();
-    assert_eq!(output.stderr, b"error: invalid KEK version\n");
-    assert_usage(output);
+    assert_denied(output, b"error: invalid KEK version\n");
 }

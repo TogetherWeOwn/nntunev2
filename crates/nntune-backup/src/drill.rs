@@ -422,9 +422,6 @@ fn decrypt_restored_dir(
     let manifest_raw = std::fs::read(restore_dir.join(bundle::MANIFEST_FILE))
         .map_err(|e| DrillError::Bundle(BundleError::Io(format!("manifest read: {e}"))))?;
     let finished = now_unix();
-    if started <= 0 || finished < started {
-        return Err(DrillError::InvalidEvidence("invalid drill timestamps"));
-    }
     Ok(DrillEvidence {
         tool: tool.to_string(),
         bundle_format_version: manifest.format_version,
@@ -496,10 +493,10 @@ fn copy_contents(src: &Path, dst: &Path) -> Result<(), String> {
             let rel = path.strip_prefix(src).map_err(|e| e.to_string())?;
             if ftype.is_dir() {
                 stack.push(path);
-            } else if ftype.is_file() {
-                std::fs::copy(&path, dst.join(rel)).map_err(|e| e.to_string())?;
-            } else {
+            } else if !ftype.is_file() {
                 return Err("refuses non-regular backup entry".into());
+            } else {
+                std::fs::copy(&path, dst.join(rel)).map_err(|e| e.to_string())?;
             }
         }
     }
@@ -667,6 +664,12 @@ mod tests {
         std::os::unix::fs::symlink(src.join("real.bin"), src.join("link.bin")).unwrap();
         let err = copy_dir(&src, &dst).unwrap_err();
         assert!(err.contains("symlink"), "unexpected error: {err}");
+        assert!(!dst.exists());
+        std::fs::remove_file(src.join("link.bin")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(src.join("socket")).unwrap();
+        let err = copy_dir(&src, &dst).unwrap_err();
+        assert_eq!(err, "refuses non-regular backup entry");
+        assert!(!dst.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

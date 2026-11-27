@@ -91,31 +91,29 @@ fn main() {
             let mut bytes = None;
             let mut tool = None;
             while let Some(a) = args.next() {
+                let value = args
+                    .next()
+                    .and_then(|v| v.into_string().ok())
+                    .unwrap_or_else(|| usage());
                 match a.to_str() {
                     Some("--bytes") if bytes.is_none() => {
-                        bytes = Some(
-                            args.next()
-                                .and_then(|n| n.to_str()?.parse().ok())
-                                .filter(|&n| n <= MAX_FIXTURE_BYTES)
-                                .unwrap_or_else(|| usage()),
-                        );
+                        bytes = Some(value.parse().unwrap_or_else(|_| usage()));
                     }
-                    Some("--tool") if tool.is_none() => {
-                        tool = Some(
-                            args.next()
-                                .and_then(|v| v.into_string().ok())
-                                .filter(|v| !v.is_empty() && !v.starts_with("--"))
-                                .unwrap_or_else(|| usage()),
-                        );
+                    Some("--tool")
+                        if tool.is_none() && !value.is_empty() && !value.starts_with("--") =>
+                    {
+                        tool = Some(value);
                     }
                     _ => usage(),
                 }
             }
-            let plaintext: Vec<u8> = (0..bytes.unwrap_or(DEFAULT_FIXTURE_BYTES))
-                .map(|i| (i % 251) as u8)
-                .collect();
-            match drill::run_synthetic_drill(&plaintext, tool.as_deref().unwrap_or("backup-drill"))
-            {
+            let bytes = bytes.unwrap_or(DEFAULT_FIXTURE_BYTES);
+            if bytes > MAX_FIXTURE_BYTES {
+                usage();
+            }
+            let tool = tool.as_deref().unwrap_or("backup-drill");
+            let plaintext: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+            match drill::run_synthetic_drill(&plaintext, tool) {
                 Ok((ev, bundle_dir, _)) => {
                     println!("{}", serde_json::to_string_pretty(&ev).unwrap());
                     // Temp dirs only: the drill proves restore from the

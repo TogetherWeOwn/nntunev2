@@ -129,7 +129,8 @@ fn hex_bytes(s: &str, expect: usize) -> Option<Vec<u8>> {
     decode_hex(s)
 }
 
-/// Authenticate every JSONL row and count malformed records as failures.
+/// Authenticate every row in `rows_jsonl` against `keyring`. The
+/// per-row KEK copy and decrypted payload are zeroized immediately.
 pub fn verify_rows(rows_jsonl: &str, keyring: &Keyring, tool: &str) -> VerifyReport {
     verify_lines(
         rows_jsonl.lines().map(Ok::<_, core::convert::Infallible>),
@@ -151,15 +152,10 @@ pub fn verify_reader(
 ) -> io::Result<VerifyReport> {
     let lines = std::iter::from_fn(|| {
         let mut line = String::new();
-        match reader
-            .by_ref()
-            .take(MAX_ROW_BYTES as u64 + 2)
-            .read_line(&mut line)
-        {
+        let mut row = reader.by_ref().take(MAX_ROW_BYTES as u64 + 1);
+        match row.read_line(&mut line) {
             Ok(0) => None,
-            Ok(_) if line.strip_suffix('\n').unwrap_or(&line).len() <= MAX_ROW_BYTES => {
-                Some(Ok(line))
-            }
+            Ok(n) if n <= MAX_ROW_BYTES => Some(Ok(line)),
             Ok(_) => Some(Err(io::ErrorKind::InvalidData.into())),
             Err(error) => Some(Err(error)),
         }
