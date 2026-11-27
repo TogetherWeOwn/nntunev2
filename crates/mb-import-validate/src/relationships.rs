@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{decode_copy_field, is_uuid, reason, FieldKind};
+use super::{decode_required, is_curated_timestamp, is_uuid, reason, FieldKind};
 
 /// Intended for curated slices, not full dumps or compressed input.
 pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -77,10 +77,7 @@ pub fn lookup(
             Projection::ArtistRelease => TargetMbid::Release(target),
             Projection::ArtistWork | Projection::RecordingWork => TargetMbid::Work(target),
         };
-        if link_type == r"\N" {
-            return Err(invalid(reason::NULL_IN_NOT_NULL));
-        }
-        let link_type = decode_copy_field(link_type).map_err(invalid)?;
+        let link_type = decode_required(link_type).map_err(invalid)?;
         // Python's str.strip() also treats these four separators as whitespace.
         if link_type
             .chars()
@@ -89,9 +86,7 @@ pub fn lookup(
         {
             return Err(invalid("invalid_link_type"));
         }
-        let timestamp = FieldKind::Timestamp
-            .check(timestamp, true)
-            .map_err(invalid)?;
+        let timestamp = decode_required(timestamp).map_err(invalid)?;
         if !is_curated_timestamp(&timestamp) {
             return Err(invalid(reason::BAD_TIMESTAMP));
         }
@@ -103,20 +98,4 @@ pub fn lookup(
         .into_iter()
         .filter_map(|(source, edge)| source.eq_ignore_ascii_case(source_mbid).then_some(edge))
         .collect())
-}
-
-// The shared validator checks calendar ranges; the producer emits only UTC
-// seconds (0–59) with either no fraction or exactly six fractional digits.
-fn is_curated_timestamp(timestamp: &str) -> bool {
-    timestamp.strip_suffix('Z').is_some_and(|utc| {
-        matches!(utc.len(), 19 | 26)
-            && utc.bytes().enumerate().all(|(i, b)| match i {
-                4 | 7 => b == b'-',
-                10 => b == b'T',
-                13 | 16 => b == b':',
-                17 => matches!(b, b'0'..=b'5'),
-                19 => b == b'.',
-                _ => b.is_ascii_digit(),
-            })
-    })
 }

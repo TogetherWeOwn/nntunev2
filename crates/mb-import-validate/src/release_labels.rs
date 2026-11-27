@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::{decode_copy_field, is_timestamp, is_uuid, reason, FieldKind};
+use super::{decode_copy_field, decode_required, is_curated_timestamp, is_uuid, reason, FieldKind};
 
 /// Uncompressed byte limit per artifact; not intended for full dumps.
 pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -53,7 +53,7 @@ pub fn lookup(
     let mut by_mbid = BTreeMap::new();
     scan::<5>(labels, Artifact::Labels, |[mbid, name, code, kind, ts]| {
         let mbid = FieldKind::Uuid.check(mbid, true)?;
-        let name = required_text(name)?;
+        let name = decode_required(name)?;
         let code = optional(code, |token| {
             let text = decode_copy_field(token)?;
             let number = text.parse::<i32>().map_err(|_| reason::BAD_INT)?;
@@ -131,15 +131,8 @@ fn scan<const N: usize>(
     Ok(())
 }
 
-fn required_text(token: &str) -> Result<String, &'static str> {
-    if token == "\\N" {
-        return Err(reason::NULL_IN_NOT_NULL);
-    }
-    decode_copy_field(token)
-}
-
 fn short_text(token: &str) -> Result<String, &'static str> {
-    let text = required_text(token)?;
+    let text = decode_required(token)?;
     if text.chars().count() > 255 {
         return Err("text_too_long");
     }
@@ -155,21 +148,8 @@ fn optional<T>(
 
 fn timestamp(token: &str) -> Result<(), &'static str> {
     // Report poison escapes before enforcing the producer's literal timestamp.
-    required_text(token)?;
-    token
-        .strip_suffix('Z')
-        .is_some_and(|utc| {
-            matches!(utc.len(), 19 | 26)
-                && utc.bytes().enumerate().all(|(i, b)| match i {
-                    4 | 7 => b == b'-',
-                    10 => b == b'T',
-                    13 | 16 => b == b':',
-                    17 => matches!(b, b'0'..=b'5'),
-                    19 => b == b'.',
-                    _ => b.is_ascii_digit(),
-                })
-                && is_timestamp(token)
-        })
+    decode_required(token)?;
+    is_curated_timestamp(token)
         .then_some(())
         .ok_or(reason::BAD_TIMESTAMP)
 }

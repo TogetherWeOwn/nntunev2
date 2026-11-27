@@ -111,6 +111,8 @@ pub mod reason {
     pub const BAD_ISRC: &str = "bad_isrc";
     pub const BAD_BOOL: &str = "bad_bool";
     pub const INVALID_ENCODING: &str = "invalid_encoding";
+    pub const BAD_LINE_NUMBER: &str = "bad_line_number";
+    pub const BAD_VIDEO_PAIR: &str = "bad_video_pair";
 }
 
 /// Validate one physical dump line.
@@ -122,10 +124,13 @@ pub mod reason {
 /// table.
 pub fn validate_line(table: Table, line_no: u64, raw: &str) -> Result<String, (&'static str, u64)> {
     let err = |why: &'static str| Err((why, line_no));
+    if !(1..=i64::MAX as u64).contains(&line_no) {
+        return err(reason::BAD_LINE_NUMBER);
+    }
     if raw.is_empty() {
         return err(reason::EMPTY_LINE);
     }
-    let fields: Vec<&str> = raw.split('\t').collect();
+    let fields: Vec<&str> = raw.splitn(table.fields() + 1, '\t').collect();
     if fields.len() != table.fields() {
         return err(reason::COLUMN_COUNT);
     }
@@ -207,6 +212,10 @@ pub fn validate_line(table: Table, line_no: u64, raw: &str) -> Result<String, (&
             Err(why) => return err(why),
         }
     }
+    // The producer excludes self-pairs. Compare the decoded, canonical UUIDs.
+    if table == Table::RecordingMusicVideo && out[0] == out[1] {
+        return err(reason::BAD_VIDEO_PAIR);
+    }
     out.push(line_no.to_string());
     Ok(out.join("\t"))
 }
@@ -231,11 +240,21 @@ pub fn escape_poison_field(raw: &str) -> String {
 /// Chunk ranges still pending, as 1-based inclusive `(start, end)` line
 /// spans over the whole dump file. `completed` is the cursor value
 /// (lines already committed); `total` the current file line count.
+///
+/// # Panics
+/// Panics before allocating or returning any ranges if the plan would exceed
+/// 16 MiB of ranges. Increase `size` to plan larger inputs.
 pub fn plan_chunks(completed: u64, total: u64, size: u64) -> Vec<(u64, u64)> {
+    const MAX_RANGES: u64 = 1_048_576;
     if size == 0 || completed >= total {
         return Vec::new();
     }
-    let mut chunks = Vec::new();
+    let count = (total - completed).div_ceil(size);
+    assert!(
+        count <= MAX_RANGES,
+        "chunk plan exceeds 16 MiB of ranges; increase chunk size"
+    );
+    let mut chunks = Vec::with_capacity(count as usize);
     let mut start = completed + 1;
     while start <= total {
         let end = start.saturating_add(size - 1).min(total);
@@ -411,7 +430,7 @@ fn decode_copy_field(value: &str) -> Result<String, &'static str> {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if matches!(bytes[i], b'\r' | b'\n') {
+        if matches!(bytes[i], 0 | b'\r' | b'\n') {
             return Err(reason::BAD_ESCAPE);
         }
         if bytes[i] != b'\\' {
@@ -474,6 +493,13 @@ fn decode_copy_field(value: &str) -> Result<String, &'static str> {
     String::from_utf8(decoded).map_err(|_| reason::BAD_ESCAPE)
 }
 
+fn decode_required(token: &str) -> Result<String, &'static str> {
+    if token == "\\N" {
+        return Err(reason::NULL_IN_NOT_NULL);
+    }
+    decode_copy_field(token)
+}
+
 /// Re-escape a decoded typed value so it round-trips through
 /// `COPY (FORMAT text)` as data: backslash, tab, LF, CR and the other C0
 /// controls COPY names get their short spellings, everything else
@@ -498,15 +524,11 @@ fn escape_copy_text(decoded: &str) -> String {
 
 /// Lowercase or uppercase hex UUID `8-4-4-4-12`, no braces, no `urn:`.
 fn is_uuid(value: &str) -> bool {
-    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
-    let parts: Vec<&str> = value.split('-').collect();
-    if parts.len() != 5 {
-        return false;
-    }
-    parts
-        .iter()
-        .zip(GROUPS)
-        .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+    value.len() == 36
+        && value.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 /// Canonical 12-character ISRC `CCOOOYYYYYYY`: 2-letter country, 3-character
@@ -530,6 +552,10 @@ fn is_isrc(value: &str) -> bool {
 /// optional zone (`Z` or `±hh[:mm]`). Rejects impossible months/days and
 /// leap-day on non-leap years so poison never reaches the typed upsert.
 fn is_timestamp(value: &str) -> bool {
+    // YYYY-MM-DD + separator + HH:MM:SS.ffffff + ±hh:mm.
+    if !(10..=32).contains(&value.len()) {
+        return false;
+    }
     // Split optional zone: trailing Z, or ±hh[:mm].
     let bare = match split_zone(value) {
         Some(bare) => bare,
@@ -541,7 +567,7 @@ fn is_timestamp(value: &str) -> bool {
     let split = bare.find('T').or_else(|| bare.find(' '));
     let (date, time) = match split {
         Some(i) => (&bare[..i], Some(&bare[i + 1..])),
-        None => (bare.as_str(), None),
+        None => (bare, None),
     };
     if !is_date(date) {
         return false;
@@ -552,10 +578,27 @@ fn is_timestamp(value: &str) -> bool {
     }
 }
 
+// The producer's UTC datetime omits the fractional part when it is zero.
+fn is_curated_timestamp(timestamp: &str) -> bool {
+    timestamp.strip_suffix('Z').is_some_and(|utc| {
+        matches!(utc.len(), 19 | 26)
+            && utc.bytes().enumerate().all(|(i, b)| match i {
+                4 | 7 => b == b'-',
+                10 => b == b'T',
+                13 | 16 => b == b':',
+                17 => matches!(b, b'0'..=b'5'),
+                19 => b == b'.',
+                _ => b.is_ascii_digit(),
+            })
+            && !utc.ends_with(".000000")
+            && is_timestamp(timestamp)
+    })
+}
+
 /// Strip one trailing `Z` or `±hh[:mm]` zone; `None` means malformed zone.
-fn split_zone(value: &str) -> Option<String> {
+fn split_zone(value: &str) -> Option<&str> {
     if let Some(bare) = value.strip_suffix('Z').or_else(|| value.strip_suffix('z')) {
-        return Some(bare.to_string());
+        return Some(bare);
     }
     // Find a trailing ±hh or ±hh:mm, scanning from the end.
     let bytes = value.as_bytes();
@@ -568,7 +611,7 @@ fn split_zone(value: &str) -> Option<String> {
     if i > 0 && (bytes[i - 1] == b'+' || bytes[i - 1] == b'-') && i > 1 {
         let bare = &value[..i - 1];
         if !bare.bytes().any(|b| b == b'T' || b == b't' || b == b' ') {
-            return Some(value.to_string());
+            return Some(value);
         }
         let zone = &value[i - 1..];
         let digits = match zone.len() {
@@ -590,11 +633,11 @@ fn split_zone(value: &str) -> Option<String> {
         };
         // PostgreSQL rejects timezone displacements above 15 hours.
         if hh <= 15 && mm <= 59 {
-            return Some(bare.to_string());
+            return Some(bare);
         }
         return None;
     }
-    Some(value.to_string())
+    Some(value)
 }
 
 fn is_date(date: &str) -> bool {

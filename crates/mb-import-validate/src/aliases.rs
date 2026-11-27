@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{decode_copy_field, is_timestamp, reason, FieldKind};
+use super::{decode_required, is_curated_timestamp, reason, FieldKind};
 
 /// Size limit for an uncompressed fixture slice, not a full dump.
 pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -73,7 +73,7 @@ pub fn lookup(bytes: &[u8], kind: EntityKind, query: &str) -> Result<Vec<AliasMa
         let mbid = FieldKind::Uuid.check(mbid, true).map_err(invalid)?;
         let name = decode_required(name).map_err(invalid)?;
         let locale = (!locale.is_empty())
-            .then(|| decode_copy_field(locale))
+            .then(|| decode_required(locale))
             .transpose()
             .map_err(invalid)?;
         let sort_name = decode_required(sort_name).map_err(invalid)?;
@@ -106,26 +106,4 @@ pub fn lookup(bytes: &[u8], kind: EntityKind, query: &str) -> Result<Vec<AliasMa
     }
     matches.sort_unstable_by(|a, b| (&a.entity.mbid, &a.locale).cmp(&(&b.entity.mbid, &b.locale)));
     Ok(matches)
-}
-
-fn decode_required(token: &str) -> Result<String, &'static str> {
-    if token == "\\N" {
-        return Err(reason::NULL_IN_NOT_NULL);
-    }
-    decode_copy_field(token)
-}
-
-fn is_curated_timestamp(timestamp: &str) -> bool {
-    timestamp.strip_suffix('Z').is_some_and(|utc| {
-        matches!(utc.len(), 19 | 26)
-            && utc.bytes().enumerate().all(|(i, b)| match i {
-                4 | 7 => b == b'-',
-                10 => b == b'T',
-                13 | 16 => b == b':',
-                17 => matches!(b, b'0'..=b'5'),
-                19 => b == b'.',
-                _ => b.is_ascii_digit(),
-            })
-            && is_timestamp(timestamp)
-    })
 }

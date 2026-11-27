@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{decode_copy_field, is_uuid, reason, FieldKind};
+use super::{decode_copy_field, decode_required, is_curated_timestamp, is_uuid, reason, FieldKind};
 
 /// Limit for an uncompressed fixture slice, not a full dump.
 pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -65,17 +65,12 @@ pub fn lookup(bytes: &[u8], work_mbid: &str) -> Result<Option<Work>, ReadError> 
             return Err(invalid(reason::COLUMN_COUNT));
         };
         let mbid = FieldKind::Uuid.check(mbid, true).map_err(invalid)?;
-        if title == r"\N" {
-            return Err(invalid(reason::NULL_IN_NOT_NULL));
-        }
-        let title = decode_copy_field(title).map_err(invalid)?;
+        let title = decode_required(title).map_err(invalid)?;
         let work_type = (work_type != r"\N")
             .then(|| decode_copy_field(work_type))
             .transpose()
             .map_err(invalid)?;
-        let timestamp = FieldKind::Timestamp
-            .check(timestamp, true)
-            .map_err(invalid)?;
+        let timestamp = decode_required(timestamp).map_err(invalid)?;
         if !is_curated_timestamp(&timestamp) {
             return Err(invalid(reason::BAD_TIMESTAMP));
         }
@@ -91,19 +86,4 @@ pub fn lookup(bytes: &[u8], work_mbid: &str) -> Result<Option<Work>, ReadError> 
         }
     }
     Ok(found)
-}
-
-// The producer emits UTC seconds (0–59) with zero or six fractional digits.
-fn is_curated_timestamp(timestamp: &str) -> bool {
-    timestamp.strip_suffix('Z').is_some_and(|utc| {
-        matches!(utc.len(), 19 | 26)
-            && utc.bytes().enumerate().all(|(i, b)| match i {
-                4 | 7 => b == b'-',
-                10 => b == b'T',
-                13 | 16 => b == b':',
-                17 => matches!(b, b'0'..=b'5'),
-                19 => b == b'.',
-                _ => b.is_ascii_digit(),
-            })
-    })
 }
