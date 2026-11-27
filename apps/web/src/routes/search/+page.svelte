@@ -42,12 +42,11 @@
 	// applies it by navigating. An external navigation (the top bar) syncs
 	// the draft — typing never touches the URL, so it never clobbers input.
 	let { data }: PageProps = $props();
-	let draft = $state('');
+	let draft = $derived(data.query ?? data.recoveryDraft);
 	let invalidDraft = $state(false);
 
 	$effect(() => {
-		draft = data.query ?? '';
-		invalidDraft = false;
+		if (data.query !== null) invalidDraft = false;
 	});
 
 	const results = $derived(data.query ? filterLibraryItems(items, data.query) : []);
@@ -83,14 +82,18 @@
 			type="search"
 			autocomplete="off"
 			maxlength={_maxQueryLength}
-			aria-invalid={invalidDraft}
+			aria-invalid={data.query === null || invalidDraft}
+			aria-describedby={data.query === null || invalidDraft ? 'search-query-error' : undefined}
 			bind:value={draft}
 			oninput={() => (invalidDraft = false)}
 		/>
 		<button type="submit">Search</button>
 	</form>
 	{#if data.query === null || invalidDraft}
-		<p role="alert">Enter a valid search with up to {_maxQueryLength} characters.</p>
+		<p id="search-query-error" role="alert">
+			{#if data.draftTruncated}Only the start of your search is shown. {/if}
+			Enter a valid search with up to {_maxQueryLength} characters.
+		</p>
 	{/if}
 
 	<p role="status" aria-atomic="true" class:nt-visually-hidden={!statusMessage}>{statusMessage}</p>
