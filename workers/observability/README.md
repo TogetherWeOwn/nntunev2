@@ -62,8 +62,8 @@ unconnected; this runtime is not a health probe, synthetic or auto-rollback.
   is returned unfollowed and treated as a failed attempt, never a retry), a
   5000ms abort/race deadline, and immediate response-body cancellation (zero body bytes retained). Errors/responses,
   webhook URL and token are never logged, stored, rendered or returned.
-- `LOGS_URL` must be an absolute HTTP(S) log-view link with a literal path,
-  at most 1024 characters. Credentials, queries and fragments are rejected.
+- `LOGS_URL` must be an absolute HTTP(S) log-view link without credentials or
+  whitespace, at most 1024 characters, with a literal path and no query or fragment.
   Missing/invalid link or webhook disables delivery, **not storage cleanup**.
   The secret endpoint never reaches the renderer. Consumer observability,
   invocation logs and traces stay disabled so automatic subrequest spans cannot

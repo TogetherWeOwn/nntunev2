@@ -268,14 +268,9 @@ export function projectTailEvent(event, policy) {
                 continue;
               }
               if (typeof text !== 'string') continue;
-              // Every UTF-16 code unit contributes at least one UTF-8 byte.
-              if (text.length > MAX_STRING_BYTES) {
-                incomplete = true;
-                continue;
-              }
               let byteLength;
               try {
-                byteLength = encoder.encode(text).length;
+                byteLength = text.length > MAX_STRING_BYTES ? text.length : encoder.encode(text).length;
               } catch {
                 incomplete = true;
                 continue;

@@ -508,9 +508,8 @@ test('policy is read on each call, not cached from an earlier window', () => {
 test('the verdict uses only the policy labels and thresholds validated at entry', () => {
   let labelReads = 0;
   let totalReads = 0;
-  const policy = policyFixture({ max_error_rate: { failed: 1, get total() {
-    return totalReads++ === 0 ? 4 : CANARIES[0];
-  } } });
+  const policy = policyFixture();
+  Object.defineProperty(policy.max_error_rate, 'total', { get: () => totalReads++ === 0 ? 4 : CANARIES[0] });
   Object.defineProperty(policy, 'service', { get: () => labelReads++ === 0 ? 'api' : CANARIES[0] });
   assert.deepEqual(evaluate([obs(), obs(), obs(), failedObs()], policy), expectedVerdict());
 });

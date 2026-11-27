@@ -46,8 +46,7 @@ function canonicalObservation(row) {
       || flags.exceeded_cpu !== (row.outcome === 'exceeded_cpu')
       || flags.exceeded_memory !== (row.outcome === 'exceeded_memory')) return null;
     const { build_sha: sha, route, error_class: errorClass } = row;
-    if (typeof sha !== 'string' || !(sha === 'unknown' || /^[0-9a-f]{40}$/.test(sha))
-      || row.release !== sha) return null;
+    if (typeof sha !== 'string' || !(sha === 'unknown' || /^[0-9a-f]{40}$/.test(sha)) || row.release !== sha) return null;
     if (typeof route !== 'string' || route.length > 128
       || !(route === 'unknown' || /^[A-Z]+ \/[A-Za-z0-9._~/{}-]*$/.test(route))) return null;
     if (typeof errorClass !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(errorClass)) return null;

@@ -27,8 +27,7 @@
 //
 // Bounds: content <= 2000 chars, exactly one embed, payload total
 // <= 6000 chars, <= 25 fields per embed, field names 1..256 chars,
-// field values 1..1024 chars. Capped lists end with a "+N more" marker.
-// Identical input always yields byte-identical output.
+// field values 1..1024 chars. Lists cap with a "+N more" marker.
 // The source-only runtime imports this pure helper; it carries no webhook
 // URL or secret and performs no delivery or deployment itself.
 
