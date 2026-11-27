@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { page } from '$app/state';
 	import { onMount } from 'svelte';
+	import { _maxQueryLength, _normalizeQuery } from './+page.js';
+	import type { PageProps } from './$types';
 	import {
 		browserStorage,
 		invalidateLibraryCache,
@@ -40,27 +41,30 @@
 	// this page share one destination. The draft is the field's text; submit
 	// applies it by navigating. An external navigation (the top bar) syncs
 	// the draft — typing never touches the URL, so it never clobbers input.
-	const applied = $derived(page.url.searchParams.get('q') ?? '');
+	let { data }: PageProps = $props();
 	let draft = $state('');
+	let invalidDraft = $state(false);
 
 	$effect(() => {
-		draft = applied;
+		draft = data.query ?? '';
+		invalidDraft = false;
 	});
 
-	const trimmed = $derived(applied.trim());
-	const results = $derived(filterLibraryItems(items, trimmed));
+	const results = $derived(data.query ? filterLibraryItems(items, data.query) : []);
 	const statusMessage = $derived.by(() => {
 		if (loading) return 'Loading your library…';
-		if (requiresSignIn || loadError || libraryUnavailable || trimmed.length === 0) return '';
+		if (requiresSignIn || loadError || libraryUnavailable || !data.query) return '';
 		const count = results.length;
-		if (count === 0) return `No results for “${trimmed}”.`;
-		return `${count} ${count === 1 ? 'result' : 'results'} for “${trimmed}”.`;
+		if (count === 0) return `No results for “${data.query}”.`;
+		return `${count} ${count === 1 ? 'result' : 'results'} for “${data.query}”.`;
 	});
 
 	function onSubmit(event: SubmitEvent): void {
 		event.preventDefault();
-		const query = draft.trim();
-		goto(query ? `/search?q=${encodeURIComponent(query)}` : '/search');
+		const query = _normalizeQuery(draft);
+		invalidDraft = query === null;
+		if (query === null) return;
+		goto(query ? `/search?${new URLSearchParams({ q: query })}` : '/search');
 	}
 </script>
 
@@ -78,10 +82,16 @@
 			name="q"
 			type="search"
 			autocomplete="off"
+			maxlength={_maxQueryLength}
+			aria-invalid={invalidDraft}
 			bind:value={draft}
+			oninput={() => (invalidDraft = false)}
 		/>
 		<button type="submit">Search</button>
 	</form>
+	{#if data.query === null || invalidDraft}
+		<p role="alert">Enter a valid search with up to {_maxQueryLength} characters.</p>
+	{/if}
 
 	<p role="status" aria-atomic="true" class:nt-visually-hidden={!statusMessage}>{statusMessage}</p>
 	{#if !loading}
@@ -96,7 +106,7 @@
 			</div>
 		{:else if libraryUnavailable}
 			<p>Your library is not available yet.</p>
-		{:else if trimmed.length === 0}
+		{:else if data.query === ''}
 			<p>Type above to search your library by title or artist.</p>
 		{:else if results.length > 0}
 			<ul>

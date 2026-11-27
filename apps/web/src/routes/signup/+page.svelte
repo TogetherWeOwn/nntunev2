@@ -13,6 +13,8 @@
 	} from '#lib/webauthn.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	const maxEmailLength = 254;
+	const maxCodeLength = 256;
 	// Teardown is permanent even when a transport or authenticator ignores abort.
 	const attempt = new AbortController();
 	onDestroy(() => attempt.abort());
@@ -65,14 +67,24 @@
 
 	afterNavigate(() => { void captureInvite(); });
 
+	function validInvite(code: string): boolean {
+		return code.length <= maxCodeLength && !/[\s\p{Cc}\p{Cs}]/u.test(code);
+	}
+
 	async function startAccount(event: SubmitEvent) {
 		event.preventDefault();
+		const attemptedEmail = email.trim();
+		const attemptedInvite = inviteCode.trim();
 		if (
 			attempt.signal.aborted ||
 			status === 'working' ||
 			status === 'finishing' ||
-			email.trim().length === 0
+			!attemptedEmail || attemptedEmail.length > maxEmailLength || !emailInput?.reportValidity()
 		) return;
+		if (!validInvite(attemptedInvite)) {
+			status = 'error';
+			return;
+		}
 		if (!passkeysSupported) {
 			status = 'unsupported';
 			return;
@@ -82,7 +94,7 @@
 			// The API answers the same shape for every email (never an
 			// existence oracle) and mails an inbox-proof code when the
 			// address can still enroll.
-			const options = await client.registerStart(email.trim(), attempt.signal, inviteCode.trim() || undefined);
+			const options = await client.registerStart(attemptedEmail, attempt.signal, attemptedInvite || undefined);
 			if (attempt.signal.aborted) return;
 			pending = options;
 			status = 'code-sent';
@@ -129,12 +141,17 @@
 
 	async function finishAccount(event: SubmitEvent) {
 		event.preventDefault();
-		if (
-			attempt.signal.aborted ||
-			pending === null ||
-			finishLocked ||
-			magicCode.trim().length === 0
-		) return;
+		if (attempt.signal.aborted || pending === null || finishLocked) return;
+		const { challenge, rp_id } = pending;
+		const attemptedEmail = email.trim();
+		const codes = {
+			magicToken: magicCode.trim(),
+			...(inviteCode.trim().length > 0 ? { inviteCode: inviteCode.trim() } : {})
+		};
+		if (!/^[A-Za-z0-9_-]{1,256}$/.test(codes.magicToken) || !validInvite(codes.inviteCode ?? '')) {
+			status = 'code-error';
+			return;
+		}
 		status = 'finishing';
 		try {
 			// The server returns only {challenge, user_id, rp_id}; the full
@@ -143,7 +160,7 @@
 			const credential = await navigator.credentials.create({
 				signal: attempt.signal,
 				publicKey: toCreationOptions(
-					toRegistrationOptions(pending.challenge, pending.rp_id, email.trim())
+					toRegistrationOptions(challenge, rp_id, attemptedEmail)
 				)
 			});
 			if (attempt.signal.aborted) return;
@@ -166,20 +183,22 @@
 			// emailed code proves inbox control before the key enrolls.
 			const result = await client.registerFinish(
 				{
-					challenge: pending.challenge,
+					challenge,
 					credentialId,
 					attestationObject,
 					clientDataJson: clientDataJSON,
-					magicToken: magicCode.trim(),
-					...(inviteCode.trim().length > 0 ? { inviteCode: inviteCode.trim() } : {})
+					...codes
 				},
 				attempt.signal
 			);
 			if (attempt.signal.aborted) return;
+			if (result?.ok !== true || (result.private_listening !== undefined && result.private_listening !== true)) {
+				throw new Error('Invalid account creation result');
+			}
 			privateListening = result.private_listening === true;
 			const purge = invalidateLibraryCache();
 			status = 'created';
-			stashSignedInEmail(email.trim());
+			stashSignedInEmail(attemptedEmail);
 			await purge;
 			if (!attempt.signal.aborted) {
 				if (privateListening) window.location.href = '/library';
@@ -250,6 +269,7 @@
 					type="text"
 					name="magic_code"
 					required
+					maxlength={maxCodeLength}
 					autocomplete="one-time-code"
 					bind:this={codeInput}
 					aria-invalid={status === 'code-error'}
@@ -263,6 +283,7 @@
 				<input
 					type="text"
 					name="invite_code"
+					maxlength={maxCodeLength}
 					autocomplete="off"
 					aria-describedby={status === 'code-error' ? 'signup-code-error' : undefined}
 					bind:value={inviteCode}
@@ -284,6 +305,7 @@
 					type="email"
 					name="email"
 					required
+					maxlength={maxEmailLength}
 					autocomplete="username"
 					bind:this={emailInput}
 					aria-invalid={status === 'error'}
@@ -294,7 +316,7 @@
 			</label>
 			<label for="signup-invite">
 				Invite code (if you have one)
-				<input id="signup-invite" type="text" autocomplete="off" bind:value={inviteCode}
+				<input id="signup-invite" type="text" autocomplete="off" maxlength={maxCodeLength} bind:value={inviteCode}
 					oninput={() => { inviteFromLink = false; }}
 					disabled={status === 'working'} />
 			</label>

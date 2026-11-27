@@ -4,6 +4,8 @@ import { BUILD_SHA } from '#lib/build.js';
 
 import type { RequestHandler } from './$types';
 
+export const prerender = false;
+
 // Dedicated deployed-build identity surface (separate from /api/health).
 // GET /api/build -> exactly `{ sha }`, where sha is the 40-char lowercase
 // hex commit SHA baked at build time, or the explicit string "unknown"

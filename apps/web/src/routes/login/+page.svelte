@@ -7,6 +7,7 @@
 	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	const maxEmailLength = 254;
 	// Teardown is permanent even when a transport or authenticator ignores abort.
 	const attempt = new AbortController();
 	onDestroy(() => attempt.abort());
@@ -24,11 +25,14 @@
 
 	async function sendMagicLink(event: SubmitEvent) {
 		event.preventDefault();
-		if (attempt.signal.aborted || status === 'sending') return;
+		if (attempt.signal.aborted || status === 'sending' || passkeyStatus === 'working') return;
+		const attemptedEmail = email.trim();
+		if (!attemptedEmail || attemptedEmail.length > maxEmailLength || !emailInput?.reportValidity()) return;
 		status = 'sending';
 		try {
-			await client.requestMagicLink(email.trim(), attempt.signal);
+			const result = await client.requestMagicLink(attemptedEmail, attempt.signal);
 			if (attempt.signal.aborted) return;
+			if (result?.ok !== true) throw new Error('Invalid email link result');
 			// Generic either way: the API never reveals which emails exist.
 			status = 'sent';
 		} catch (error) {
@@ -50,9 +54,9 @@
 
 	async function signInWithPasskey() {
 		if (passkeyStatus === 'working') return;
-		if (attempt.signal.aborted) return;
+		if (attempt.signal.aborted || status === 'sending') return;
 		const attemptedEmail = email.trim();
-		if (!emailInput?.reportValidity() || attemptedEmail.length === 0) {
+		if (!emailInput?.reportValidity() || attemptedEmail.length === 0 || attemptedEmail.length > maxEmailLength) {
 			passkeyStatus = attemptedEmail.length === 0 ? 'email-required' : 'idle';
 			emailInput?.focus();
 			return;
@@ -95,7 +99,7 @@
 				throw new Error('credential missing assertion fields');
 			}
 			// Exact finish shape (the API rejects unknown fields).
-			await client.loginFinish(
+			const result = await client.loginFinish(
 				{
 					challenge: options.challenge,
 					credentialId,
@@ -106,6 +110,7 @@
 				attempt.signal
 			);
 			if (attempt.signal.aborted) return;
+			if (result?.ok !== true) throw new Error('Invalid sign-in result');
 			stashSignedInEmail(attemptedEmail);
 			await invalidateLibraryCache();
 			if (!attempt.signal.aborted) window.location.href = '/library';
@@ -165,7 +170,7 @@
 
 	<section aria-labelledby="magic-link-heading">
 		<h2 id="magic-link-heading">Email link</h2>
-		<form onsubmit={sendMagicLink}>
+		<form method="post" onsubmit={sendMagicLink}>
 			<label for="login-email">
 				Email
 				<input
@@ -173,13 +178,14 @@
 					type="email"
 					name="email"
 					required
+					maxlength={maxEmailLength}
 					autocomplete="username"
 					bind:this={emailInput}
 					bind:value={email}
 					disabled={status === 'sending' || passkeyStatus === 'working'}
 				/>
 			</label>
-			<button class="nt-button nt-button--ghost" type="submit" disabled={status === 'sending'}>
+			<button class="nt-button nt-button--ghost" type="submit" disabled={status === 'sending' || passkeyStatus === 'working'}>
 				{status === 'sending' ? 'Sending…' : 'Email me a sign-in link'}
 			</button>
 		</form>

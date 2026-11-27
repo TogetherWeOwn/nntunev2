@@ -4,6 +4,8 @@ import { APP_VERSION } from '#lib/version.js';
 
 import type { RequestHandler } from './$types';
 
+export const prerender = false;
+
 // Exactly {ok, version}: version is the public package version, never an
 // internal identifier (commit SHA, hostname, binding). Pinned by
 // apps/web/tests/smoke.spec.ts and src/lib/version.test.ts.

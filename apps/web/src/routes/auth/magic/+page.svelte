@@ -1,3 +1,15 @@
+<script module lang="ts">
+	export function takeMagicToken(location: Pick<Location, 'search' | 'pathname'>, history: Pick<History, 'replaceState'>): string | null {
+		const tokens = new URLSearchParams(location.search).getAll('token');
+		try {
+			history.replaceState(null, '', location.pathname);
+		} catch {
+			return null;
+		}
+		return tokens.length === 1 && /^[A-Za-z0-9_-]{1,256}$/.test(tokens[0]) ? tokens[0] : null;
+	}
+</script>
+
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
@@ -43,9 +55,8 @@
 		// scrubbed from the address bar/history, and only spent on an
 		// explicit confirm click below.
 		signedInEmail = readSignedInEmail();
-		const captured = new URLSearchParams(window.location.search).get('token');
-		window.history.replaceState(null, '', window.location.pathname);
-		if (captured === null || captured.length === 0) {
+		const captured = takeMagicToken(window.location, window.history);
+		if (captured === null) {
 			status = 'error';
 		} else {
 			token = captured;
@@ -64,6 +75,10 @@
 		try {
 			const result = await client.finishMagicLink(token);
 			if (!mounted) return;
+			if (result?.ok !== true) {
+				status = 'error';
+				return;
+			}
 			const purge = invalidateLibraryCache();
 			// Show which account this is on the next screen, before any
 			// provider credential is typed.
