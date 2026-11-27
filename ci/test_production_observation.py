@@ -41,6 +41,19 @@ def fixture(*, start_hour=12, run_attempt="2", smoke_job_id="456"):
 
 
 class ProductionObservationTests(unittest.TestCase):
+    def test_missing_build_sentinel_cannot_be_pinned(self):
+        for pin, deployed in (("sha", "web_sha"), ("api_sha", "api_sha")):
+            with self.subTest(pin=pin):
+                pins, watch = fixture()
+                missing = "0" * 40
+                pins["candidate"][pin] = missing
+                if pin == "sha":
+                    pins["final_smoke"][pin] = missing
+                for sample in watch["samples"]:
+                    sample[deployed] = missing
+                with self.assertRaisesRegex(Refused, "^invalid candidate identity$"):
+                    validate_observation(pins, watch)
+
     def test_cli_refuses_an_earlier_healthy_window_for_the_same_build(self):
         _, earlier_watch = fixture()
         pins, fresh_watch = fixture(start_hour=13, run_attempt="3", smoke_job_id="789")
@@ -233,6 +246,7 @@ class ProductionObservationTests(unittest.TestCase):
                     self.assertEqual(result.stderr, "")
 
             check(json.dumps(watch), 0)
+            check(json.dumps(watch)[:-24], 1)
             watch["samples"][-1]["evidence"] = "https://example.invalid/?token=synthetic-private-text"
             check(json.dumps(watch), 1)
             check('{"schema": 1, "schema": 1}', 1)

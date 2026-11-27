@@ -34,6 +34,22 @@ def backend_report(pins, *, incomplete=False):
 
 
 class ProductionObservationRecoveryTests(unittest.TestCase):
+    def test_last_moment_error_breach_cannot_be_erased_by_a_healthy_close(self):
+        pins, watch = fixture()
+        close = watch["samples"][-1]
+        before_close = "2026-10-01T12:29:59.999999Z"
+        watch["closed_at"] = close["observed_at"] = before_close
+        with self.assertRaisesRegex(Refused, "watch did not close successfully"):
+            validate_observation(pins, watch)
+
+        watch["closed_at"] = close["observed_at"] = "2026-10-01T12:30:00Z"
+        validate_observation(pins, watch)
+        breach = {**close, "observed_at": before_close, "evidence": "#evidence-last-error",
+                  "readbacks": {**close["readbacks"], "stream_errors": "breached"}}
+        watch["samples"].insert(-1, breach)
+        with self.assertRaisesRegex(Refused, "readback failed, missing or unusable"):
+            validate_observation(pins, watch)
+
     def test_concurrent_health_conflict_refuses_close_in_either_order(self):
         pins, watch = fixture()
         self.assertEqual(backend_report(pins), (0, {"identity": "matched"}))

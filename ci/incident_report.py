@@ -57,6 +57,10 @@ class ResponseTooLarge(ReportError):
     """Only this transport failure permits a smaller comment read."""
 
 
+class AmbiguousGateEvidence(ReportError):
+    """Hold this gate when the required evidence step appears more than once."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args):
         return None
@@ -92,13 +96,27 @@ class API:
             raise ReportError("GitHub response malformed") from None
 
     def pages(self, path, key=None):
-        result = []
+        result, total = [], None
+        seen_jobs = set()
         for page in range(1, 11):
             data = self.request("GET", path + ("&" if "?" in path else "?") +
                                 f"per_page=100&page={page}")
-            rows = data[key] if key else data
+            rows = data
+            if key is not None:
+                rows = data.get(key) if isinstance(data, dict) else None
             if not isinstance(rows, list) or len(rows) > 100:
                 raise ReportError("GitHub list malformed")
+            if key == "jobs":
+                count = data.get("total_count")
+                if (type(count) is not int or count < 0 or (total is not None and count != total)
+                        or len(rows) != min(100, count - len(result))):
+                    raise ReportError("GitHub job listing incomplete")
+                total = count
+                for row in rows:
+                    job_id = row.get("id") if isinstance(row, dict) else None
+                    if type(job_id) is not int or job_id <= 0 or job_id in seen_jobs:
+                        raise ReportError("GitHub job identity malformed or duplicate")
+                    seen_jobs.add(job_id)
             result.extend(rows)
             if len(rows) < 100:
                 return result
@@ -135,12 +153,24 @@ class API:
 
 
 def trusted(run):
-    workflow = run.get("path", "").removeprefix(".github/workflows/")
+    if not isinstance(run, dict):
+        return False
+    path, sha = run.get("path"), run.get("head_sha")
+    repository, event = run.get("head_repository"), run.get("event")
+    if not (isinstance(path, str) and isinstance(sha, str) and isinstance(repository, dict)
+            and isinstance(event, str) and all(type(run.get(key)) is int and run[key] > 0
+                                               for key in ("id", "run_attempt"))):
+        return False
+    workflow = path.removeprefix(".github/workflows/")
     return (workflow in WORKFLOWS and run.get("head_branch") == "main"
-            and run.get("head_repository", {}).get("full_name") == REPO
+            and repository.get("full_name") == REPO
             and run.get("status") == "completed"
-            and run.get("event") in WORKFLOWS[workflow]
-            and re.fullmatch(r"[0-9a-f]{40}", run.get("head_sha", "")) is not None)
+            and event in WORKFLOWS[workflow]
+            and re.fullmatch(r"[0-9a-f]{40}", sha) is not None)
+
+
+def run_url(run_id, attempt):
+    return f"https://github.com/{REPO}/actions/runs/{run_id}/attempts/{attempt}"
 
 
 def actions_time(value):
@@ -219,7 +249,23 @@ def print_staging_timing():
     print(json.dumps(staging_timing(evidence)))
 
 
+def job_steps(job):
+    steps = job.get("steps", [])
+    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+        raise ReportError("GitHub gate steps malformed")
+    return steps
+
+
+def evidence_step(steps, name):
+    selected = [step for step in steps if step.get("name") == name]
+    if len(selected) > 1:
+        raise AmbiguousGateEvidence
+    return selected[0] if selected else {}
+
+
 def gate_result(jobs, name, evidence):
+    if any(not isinstance(job, dict) for job in jobs):
+        raise ReportError("GitHub gate jobs malformed")
     selected = [j for j in jobs if j.get("name") == name]
     # Preserve the smoke key for both historical jobs and the combined job.
     shared_smoke = name == POST_DEPLOY_SMOKE and not selected
@@ -228,25 +274,55 @@ def gate_result(jobs, name, evidence):
     if len(selected) != 1:
         return None
     job = selected[0]
+    steps = job_steps(job)
     if shared_smoke or name == POST_DEPLOY_JOURNEY:
-        steps = [s for s in job.get("steps", []) if s.get("name") == SMOKE_STEP]
-        if len(steps) > 1 or (shared_smoke and not steps):
+        smoke_step = evidence_step(steps, SMOKE_STEP)
+        if shared_smoke and not smoke_step:
             return None
-        if steps:
-            smoke = steps[0].get("conclusion")
-            if shared_smoke and smoke in BAD | {"success"}:
-                return {**job, "conclusion": smoke, "steps": steps}
+        if smoke_step:
+            smoke = smoke_step.get("conclusion")
+            if shared_smoke and isinstance(smoke, str) and smoke in BAD | {"success"}:
+                return {**job, "conclusion": smoke, "steps": [smoke_step]}
             if not shared_smoke and smoke != "success":
                 return None
             # A failure before smoke belongs to the first gate.
-    recovered = any(s.get("name") == evidence and s.get("conclusion") == "success"
-                    for s in job.get("steps", [])) if evidence is not None else any(
-                        j.get("name") == "staging-web" and j.get("conclusion") == "success"
-                        and any(s.get("name") == "Deploy to staging"
-                                and s.get("conclusion") == "success" for s in j.get("steps", []))
+    conclusion = job.get("conclusion")
+    if not isinstance(conclusion, str) or conclusion not in BAD | {"success"}:
+        return None
+    if conclusion in BAD:
+        return job
+    if evidence is not None:
+        recovered = evidence_step(steps, evidence).get("conclusion") == "success"
+    else:
+        recovered = any(j.get("name") == "staging-web" and j.get("conclusion") == "success"
+                        and evidence_step(job_steps(j), "Deploy to staging").get("conclusion") == "success"
                         for j in jobs)
-    return job if (job.get("conclusion") in BAD or
-                   (job.get("conclusion") == "success" and recovered)) else None
+    return job if recovered else None
+
+
+def failing_step_numbers(job):
+    numbers = []
+    for step in job_steps(job):
+        conclusion = step.get("conclusion")
+        if isinstance(conclusion, str) and conclusion in BAD:
+            number = step.get("number")
+            if type(number) is not int or number < 1:
+                raise ReportError("GitHub failing step number malformed")
+            numbers.append(str(number))
+    return numbers
+
+
+def newer_gate_action(newer_jobs, name, evidence, *, recovering):
+    ambiguous = False
+    for rows in newer_jobs:
+        try:
+            if gate_result(rows, name, evidence) is not None:
+                return "superseded"
+        except AmbiguousGateEvidence:
+            ambiguous = True
+    if recovering and ambiguous:
+        return f"held: ambiguous evidence for {name}"
+    return None
 
 
 def source(issue):
@@ -332,11 +408,9 @@ def _ensure_comment(api, issue, key, occurrence, kind, dry_run):
             # The durable intent stays pending until POST and the final PATCH
             # succeed. A lost response is searched from its saved lower bound.
             if not dry_run:
-                text = DELIVERY.sub("", issue["body"]).replace(
-                    "<!-- incident-notification: failure -->", "").strip()
                 prefix = "Recovered." if kind == "recovery" else "Still failing."
                 api.request("POST", f"/issues/{issue['number']}/comments",
-                            {"body": prefix + "\n\n" + text + "\n" + marker})
+                            {"body": f"{prefix}\n\nRun: {run_url(*occurrence)}\n\n{marker}"})
             state["delivered"] = True
             save_delivery(api, issue, state, dry_run)
             return True
@@ -418,7 +492,7 @@ def recent(api, dry_run=False):
 
 def report(api, run_id, dry_run=False, newer_evidence=None):
     run = api.request("GET", f"/actions/runs/{run_id}")
-    if not trusted(run):
+    if not trusted(run) or run["id"] != run_id:
         raise ReportError("Untrusted or incomplete gate run")
     workflow = run["path"].rsplit("/", 1)[-1]
     attempt = run["run_attempt"]
@@ -449,21 +523,26 @@ def report(api, run_id, dry_run=False, newer_evidence=None):
         issues = [dict(i) for i in issues]
     actions = _reconcile_pending(api, issues, dry_run)
     for name, evidence in GATES[workflow].items():
-        job = gate_result(jobs, name, evidence)
+        try:
+            job = gate_result(jobs, name, evidence)
+        except AmbiguousGateEvidence:
+            actions.append(f"held: ambiguous evidence for {name}")
+            continue
         if job is None:
             continue
-        if any(gate_result(rows, name, evidence) is not None for rows in newer_jobs):
-            actions.append("superseded")
-            continue
         conclusion = job.get("conclusion")
-        failed = [str(s["number"]) for s in job.get("steps", []) if s.get("conclusion") in BAD]
+        newer_action = newer_gate_action(newer_jobs, name, evidence, recovering=conclusion == "success")
+        if newer_action is not None:
+            actions.append(newer_action)
+            continue
+        failed = failing_step_numbers(job)
         # Stable workflow/job key, independent of mapping order. Names are our
         # constants, not user-controlled API strings. Never rename a live key.
         key = workflow + ":" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
         marker = f"<!-- incident-key: {key} -->"
         matches = sorted([i for i in issues if "pull_request" not in i
                           and marker in (i.get("body") or "")], key=lambda i: i["number"])
-        url = f"https://github.com/{REPO}/actions/runs/{run_id}/attempts/{attempt}"
+        url = run_url(run_id, attempt)
         body = (f"Run: {url}\n\nWorkflow source SHA: `{run['head_sha']}`\n\n"
                 f"Gate: {name}\n\nThreshold: job and required evidence step success; "
                 f"measured conclusion: {conclusion}; failing step numbers: "
