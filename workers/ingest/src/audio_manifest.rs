@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{jobs::validate_job_id, nzb_intake::MAX_FILES};
+use crate::{dispatch::validate_user_id, jobs::validate_job_id, nzb_intake::MAX_FILES};
 
 // Leave room for the rest of the checkpoint within a Workflow step result.
 pub const MAX_MANIFEST_BYTES: usize = 512 * 1024;
@@ -217,11 +217,7 @@ fn text(raw: &str) -> bool {
 }
 
 pub(crate) fn valid_identity(job_id: &str, user_id: &str, original_hash: &str) -> bool {
-    validate_job_id(job_id)
-        && !user_id.is_empty()
-        && user_id.len() <= 128
-        && text(user_id)
-        && hash(original_hash)
+    validate_job_id(job_id) && validate_user_id(user_id) && text(user_id) && hash(original_hash)
 }
 
 fn image_mime(raw: &str) -> bool {
