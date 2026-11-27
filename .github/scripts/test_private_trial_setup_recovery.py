@@ -35,7 +35,6 @@ def apply_intent():
         expected_ledger=(("0063_private_trial.sql", DIGEST),),
     )
 
-
 def connection_intent():
     return ConnectionIntent(
         account_id="account-1",
@@ -47,7 +46,6 @@ def connection_intent():
         access_client_ref="access-client-1",
         origin_ca_ref="origin-ca-1",
     )
-
 
 def connection_readback(intent, **changes):
     values = {
@@ -65,7 +63,6 @@ def connection_readback(intent, **changes):
     }
     values.update(changes)
     return ConnectionReadback(**values)
-
 
 class ApplyRecoveryTests(unittest.TestCase):
     def test_unsent_apply_requires_complete_pre_apply_state(self):
