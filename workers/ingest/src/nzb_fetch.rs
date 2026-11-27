@@ -91,8 +91,7 @@ const ALLOWED_FETCH_PORT: u16 = 443;
 pub(crate) const MAX_FETCH_URL_BYTES: usize = 8 * 1024;
 
 pub(crate) fn valid_url_text(url: &str) -> bool {
-    !url.is_empty()
-        && url.len() <= MAX_FETCH_URL_BYTES
+    url.len() <= MAX_FETCH_URL_BYTES
         && !url.contains('\\')
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
@@ -337,7 +336,7 @@ pub fn validate_fetch_url(
     let raw_host = split_host(authority)?;
     let lower = raw_host.to_ascii_lowercase();
     let host = lower.strip_suffix('.').unwrap_or(&lower);
-    if !host_shape_ok(host) {
+    if host.parse::<IpAddr>().is_err() && !host_shape_ok(host) {
         return Err(FetchRejection::MalformedUrl);
     }
     if !host_allowlisted(host, config) {
@@ -434,9 +433,6 @@ pub fn fetch_nzb(
         // The guard runs before EVERY transport call, including the first:
         // a blocked URL is rejected before any fetch happens.
         let target = validate_fetch_url(&current, config, dns)?;
-        if elapsed >= config.timeout_ms {
-            return Err(FetchRejection::Timeout);
-        }
         let response = transport.get(&current)?;
         for chunk in &response.chunks {
             elapsed = elapsed.saturating_add(chunk.delay_ms);
@@ -582,6 +578,10 @@ mod tests {
             validate_fetch_url("https://nzb.example:+443/x.nzb", &cfg, &NoDns),
             Err(FetchRejection::MalformedUrl)
         );
+        assert_eq!(
+            validate_fetch_url("https://[nzb.example]/x.nzb", &cfg, &PublicDns),
+            Err(FetchRejection::MalformedUrl)
+        );
     }
 
     struct PublicDns;
@@ -650,7 +650,9 @@ mod tests {
             Ok("https://nzb.example/dl?src=https://cdn.example/x".to_string())
         );
         let oversized = format!("/{}", "a".repeat(MAX_FETCH_URL_BYTES));
-        assert!(resolve_location("nzb.example", &oversized).is_err());
+        for location in [oversized.as_str(), r"/a\b", "/a\0b"] {
+            assert!(resolve_location("nzb.example", location).is_err());
+        }
     }
 
     #[test]

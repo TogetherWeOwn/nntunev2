@@ -222,9 +222,6 @@ pub(crate) fn host_shape_ok(host: &str) -> bool {
     if host.is_empty() || host.len() > 253 {
         return false;
     }
-    if host.parse::<IpAddr>().is_ok() {
-        return true;
-    }
     // Never a URL: no scheme, no path, no userinfo, no port suffix.
     if host.contains("://")
         || host.contains('/')
@@ -233,6 +230,10 @@ pub(crate) fn host_shape_ok(host: &str) -> bool {
         || host.contains(' ')
     {
         return false;
+    }
+    // DNS name labels or an IP literal.
+    if host.parse::<IpAddr>().is_ok() {
+        return true;
     }
     // Other URL parsers may interpret numeric final labels as IPv4.
     let last = host.rsplit('.').next().unwrap_or_default();
@@ -358,7 +359,10 @@ pub fn validate_indexer_url(
     let (raw_host, port) = split_host_port(authority)?;
     let host = raw_host.to_ascii_lowercase();
     let host = host.strip_suffix('.').unwrap_or(&host);
-    if !host_shape_ok(host) {
+    if host.is_empty() {
+        return Err(FetchRejection::MalformedUrl);
+    }
+    if host.parse::<IpAddr>().is_err() && !host_shape_ok(host) {
         return Err(FetchRejection::MalformedUrl);
     }
     let addresses = match host.parse::<IpAddr>() {
@@ -639,6 +643,7 @@ mod tests {
         // non-LDH host: a WHATWG parser would read `\`/`%` differently.
         for host in [
             "[indexer.example]",
+            "indexer.example:+443",
             "2130706433",
             r"127.0.0.1\x.evil.example",
             "indexer%2eexample",
@@ -686,7 +691,8 @@ mod tests {
         let diagnostic = format!("{target:?} {:?} {response:?}", transport.dials[0]);
         assert!(!diagnostic.contains("private-query"));
         assert!(!diagnostic.contains("synthetic-key"));
-        assert_eq!(url_host_for_log("https://[synthetic-key]"), "invalid");
+        assert_eq!(url_host_for_log("https://[::1]:synthetic-key"), "invalid");
+        assert_eq!(url_host_for_log("https://secret/path@host"), "invalid");
     }
 
     #[test]
@@ -726,9 +732,10 @@ mod tests {
     #[test]
     fn path_absolute_redirect_from_ipv6_literal_host_is_rebracketed() {
         let start = format!("https://[{PUBLIC_V6}]/api");
-        let next = format!("https://[{PUBLIC_V6}]/next");
+        let location = "/next?q=https://example.invalid/";
+        let next = format!("https://[{PUBLIC_V6}]{location}");
         let mut transport = FakeTransport::default()
-            .serve(&start, redirect("/next", 5))
+            .serve(&start, redirect(location, 5))
             .serve(&next, ok(5, 5));
         assert_eq!(
             fetch_indexer(&start, &FetchConfig::default(), &NoDns, &mut transport),

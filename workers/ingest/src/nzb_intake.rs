@@ -481,7 +481,7 @@ fn sum_segment_bytes(body: &str) -> Result<u128, ()> {
         let tag = &body[open.start..open.end];
         let tag_bytes = tag.as_bytes();
         let mut k = open.name_end - open.start - 1;
-        let mut tag_value: Option<u128> = None;
+        let mut tag_value: Option<u64> = None;
         loop {
             k = skip_ws(tag_bytes, k);
             if k >= tag_bytes.len() || tag_bytes[k] == b'>' || tag[k..].starts_with("/>") {
@@ -511,7 +511,7 @@ fn sum_segment_bytes(body: &str) -> Result<u128, ()> {
                     if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
                         return Err(());
                     }
-                    match raw.parse::<u128>() {
+                    match raw.parse::<u64>() {
                         Ok(n) => tag_value = Some(n),
                         Err(_) => total = u128::MAX,
                     }
@@ -520,7 +520,7 @@ fn sum_segment_bytes(body: &str) -> Result<u128, ()> {
             }
         }
         if let Some(n) = tag_value {
-            total = total.saturating_add(n);
+            total = total.saturating_add(u128::from(n));
         }
         offset = open.end;
     }
@@ -540,6 +540,15 @@ pub fn estimate_nzb_with_limits(
             size_bytes: body.len(),
             max_bytes: limits.max_nzb_bytes,
         });
+    }
+    // Work on bytes, never on a str slice: a multibyte char straddling byte
+    // 1024 would make `&body[..1024]` panic and abort the isolate on wasm.
+    let head = &body.as_bytes()[..body.len().min(1024)];
+    let head_has_nzb = head.windows(4).any(|w| w == b"<nzb");
+    let head_has_xml = head.windows(5).any(|w| w == b"<?xml");
+    // The full-body check needs no slicing and is therefore panic-free.
+    if !(head_has_nzb || (head_has_xml && body.contains("<nzb"))) {
+        return Err(IntakeRejection::NotNzb);
     }
     let root = next_open_tag(body, 0).map_err(|_| IntakeRejection::Malformed)?;
     if !root.is_some_and(|tag| body[tag.start + 1..tag.name_end].rsplit(':').next() == Some("nzb"))
@@ -761,7 +770,7 @@ mod tests {
             IntakeRejection::NotNzb
         );
         assert_eq!(
-            estimate_nzb(r#"{"json": "not xml"}"#).unwrap_err(),
+            estimate_nzb(r#"{"json": "not <xml"}"#).unwrap_err(),
             IntakeRejection::NotNzb
         );
     }
@@ -774,6 +783,8 @@ mod tests {
         );
         for doc in [
             "<nzb/><file/>",
+            "<nzb/>trailing text",
+            "<nzb/><![CDATA[trailing text]]>",
             "<nzb><segment bytes/></nzb>",
             "<nzb><segment bytes='1' bytes='2'/></nzb>",
         ] {
@@ -848,6 +859,7 @@ mod tests {
     #[test]
     fn well_formedness_accepts_legal_xml_shapes() {
         for doc in [
+            "\u{feff}<?xml?><nzb/>",
             "<?xml?><nzb><segment>x@y</segment></nzb>",
             "<?xml version=\"1.0\"?><nzb><!-- a comment --><segment>x@y</segment></nzb>",
             "<?xml?><nzb><segment/> </nzb>",

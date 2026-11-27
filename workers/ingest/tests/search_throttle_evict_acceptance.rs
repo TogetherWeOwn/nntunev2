@@ -93,6 +93,9 @@ fn overflow_preserves_spent_buckets_until_refill() {
     let refilled = NOW + cfg.window_secs;
     assert!(is_allow(&store.check(&overflow, &cfg, refilled)));
     assert!(!is_allow(&store.check(&overflow, &cfg, refilled)));
+    let new_key = key_for(CAP + 1);
+    assert!(is_allow(&store.check(&new_key, &cfg, NOW)));
+    assert!(!is_allow(&store.check(&new_key, &cfg, refilled)));
 }
 
 #[test]
