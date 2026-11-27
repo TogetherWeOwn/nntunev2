@@ -243,7 +243,7 @@ export function syntheticNntpEndpoint(): NntpEndpoint & { hasPassword: boolean }
 
 export function isAccessRedirect(location: string, requestUrl: string): boolean {
   if (!location || /[\s\\]/.test(location)) return false;
-  const target = URL.parse(location, requestUrl);
+  const target = URL.parse(location, requestUrl) ?? URL.parse(location);
   return target?.protocol === 'https:' &&
     (target.hostname.endsWith('.cloudflareaccess.com') ||
       /^\/cdn-cgi\/access(?:\/|$)/.test(target.pathname));
