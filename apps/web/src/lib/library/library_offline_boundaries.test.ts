@@ -6,18 +6,19 @@ import {
 	LIBRARY_QUEUE_KEY, LIBRARY_SESSION_BINDING_KEY, LIBRARY_SNAPSHOT_KEY, libraryScopeBinding,
 	toLibraryItems, type SnapshotStorage
 } from './cache.js';
-import { loadCollections, type CollectionFilter } from './collections.js';
-import { loadFavorites } from './favorites.js';
+import { displayCollections, loadCollections, type CollectionFilter, type CollectionSort } from './collections.js';
+import { favoritesKey, loadFavorites, saveFavorites, updateStoredFavorites } from './favorites.js';
 import { moveFavoriteId, restoreFavoriteId, type FavoriteMoveDirection } from './favorites-order.js';
-import { setTrackLike } from './likes.js';
+import { importDeviceLikes, setTrackLike } from './likes.js';
 import { orderLibraryItems, type LibraryOrder } from './order.js';
 import { loadRecentFinds, saveRecentFinds } from './recent-finds.js';
 import { recentPlayTitles } from './recent-plays.js';
 import { createLibraryRefresher, type LibraryRefreshUpdate } from './refresh.js';
-import { hiddenSelectedCount, pruneSelection } from './selection.js';
+import { appendSelection, hiddenSelectedCount, pruneSelection, selectAllDisplayed,
+	selectRange, selectSelectedItems, toggleSelected } from './selection.js';
 import { verifyLibrarySession } from './session-verification.js';
 import { resolveStreamUrl } from './stream-url.js';
-import { loadTrackTaste, saveTrackTaste } from './taste.js';
+import { loadTrackTaste, saveTrackTaste, type TasteSignal } from './taste.js';
 
 const binding = 'A'.repeat(43);
 
@@ -98,6 +99,20 @@ it('withholds favorites fallback after the storage context ends', () => {
 	expect(loadFavorites(session, null, ['current-track'])).toEqual(['current-track']);
 });
 
+it('keeps only distinct nonblank favorites and refuses malformed locked edits', async () => {
+	const session = memoryStorage(), local = memoryStorage();
+	session.setItem(LIBRARY_AUTH_CONTEXT_KEY, 'current');
+	const key = favoritesKey(session)!;
+	expect(saveFavorites(session, local, ['Track_A', ' ', 'Track_A'])).toBe(true);
+	expect(local.getItem(key)).toBe('["Track_A"]');
+	vi.stubGlobal('navigator', { locks: { request: async (_name: string, _options: LockOptions, work: LockGrantedCallback) => work({} as Lock) } });
+	expect(await updateStoredFavorites(session, local, key, () => [' '])).toBeNull();
+	expect(local.getItem(key)).toBe('["Track_A"]');
+	local.setItem(key, '[" "]');
+	expect(await updateStoredFavorites(session, local, key, () => ['Track_A'])).toBeNull();
+	expect(loadFavorites(session, local)).toEqual([]);
+});
+
 it('keeps distinct recent finds within the persistence cap', () => {
 	const session = memoryStorage(), local = memoryStorage();
 	session.setItem(LIBRARY_AUTH_CONTEXT_KEY, 'current');
@@ -108,16 +123,38 @@ it('keeps distinct recent finds within the persistence cap', () => {
 it('preserves ordering on unknown or malformed controls', () => {
 	const stored = ['b', 'a'];
 	expect(moveFavoriteId(stored, stored, 'b', 'sideways' as FavoriteMoveDirection)).toBe(stored);
+	const blank = [' ', 'a'];
+	expect(moveFavoriteId(blank, blank, ' ', 'down')).toBe(blank);
+	expect(moveFavoriteId(blank, blank, 'a', 'up')).toBe(blank);
+	expect(moveFavoriteId(stored, ['b', 'b'], 'b', 'down')).toBe(stored);
 	expect(restoreFavoriteId(stored, 'c', { previousIndex: NaN, predecessor: null, successor: null })).toBe(stored);
+	expect(restoreFavoriteId(stored, ' ', { previousIndex: 0, predecessor: null, successor: null })).toBe(stored);
 	const tracks = stored.map((id) => ({ id, artist: id }));
 	expect(orderLibraryItems(tracks, 'unexpected' as LibraryOrder)).toEqual(tracks);
+	const rows = stored.map((id) => ({ id, title: id, kind: 'Artist' as const, creator: '', artPath: null }));
+	expect(displayCollections(rows, '', 'unexpected' as CollectionSort, false)).toEqual(rows);
 });
 
 it('ignores blank row IDs and counts each selected ID once', () => {
-	expect(toLibraryItems([{ id: ' ' }, { id: 'Track_A' }])).toEqual([{ id: 'Track_A' }]);
+	const malformed = Object.assign([], { id: 'array-row' });
+	expect(toLibraryItems([malformed, { id: ' ' }, { id: 'Track_A' }])).toEqual([{ id: 'Track_A' }]);
 	const stored = ['b', 'a', ' '];
 	expect(pruneSelection(['a', 'a', 'b', ' '], stored)).toEqual(['a', 'b']);
 	expect(hiddenSelectedCount(['a', 'a', 'b'], ['b'])).toBe(1);
+});
+
+it('keeps blank IDs out of selection projections and queue actions', () => {
+	const selection = ['a'];
+	const visible = ['a', ' ', 'b'];
+	const rows = visible.map((id) => ({ id }));
+	const queue = { tracks: [], currentIndex: -1 };
+	expect(toggleSelected(selection, ' ')).toBe(selection);
+	expect(selectRange(selection, visible, 'a', ' ')).toBe(selection);
+	expect(selectRange(selection, visible, ' ', 'a')).toEqual([]);
+	expect(selectRange(selection, visible, 'a', 'b')).toEqual(['a', 'b']);
+	expect(selectAllDisplayed(selection, visible)).toEqual(['a', 'b']);
+	expect(selectSelectedItems(rows, [' '])).toEqual([]);
+	expect(appendSelection(queue, [' '], rows)).toEqual({ queue, added: 0, skipped: 0 });
 });
 
 it('rejects unknown collection filters before dispatch', async () => {
@@ -138,10 +175,20 @@ it('refuses malformed preference requests before dispatch', async () => {
 	const client = { get: vi.fn(), put: vi.fn(), delete: vi.fn() } satisfies Pick<ApiClient, 'get' | 'put' | 'delete'>;
 	await expect(loadTrackTaste(client, '')).rejects.toThrow();
 	await expect(saveTrackTaste(client, binding, 'track/path', 'hide')).rejects.toThrow();
+	await expect(saveTrackTaste(client, binding, 'track', 'unexpected' as TasteSignal)).rejects.toThrow();
 	await expect(setTrackLike(client, 'track', 'false' as unknown as boolean)).rejects.toThrow();
 	expect(client.get).not.toHaveBeenCalled();
 	expect(client.put).not.toHaveBeenCalled();
 	expect(client.delete).not.toHaveBeenCalled();
+});
+
+it('refuses device likes import without a canonical binding', async () => {
+	const post = vi.fn().mockResolvedValue({ added: 1, already: 0, rejected: [] });
+	const retireConfirmed = vi.fn(async () => true);
+	const run = async <T>(work: () => T) => work();
+	await expect(importDeviceLikes({ post }, ['Track_A'], { binding: '', isCurrent: () => true, run, retireConfirmed })).resolves.toBeNull();
+	expect(post).not.toHaveBeenCalled();
+	expect(retireConfirmed).not.toHaveBeenCalled();
 });
 
 it('rejects malformed release taste entries alongside valid track preferences', async () => {
@@ -150,6 +197,13 @@ it('rejects malformed release taste entries alongside valid track preferences', 
 		{ kind: 'release', target_id: 'bad', signal: 'bad' }
 	] });
 	await expect(loadTrackTaste({ get }, binding)).rejects.toThrow();
+	get.mockResolvedValue({ session_binding: binding, items: [
+		{ kind: 'track', target_id: 'Track_A', signal: 'hide', until: null },
+		{ kind: 'release', target_id: '00000000-0000-4000-8000-000000000001', signal: 'love', until: null }
+	] });
+	await expect(loadTrackTaste({ get }, binding)).resolves.toEqual({
+		tracks: new Map([['Track_A', { signal: 'hide', until: null }]]), complete: true
+	});
 });
 
 it('does not dispatch session verification with a malformed expected binding', async () => {
