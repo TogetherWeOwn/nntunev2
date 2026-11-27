@@ -12,9 +12,9 @@
 //! stream Worker's play grants (`workers/stream/src/grant.rs`), hex instead
 //! of base64url so this crate needs no new dependency.
 //!
-//! Every rejection maps to one generic 401 (`unauthorized`) that never says
-//! which check failed, and every route runs [`authenticate`] before reading
-//! the body or touching the queue, KV, rate limiter, ledger or meter.
+//! Invalid grants map to one generic 401 (`unauthorized`). Unconfigured
+//! authentication fails closed with 503. Every route authenticates before
+//! reading the body or touching the queue, KV, rate limiter, ledger or meter.
 
 use sha2::{Digest, Sha256};
 
@@ -37,14 +37,18 @@ pub const MAX_GRANT_TTL: u64 = 900;
 /// Issuer clock skew tolerated on top of [`MAX_GRANT_TTL`].
 pub const CLOCK_SKEW_SECS: u64 = 60;
 
+const BEARER_PREFIX: &str = "Bearer ";
+// A 128-byte user id, the longest current scope and a 20-digit expiry,
+// hex-encoded and framed with the version and SHA-256 signature, fit here.
+const MAX_AUTHORIZATION_BYTES: usize = 512;
+
 /// The authenticated caller a route acts for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Caller {
     pub user_id: String,
 }
 
-/// Why a request was refused. All variants render the same 401; the
-/// distinction exists for tests only.
+/// Why authentication failed. Grant failures share one public response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthError {
     /// No `Authorization: Bearer` header.
@@ -82,35 +86,42 @@ pub(crate) fn authenticate_scoped(
     now_unix: u64,
     scope: &str,
 ) -> Result<Caller, AuthError> {
-    let secret = match secret {
-        Some(s) if s.len() >= MIN_SECRET_BYTES => s.as_bytes(),
-        _ => return Err(AuthError::NotConfigured),
-    };
-    let token = authorization
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or(AuthError::Missing)?;
-    verify_scoped(token, secret, now_unix, scope)
+    let token = authorization.and_then(|value| value.strip_prefix(BEARER_PREFIX));
+    verify_scoped(
+        token,
+        secret.unwrap_or_default().as_bytes(),
+        now_unix,
+        scope,
+    )
 }
 
 /// Verify one grant token.
 pub fn verify(token: &str, secret: &[u8], now_unix: u64) -> Result<Caller, AuthError> {
-    verify_scoped(token, secret, now_unix, INGEST_WRITE_SCOPE)
+    verify_scoped(Some(token), secret, now_unix, INGEST_WRITE_SCOPE)
 }
 
 fn verify_scoped(
-    token: &str,
+    token: Option<&str>,
     secret: &[u8],
     now_unix: u64,
     required_scope: &str,
 ) -> Result<Caller, AuthError> {
-    let rest = token.strip_prefix("v1.").ok_or(AuthError::Malformed)?;
-    let (payload_hex, sig_hex) = rest.split_once('.').ok_or(AuthError::Malformed)?;
-    if payload_hex.is_empty() {
+    if secret.len() < MIN_SECRET_BYTES {
+        return Err(AuthError::NotConfigured);
+    }
+    let token = token.ok_or(AuthError::Missing)?;
+    if token.len() > MAX_AUTHORIZATION_BYTES - BEARER_PREFIX.len() {
         return Err(AuthError::Malformed);
     }
-    let sig = hex::decode(sig_hex).map_err(|_| AuthError::Malformed)?;
+    let rest = token.strip_prefix("v1.").ok_or(AuthError::Malformed)?;
+    let (payload_hex, sig_hex) = rest.split_once('.').ok_or(AuthError::Malformed)?;
+    if payload_hex.is_empty() || !payload_hex.len().is_multiple_of(2) {
+        return Err(AuthError::Malformed);
+    }
+    let mut sig = [0u8; 32];
+    hex::decode_to_slice(sig_hex, &mut sig).map_err(|_| AuthError::Malformed)?;
     let expected = hmac_sha256(secret, payload_hex.as_bytes());
-    if sig.len() != expected.len() || !constant_time_eq(&sig, &expected) {
+    if !constant_time_eq(&sig, &expected) {
         return Err(AuthError::BadSignature);
     }
     let payload = hex::decode(payload_hex).map_err(|_| AuthError::Malformed)?;
@@ -125,6 +136,9 @@ fn verify_scoped(
     }
     if scope != required_scope {
         return Err(AuthError::WrongScope);
+    }
+    if exp.len() > 20 || !exp.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(AuthError::Malformed);
     }
     let exp_unix: u64 = exp.parse().map_err(|_| AuthError::Malformed)?;
     if now_unix >= exp_unix {
@@ -326,6 +340,62 @@ mod tests {
         assert_eq!(
             authenticate(Some(&header), Some(&SECRET[..MIN_SECRET_BYTES - 1]), NOW),
             Err(AuthError::NotConfigured)
+        );
+    }
+
+    #[test]
+    fn bounds_reject_unconfigured_verification_and_malformed_headers() {
+        let short_secret = b"synthetic short key";
+        let token = issue("user_01", INGEST_WRITE_SCOPE, NOW + 1, short_secret);
+        assert_eq!(
+            verify(&token, short_secret, NOW),
+            Err(AuthError::NotConfigured)
+        );
+
+        let header = bearer("user_01", INGEST_WRITE_SCOPE, NOW + 1);
+        let (prefix, signature) = header.rsplit_once('.').unwrap();
+        for malformed in [
+            format!("{header}, {header}"),
+            format!("{header} "),
+            format!("{prefix}.{}", &signature[..signature.len() - 2]),
+            format!("{prefix}.{}", "aa".repeat(MAX_AUTHORIZATION_BYTES)),
+            format!(
+                "Bearer v1.{}.{signature}",
+                "aa".repeat(MAX_AUTHORIZATION_BYTES)
+            ),
+        ] {
+            assert_eq!(
+                authenticate(Some(&malformed), Some(SECRET), NOW),
+                Err(AuthError::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn bounds_reject_invalid_expiries_and_replay_after_expiry() {
+        for exp in [
+            "+1800000001",
+            "18446744073709551616",
+            "000000000018000000001",
+        ] {
+            let payload = hex::encode(format!("user_01|{INGEST_WRITE_SCOPE}|{exp}"));
+            let sig = hex::encode(hmac_sha256(SECRET.as_bytes(), payload.as_bytes()));
+            let token = format!("v1.{payload}.{sig}");
+            assert_eq!(
+                verify(&token, SECRET.as_bytes(), NOW),
+                Err(AuthError::Malformed)
+            );
+        }
+
+        let user = "é".repeat(64);
+        let header = bearer(&user, INGEST_WRITE_SCOPE, u64::MAX);
+        assert_eq!(
+            authenticate(Some(&header), Some(SECRET), u64::MAX - 1),
+            Ok(Caller { user_id: user })
+        );
+        assert_eq!(
+            authenticate(Some(&header), Some(SECRET), u64::MAX),
+            Err(AuthError::Expired)
         );
     }
 

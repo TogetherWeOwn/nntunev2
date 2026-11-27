@@ -23,10 +23,12 @@
 
 use worker::{Env, Result};
 
-use crate::jobs::{validate_job_id, JobCheckpoint, JobState};
+use crate::jobs::{validate_job_id, JobCheckpoint, JobState, MAX_ATTEMPTS, MAX_REPAIR_ROUNDS};
+use crate::nzb_intake::{MAX_DECLARED_BYTES, MAX_SEGMENTS};
+use crate::probe::MAX_PROBE_SEGMENTS;
 use crate::queue::QueueMsg;
 use crate::retry::redrive_checkpoint;
-use crate::verify::VerifyProgress;
+use crate::verify::{VerifyProgress, MAX_VERIFY_FILES};
 
 pub const STATE_KV_BINDING: &str = "INGEST_STATE";
 pub const CHECKPOINT_TTL_SECS: u64 = 60 * 60 * 24 * 30;
@@ -150,6 +152,32 @@ pub fn is_failed_for(cp: &JobCheckpoint, msg: &QueueMsg) -> bool {
         && cp.source == msg.source
 }
 
+fn validate_checkpoint(cp: &JobCheckpoint, job_id: &str) -> Result<()> {
+    if cp.job_id != job_id || cp.validate_audio_manifest().is_err() {
+        return Err(worker::Error::RustError(
+            "checkpoint identity mismatch".into(),
+        ));
+    }
+    // The exact end is a valid completed cursor. Anything beyond it must
+    // fail here instead of advancing the consumer past unperformed work.
+    if !(1..=MAX_ATTEMPTS).contains(&cp.attempt)
+        || cp.repair_rounds > MAX_REPAIR_ROUNDS
+        || cp.transcode_inputs.len() > MAX_VERIFY_FILES
+        || cp.transcode_next > cp.transcode_inputs.len()
+        || cp.probe_tally.as_ref().is_some_and(|tally| {
+            !(1..=MAX_SEGMENTS.div_ceil(MAX_PROBE_SEGMENTS)).contains(&tally.total_batches)
+                || tally.missing_by_batch.iter().any(|(&index, &missing)| {
+                    index >= tally.total_batches || missing as usize > MAX_PROBE_SEGMENTS
+                })
+        })
+    {
+        return Err(worker::Error::RustError(
+            "invalid checkpoint progress".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn get(env: &Env, job_id: &str) -> Result<Option<JobCheckpoint>> {
     let key =
         checkpoint_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
@@ -160,11 +188,7 @@ pub async fn get(env: &Env, job_id: &str) -> Result<Option<JobCheckpoint>> {
         .await
         .map_err(|_| worker::Error::RustError("checkpoint unavailable".into()))?;
     if let Some(cp) = &loaded {
-        if cp.job_id != job_id || cp.validate_audio_manifest().is_err() {
-            return Err(worker::Error::RustError(
-                "checkpoint identity mismatch".into(),
-            ));
-        }
+        validate_checkpoint(cp, job_id)?;
     }
     Ok(loaded)
 }
@@ -172,9 +196,7 @@ pub async fn get(env: &Env, job_id: &str) -> Result<Option<JobCheckpoint>> {
 pub async fn put(env: &Env, checkpoint: &JobCheckpoint) -> Result<()> {
     let key = checkpoint_key(&checkpoint.job_id)
         .ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
-    checkpoint
-        .validate_audio_manifest()
-        .map_err(|_| worker::Error::RustError("checkpoint identity mismatch".into()))?;
+    validate_checkpoint(checkpoint, &checkpoint.job_id)?;
     put_json(
         env,
         key,
@@ -211,16 +233,44 @@ fn verify_key(job_id: &str) -> Option<String> {
     validate_job_id(job_id).then(|| format!("ingest:verify:{job_id}"))
 }
 
+fn validate_verify_progress(progress: &VerifyProgress) -> Result<()> {
+    // The consumer sums spool lengths and judged positions before the
+    // verifier checks them against the current NZB. Bound those sums on
+    // read and permit the final verification round after all repairs.
+    if !(1..=MAX_REPAIR_ROUNDS + 1).contains(&progress.round)
+        || progress
+            .staged
+            .iter()
+            .any(|(&index, staged)| index >= MAX_VERIFY_FILES || staged.spool.len() > MAX_SEGMENTS)
+        || progress
+            .spool
+            .iter()
+            .any(|(&index, spool)| index >= MAX_VERIFY_FILES || spool.len() > MAX_SEGMENTS)
+        || progress.judging.iter().any(|(&index, cursor)| {
+            index >= MAX_VERIFY_FILES
+                || cursor.segment > MAX_SEGMENTS
+                || cursor.pos > MAX_DECLARED_BYTES
+        })
+    {
+        return Err(worker::Error::RustError("invalid verify progress".into()));
+    }
+    Ok(())
+}
+
 /// Load one job's Verifying resume state (see the module docs).
 pub async fn get_verify(env: &Env, job_id: &str) -> Result<Option<VerifyProgress>> {
     let key =
         verify_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
     let store = env.kv(STATE_KV_BINDING)?;
-    store
+    let loaded = store
         .get(&key)
         .json::<VerifyProgress>()
         .await
-        .map_err(|e| worker::Error::RustError(e.to_string()))
+        .map_err(|_| worker::Error::RustError("verify progress unavailable".into()))?;
+    if let Some(progress) = &loaded {
+        validate_verify_progress(progress)?;
+    }
+    Ok(loaded)
 }
 
 /// Store one job's Verifying resume state. The consumer's Verifying step
@@ -229,6 +279,7 @@ pub async fn get_verify(env: &Env, job_id: &str) -> Result<Option<VerifyProgress
 pub async fn put_verify(env: &Env, job_id: &str, progress: &VerifyProgress) -> Result<()> {
     let key =
         verify_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
+    validate_verify_progress(progress)?;
     put_json(
         env,
         key,
@@ -242,6 +293,9 @@ pub async fn put_verify(env: &Env, job_id: &str, progress: &VerifyProgress) -> R
 mod tests {
     use super::*;
     use crate::dispatch::build_search_dispatch;
+    use crate::probe::ProbeTally;
+    use crate::transcode::TranscodeInput;
+    use crate::verify::JudgeCursor;
 
     fn msg() -> QueueMsg {
         build_search_dispatch("user_01", "dark side", "vault_idx_01", &[3000], 25, 0).unwrap()
@@ -341,6 +395,94 @@ mod tests {
         assert_eq!(replay_decision(Some(&cp), &msg), ReplayDecision::Conflict);
         cp.user_id = "other_user".into();
         assert_eq!(replay_decision(Some(&cp), &msg), ReplayDecision::Queued);
+    }
+
+    #[test]
+    fn bounds_preserve_legacy_and_completed_transcode_cursors() {
+        let msg = msg();
+        let mut legacy = serde_json::to_value(initial(&msg)).unwrap();
+        let fields = legacy.as_object_mut().unwrap();
+        fields.remove("transcode_next");
+        fields.remove("transcode_inputs");
+        let mut cp: JobCheckpoint = serde_json::from_value(legacy).unwrap();
+        assert!(validate_checkpoint(&cp, &msg.job_id).is_ok());
+        assert!(validate_checkpoint(&cp, "other_job").is_err());
+        cp.transcode_next = 1;
+        assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
+
+        cp.transcode_inputs.push(TranscodeInput {
+            file_index: 0,
+            key: VerifyProgress::file_key(&msg.job_id, 1, 0, "track.flac"),
+            sha256: "a".repeat(64),
+            size: 1,
+            scratch_prefix: VerifyProgress::scratch_prefix(&msg.job_id, 1),
+        });
+        cp.state = JobState::Transcoding;
+        assert!(validate_checkpoint(&cp, &msg.job_id).is_ok());
+        assert!(admission_write(Some(&cp), &msg).is_none());
+        cp.transcode_next = usize::MAX;
+        assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
+        cp.transcode_next = 0;
+        cp.transcode_inputs
+            .resize(MAX_VERIFY_FILES + 1, cp.transcode_inputs[0].clone());
+        assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
+    }
+
+    #[test]
+    fn bounds_reject_invalid_probe_and_retry_progress() {
+        let msg = msg();
+        let mut cp = initial(&msg);
+        cp.attempt = MAX_ATTEMPTS;
+        cp.repair_rounds = MAX_REPAIR_ROUNDS;
+        let mut tally = ProbeTally::new(MAX_SEGMENTS.div_ceil(MAX_PROBE_SEGMENTS));
+        tally
+            .missing_by_batch
+            .insert(tally.total_batches - 1, MAX_PROBE_SEGMENTS as u32);
+        cp.probe_tally = Some(tally.clone());
+        assert!(validate_checkpoint(&cp, &msg.job_id).is_ok());
+        let mut corrupt = tally.clone();
+        corrupt.total_batches += 1;
+        cp.probe_tally = Some(corrupt);
+        assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
+        let mut corrupt = tally.clone();
+        corrupt.missing_by_batch.insert(tally.total_batches, 0);
+        cp.probe_tally = Some(corrupt);
+        assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
+        let mut corrupt = tally.clone();
+        corrupt.missing_by_batch.insert(0, u32::MAX);
+        cp.probe_tally = Some(corrupt);
+        assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
+        cp.probe_tally = Some(tally);
+        cp.repair_rounds += 1;
+        assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
+        cp.repair_rounds -= 1;
+        cp.attempt = 0;
+        assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
+    }
+
+    #[test]
+    fn bounds_reject_invalid_verify_cursors_before_summing_positions() {
+        let mut progress = VerifyProgress::new(MAX_REPAIR_ROUNDS + 1);
+        let cursor = JudgeCursor {
+            segment: 1,
+            pos: MAX_DECLARED_BYTES,
+            block_index: 1,
+            in_block: 0,
+            crc32: 0,
+            bad: 0,
+            fingerprint: "synthetic-fingerprint".into(),
+        };
+        progress.judging.insert(0, cursor.clone());
+        progress.judging.insert(1, cursor.clone());
+        assert!(validate_verify_progress(&progress).is_ok());
+        progress.judging.get_mut(&1).unwrap().pos = u64::MAX;
+        assert!(validate_verify_progress(&progress).is_err());
+        progress.judging.insert(1, cursor);
+        progress.spool.insert(MAX_VERIFY_FILES, Vec::new());
+        assert!(validate_verify_progress(&progress).is_err());
+        progress.spool.clear();
+        progress.round += 1;
+        assert!(validate_verify_progress(&progress).is_err());
     }
 
     #[test]

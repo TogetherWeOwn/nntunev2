@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::dispatch::validate_user_id;
+use crate::jobs::{validate_job_id, MAX_ATTEMPTS};
 use crate::queue::{QueueMsg, WORKFLOW_STEPS};
 
 /// Analytics Engine binding name: must match `[analytics_engine_datasets]`
@@ -35,9 +37,8 @@ pub struct MeterEvent {
     pub attempt: u32,
 }
 
-/// Build the event for a stage transition. `stage` must be one of
-/// [`WORKFLOW_STEPS`] so metering can never invent a stage the pipeline
-/// does not have.
+/// Build the event for a stage transition, checking the stage and field
+/// bounds before copying identities into the event.
 pub fn meter_event(
     msg: &QueueMsg,
     stage: &str,
@@ -45,6 +46,14 @@ pub fn meter_event(
 ) -> Result<MeterEvent, MeterWriteError> {
     if !WORKFLOW_STEPS.contains(&stage) {
         return Err(MeterWriteError::UnknownStage);
+    }
+    // The edge sink duplicates both IDs in the JSON and separate blobs.
+    // Their existing byte limits bound the total size even with JSON escaping.
+    if !validate_job_id(&msg.job_id)
+        || !validate_user_id(&msg.user_id)
+        || !(1..=MAX_ATTEMPTS).contains(&msg.attempt)
+    {
+        return Err(MeterWriteError::InvalidEvent);
     }
     Ok(MeterEvent {
         job_id: msg.job_id.clone(),
@@ -78,13 +87,15 @@ impl MeterTransportReason {
 }
 
 /// How a meter write or admission ledger failed. A dropped event must never look accepted:
-/// retryable failures map to HTTP 503 + `Retry-After` at the route, while an
-/// unknown stage is a caller bug and maps to 400.
+/// an invalid stage is a caller error (400). An unavailable event, including
+/// invalid metering metadata, maps to 503 + `Retry-After` at the route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeterWriteError {
     /// `stage` was not in [`WORKFLOW_STEPS`]. Returned before any write is
     /// attempted, so the sink is never touched.
     UnknownStage,
+    /// An identity or attempt fell outside the ingest event bounds.
+    InvalidEvent,
     /// The binding/transport failed before any dataset status existed
     /// (missing `INGEST_METER` binding, connection refused, timeout).
     Transport(MeterTransportReason),
@@ -99,6 +110,7 @@ impl MeterWriteError {
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::UnknownStage => "meter_unknown_stage",
+            Self::InvalidEvent => "meter_invalid_event",
             Self::Transport(MeterTransportReason::BindingMissing) => "meter_binding_missing",
             Self::Transport(MeterTransportReason::WriteFailed) => "meter_write_failed",
             Self::Rejected { .. } => "meter_write_rejected",
@@ -140,9 +152,8 @@ pub trait MeterSink {
 
 /// Emit one stage-transition meter event through the sink.
 ///
-/// Builds the event with [`meter_event`] (an unknown stage returns
-/// [`MeterWriteError::UnknownStage`] BEFORE touching the sink), delivers
-/// exactly one body shaped like the [`MeterEvent`], and classifies the
+/// Builds and validates the event with [`meter_event`] before touching the
+/// sink, delivers exactly one [`MeterEvent`] body, and classifies the
 /// result: 2xx is `Ok`, anything else (transport `Err` or non-2xx) is a
 /// retryable `Err`. Never `Ok` on failure: a dropped event must never look
 /// accepted.
@@ -201,6 +212,67 @@ mod tests {
             self.writes.push((dataset.to_owned(), body));
             Ok(self.status)
         }
+    }
+
+    #[test]
+    fn bounds_reject_invalid_meter_fields_before_writing() {
+        let msg = build_upload_dispatch("user_01", SMALL_NZB).unwrap();
+        let mut sink = RecordingSink {
+            status: 204,
+            writes: Vec::new(),
+        };
+        for invalid in [
+            QueueMsg {
+                job_id: "a".repeat(65),
+                ..msg.clone()
+            },
+            QueueMsg {
+                job_id: "../job".into(),
+                ..msg.clone()
+            },
+            QueueMsg {
+                user_id: "é".repeat(65),
+                ..msg.clone()
+            },
+            QueueMsg {
+                user_id: "bad:user".into(),
+                ..msg.clone()
+            },
+            QueueMsg {
+                attempt: 0,
+                ..msg.clone()
+            },
+            QueueMsg {
+                attempt: MAX_ATTEMPTS + 1,
+                ..msg.clone()
+            },
+            QueueMsg {
+                attempt: u32::MAX,
+                ..msg.clone()
+            },
+        ] {
+            let err = emit_meter(&mut sink, &invalid, "probe", MeterOutcome::Ok).unwrap_err();
+            assert_eq!(err, MeterWriteError::InvalidEvent);
+            assert_eq!(err.http_status(), 503);
+        }
+        assert!(sink.writes.is_empty());
+    }
+
+    #[test]
+    fn bounds_keep_maximum_size_meter_event_within_blob_budget() {
+        let mut msg = build_upload_dispatch("user_01", SMALL_NZB).unwrap();
+        msg.job_id = "a".repeat(64);
+        msg.user_id = "\u{1}".repeat(128); // Six JSON bytes per input byte.
+        msg.attempt = MAX_ATTEMPTS;
+        let stage = WORKFLOW_STEPS
+            .into_iter()
+            .max_by_key(|stage| stage.len())
+            .unwrap();
+        let event = meter_event(&msg, stage, MeterOutcome::Failed).unwrap();
+        let json = meter_write_body(&event).to_string();
+        let blob_bytes = json.len() + event.job_id.len() + event.user_id.len() + "failed".len();
+        assert!(blob_bytes <= 5_120);
+        assert!(stage.len() <= 96);
     }
 
     #[test]
