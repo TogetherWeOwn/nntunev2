@@ -290,7 +290,7 @@ fn matches_target_and_trusted_context_enforce_canonical_uuid_and_bounds() {
     for entry in [&metadata, &etag_metadata] {
         let redacted = format!("{entry:?}");
         assert!(redacted.contains("S3MediaMetadata"));
-        for secret in [BUCKET, KEY, VERSION, ETAG] {
+        for secret in [BUCKET, KEY, VERSION, ETAG.trim_matches('"')] {
             assert!(!redacted.contains(secret), "{redacted}");
         }
     }
