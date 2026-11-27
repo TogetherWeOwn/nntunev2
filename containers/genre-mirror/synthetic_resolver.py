@@ -10,6 +10,7 @@ from pathlib import Path
 
 from cohort import MAX_ROWS, _mbid, admit_cohort
 from extract_receipts import FILES, verify_receipts
+from extract_receipts import MAX_ROWS as MAX_EXTRACT_ROWS
 from rollup import resolve
 from taxonomy import _is_qid
 
@@ -24,15 +25,18 @@ FIXTURE_PAIRS = frozenset({
 
 def resolve_synthetic(cohort_bytes, genres, parents, memberships, config):
     """Validate supplied fixture rows against the admitted cohort and resolve them."""
-    cohort = admit_cohort(cohort_bytes)
-    if type(memberships) is not list or len(memberships) > MAX_ROWS:
+    if any(type(rows) is not list or len(rows) > MAX_EXTRACT_ROWS for rows in (genres, parents)):
+        raise ValueError("invalid or over-budget synthetic graph rows")
+    if type(memberships) is not list or len(memberships) > min(MAX_ROWS, len(FIXTURE_PAIRS)):
         raise ValueError("invalid or over-budget synthetic memberships")
+    cohort = admit_cohort(cohort_bytes)
     artists = set(cohort["artist_mbids"])
     seen = set()
     rows = []
     for row in memberships:
         if (type(row) is not dict or set(row) != {"artist_mbid", "genre_qid", "source"}
-                or row["source"] != "synthetic-fixture" or not _is_qid(row["genre_qid"])):
+                or type(row["source"]) is not str or row["source"] != "synthetic-fixture"
+                or not _is_qid(row["genre_qid"])):
             raise ValueError("invalid or unsupported synthetic membership")
         artist = _mbid(row["artist_mbid"])
         key = (artist, row["genre_qid"])

@@ -50,14 +50,16 @@ def _is_text(value, max_len):
 def _present_set(genres):
     if type(genres) is not list:
         raise ValueError("invalid genre rollup input: genres")
-    present = set()
+    present, seen = set(), set()
     for g in genres:
         if type(g) is not dict or not _is_qid(g.get("genre_qid")):
             raise ValueError("invalid genre rollup input: genres")
-        if type(g.get("present")) is not bool:
+        qid = g["genre_qid"]
+        if type(g.get("present")) is not bool or qid in seen:
             raise ValueError("invalid genre rollup input: genres")
+        seen.add(qid)
         if g["present"]:
-            present.add(g["genre_qid"])
+            present.add(qid)
     return present
 
 
