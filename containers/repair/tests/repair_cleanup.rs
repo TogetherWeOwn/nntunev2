@@ -223,3 +223,17 @@ fn cleanup_removes_only_selected_round_and_is_repeatable() {
     assert_eq!(status, 200);
     assert_eq!(kept_final, out2);
 }
+
+#[test]
+fn cleanup_reports_round_removal_failure() {
+    let f = Fixture::new("exit 0");
+    let job = f.root.join("scratch").join(JOB);
+    fs::create_dir_all(&job).unwrap();
+    let round = job.join("r1");
+    fs::write(&round, b"unexpected entry").unwrap();
+
+    let (status, body) = f.post_cleanup(&serde_json::json!({"job_id": JOB, "round": 1}));
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body["error"], "repair_unavailable");
+    assert_eq!(fs::read(round).unwrap(), b"unexpected entry");
+}

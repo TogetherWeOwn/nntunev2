@@ -1,10 +1,7 @@
 //! Chunked-framing and body-size refusal coverage for the repair Container.
 //!
-//! Pins existing wire branches in `containers/repair/src/lib.rs` without
-//! touching implementation: multi-chunk `Transfer-Encoding: chunked` PUTs
-//! (including a short chunk extension and the normal empty trailer), the
-//! 411 `length_required` refusal when framing is absent, and the 413
-//! `payload_too_large` refusal for an oversized declared JSON body.
+//! Covers complete and malformed HTTP framing, the header and JSON
+//! size limits, and preservation of staged bytes after a rejected PUT.
 //!
 //! Socket reads/writes are bounded so a decoding regression fails
 //! deterministically instead of hanging the suite. Fake `par2` only,
@@ -14,7 +11,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -96,6 +93,7 @@ impl Fixture {
         stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
         stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
         stream.write_all(raw).unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
         let mut response = Vec::new();
         // A refusal (411/413) is sent without consuming already-arrived
         // request body bytes, so the kernel answers the close with RST
@@ -260,4 +258,86 @@ fn oversized_declared_json_is_413_without_par2() {
         "payload_too_large"
     );
     assert_eq!(f.invocations(), 0);
+}
+
+#[test]
+fn malformed_or_ambiguous_request_headers_are_rejected() {
+    let f = Fixture::new("exit 0");
+    for headers in [
+        "Content-Length: invalid",
+        "Content-Length: +0",
+        "Content-Length: 18446744073709551616",
+        "Content-Length: 0\r\nContent-Length: 0",
+        "Content-Length: 0\r\nTransfer-Encoding: chunked",
+        "Transfer-Encoding: gzip, chunked",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked",
+        "Transfer-Encoding : chunked",
+        "X-Test: ok\nContent-Length: 0",
+    ] {
+        let raw = format!("GET /health HTTP/1.1\r\nHost: container\r\n{headers}\r\n\r\n");
+        let (status, body) = f.request(raw.as_bytes());
+        assert_eq!(status, 400, "{headers:?}");
+        assert_eq!(body, br#"{"error":"invalid_request"}"#);
+    }
+    let (status, _) = f.request(b"GET /health\r\nHost: container\r\n\r\n");
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn request_header_limit_includes_the_terminator() {
+    let f = Fixture::new("exit 0");
+    let start = "GET /health HTTP/1.1\r\nHost: container\r\nX-Test: ";
+    let end = "\r\n\r\n";
+    for (len, expected) in [(16 << 10, 200), ((16 << 10) + 1, 400)] {
+        let value = "a".repeat(len - start.len() - end.len());
+        let (status, _) = f.request(format!("{start}{value}{end}").as_bytes());
+        assert_eq!(status, expected, "header length {len}");
+    }
+}
+
+#[test]
+fn truncated_fixed_length_json_cannot_clean_a_round() {
+    let f = Fixture::new("exit 0");
+    let key = object_key_for_file_name("track.flac");
+    assert_eq!(f.put_in(JOB, 1, "track.flac", b"ORIGINAL"), 201);
+    let body = format!(r#"{{"job_id":"{JOB}","round":1}}"#);
+    let raw = format!(
+        "POST /cleanup HTTP/1.1\r\nHost: container\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len() + 1
+    );
+    let (status, response) = f.request(raw.as_bytes());
+    assert_eq!(status, 400);
+    assert_eq!(response, br#"{"error":"invalid_request"}"#);
+    assert_eq!(fs::read(f.staged_path(JOB, 1, &key)).unwrap(), b"ORIGINAL");
+}
+
+#[test]
+fn malformed_chunked_put_preserves_the_staged_input() {
+    let f = Fixture::new("exit 0");
+    let key = object_key_for_file_name("track.flac");
+    assert_eq!(f.put_in(JOB, 1, "track.flac", b"ORIGINAL"), 201);
+    let path = f.staged_path(JOB, 1, &key);
+    let head = format!(
+        "PUT /jobs/{JOB}/r1/in/{key} HTTP/1.1\r\nHost: container\r\nTransfer-Encoding: chunked\r\n\r\n"
+    );
+    for body in [
+        "3\r\nNEWxx0\r\n\r\n",
+        "3\r\nNE",
+        "3\r\nNEW\r\n",
+        "3\r\nNEW\r\n0\r\n",
+        "3\r\nNEW\r\n0\r\nX-Test: ok\r\n",
+        "3\r\nNEW\r\n0\r\nContent-Length: 3\r\n\r\n",
+        "3\r\nNEW\r\n0\r\ninvalid trailer\r\n\r\n",
+        "3\r\nNEW\r\n+0\r\n\r\n",
+    ] {
+        let (status, response) = f.request(format!("{head}{body}").as_bytes());
+        assert_eq!(status, 400, "{body:?}");
+        assert_eq!(response, br#"{"error":"invalid_request"}"#, "{body:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"ORIGINAL", "{body:?}");
+        assert!(!path.with_extension("tmp").exists(), "{body:?}");
+    }
+    let body = "3;ext=x\r\nNEW\r\n0\r\nX-Test: ok\r\nX-End: yes\r\n\r\n";
+    let (status, _) = f.request(format!("{head}{body}").as_bytes());
+    assert_eq!(status, 201);
+    assert_eq!(fs::read(path).unwrap(), b"NEW");
 }
