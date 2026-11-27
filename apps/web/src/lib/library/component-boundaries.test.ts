@@ -24,7 +24,7 @@ function component(path: string, overrides: Record<string, unknown>, expose: str
 	return new Function(...Object.keys(bindings), `${outputText}\nreturn ${expose};`)(...Object.values(bindings));
 }
 
-test('liked shelf retirement clears feedback and a read failure in the same scope keeps it', async () => {
+test.each([0, 401, 403, 412])('liked shelf feedback after a failed read (%i) stays within its scope', async (status) => {
 	const effect = vi.fn();
 	const observeSession = vi.fn((_clear: () => void) => observe());
 	const items = [{ kind: 'track', targetId: 'old-song' }];
@@ -35,10 +35,10 @@ test('liked shelf retirement clears feedback and a read failure in the same scop
 	}, "{ read, report: (message) => { feedback = message; }, switchBinding: () => { libraryBinding = 'new'; }, state: () => ({ likes, phase, feedback }) }");
 	await view.read(new AbortController().signal, owner, 'old');
 	expect(view.state()).toEqual({ likes: items, phase: 'ready', feedback: '' });
-	view.report('Some favorites remain on this device.');
-	loadLikes.mockRejectedValueOnce(new Error('Offline'));
+	view.report('Imported.');
+	loadLikes.mockRejectedValueOnce(status ? new ApiError(status, 'denied', 'Denied') : new Error('Offline'));
 	await view.read(new AbortController().signal, owner, 'old');
-	expect(view.state()).toEqual({ likes: [], phase: 'error', feedback: 'Some favorites remain on this device.' });
+	expect(view.state()).toEqual({ likes: [], phase: status === 401 ? 'sign-in' : 'error', feedback: status ? '' : 'Imported.' });
 	observeSession.mock.calls[0][0]();
 	expect(view.state()).toEqual({ likes: [], phase: 'error', feedback: '' });
 	await view.read(new AbortController().signal, owner, 'old');
