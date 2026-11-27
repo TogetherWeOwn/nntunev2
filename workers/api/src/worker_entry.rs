@@ -8275,6 +8275,16 @@ fn construct_production_subsonic_snapshot(
     .map_err(|_| subsonic_catalogue_error(query))
 }
 
+fn parse_subsonic_mount_credentials(
+    method: &str,
+    query: &str,
+    body: &str,
+) -> Result<nntune_subsonic::auth::Credentials, crate::subsonic_http::CredentialParseError> {
+    let form_body =
+        (method.eq_ignore_ascii_case("POST") && !body.is_empty()).then_some(body.as_bytes());
+    crate::subsonic_http::parse_credentials(Some(query), form_body)
+}
+
 /// Authenticate before constructing the member-scoped dispatch store.
 /// Playback remains unavailable until an occurrence has a trusted binding
 /// to an application track; the dispatcher never receives audio bytes.
@@ -8318,9 +8328,7 @@ pub async fn subsonic_mount(
             ))
         }
     };
-    let form_body =
-        (method.eq_ignore_ascii_case("POST") && !body.is_empty()).then_some(body.as_bytes());
-    let credentials = match crate::subsonic_http::parse_credentials(Some(query), form_body) {
+    let credentials = match parse_subsonic_mount_credentials(method, query, body) {
         Ok(credentials) => credentials,
         Err(err) => return respond_document(&core::parse_error_response(&merged, err)),
     };
@@ -9177,13 +9185,18 @@ mod tests {
         assert!(
             ok.status == 200 && ok.body.len() <= nntune_subsonic::MAX_PRODUCTION_RESPONSE_BYTES
         );
+        let json: serde_json::Value = serde_json::from_slice(&ok.body).unwrap();
+        let response = &json["subsonic-response"];
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["albumList2"]["album"][0]["id"], "release");
+        assert_eq!(response["albumList2"]["album"][0]["name"], "Canary Album");
     }
 
     #[tokio::test]
-    async fn dormant_auth_refusals_block_catalogue_load_and_stay_unmounted() {
+    async fn dormant_auth_refusals_block_catalogue_load_and_adapter_stays_unmounted() {
         use crate::subsonic_auth::AuthError;
         use crate::subsonic_dispatch::{auth_error_response, parse_error_response};
-        use crate::subsonic_http::parse_credentials;
+        use crate::subsonic_http::CredentialParseError;
 
         for (err, code) in [
             (AuthError::Unsupported, 42),
@@ -9211,21 +9224,23 @@ mod tests {
             assert!(!txt.contains("Canary") && !txt.contains("nsk_synth"));
         }
         for bad in ["apiKey=a&apiKey=b", "apiKey=%ZZ", "u[]=nsu_synth"] {
-            let err = parse_credentials(Some(bad), None).unwrap_err();
+            let err = parse_subsonic_mount_credentials("GET", bad, "").unwrap_err();
             let txt = String::from_utf8(parse_error_response("f=json", err).body).unwrap();
             assert!(txt.len() <= 1024 && txt.contains("\"code\":0") && !txt.contains("nsu_synth"));
         }
+        let query = "apiKey=query-synthetic";
+        let body = "apiKey=body-synthetic";
+        let get = parse_subsonic_mount_credentials("GET", query, body).unwrap();
+        assert_eq!(get.api_key.as_deref(), Some("query-synthetic"));
+        assert_eq!(
+            parse_subsonic_mount_credentials("POST", query, body).unwrap_err(),
+            CredentialParseError::DuplicateCredential,
+        );
+        // The existing compatibility route serves an empty store. It must
+        // never dispatch to the authenticated adapter.
         let lib_src = include_str!("lib.rs");
         assert!(lib_src.contains("SubsonicApp::production(MemStore::empty())"));
         assert!(!lib_src.contains("subsonic_mount"));
-        let mount = include_str!("worker_entry.rs")
-            .split_once("\npub async fn subsonic_mount(")
-            .unwrap()
-            .1
-            .split_once("\n}\n")
-            .unwrap()
-            .0;
-        assert!(mount.contains("method.eq_ignore_ascii_case(\"POST\") && !body.is_empty()"));
     }
 
     const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
