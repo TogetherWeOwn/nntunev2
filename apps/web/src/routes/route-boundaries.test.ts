@@ -81,12 +81,14 @@ describe('client-only route loaders', () => {
 		['', ''],
 		['?q=++Caf%C3%A9%2B+%F0%9F%8E%B5++', 'Café+ 🎵'],
 		[`?q=${'a'.repeat(512)}`, 'a'.repeat(512)],
-		[`?q=${'a'.repeat(513)}`, null],
+		[`?q=${'a'.repeat(513)}`, null, 'a'.repeat(513)],
 		['?q=one&%71=two', null],
 		['?q=%00artist', null]
-	])('validates the applied search query %s', async (query, expected) => {
+	])('validates the applied search query %s', async (query, expected, recoveryDraft = '') => {
 		const url = new URL(`/search${query}`, 'https://example.test');
-		expect(await search.load({ url } as Parameters<typeof search.load>[0])).toMatchObject({ query: expected });
+		expect(await search.load({ url } as Parameters<typeof search.load>[0])).toEqual({
+			query: expected, recoveryDraft, draftTruncated: false
+		});
 	});
 
 	it.each([false, true])('renders an editable rejected query (truncated=%s)', async (truncated) => {
@@ -190,22 +192,30 @@ describe('credential inputs', () => {
 		{ magicCode: 'bad code', inviteCode: '', calls: 0 },
 		{ magicCode: 'a'.repeat(257), inviteCode: '', calls: 0 },
 		{ magicCode: 'synthetic', inviteCode: 'bad\u0000invite', calls: 0 },
-		{ magicCode: 'synthetic', inviteCode: '', calls: 1 }
-	])('gates signup ceremony and rejects an invalid private-listening reply', async ({ magicCode, inviteCode, calls }) => {
+		{ magicCode: 'synthetic', inviteCode: '', calls: 1, reply: {} },
+		{ magicCode: 'synthetic', inviteCode: '', calls: 1, reply: { ok: true, private_listening: false } },
+		{ magicCode: 'synthetic', inviteCode: '', calls: 1, reply: { ok: true }, target: '/account/billing' },
+		{ magicCode: 'synthetic', inviteCode: '', calls: 1, reply: { ok: true, private_listening: true }, target: '/library' }
+	])('gates signup ceremony and post-signup navigation', async ({ magicCode, inviteCode, calls, reply, target = '/signup' }) => {
 		class Credential {}
 		const create = vi.fn(async () => new Credential());
-		const registerFinish = vi.fn(async () => ({ ok: true, private_listening: false }));
+		const registerFinish = vi.fn(async () => reply);
 		const invalidateLibraryCache = vi.fn();
+		const stashSignedInEmail = vi.fn();
+		const location = { href: '/signup' };
 		await authHandler('signup', 'finishAccount', {
 			...emailForm, status: 'code-sent', maxCodeLength: 256, magicCode, inviteCode,
 			pending: { challenge: 'synthetic', rp_id: 'example.test' }, finishLocked: false, privateListening: false,
 			navigator: { credentials: { create } }, PublicKeyCredential: Credential,
 			toCreationOptions: vi.fn(), toRegistrationOptions: vi.fn(),
 			serializePublicKeyCredential: () => ({ id: 'synthetic', response: { attestationObject: 'data', clientDataJSON: 'data' } }),
-			client: { registerFinish }, invalidateLibraryCache, ApiError: class extends Error {}, isPasskeyDismissal: () => false
+			client: { registerFinish }, invalidateLibraryCache, stashSignedInEmail, window: { location },
+			ApiError: class extends Error {}, isPasskeyDismissal: () => false
 		}, ['validInvite'])(event);
 		expect(create).toHaveBeenCalledTimes(calls);
 		expect(registerFinish).toHaveBeenCalledTimes(calls);
-		expect(invalidateLibraryCache).not.toHaveBeenCalled();
+		expect(invalidateLibraryCache).toHaveBeenCalledTimes(Number(target !== '/signup'));
+		expect(stashSignedInEmail).toHaveBeenCalledTimes(Number(target !== '/signup'));
+		expect(location.href).toBe(target);
 	});
 });
