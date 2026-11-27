@@ -117,7 +117,8 @@ pub fn upsert_library_sql() -> &'static str {
      ON CONFLICT (idempotency_key) DO UPDATE SET \
      job_id = EXCLUDED.job_id, \
      release_mbid = EXCLUDED.release_mbid, \
-     recording_mbids = EXCLUDED.recording_mbids"
+     recording_mbids = EXCLUDED.recording_mbids \
+     WHERE library.user_id = EXCLUDED.user_id"
 }
 
 /// Shared publish (ADR 0013): NULL owner, fenced by the publishing job's
@@ -166,11 +167,8 @@ pub enum UpsertOutcome {
 
 /// Classify a library upsert by its affected-row count.
 ///
-/// The statement only ever affects 0 rows through the fence: the
-/// conflict path is `DO UPDATE` (a converged replay still reports 1),
-/// and `$2` is the already-validated job owner, so a missing fence row
-/// means `deleting_at` is set (or the account was erased between job
-/// acceptance and write). Both are the same permanent outcome.
+/// A same-owner replay affects one row. A closed owner fence or an owner
+/// conflict affects zero rows and preserves the permanent refusal.
 pub const fn upsert_outcome(affected_rows: u64) -> UpsertOutcome {
     if affected_rows == 0 {
         UpsertOutcome::AccountDeleting
@@ -241,7 +239,11 @@ pub fn validate_library_write(write: &LibraryWrite) -> Result<(), &'static str> 
     if write.user_id.is_empty() || write.user_id.len() > 128 {
         return Err("user id must be 1..=128 chars");
     }
-    validate_shared_library_write(&shared_upsert_params(write))
+    validate_shared_library_write(&shared_upsert_params(write))?;
+    if write.idempotency_key.split(':').nth(1) != Some(write.user_id.as_str()) {
+        return Err("idempotency key must belong to the write owner");
+    }
+    Ok(())
 }
 
 /// Same key/MBID bounds as the legacy writer, without an owner requirement.
@@ -271,7 +273,11 @@ pub fn validate_shared_library_write(write: &SharedUpsertParams<'_>) -> Result<(
     }
     {
         let mut seen = HashSet::with_capacity(write.recording_mbids.len());
-        if write.recording_mbids.iter().any(|m| !seen.insert(m)) {
+        if write
+            .recording_mbids
+            .iter()
+            .any(|m| !seen.insert(m.to_ascii_lowercase()))
+        {
             return Err("duplicate recording mbids");
         }
     }

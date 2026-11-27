@@ -72,6 +72,10 @@ pub async fn prepare_verified_candidate<S: ScratchPrefixStore, D: Future<Output 
     if !valid_identity(input.job_id, input.user_id, input.expected_hash) {
         return Err(ProducerError::Identity);
     }
+    // Combined repair dispatches indicate unfinished verification.
+    if !input.progress.repair_set_ids.is_empty() {
+        return Err(ProducerError::Selection(SelectionError::Identity));
+    }
     let plan = AudioSelectionPlan::from_original(input.original, input.expected_hash)
         .map_err(ProducerError::Selection)?;
     let mut reader = ScratchAudioReader::bind(
