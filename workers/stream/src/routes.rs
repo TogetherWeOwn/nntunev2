@@ -10,6 +10,12 @@
 //! change here (including the `503` → `200` mutant) turns the native suite
 //! red long before deploy.
 
+use std::{
+    future::{poll_fn, Future},
+    pin::pin,
+    task::Poll,
+};
+
 /// Durable Object class name. Must match `class_name` in
 /// `workers/stream/wrangler.toml` and the `pub struct` in `src/runtime.rs`
 /// (pinned by `do_class_name_matches_wrangler_and_runtime`).
@@ -199,6 +205,23 @@ pub fn decide_public_route(method: &str, path: &str) -> PublicRoute {
         Some(track_id) => PublicRoute::Play { track_id },
         None => PublicRoute::NotFound,
     }
+}
+
+/// Race a provider handshake against its operation deadline.
+pub async fn dial_before_deadline<T>(
+    deadline: impl Future<Output = ()>,
+    dial: impl Future<Output = nntune_core::Result<T>>,
+) -> nntune_core::Result<T> {
+    let (mut deadline, mut dial) = (pin!(deadline), pin!(dial));
+    poll_fn(|cx| {
+        if deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(nntune_core::Error::Io(
+                std::io::ErrorKind::TimedOut.into(),
+            )));
+        }
+        dial.as_mut().poll(cx)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -438,7 +461,7 @@ mod tests {
             })
             .expect("public fetch handler");
         let expected_public_fetch = syn::parse_str::<syn::ItemFn>(
-            "async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {\n                match routes::decide_public_route(req.method().as_ref(), &req.path()) {\n                    PublicRoute::Play { track_id } => play_fetch(req, env, ctx, &track_id).await,\n                    PublicRoute::NotFound => {\n                        let (status, body) = routes::decide_public_fetch();\n                        Response::error(body, status)\n                    }\n                }\n            }",
+            "async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {\n                match routes::decide_public_route(&req.inner().method(), &req.path()) {\n                    PublicRoute::Play { track_id } => play_fetch(req, env, ctx, &track_id).await,\n                    PublicRoute::NotFound => {\n                        let (status, body) = routes::decide_public_fetch();\n                        Response::error(body, status)\n                    }\n                }\n            }",
         )
         .expect("parse expected public fetch handler");
         assert_eq!(
@@ -482,7 +505,7 @@ mod tests {
             "Durable Object fetch handler must not carry cfg/other attributes"
         );
         let expected_durable_object_fetch = syn::parse_str::<syn::ImplItemFn>(
-            "async fn fetch(&self, mut req: Request) -> Result<Response> {\n                let has_owner_name = self.state.id().name().is_some();\n                match routes::decide_pool_action(req.method().as_ref(), &req.path(), has_owner_name) {\n                    PoolAction::Respond(ProbeDecision::NotFound) => Response::error(ProbeDecision::NotFound.body(), ProbeDecision::NotFound.status(),),\n                    PoolAction::Respond(decision) => respond(route_reply(decision)),\n                    PoolAction::RunProbe => respond(self.probe(&mut req).await),\n                    PoolAction::RunBody => respond_body(self.body(&mut req).await),\n                    PoolAction::RunDelivered => respond(self.delivered(&mut req).await),\n                }\n            }",
+            "async fn fetch(&self, mut req: Request) -> Result<Response> {\n                let has_owner_name = self.state.id().name().is_some();\n                match routes::decide_pool_action(&req.inner().method(), &req.path(), has_owner_name) {\n                    PoolAction::Respond(ProbeDecision::NotFound) => Response::error(ProbeDecision::NotFound.body(), ProbeDecision::NotFound.status(),),\n                    PoolAction::Respond(decision) => respond(route_reply(decision)),\n                    PoolAction::RunProbe => respond(self.probe(&mut req).await),\n                    PoolAction::RunBody => respond_body(self.body(&mut req).await),\n                    PoolAction::RunDelivered => respond(self.delivered(&mut req).await),\n                }\n            }",
         )
         .expect("parse expected Durable Object handler");
         assert_eq!(
