@@ -148,10 +148,10 @@ def decide_apply_recovery(intent: ApplyIntent, observation: ApplyObservation,
     if status not in ("unsent", "sent_unknown"):
         raise RecoveryInputError("invalid apply status")
     _check_apply(intent, observation)
-    pre = observation.catalog_digest == intent.pre_apply_digest and not observation.ledger
+    pre = observation.catalog_digest == intent.pre_apply_digest and observation.ledger == intent.expected_ledger[:-1]
     post = (observation.catalog_digest == intent.post_apply_digest
             and observation.ledger == intent.expected_ledger)
-    if post:
+    if post and status == "sent_unknown":
         return ApplyDecision("skip_apply", "complete post-apply state is present")
     if pre:
         return ApplyDecision("apply", "complete pre-apply state is present")
@@ -205,10 +205,13 @@ def plan_cleanup(scope: CleanupScope,
         _text(row.attempt_id, "resource attempt")
         _text(row.account_id, "resource account")
         _text(row.kind, "resource kind")
-        if row.resource_id in selected and row.attempt_id == scope.attempt_id and row.account_id == scope.account_id:
-            if row.resource_id in matches:
-                return CleanupDecision("hold", "cleanup readback repeats a selected resource")
-            matches[row.resource_id] = row
+        if row.resource_id not in selected:
+            continue
+        if row.resource_id in matches:
+            return CleanupDecision("hold", "cleanup readback repeats a selected resource")
+        if row.attempt_id != scope.attempt_id or row.account_id != scope.account_id:
+            return CleanupDecision("hold", "cleanup readback conflicts with the selected scope")
+        matches[row.resource_id] = row
     if set(matches) != selected:
         return CleanupDecision("hold", "cleanup scope lacks an exact readback")
     return CleanupDecision("cleanup", "all selected resources are exact attempt-owned matches",

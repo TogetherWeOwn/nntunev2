@@ -81,12 +81,20 @@ class ApplyRecoveryTests(unittest.TestCase):
         intent = apply_intent()
         post = ApplyObservation(POST_DIGEST, intent.expected_ledger)
         self.assertEqual(decide_apply_recovery(intent, post, "sent_unknown").action, "skip_apply")
+        self.assertEqual(decide_apply_recovery(intent, post, "unsent").action, "hold")
         partial = ApplyObservation(POST_DIGEST, ())
         self.assertEqual(decide_apply_recovery(intent, partial, "sent_unknown").action, "hold")
         self.assertEqual(
             decide_apply_recovery(intent, ApplyObservation(DIGEST, ()), "sent_unknown").action,
             "apply",
         )
+
+    def test_retry_keeps_an_earlier_ledger_prefix(self):
+        intent = apply_intent()
+        earlier = (("0062_previous.sql", "d" * 64),)
+        intent = ApplyIntent(**{**intent.__dict__, "expected_ledger": earlier + intent.expected_ledger})
+        self.assertEqual(decide_apply_recovery(intent, ApplyObservation(DIGEST, earlier), "sent_unknown").action,
+                         "apply")
 
     def test_apply_recovery_rejects_duplicate_ledger_rows(self):
         intent = apply_intent()
@@ -139,6 +147,8 @@ class CleanupScopeTests(unittest.TestCase):
         scope = CleanupScope("attempt-1", "account-1", ("config-1", "ca-1"))
         config = ResourceReadback("config-1", "attempt-1", "account-1", "hyperdrive")
         self.assertEqual(plan_cleanup(scope, [config]).action, "hold")
+        conflict = ResourceReadback("config-1", "attempt-2", "account-1", "hyperdrive")
+        self.assertEqual(plan_cleanup(scope, [config, conflict]).action, "hold")
         self.assertEqual(plan_cleanup(scope, [config, config,
                                                ResourceReadback("ca-1", "attempt-1", "account-1", "origin-ca")]).action,
                          "hold")
