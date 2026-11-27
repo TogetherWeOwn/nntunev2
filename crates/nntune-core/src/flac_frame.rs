@@ -43,12 +43,6 @@ impl FrameReader {
         } else {
             2
         };
-        // Seek timing and PCM interpretation use a single STREAMINFO format.
-        if (header.sample_rate, header.bits_per_sample, channels)
-            != (info.sample_rate, info.bits_per_sample, info.channels)
-        {
-            return Err(());
-        }
         let mut first_channel = Vec::new();
         let (first_width, stereo) = if header.channel_assignment <= 7 {
             (header.bits_per_sample, None)
