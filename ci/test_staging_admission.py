@@ -326,10 +326,11 @@ class World:
                  "created_at": iso(-1), "updated_at": iso(-1), "status": status,
                  "conclusion": "success" if status == "completed" else None}
         self.runs.append(other)
-        self.others[101] = [{"name": job, "status": status, "conclusion": conclusion,
-                             "completed_at": iso(-1), "run_attempt": 1},
-                            {"name": "staging-web" if job == "staging-api" else "staging-api",
-                             "status": "completed", "conclusion": "skipped", "run_attempt": 1}]
+        other_lane = "staging-web" if job == "staging-api" else "staging-api"
+        self.others[101] = [
+            dict(self.job(job, -1), run_id=101, head_sha=OTHER_SHA, status=status, conclusion=conclusion),
+            dict(self.job(other_lane, -1), run_id=101, head_sha=OTHER_SHA, conclusion="skipped"),
+        ]
 
     def routes(self, artifacts=None, jobs=None):
         base = "?per_page=100&page=1"
@@ -626,7 +627,7 @@ class PrivateAdmissionTests(Base):
         other_id = RUN_ID - 1
         world.runs[-1].update(id=other_id, head_sha=SHA)
         jobs = world.others[other_id] = world.others.pop(101)
-        stream = dict(jobs[0], name="staging-stream")
+        stream = dict(world.job("staging-stream", -1), run_id=other_id, conclusion="skipped")
         jobs.append(stream)
         self.assertEqual(world.verify()["result"], "satisfied")
         stream["conclusion"] = "success"
@@ -983,6 +984,64 @@ class AttemptJobsPaginationTests(Base):
         actions = FakeActions(self.routes)
         self.refused("incomplete or exhausted jobs", self.world.verify_with_actions, actions)
         self.assertNotIn(self.second, actions.calls)
+
+
+class CompetingJobsPaginationTests(Base):
+    first = "runs/101/jobs?filter=all&per_page=100&page=1"
+    second = "runs/101/jobs?filter=all&per_page=100&page=2"
+
+    def setUp(self):
+        self.world = World()
+        self.world.add_other("skipped")
+        latest_attempt = 15
+        self.world.runs[-1].update(created_at=iso(-40), updated_at=iso(16), run_attempt=latest_attempt)
+        names = ("gate", "staging-web", "staging-api", "staging-mb", "staging-ingest",
+                 "staging-stream", "Retire the selected private staging fixture")
+        # The latest reruns skipped deployment. With newer attempts on page
+        # one, the original attempt's API deployment is only on page two.
+        history = []
+        for attempt in range(latest_attempt, 0, -1):
+            done = attempt if attempt > 1 else -18
+            for name in names:
+                if (attempt, name) != (1, "staging-api"):
+                    history.append(dict(self.world.job(name, done, started=done - 1), run_id=101,
+                                        head_sha=OTHER_SHA, run_attempt=attempt,
+                                        conclusion="success" if name == "gate" else "skipped"))
+        self.earlier_api = dict(self.world.job("staging-api", -15, started=-17, steps=[
+            self.world.step("Deploy api to staging", 1),
+        ]), run_id=101, head_sha=OTHER_SHA)
+        self.total = len(history) + 1
+        self.first_jobs, self.remaining_jobs = history[:100], history[100:]
+        self.routes = self.world.routes()
+        self.routes[self.first] = page("jobs", self.first_jobs, total=self.total)
+
+    def test_decisive_deployment_on_second_page(self):
+        self.routes[self.second] = page("jobs", self.remaining_jobs + [self.earlier_api], total=self.total)
+        actions = FakeActions(self.routes)
+        self.assertEqual(self.world.verify_with_actions(actions), self.world.receipt)
+        self.assertEqual([route for route in actions.calls if "jobs?filter=all" in route],
+                         [self.first, self.second])
+
+        late_api = dict(self.earlier_api, completed_at=iso(-1))
+        self.routes[self.second] = page("jobs", self.remaining_jobs + [late_api], total=self.total)
+        self.assertWorldRefused(self.world, "intervening staging deployment", routes=self.routes)
+
+    def test_refuses_missing_or_inconsistent_second_page(self):
+        for case, payload, reason in (
+            ("missing", None, "unavailable"),
+            ("short", page("jobs", self.remaining_jobs, total=self.total), "incomplete or exhausted jobs"),
+            ("count drift", page("jobs", self.remaining_jobs + [self.earlier_api], total=self.total + 1),
+             "incomplete or exhausted jobs"),
+            ("overlap", page("jobs", self.remaining_jobs + [self.first_jobs[-1]], total=self.total),
+             "incomplete or exhausted jobs"),
+        ):
+            with self.subTest(case=case):
+                routes = dict(self.routes)
+                if payload is not None:
+                    routes[self.second] = payload
+                actions = FakeActions(routes)
+                self.refused(reason, self.world.verify_with_actions, actions)
+                self.assertIn(self.second, actions.calls)
 
 
 class VerifyTests(Base):
@@ -1432,8 +1491,8 @@ class VerifyTests(Base):
                 w.add_other("success", status=status)
                 w.runs[1]["run_attempt"] = 2
                 w.others[101][0].update(status="completed", completed_at=iso(-30))
-                w.others[101].append({"name": "gate", "status": status,
-                                      "run_attempt": 2, "conclusion": None})
+                w.others[101].append(dict(w.job("gate", -1), run_id=101, head_sha=OTHER_SHA,
+                                          status=status, run_attempt=2, conclusion=None))
                 self.assertWorldRefused(w, "missing current-attempt conflicting staging jobs")
 
     def test_current_attempt_terminal_lanes_can_finish_before_other_jobs(self):
@@ -1478,7 +1537,7 @@ class VerifyTests(Base):
     def test_missing_conflicting_lanes_refuses(self):
         w = World()
         w.add_other("success")
-        w.others[101] = [{"name": "gate", "status": "completed", "conclusion": "success"}]
+        w.others[101] = [dict(w.job("gate", -1), run_id=101, head_sha=OTHER_SHA)]
         self.assertWorldRefused(w, "missing conflicting staging jobs")
 
     def test_jobs_missing_duplicate_or_failed(self):

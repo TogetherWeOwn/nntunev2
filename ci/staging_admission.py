@@ -523,14 +523,16 @@ class Actions:
         return rows
 
     def attempt_jobs(self, run_id, attempt):
-        route = f"runs/{run_id}/attempts/{attempt}/jobs"
+        return self.jobs(f"runs/{run_id}/attempts/{attempt}/jobs")
+
+    def jobs(self, route):
+        query = route + ("&" if "?" in route else "?")
         page_size, max_pages = 100, 10
         reason = "incomplete or exhausted jobs listing"
         jobs, seen, total = [], set(), None
-        # Finish the inventory before checking required names. Later pages can
-        # contain a required job or a second job with the same required name.
+        # Finish the inventory before matching job names or evaluating conflicts.
         for number in range(1, max_pages + 1):
-            data = parse_json(self.read(f"{route}?per_page={page_size}&page={number}", MAX_JOB_PAGE), MAX_JOB_PAGE)
+            data = parse_json(self.read(f"{query}per_page={page_size}&page={number}", MAX_JOB_PAGE), MAX_JOB_PAGE)
             count, batch = data.get("total_count"), data.get("jobs")
             require(type(count) is int and 0 <= count <= page_size * max_pages
                     and (total is None or total == count) and isinstance(batch, list)
@@ -839,7 +841,7 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
                 continue
         # Include ALL attempts: a failed latest rerun must not hide a mutation
         # from an earlier attempt after the candidate journey started.
-        other_jobs = actions.listing(f"runs/{other_id}/jobs?filter=all", "jobs")
+        other_jobs = actions.jobs(f"runs/{other_id}/jobs?filter=all")
         require(all(any(job.get("name") == lane for job in other_jobs) for lane in deploy_steps),
                 "missing conflicting staging jobs; fresh journey required")
         if other["status"] != "completed":
