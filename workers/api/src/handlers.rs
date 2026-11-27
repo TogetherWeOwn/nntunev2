@@ -9238,6 +9238,7 @@ pub(crate) mod tests {
         include!("private_playlists_postgres_tests.rs");
         include!("../tests/fixtures/private_playlist_repeated_read.rs");
         include!("../tests/fixtures/private_playlist_library_reload.rs");
+        include!("../tests/fixtures/private_playlist_owner_scope.rs");
     }
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -28425,6 +28426,97 @@ pub(crate) mod tests {
             r#"{"code":"not_found","message":"not found","retryable":false}"#
         );
         assert!(resp.set_cookie.is_none());
+    }
+
+    #[test]
+    fn playlist_http_surface_remains_unmounted_for_sessions_and_bearers() {
+        // Non-preflight playlist operations remain unmounted (404). OPTIONS
+        // preflight posture is pinned separately by the scope-map tests above
+        // and in `credential_mint_validation_acceptance.rs`.
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+
+        // Positive control: the cookie session is active on mounted routes.
+        let creds = h.call_full(
+            "GET",
+            "/v1/credentials",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(creds.status, 200, "{}", creds.body);
+
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "label": "playlist-check",
+                "scopes": ["library:read", "playlists:write"],
+                "ttl_secs": 3600
+            }),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let minted_body: serde_json::Value = serde_json::from_str(&minted.body).unwrap();
+        let bearer = format!("Bearer {}", mint_secret(&minted_body));
+        let library = h.call_bearer("GET", "/v1/library", Some(bearer.clone()));
+        assert_eq!(library.status, 200, "{}", library.body);
+
+        let expected = not_found();
+        let routes = [
+            ("GET", "/v1/playlists"),
+            ("HEAD", "/v1/playlists"),
+            ("POST", "/v1/playlists"),
+            ("DELETE", "/v1/playlists"),
+            ("GET", "/v1/playlists/plRepeatedRefs00000000"),
+            ("PUT", "/v1/playlists/plRepeatedRefs00000000"),
+            ("PATCH", "/v1/playlists/plRepeatedRefs00000000"),
+            ("DELETE", "/v1/playlists/plRepeatedRefs00000000"),
+            ("GET", "/v1/playlists/plRepeatedRefs00000000/tracks"),
+            ("POST", "/v1/playlists/plRepeatedRefs00000000/tracks"),
+            ("PUT", "/v1/playlists/plRepeatedRefs00000000/tracks"),
+            ("PATCH", "/v1/playlists/plRepeatedRefs00000000/tracks"),
+            (
+                "DELETE",
+                "/v1/playlists/plRepeatedRefs00000000/tracks/00000000-0000-0000-0000-000000000001",
+            ),
+            (
+                "POST",
+                "/v1/playlists/plRepeatedRefs00000000/entries/00000000-0000-0000-0000-000000000001/restore",
+            ),
+            ("GET", "/api/playlists"),
+            ("POST", "/api/playlists"),
+            ("GET", "/api/playlists/plRepeatedRefs00000000"),
+            ("PUT", "/api/playlists/plRepeatedRefs00000000"),
+            ("PATCH", "/api/playlists/plRepeatedRefs00000000"),
+            ("DELETE", "/api/playlists/plRepeatedRefs00000000"),
+        ];
+
+        for &(method, path) in &routes {
+            let body = matches!(method, "POST" | "PUT" | "PATCH")
+                .then(|| r#"{"name":"Unmounted"}"#.to_string());
+            let session_resp = h.call_full(
+                method,
+                path,
+                body.clone(),
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            );
+            assert_eq!(
+                (session_resp.status, session_resp.body.as_str()),
+                (expected.status, expected.body.as_str()),
+                "session {method} {path} must stay unmounted"
+            );
+            assert!(session_resp.set_cookie.is_none(), "session {method} {path}");
+
+            let bearer_resp = h.call_bearer(method, path, Some(bearer.clone()));
+            assert_eq!(
+                (bearer_resp.status, bearer_resp.body.as_str()),
+                (expected.status, expected.body.as_str()),
+                "bearer {method} {path} must stay unmounted"
+            );
+            assert!(bearer_resp.set_cookie.is_none(), "bearer {method} {path}");
+        }
     }
 
     // Shared synthetic-authenticator builders for the passkey tests below.
