@@ -22,6 +22,15 @@ pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_ARTICLES: usize = 4096;
 pub const MAX_REFERENCE_BYTES: usize = 998;
 
+// Each article contributes a nonempty decoded part bounded by its wire cap.
+fn extent_fits_articles(bytes: u64, count: usize) -> bool {
+    let count = count as u64;
+    bytes >= count
+        && count
+            .checked_mul(MAX_ARTICLE_BYTES as u64)
+            .is_some_and(|max| bytes <= max)
+}
+
 /// Errors intentionally never carry a source value or a parser diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceError {
@@ -288,6 +297,7 @@ impl OriginalSource {
             || self.file_size > MAX_FILE_BYTES
             || self.articles.is_empty()
             || self.articles.len() > MAX_ARTICLES
+            || !extent_fits_articles(self.file_size, self.articles.len())
         {
             return Err(SourceError::Bounds);
         }
