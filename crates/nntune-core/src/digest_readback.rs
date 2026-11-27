@@ -248,11 +248,12 @@ pub struct CompletedInventory<'a> {
     pub page_versions: &'a [&'a str],
 }
 
-fn matches_version(pin: ReadbackPin<'_>, expected: &str) -> bool {
-    pin.version == Some(expected)
-        && expected != "null"
-        && (1..=1024).contains(&expected.len())
-        && expected.bytes().all(|byte| byte.is_ascii_graphic())
+fn valid_version(version: &str) -> bool {
+    version != "null"
+        && (1..=1024).contains(&version.len())
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b',')
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -327,13 +328,13 @@ pub async fn verify_enrolled_readback_with_seek<'a, B: ReadbackBody>(
         || pages.len() != manifest.geometry().pages() as usize
         || pages.len() != completed.page_versions.len()
         || media.object_key != format!("media/{lifecycle}")
-        || !matches_version(media, completed.media_version)
+        || media.version != Some(completed.media_version)
         || !pages
             .iter()
             .zip(completed.page_versions)
             .all(|(&(index, pin), &version)| {
                 pin.object_key == format!("{map_prefix}/{index:08x}")
-                    && matches_version(pin, version)
+                    && pin.version == Some(version)
             })
     {
         return Err(EnrolledReadbackError::Body(BodyReadbackError::Inventory));
@@ -378,7 +379,7 @@ async fn verify_readback<'a, B: ReadbackBody, V: MediaValidation>(
             && !pin.object_key.is_empty()
             && keys.insert(pin.object_key)
             && pin.version.is_some() == media.version.is_some()
-            && !matches!(pin.version, Some("" | "null"))
+            && pin.version.is_none_or(valid_version)
     }) {
         return Err(BodyReadbackError::Inventory);
     }
@@ -724,7 +725,11 @@ mod tests {
     async fn enrolled_readback_refuses_matching_malformed_versions_before_io() {
         let (f, context, record) = enrolled_origin(&split_flac());
         let oversized = "v".repeat(1025);
-        for (case, version) in [("oversized", oversized.as_str()), ("non-graphic", "v 1")] {
+        for (case, version) in [
+            ("oversized", oversized.as_str()),
+            ("non-graphic", "v 1"),
+            ("ambiguous", "v1,v2"),
+        ] {
             let inventory = CompletedInventory {
                 media_version: version,
                 ..completed_inventory(&context)
