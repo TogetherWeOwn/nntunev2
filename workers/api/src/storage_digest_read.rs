@@ -1,6 +1,6 @@
 //! Unmounted, protected lookup for a previously authorized playback reference.
 
-use nntune_core::digest_read_snapshot::DigestReadSnapshot;
+use nntune_core::{digest_geometry::DigestGeometry, digest_read_snapshot::DigestReadSnapshot};
 use std::time::SystemTime;
 use tokio_postgres::types::{FromSql, Type};
 
@@ -77,6 +77,13 @@ pub async fn protect_digest_read(
     authorize: impl AsyncFnOnce(&DigestReadTarget) -> Option<SystemTime>,
     now: impl Fn() -> SystemTime,
 ) -> Result<Option<CommittedDigestRead>, StoreError> {
+    let Some(geometry) = u64::try_from(target.plaintext_bytes)
+        .ok()
+        .filter(|&len| len > 0)
+        .and_then(DigestGeometry::new)
+    else {
+        return Ok(None);
+    };
     let Some(cutoff) = authorize(&target).await else {
         return Ok(None);
     };
@@ -133,11 +140,28 @@ pub async fn protect_digest_read(
         page_versions: row.try_get("page_versions").map_err(|_| StoreError)?,
         usable_until: row.try_get("usable_until").map_err(|_| StoreError)?,
     };
+    if pins.map_id[6] >> 4 != 4
+        || pins.map_id[8] >> 6 != 2
+        || pins.page_versions.len() != geometry.pages() as usize
+        || !valid_version(&pins.media_version)
+        || !pins
+            .page_versions
+            .iter()
+            .all(|version| valid_version(version))
+    {
+        return Err(StoreError);
+    }
     if !deadline_allowed(pins.usable_until, requested_until, now()) {
         return Ok(None);
     }
     tx.commit().await.map_err(|_| StoreError)?;
     Ok((now() < pins.usable_until).then_some(CommittedDigestRead { target, pins }))
+}
+
+fn valid_version(version: &str) -> bool {
+    (1..=1024).contains(&version.len())
+        && version != "null"
+        && version.bytes().all(|b| b.is_ascii_graphic() && b != b',')
 }
 
 fn deadline_allowed(until: SystemTime, cutoff: SystemTime, now: SystemTime) -> bool {

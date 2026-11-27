@@ -114,6 +114,8 @@ impl PrivatePlayback<'_> {
         };
         if claims.session_id != pins.account_session
             || exp <= now
+            || exp - now > crate::play_grant::MAX_GRANT_TTL
+            || pins.renew_until.is_some_and(|until| exp > until)
             || exp > lease.continuation_deadline.min(claims.expires_at)
             || self.grant_secret.len() < MIN_SECRET_BYTES
             || !authorized(db, policy, claims).await?
@@ -201,22 +203,10 @@ impl PrivatePlayback<'_> {
         scope: BrowserScope<'_>,
         now: impl Fn() -> SystemTime,
     ) -> Result<Option<PrivateReceipt>, StoreError> {
-        let Some((signed, _)) = bearer.strip_prefix("v4.").and_then(|v| v.split_once('.')) else {
+        let Some(user) = stream_grant_user(self.grant_secret, bearer, seconds(now())?) else {
             return Ok(None);
         };
-        let Ok(payload) = crate::b64::decode(signed) else {
-            return Ok(None);
-        };
-        let Ok(payload) = std::str::from_utf8(&payload) else {
-            return Ok(None);
-        };
-        let Some((user, _)) = payload
-            .split_once('|')
-            .filter(|(user, _)| is_valid_key_field(user, 128))
-        else {
-            return Ok(None);
-        };
-        let Some((lease, pins)) = current(db, user).await? else {
+        let Some((lease, pins)) = current(db, &user).await? else {
             return Ok(None);
         };
         let Some(row) = db.query_typed_opt(
@@ -232,7 +222,7 @@ impl PrivatePlayback<'_> {
         let created_at = time("created_at")?;
         let claims = SessionClaims {
             session_id: pins.account_session.clone(),
-            user_id: user.into(),
+            user_id: user.clone(),
             created_at,
             issued_at: created_at,
             expires_at: time("expires_at")?,
@@ -245,14 +235,20 @@ impl PrivatePlayback<'_> {
         let receipt = self
             .browser_receipt_for(db, &claims, lease, &pins, scope, seconds(now())?)
             .await?;
-        Ok(receipt.filter(|receipt| {
-            now() < receipt.music.grant_deadline
-                && bool::from(
-                    bearer
-                        .as_bytes()
-                        .ct_eq(receipt.relay.grant.token.as_bytes()),
-                )
-        }))
+        let Some(receipt) = receipt.filter(|receipt| {
+            bool::from(
+                bearer
+                    .as_bytes()
+                    .ct_eq(receipt.relay.grant.token.as_bytes()),
+            )
+        }) else {
+            return Ok(None);
+        };
+        let lease = query_playback_lease_row(db, &user).await?;
+        Ok(
+            (lease.as_ref() == Some(&receipt.relay.lease) && now() < receipt.music.grant_deadline)
+                .then_some(receipt),
+        )
     }
 
     pub(crate) fn catalogue_reference(receipt: &PrivateReceipt) -> [u8; 16] {
@@ -373,7 +369,11 @@ impl PrivatePlayback<'_> {
                     private: classify_play_privacy(&tx, user, tab, &key, start).await?,
                 }
             };
-            let renew_until = *pins.renew_until.get_or_insert(authorized_until);
+            // Older receipts remain readable until expiry, but cannot prove
+            // the original renewal cutoff once the lease has expired.
+            let Some(renew_until) = pins.renew_until else {
+                return Ok(None);
+            };
             if start >= renew_until {
                 return Ok(None);
             }
@@ -423,5 +423,66 @@ impl PrivatePlayback<'_> {
             Ok((now() < receipt.music.grant_deadline).then_some(receipt))
         };
         with_deadline(operation, LOOKUP_TIMEOUT_MS, StoreError).await
+    }
+}
+
+fn stream_grant_user(secret: &[u8], bearer: &str, now: u64) -> Option<String> {
+    if bearer.len() > 1800 {
+        return None;
+    }
+    let (signed, signature) = bearer.rsplit_once('.')?;
+    let encoded = signed.strip_prefix("v4.")?;
+    if !verify_grant_signature(secret, signed, signature) {
+        return None;
+    }
+    let payload = crate::b64::decode(encoded).ok()?;
+    let mut parts = std::str::from_utf8(&payload).ok()?.split('|');
+    let (user, track, play, epoch, expires, digest) = (
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    );
+    let exp = expires.parse::<u64>().ok()?;
+    if parts.next().is_some()
+        || !is_browser_play(play)
+        || derive_play_idempotency_key(user, track, play).is_err()
+        || !epoch.bytes().all(|b| b.is_ascii_digit())
+        || epoch.parse::<u64>().is_err()
+        || !expires.bytes().all(|b| b.is_ascii_digit())
+        || exp <= now
+        || exp - now > crate::play_grant::MAX_GRANT_TTL
+        || !nntune_core::transcode::canonical_sha256_hex(digest).is_ok_and(|hash| hash == digest)
+    {
+        return None;
+    }
+    Some(user.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_grant_requires_live_signed_browser_claims() {
+        let key = [42; 32];
+        let play = format!("{PREFIX}{}", "A".repeat(22));
+        let digest = "a".repeat(64);
+        let grant = mint_grant(&key, "member", "track", &play, 1, 120, &digest).unwrap();
+        assert_eq!(
+            stream_grant_user(&key, &grant.token, 119).as_deref(),
+            Some("member")
+        );
+        assert!(stream_grant_user(&key, &grant.token, 120).is_none());
+        assert!(stream_grant_user(&[17; 32], &grant.token, 119).is_none());
+        assert!(stream_grant_user(&key, &format!("{}.", grant.token), 119).is_none());
+        let non_browser =
+            mint_grant(&key, "member", "track", "private_other", 1, 120, &digest).unwrap();
+        assert!(stream_grant_user(&key, &non_browser.token, 119).is_none());
+        let extra_field =
+            mint_grant(&key, "member|other", "track", &play, 1, 120, &digest).unwrap();
+        assert!(stream_grant_user(&key, &extra_field.token, 119).is_none());
     }
 }

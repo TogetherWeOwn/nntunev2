@@ -4,7 +4,6 @@ use super::{not_found, preference_authenticate, session_binding, unavailable};
 use super::{AsyncDns, Ctx, Dialer, Mailer, Request, Response, SingleUseStore, Store};
 use crate::play_grant::{self, IssuedGrant};
 use crate::playback::LeaseRow;
-use hmac::{Hmac, KeyInit, Mac};
 use std::num::NonZeroU64;
 
 pub(crate) struct BrowserGrant<'a> {
@@ -177,10 +176,12 @@ fn valid_grant(secret: Option<&[u8]>, grant: &BrowserGrant<'_>, now: u64, versio
         track_id,
         play_id,
         epoch,
-        ..
+        expires_at,
+        continuation_deadline,
     } = grant.lease;
     if exp <= now
         || exp - now > play_grant::MAX_GRANT_TTL
+        || (version == "v4" && exp > (*expires_at).min(*continuation_deadline))
         || crate::ledger::derive_play_idempotency_key(grant.user_id, track_id, play_id).is_err()
         || !crate::ledger::is_valid_key_field(session_id, 128)
         || !nntune_core::transcode::canonical_sha256_hex(grant.artifact_sha256)
@@ -188,7 +189,7 @@ fn valid_grant(secret: Option<&[u8]>, grant: &BrowserGrant<'_>, now: u64, versio
     {
         return false;
     }
-    let Some(secret) = secret.filter(|secret| secret.len() >= play_grant::MIN_SECRET_BYTES) else {
+    let Some(secret) = secret else {
         return false;
     };
     // Authenticate the exact receipt against the receiver's canonical signed wire format.
@@ -200,15 +201,5 @@ fn valid_grant(secret: Option<&[u8]>, grant: &BrowserGrant<'_>, now: u64, versio
     let Some((signed, signature)) = grant.grant.token.rsplit_once('.') else {
         return false;
     };
-    if signed != expected || signature.len() != 43 {
-        return false;
-    };
-    let (Ok(signature), Ok(mut mac)) = (
-        crate::b64::decode(signature),
-        Hmac::<sha2::Sha256>::new_from_slice(secret),
-    ) else {
-        return false;
-    };
-    mac.update(signed.as_bytes());
-    mac.verify_slice(&signature).is_ok()
+    signed == expected && crate::private_playback::verify_grant_signature(secret, signed, signature)
 }
