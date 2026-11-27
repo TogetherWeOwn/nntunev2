@@ -692,6 +692,16 @@ mod worker_entry {
         bucket: Bucket,
     }
 
+    pub(super) async fn read_index_body(
+        size: u64,
+        body: impl std::future::Future<Output = Result<Vec<u8>, RepoError>>,
+    ) -> Result<Vec<u8>, RepoError> {
+        if size != IDX_LEN as u64 {
+            return Err(decode_failed());
+        }
+        body.await
+    }
+
     impl RangeSource for R2Source {
         async fn read_all(&self, key: &str) -> Result<Option<Vec<u8>>, RepoError> {
             let Some(object) = self
@@ -703,11 +713,12 @@ mod worker_entry {
             else {
                 return Ok(None);
             };
-            if object.size() != IDX_LEN as u64 {
-                return Err(decode_failed());
-            }
-            let body = object.body().ok_or_else(query_failed)?;
-            body.bytes().await.map(Some).map_err(|_| query_failed())
+            read_index_body(object.size(), async {
+                let body = object.body().ok_or_else(query_failed)?;
+                body.bytes().await.map_err(|_| query_failed())
+            })
+            .await
+            .map(Some)
         }
 
         async fn read_range(
@@ -1279,6 +1290,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn r2_index_size_is_checked_before_buffering() {
+        use worker_entry::read_index_body;
+
+        for size in [IDX_LEN as u64 - 1, IDX_LEN as u64 + 1, u64::MAX] {
+            let result = block_on(read_index_body(size, async {
+                panic!("invalid index size reached the body read");
+            }));
+            assert_eq!(result.unwrap_err().stage(), RepoStage::Decode);
+        }
+        let result = block_on(read_index_body(IDX_LEN as u64, async {
+            Ok(vec![0; IDX_LEN])
+        }));
+        assert_eq!(result.unwrap().len(), IDX_LEN);
+    }
+
     fn artist_block(prefix: &str, offset: u64, len: u32, raw: Vec<u8>) -> SnapshotRepo<MemSource> {
         let mut source = MemSource::default();
         let mut idx = vec![0; IDX_LEN];
@@ -1300,6 +1327,8 @@ mod tests {
             ("crosses-part-end", MAX_PART_BYTES - 1, 2, 1),
             ("overflow", u64::MAX, 2, 1),
             ("compressed-cap", 0, MAX_COMPRESSED_BLOCK_BYTES + 1, 1),
+            ("valid-part-end", MAX_PART_BYTES - 1, 1, 2),
+            ("valid-compressed-length", 0, MAX_COMPRESSED_BLOCK_BYTES, 2),
             ("outside-object", 5, 1, 2),
             ("short-range", 3, 2, 2),
         ] {
