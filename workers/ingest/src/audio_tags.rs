@@ -84,7 +84,7 @@ fn comments(mut body: &[u8], hints: &mut AudioHints) -> Result<(), TagReadError>
     // to fetch a bigger prefix. No allocation follows an untrusted length/count.
     let parsed = (|| {
         let vendor_len = le_len(&mut body)?;
-        take(&mut body, vendor_len)?;
+        std::str::from_utf8(take(&mut body, vendor_len)?).map_err(|_| TagReadError::Malformed)?;
         let count = le_len(&mut body)?;
         if count > MAX_COMMENTS {
             return Err(TagReadError::Malformed);

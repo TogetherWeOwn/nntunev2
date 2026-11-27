@@ -10,15 +10,17 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    audio_manifest::AcceptedAudioManifest,
+    audio_manifest::{valid_identity, AcceptedAudioManifest, MAX_AUDIO_ENTRIES},
     audio_positions::{prepare_all_local_occurrences, PositionError},
     queue::validate_mbid,
 };
 
 const CHECKPOINT_VERSION: u8 = 1;
+// Fits MAX_AUDIO_ENTRIES even with maximal position values and JSONB spacing.
+const MAX_CHECKPOINT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClassError {
@@ -60,12 +62,42 @@ pub struct ClassifiedEntry {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ClassificationCheckpoint {
+struct ClassificationRecord {
     version: u8,
     job_id: String,
     user_id: String,
     original_content_sha256: String,
     entries: Vec<ClassifiedEntry>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ClassificationCheckpoint(ClassificationRecord);
+
+impl<'de> Deserialize<'de> for ClassificationCheckpoint {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let record = ClassificationRecord::deserialize(deserializer)?;
+        if record.version != CHECKPOINT_VERSION
+            || !valid_identity(
+                &record.job_id,
+                &record.user_id,
+                &record.original_content_sha256,
+            )
+            || record.entries.is_empty()
+            || record.entries.len() > MAX_AUDIO_ENTRIES
+        {
+            return Err(serde::de::Error::custom(
+                "invalid classification checkpoint",
+            ));
+        }
+        let mut group_kinds = BTreeMap::new();
+        for row in &record.entries {
+            if *group_kinds.entry(row.release_group_ref).or_insert(row.kind) != row.kind {
+                return Err(serde::de::Error::custom("mixed classification group"));
+            }
+        }
+        Ok(Self(record))
+    }
 }
 
 impl fmt::Debug for ClassificationCheckpoint {
@@ -77,27 +109,30 @@ impl fmt::Debug for ClassificationCheckpoint {
 impl ClassificationCheckpoint {
     /// Private storage seam. Never accept this JSON from a client.
     pub fn parse(raw: &str) -> Result<Self, ClassError> {
-        serde_json::from_str::<ClassificationCheckpoint>(raw).map_err(|_| ClassError::Evidence)
+        if raw.len() > MAX_CHECKPOINT_BYTES {
+            return Err(ClassError::Evidence);
+        }
+        serde_json::from_str(raw).map_err(|_| ClassError::Evidence)
     }
 
     pub fn is_for(&self, job_id: &str, user_id: &str) -> bool {
-        self.job_id == job_id && self.user_id == user_id
+        self.0.job_id == job_id && self.0.user_id == user_id
     }
 
     pub fn job_id(&self) -> &str {
-        &self.job_id
+        &self.0.job_id
     }
 
     pub fn user_id(&self) -> &str {
-        &self.user_id
+        &self.0.user_id
     }
 
     pub fn original_content_sha256(&self) -> &str {
-        &self.original_content_sha256
+        &self.0.original_content_sha256
     }
 
     pub fn entries(&self) -> &[ClassifiedEntry] {
-        &self.entries
+        &self.0.entries
     }
 }
 
@@ -146,9 +181,19 @@ pub fn classify_entries(
         groups.entry(entry.release_group_ref).or_default().push(i);
     }
     for indexes in groups.values() {
-        let verified = indexes.iter().filter(|&&i| evidence[i].is_some()).count();
-        if verified != 0 && verified != indexes.len() {
-            return Err(ClassError::MixedRelease);
+        // One frozen release group must resolve from one mirror snapshot.
+        let first = evidence[indexes[0]].as_ref();
+        for &i in &indexes[1..] {
+            match (first, evidence[i].as_ref()) {
+                (Some(a), Some(b))
+                    if !a.release_mbid.eq_ignore_ascii_case(&b.release_mbid)
+                        || a.snapshot_sha256 != b.snapshot_sha256 =>
+                {
+                    return Err(ClassError::Evidence);
+                }
+                (Some(_), Some(_)) | (None, None) => {}
+                _ => return Err(ClassError::MixedRelease),
+            }
         }
     }
     let needs_local = groups
@@ -159,19 +204,19 @@ pub fn classify_entries(
         .transpose()
         .map_err(ClassError::Positions)?;
     let mut classified: Vec<ClassifiedEntry> = Vec::with_capacity(entries.len());
-    let mut verified_winners = BTreeMap::<(u32, String, i32, i32), u32>::new();
+    let mut verified_winners = BTreeMap::<(u32, i32, i32), (&str, u32)>::new();
     for (i, entry) in entries.iter().enumerate() {
         if let Some(ev) = &evidence[i] {
-            let key = (
-                entry.release_group_ref,
-                ev.recording_mbid.to_ascii_lowercase(),
-                ev.medium_no,
-                ev.track_no,
-            );
+            let key = (entry.release_group_ref, ev.medium_no, ev.track_no);
             let duplicate_of = match verified_winners.get(&key) {
-                Some(&winner) => Some(winner),
+                Some(&(recording, winner))
+                    if recording.eq_ignore_ascii_case(&ev.recording_mbid) =>
+                {
+                    Some(winner)
+                }
+                Some(_) => return Err(ClassError::Evidence),
                 None => {
-                    verified_winners.insert(key, entry.audio_ordinal);
+                    verified_winners.insert(key, (&ev.recording_mbid, entry.audio_ordinal));
                     None
                 }
             };
@@ -198,11 +243,11 @@ pub fn classify_entries(
             });
         }
     }
-    Ok(ClassificationCheckpoint {
+    Ok(ClassificationCheckpoint(ClassificationRecord {
         version: CHECKPOINT_VERSION,
         job_id: manifest.job_id().to_string(),
         user_id: manifest.user_id().to_string(),
         original_content_sha256: manifest.original_content_sha256().to_string(),
         entries: classified,
-    })
+    }))
 }

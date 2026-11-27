@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::nzb_intake::IntakeEstimate;
+use crate::nzb_intake::{IntakeEstimate, DEFAULT_LIMITS};
 use crate::probe::{validate_message_id, MAX_PROBE_SEGMENTS, MAX_SEGMENT_BYTES};
 
 /// Match the parser's compiled-in cap for total declared NZB bytes.
@@ -45,10 +45,7 @@ pub enum ParseRejection {
 /// per-segment cap by construction), so they are always `Some` here; the
 /// `None` explicit-unknown case only arises for fixture-built values.
 pub fn parse_upload(xml: &[u8], estimate: &IntakeEstimate) -> Result<ParsedNzb, ParseRejection> {
-    let document = nntune_core::nzb::parse(xml).map_err(|error| match error {
-        nntune_core::Error::Bounds { .. } => ParseRejection::TooLarge,
-        _ => ParseRejection::Invalid("nntune-core rejected NZB"),
-    })?;
+    let document = parse_upload_document(xml, estimate)?;
     let file_count = document.files.len();
     let mut message_ids = Vec::new();
     let mut segment_bytes = Vec::new();
@@ -97,19 +94,15 @@ pub struct ParsedFile {
 /// Project the shared-parser document per file (see [`ParsedFile`]).
 ///
 /// Runs the same bounded parser and estimate cross-check as
-/// [`parse_upload`]: the file/segment counts must agree with the intake
-/// guard and every message-id must pass the strict rule before any of
-/// them may reach a provider connection.
+/// [`parse_upload`]: the file/segment counts and declared byte total must
+/// agree with the intake guard, and every message-id must pass the strict
+/// rule before any of them may reach a provider connection.
 pub fn parse_upload_files(
     xml: &[u8],
     estimate: &IntakeEstimate,
 ) -> Result<Vec<ParsedFile>, ParseRejection> {
-    let document = nntune_core::nzb::parse(xml).map_err(|error| match error {
-        nntune_core::Error::Bounds { .. } => ParseRejection::TooLarge,
-        _ => ParseRejection::Invalid("nntune-core rejected NZB"),
-    })?;
+    let document = parse_upload_document(xml, estimate)?;
     let mut files = Vec::with_capacity(document.files.len());
-    let mut segment_count = 0usize;
     for file in document.files {
         let mut segment_ids = Vec::with_capacity(file.segments.len());
         let mut segment_bytes = Vec::with_capacity(file.segments.len());
@@ -119,7 +112,6 @@ pub fn parse_upload_files(
                     "message-ids must be valid msg-ids (printable ASCII, one @)",
                 ));
             }
-            segment_count += 1;
             segment_bytes.push(
                 u64::try_from(segment.encoded_bytes)
                     .ok()
@@ -134,12 +126,34 @@ pub fn parse_upload_files(
             segment_bytes,
         });
     }
-    if files.len() != estimate.file_count || segment_count != estimate.segment_count {
+    Ok(files)
+}
+
+fn parse_upload_document(
+    xml: &[u8],
+    estimate: &IntakeEstimate,
+) -> Result<nntune_core::nzb::Document, ParseRejection> {
+    if xml.len() > DEFAULT_LIMITS.max_nzb_bytes
+        || estimate.file_count > DEFAULT_LIMITS.max_files
+        || estimate.segment_count > DEFAULT_LIMITS.max_segments
+        || estimate.declared_bytes > DEFAULT_LIMITS.max_declared_bytes
+    {
+        return Err(ParseRejection::TooLarge);
+    }
+    let document = nntune_core::nzb::parse(xml).map_err(|error| match error {
+        nntune_core::Error::Bounds { .. } => ParseRejection::TooLarge,
+        _ => ParseRejection::Invalid("nntune-core rejected NZB"),
+    })?;
+    let segment_count: usize = document.files.iter().map(|file| file.segments.len()).sum();
+    if document.files.len() != estimate.file_count
+        || segment_count != estimate.segment_count
+        || u64::try_from(document.encoded_bytes) != Ok(estimate.declared_bytes)
+    {
         return Err(ParseRejection::Invalid(
             "parse disagrees with the intake guard",
         ));
     }
-    Ok(files)
+    Ok(document)
 }
 
 /// Cross-check a parse against the intake guard's estimate. Any disagreement
@@ -187,6 +201,14 @@ pub fn check_parsed(estimate: &IntakeEstimate, parsed: &ParsedNzb) -> Result<(),
     };
     if total_bytes > MAX_ENCODED_BYTES {
         return Err("total segment byte ranges exceed the document limit");
+    }
+    // Legacy ranges may be explicitly unknown. Known ranges still cannot
+    // exceed the intake total, and a complete projection must match it.
+    if total_bytes > estimate.declared_bytes
+        || (total_bytes != estimate.declared_bytes
+            && parsed.segment_bytes.iter().all(Option::is_some))
+    {
+        return Err("segment byte ranges disagree with the intake guard");
     }
     // Ids flow into NNTP STAT/ARTICLE lines on the user's provider
     // connection: only strict message-ids pass, so a hostile NZB (or BYO

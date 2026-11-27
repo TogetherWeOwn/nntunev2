@@ -8,7 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    audio_manifest::{AcceptedAudioManifest, AudioEntry, AudioHints, ManifestError},
+    audio_manifest::{
+        valid_identity, AcceptedAudioManifest, AudioEntry, AudioHints, ManifestError,
+    },
     audio_selection::{AudioSelectionPlan, ExtractedAudio},
 };
 
@@ -149,6 +151,9 @@ pub fn prepare_manifest(
             })
     {
         return Err(GroupingError::Identity);
+    }
+    if !valid_identity(job_id, user_id, plan.original_content_sha256()) {
+        return Err(GroupingError::Manifest(ManifestError::Invalid));
     }
     let hints = extracted
         .iter()
