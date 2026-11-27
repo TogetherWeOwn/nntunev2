@@ -1,3 +1,5 @@
+import { isShareTimestamp } from './shareTimestamp.js';
+
 export type ShareSeekTarget = { trackId: string; streamUrl: string; seconds: number };
 type Pending = ShareSeekTarget & {
 	appliedSeconds: number | null;
@@ -14,7 +16,7 @@ export function createPendingShareSeek() {
 		get current(): Readonly<Omit<Pending, 'capture'>> | null { return pending; },
 		get revision() { return revision; },
 		set(target: ShareSeekTarget, capture: Pending['capture']) {
-			pending = { ...target, capture, appliedSeconds: null };
+			pending = isShareTimestamp(target.seconds) ? { ...target, capture, appliedSeconds: null } : null;
 			return ++revision;
 		},
 		clear,

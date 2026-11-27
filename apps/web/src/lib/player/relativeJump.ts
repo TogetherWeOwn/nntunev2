@@ -12,14 +12,16 @@ export type JumpOutcome =
 	| { kind: 'unavailable' }
 	| { kind: 'refused' };
 
-type JumpMedia = Pick<HTMLMediaElement, 'currentTime' | 'duration' | 'seekable'>;
+type JumpMedia = Pick<HTMLMediaElement, 'currentTime' | 'duration' | 'seekable'> & Partial<Pick<HTMLMediaElement, 'error'>>;
 
 // Readback slack for float/quantised positions, as in the restart readback.
 const TOLERANCE = 0.05;
 
 function seekableCovers(ranges: TimeRanges, target: number): boolean {
 	for (let index = 0; index < ranges.length; index += 1) {
-		if (ranges.start(index) <= target + TOLERANCE && ranges.end(index) >= target - TOLERANCE) {
+		const start = ranges.start(index), end = ranges.end(index);
+		if (Number.isFinite(start) && Number.isFinite(end) && end > start &&
+			start <= target + TOLERANCE && end >= target - TOLERANCE) {
 			return true;
 		}
 	}
@@ -38,12 +40,15 @@ export function jumpMedia(
 	media: JumpMedia & { readonly seeking?: boolean }, direction: JumpDirection, matches: () => boolean = () => true, assigned?: () => void,
 	seconds = RELATIVE_JUMP_SECONDS, onSystemUnavailable?: () => void, landed?: (target: number, duration: number, observed: number) => void
 ): JumpOutcome {
+	if ((direction !== 'back' && direction !== 'forward') || !Number.isFinite(seconds) || seconds <= 0) {
+		return { kind: 'unavailable' };
+	}
 	let duration: number, position: number;
 	let target: number;
 	let raw: number;
 	try {
 		({ duration, currentTime: position } = media);
-		if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(position) || (onSystemUnavailable && 'error' in media && media.error)) {
+		if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(position) || media.error) {
 			onSystemUnavailable?.();
 			return { kind: 'unavailable' };
 		}

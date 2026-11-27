@@ -5,6 +5,8 @@
  * uses its own policy so repeat never traps a deliberate Next.
  */
 
+import { MAX_SERIALIZED_CHARS } from './localStateBounds.js';
+
 export interface Track {
 	id: string;
 	title: string;
@@ -207,7 +209,9 @@ export function shuffleUpcoming(state: QueueState, random: () => number = Math.r
 	if (state.currentIndex < 0 || state.tracks.length - start < 2) return state;
 	const tracks = [...state.tracks];
 	for (let i = tracks.length - 1; i > start; i -= 1) {
-		const j = start + Math.floor(random() * (i - start + 1));
+		const sample = random();
+		if (!Number.isFinite(sample) || sample < 0 || sample >= 1) return state;
+		const j = start + Math.floor(sample * (i - start + 1));
 		[tracks[i], tracks[j]] = [tracks[j]!, tracks[i]!];
 	}
 	return { ...state, tracks };
@@ -337,6 +341,7 @@ export function restoreQueue(raw: string | null, catalogue: readonly Track[]): Q
 export function decodeQueue(
 	raw: string, catalogue: readonly Track[], { allowInvalidCurrentId = false } = {}
 ): QueueState | null {
+	if (raw.length > MAX_SERIALIZED_CHARS) return null;
 	try {
 		const parsed = JSON.parse(raw) as { orderIds?: unknown; currentId?: unknown };
 		if (!Array.isArray(parsed.orderIds) || parsed.orderIds.length > catalogue.length ||

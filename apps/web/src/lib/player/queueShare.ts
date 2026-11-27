@@ -18,12 +18,16 @@ export function createQueueShare(deps: QueueShareDeps) {
 		deps.onOutcome(status, fallbackUrl, deps.getQueue());
 	}
 	function reset(): void {
+		if (!alive) return;
 		generation += 1;
 		outcome('', null);
 	}
 	async function copy(id: string): Promise<void> {
+		if (!alive) return;
+		const action = generation + 1;
+		const isCurrent = () => alive && action === generation;
 		reset();
-		const action = generation;
+		if (!isCurrent()) return;
 		const queue = deps.getQueue();
 		const queued = queue.tracks.find((track) => track.id === id);
 		if (!queued) {
@@ -39,10 +43,11 @@ export function createQueueShare(deps: QueueShareDeps) {
 		try {
 			url = `${deps.getOrigin()}/library?${buildShareQuery(id, seconds)}`;
 		} catch {
-			outcome(unavailable, null);
+			if (isCurrent()) outcome(unavailable, null);
 			return;
 		}
 		const clipboard = deps.getClipboard();
+		if (!isCurrent()) return;
 		if (!clipboard) {
 			outcome('', url);
 			return;
@@ -53,7 +58,7 @@ export function createQueueShare(deps: QueueShareDeps) {
 		} catch {
 			written = false;
 		}
-		if (!alive || action !== generation) return;
+		if (!isCurrent()) return;
 		if (!deps.getQueue().tracks.some((track) => track.id === id)) {
 			outcome(unavailable, null);
 			return;

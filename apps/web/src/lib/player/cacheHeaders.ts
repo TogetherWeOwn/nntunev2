@@ -14,7 +14,8 @@ export type MediaKind = 'audio' | 'artwork';
 
 /** `Cache-Control` value for a media kind. */
 export function cacheControlFor(kind: MediaKind): string {
-	return kind === 'audio' ? AUDIO_CACHE_CONTROL : ARTWORK_CACHE_CONTROL;
+	if (kind === 'artwork') return ARTWORK_CACHE_CONTROL;
+	return kind === 'audio' ? AUDIO_CACHE_CONTROL : 'no-store';
 }
 
 /** Response headers for an audio (stream play) response. */

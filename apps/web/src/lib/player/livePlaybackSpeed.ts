@@ -19,6 +19,7 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 	}
 
 	function write(request?: number, current = target(), inherited?: number | null): void {
+		if (inherited != null && !Number.isFinite(inherited)) inherited = null;
 		const intended = inherited ?? (request === undefined ? preference?.current() : clampPlaybackSpeed(request));
 		if (intended === undefined || !current?.matches()) return;
 		const previousPort = writePort;

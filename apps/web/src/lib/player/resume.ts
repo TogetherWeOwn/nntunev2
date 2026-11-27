@@ -45,12 +45,12 @@ export function createResumeStore({
 		return Object.create(null);
 	}
 
-	function readAll(): Record<string, number> {
+	function readAll(): Record<string, number> | null {
 		let raw: string | null;
 		try {
 			raw = storage.getItem(storageKey);
 		} catch {
-			return emptyPositions();
+			return null;
 		}
 		if (raw === null) return emptyPositions();
 		if (raw.length > MAX_SERIALIZED_CHARS) return emptyPositions();
@@ -96,30 +96,19 @@ export function createResumeStore({
 			if (trackId === '' || trackId.length > MAX_OPAQUE_ID_CHARS) return;
 			if (!isValidPosition(seconds)) return;
 			const positions = readAll();
+			if (!positions) return;
 			const isOwn = Object.prototype.hasOwnProperty.call(positions, trackId);
 			if (!isOwn && Object.keys(positions).length >= MAX_RESUME_ENTRIES) return;
 			positions[trackId] = seconds;
-			let serialized: string;
-			try {
-				serialized = JSON.stringify(positions);
-			} catch {
-				return;
-			}
-			if (serialized.length > MAX_SERIALIZED_CHARS) return;
-			try {
-				storage.setItem(storageKey, serialized);
-			} catch {
-				// Fail-soft: playback continues from the start.
-			}
+			writeAll(positions);
 		},
 		positionFor(trackId: string) {
 			const positions = readAll();
-			if (!Object.prototype.hasOwnProperty.call(positions, trackId)) return null;
-			return positions[trackId] ?? null;
+			return positions?.[trackId] ?? null;
 		},
 		clear(trackId: string) {
 			const positions = readAll();
-			if (!Object.prototype.hasOwnProperty.call(positions, trackId)) return;
+			if (!positions || !Object.prototype.hasOwnProperty.call(positions, trackId)) return;
 			delete positions[trackId];
 			writeAll(positions);
 		}

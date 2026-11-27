@@ -13,7 +13,7 @@
  * so valid behavior is preserved bit-for-bit.
  */
 
-/** Max raw serialized chars (inclusive, untrimmed) for either payload. */
+/** Max raw serialized chars (inclusive, untrimmed). */
 export const MAX_SERIALIZED_CHARS = 65_536;
 
 /**

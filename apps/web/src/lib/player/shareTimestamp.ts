@@ -6,6 +6,10 @@
 const CLOCK_PART = /^\d+$/;
 const PLAIN_SECONDS = /^\d+(\.\d+)?$/;
 
+export function isShareTimestamp(seconds: number): boolean {
+	return Number.isFinite(seconds) && seconds >= 0 && seconds <= Number.MAX_SAFE_INTEGER;
+}
+
 export function parseTimestampParam(raw: string | null | undefined): number | null {
 	if (raw === null || raw === undefined) return null;
 	const trimmed = raw.trim();
@@ -17,13 +21,14 @@ export function parseTimestampParam(raw: string | null | undefined): number | nu
 		const numbers = parts.map(Number);
 		// Seconds/minutes below the leading part must stay under 60.
 		if (numbers.slice(1).some((n) => n >= 60)) return null;
-		return numbers.length === 2
+		const seconds = numbers.length === 2
 			? numbers[0]! * 60 + numbers[1]!
 			: numbers[0]! * 3600 + numbers[1]! * 60 + numbers[2]!;
+		return isShareTimestamp(seconds) ? seconds : null;
 	}
 	if (!PLAIN_SECONDS.test(trimmed)) return null;
 	const seconds = Number(trimmed);
-	return Number.isFinite(seconds) ? seconds : null;
+	return isShareTimestamp(seconds) ? seconds : null;
 }
 
 export interface ShareParams {
@@ -56,8 +61,8 @@ export function buildShareQuery(trackId: string, seconds: number): string {
 	if (trackId.trim() === '') {
 		throw new RangeError('share links need a non-blank track id');
 	}
-	if (!Number.isFinite(seconds) || seconds < 0) {
-		throw new RangeError(`share timestamp must be finite non-negative seconds, got ${seconds}`);
+	if (!isShareTimestamp(seconds)) {
+		throw new RangeError('share timestamp is outside the supported range');
 	}
 	return `track=${encodeURIComponent(trackId)}&t=${Math.floor(seconds)}`;
 }

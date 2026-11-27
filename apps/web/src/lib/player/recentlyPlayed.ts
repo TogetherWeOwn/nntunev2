@@ -130,11 +130,8 @@ export function createRecentlyPlayedStore({
 
 	/** The current list: the cached visit result once known, else a fresh read. */
 	function current(): RecentEntry[] {
-		if (cached === null) {
-			const fresh = readStorage();
-			if (fresh === null) return [];
-			cached = fresh;
-		}
+		cached ??= readStorage();
+		if (cached === null) return [];
 		return cached;
 	}
 
@@ -156,14 +153,17 @@ export function createRecentlyPlayedStore({
 		record(trackId, playedAt = now()) {
 			if (!isValidId(trackId) || !isValidPlayedAt(playedAt)) return;
 			const rest = current().filter((entry) => entry.trackId !== trackId);
+			if (cached === null) return;
 			commit([{ trackId, playedAt }, ...rest].slice(0, MAX_RECENTLY_PLAYED));
 		},
 		replay(trackId) {
 			if (!isValidId(trackId)) return;
 			const list = current();
 			if (!list.some((entry) => entry.trackId === trackId)) return;
+			const playedAt = now();
+			if (!isValidPlayedAt(playedAt)) return;
 			const rest = list.filter((entry) => entry.trackId !== trackId);
-			commit([{ trackId, playedAt: now() }, ...rest].slice(0, MAX_RECENTLY_PLAYED));
+			commit([{ trackId, playedAt }, ...rest].slice(0, MAX_RECENTLY_PLAYED));
 		},
 		forget(trackId) {
 			if (!isValidId(trackId)) return;

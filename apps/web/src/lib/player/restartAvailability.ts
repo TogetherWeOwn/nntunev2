@@ -6,7 +6,7 @@ export function restartIsAvailable(element: HTMLAudioElement, matches = () => tr
 			Number.isFinite(element.duration) && matches() &&
 			element.duration > 0 && matches() &&
 			Number.isFinite(element.currentTime) && matches() &&
-			seekableIncludesStart(element, matches)
+			seekableIncludesStart(element, matches, true)
 		);
 	} catch {
 		return false;

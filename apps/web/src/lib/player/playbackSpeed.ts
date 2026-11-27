@@ -15,11 +15,9 @@ export function clampPlaybackSpeed(rate: number): number {
 
 export function parsePlaybackSpeed(raw: string | null): number {
 	if (raw === null) return DEFAULT_PLAYBACK_SPEED;
-	// Blank is garbage, not 0: `Number('')` is 0, so reject blanks first.
-	if (raw.trim() === '') return DEFAULT_PLAYBACK_SPEED;
-	const parsed = Number(raw.trim());
-	if (!Number.isFinite(parsed)) return DEFAULT_PLAYBACK_SPEED;
-	return clampPlaybackSpeed(parsed);
+	const decimal = raw.trim();
+	if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(decimal)) return DEFAULT_PLAYBACK_SPEED;
+	return clampPlaybackSpeed(Number(decimal));
 }
 
 type RateTarget = { playbackRate: number };
