@@ -334,10 +334,17 @@ def confined_path(root, path):
     return candidate
 
 
+def markdown_source(root, source_rel):
+    path = confined_path(root, source_rel)
+    if not path.is_file():
+        raise OSError("expected a regular file")
+    return path
+
+
 def check_source(source_rel, root, anchor_cache):
     """Return [(lineno, target, reason)] violations for one markdown file."""
     try:
-        text = confined_path(root, source_rel).read_text(encoding="utf-8")
+        text = markdown_source(root, source_rel).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise LintError(f"cannot read {source_rel}: {exc}") from exc
     violations = []
@@ -387,15 +394,11 @@ def is_fixture_path(path):
 
 
 def explicit_markdown_files(root, names):
-    files = []
-    for name in names:
-        path = Path(name)
+    for path in map(Path, names):
         if path.is_absolute():
             path = confined_path(root, path).resolve().relative_to(root)
         if is_markdown_path(path) and not is_fixture_path(path):
-            confined_path(root, path)
-            files.append(path)
-    return files
+            yield path
 
 
 def _tracked_markdown_files(root):
@@ -572,7 +575,7 @@ def main(argv=None):
         if not root.is_dir():
             raise LintError(f"repository root is not a directory: {root}")
         if args.files is not None:
-            files = explicit_markdown_files(root, args.files)
+            files = list(explicit_markdown_files(root, args.files))
         elif args.base_ref:
             files = changed_markdown_files(root, args.base_ref)
         else:

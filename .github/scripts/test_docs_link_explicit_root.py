@@ -20,6 +20,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -53,11 +54,15 @@ class TestExplicitRootConfinement(unittest.TestCase):
             sub = root / "repo"
             sub.mkdir()
             (sub / "alias.md").symlink_to(root / "outside.md")
+            os.mkfifo(sub / "pipe.md")
+            subprocess.run(["git", "init", "-q", str(sub)], check=True)
+            subprocess.run(["git", "-C", str(sub), "add", "alias.md"], check=True)
             for lint in (main, citation_main):
-                for name in ("../outside.md", "alias.md", "missing.md"):
-                    with self.subTest(lint=lint.__module__, name=name):
-                        with contextlib.redirect_stdout(io.StringIO()):
-                            self.assertNotEqual(0, lint(["--root", str(sub), "--files", name]))
+                for name in ("../outside.md", "alias.md", "missing.md", "pipe.md", None):
+                    args = ["--files", name] if name else []
+                    with self.subTest(lint=lint.__module__, name=name), contextlib.redirect_stdout(io.StringIO()):
+                        with patch.object(Path, "read_text", side_effect=AssertionError("unsafe source read")):
+                            self.assertNotEqual(0, lint(["--root", str(sub), *args]))
 
     def test_link_target_cannot_resolve_outside_root(self):
         with tempfile.TemporaryDirectory() as tmp:
