@@ -68,10 +68,11 @@ mod tests {
 
     #[test]
     fn retry_payload_requires_a_bounded_object_and_advanceable_revision() {
-        assert_eq!(
-            retry_revision(br#" {"revision":4294967294}"#),
-            Some(u32::MAX - 1)
-        );
+        let mut body = format!("{:128}", r#"{"revision":4294967294}"#);
+        assert_eq!(retry_revision(body.as_bytes()), Some(u32::MAX - 1));
+        body.push(' ');
+        assert!(retry_revision(body.as_bytes()).is_none());
+        assert!(retry_revision(br#"{"revision":4,"revision":5}"#).is_none());
         for body in ["[4]", r#"{"revision":4294967295}"#] {
             assert_eq!(retry_revision(body.as_bytes()), None);
         }

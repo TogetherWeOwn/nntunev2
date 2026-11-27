@@ -209,6 +209,7 @@ mod tests {
         let digest = "ab".repeat(32);
         let pin = Some((1, "v+/="));
         assert!(valid_lookup(track, bucket, pin, Some(&digest)));
+        assert!(!valid_lookup(track, "invalid/bucket", pin, Some(&digest)));
         for pin in [(0, "v1"), (-1, "v1"), (1, "null"), (1, "v1,v2")] {
             assert!(!valid_lookup(track, bucket, Some(pin), None));
         }
