@@ -45,7 +45,7 @@ pub enum MintError {
     NotConfigured,
     /// The user id is empty, over 128 bytes, or contains `:`, `|` or NUL.
     InvalidUser,
-    /// The scope is unknown to the ingest Worker.
+    /// The scope is outside this signer's allowlist.
     InvalidScope,
     /// The grant would already be expired at issuance.
     InvalidLifetime,
