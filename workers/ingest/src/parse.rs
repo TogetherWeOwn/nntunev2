@@ -156,8 +156,8 @@ fn parse_upload_document(
     Ok(document)
 }
 
-/// Cross-check a parse against the intake guard's estimate. Any disagreement
-/// fails the job before a single provider connection is spent.
+/// Cross-check projected counts, range geometry and message IDs. The shared
+/// upload parser reconciles the XML's declared byte total before projection.
 pub fn check_parsed(estimate: &IntakeEstimate, parsed: &ParsedNzb) -> Result<(), &'static str> {
     if parsed.file_count != estimate.file_count || parsed.segment_count != estimate.segment_count {
         return Err("parse disagrees with the intake guard");
@@ -201,14 +201,6 @@ pub fn check_parsed(estimate: &IntakeEstimate, parsed: &ParsedNzb) -> Result<(),
     };
     if total_bytes > MAX_ENCODED_BYTES {
         return Err("total segment byte ranges exceed the document limit");
-    }
-    // Legacy ranges may be explicitly unknown. Known ranges still cannot
-    // exceed the intake total, and a complete projection must match it.
-    if total_bytes > estimate.declared_bytes
-        || (total_bytes != estimate.declared_bytes
-            && parsed.segment_bytes.iter().all(Option::is_some))
-    {
-        return Err("segment byte ranges disagree with the intake guard");
     }
     // Ids flow into NNTP STAT/ARTICLE lines on the user's provider
     // connection: only strict message-ids pass, so a hostile NZB (or BYO

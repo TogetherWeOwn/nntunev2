@@ -9,14 +9,14 @@ use nntune_ingest::{
     dispatch::content_sha256_hex,
     fixtures::SMALL_NZB,
     nzb_intake::{estimate_nzb, DEFAULT_LIMITS},
-    parse::{check_parsed, parse_upload, parse_upload_files, ParseRejection},
+    parse::{parse_upload, parse_upload_files, ParseRejection},
 };
 use serde_json::json;
 
 #[test]
 fn nzb_projections_refuse_disagreeing_declared_bytes() {
     let estimate = estimate_nzb(SMALL_NZB).unwrap();
-    let parsed = parse_upload(SMALL_NZB.as_bytes(), &estimate).unwrap();
+    assert!(parse_upload(SMALL_NZB.as_bytes(), &estimate).is_ok());
     assert!(parse_upload_files(SMALL_NZB.as_bytes(), &estimate).is_ok());
     for declared_bytes in [199, 201] {
         let mut mismatched = estimate;
@@ -29,7 +29,6 @@ fn nzb_projections_refuse_disagreeing_declared_bytes() {
             parse_upload_files(SMALL_NZB.as_bytes(), &mismatched),
             Err(ParseRejection::Invalid(_))
         ));
-        assert!(check_parsed(&mismatched, &parsed).is_err());
     }
 }
 
@@ -165,4 +164,18 @@ fn classification_readback_refuses_unknown_version_and_mixed_kind() {
         );
         assert!(serde_json::from_value::<ClassificationCheckpoint>(value).is_err());
     }
+}
+
+#[test]
+fn classification_readback_enforces_byte_cap() {
+    const CAP: usize = 1024 * 1024;
+    let checkpoint = classify_entries(&manifest(), &[None, None]).unwrap();
+    let mut raw = serde_json::to_string(&checkpoint).unwrap();
+    raw.extend(std::iter::repeat_n(' ', CAP - raw.len()));
+    assert_eq!(ClassificationCheckpoint::parse(&raw).unwrap(), checkpoint);
+    raw.push(' ');
+    assert_eq!(
+        ClassificationCheckpoint::parse(&raw),
+        Err(ClassError::Evidence)
+    );
 }

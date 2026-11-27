@@ -128,8 +128,8 @@ fn comments(mut body: &[u8], hints: &mut AudioHints) -> Result<(), TagReadError>
     parsed.map_err(|_| TagReadError::Malformed)
 }
 
-/// Read a capped FLAC prefix through its last metadata block. An incomplete
-/// prefix yields no partial hints, and unknown formats are explicitly refused.
+/// Read a capped FLAC prefix through its last metadata block. Incomplete or
+/// malformed metadata yields no partial hints. Unknown formats are refused.
 /// Picture blocks are skipped: their presence never implies valid/staged art.
 /// STREAMINFO duration is a hint too; no tag can assert a computed fingerprint.
 pub fn read_flac_hints(prefix: &[u8]) -> Result<AudioHints, TagReadError> {
