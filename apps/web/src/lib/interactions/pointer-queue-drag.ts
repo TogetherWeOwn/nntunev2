@@ -15,6 +15,7 @@ interface QueueDragOptions {
 export function pointerQueueDrag(node: HTMLElement, initial: QueueDragOptions) {
 	let options = initial;
 	let pointer: number | null = null;
+	let sourceList: HTMLElement | null = null;
 	let origin = { x: 0, y: 0 };
 	let ids: string[] = [];
 	let ghost: HTMLElement | null = null;
@@ -25,11 +26,12 @@ export function pointerQueueDrag(node: HTMLElement, initial: QueueDragOptions) {
 
 	function scroll(time: number) {
 		if (pointer === null || !ghost) return;
+		const list = options.list();
+		if (!list || list !== sourceList) { finish(); return; }
 		const elapsed = Math.min(32, lastFrame ? time - lastFrame : 16);
 		lastFrame = time;
-		const list = options.list();
-		const bounds = list?.getBoundingClientRect();
-		if (list && bounds && position.x >= bounds.left && position.x <= bounds.right) {
+		const bounds = list.getBoundingClientRect();
+		if (position.x >= bounds.left && position.x <= bounds.right) {
 			// Prefer the nearest scrolling pane, then its ancestors at an edge.
 			for (let element: HTMLElement | null = list; element; element = element.parentElement) {
 				const page = element === document.scrollingElement;
@@ -58,6 +60,7 @@ export function pointerQueueDrag(node: HTMLElement, initial: QueueDragOptions) {
 		if (pointer === null) return;
 		const id = pointer;
 		pointer = null;
+		sourceList = null;
 		cancelAnimationFrame(frame);
 		frame = 0;
 		lastFrame = 0;
@@ -72,14 +75,17 @@ export function pointerQueueDrag(node: HTMLElement, initial: QueueDragOptions) {
 	function key(event: KeyboardEvent) { if (event.key === 'Escape') { event.preventDefault(); finish(); } }
 	function hidden() { if (document.hidden) finish(); }
 	function targetAt(x: number, y: number): Element | null {
+		if (!Number.isFinite(x) || !Number.isFinite(y) || options.list() !== sourceList) return null;
 		const target = document.elementFromPoint(x, y);
-		return target && options.list()?.contains(target) ? target : null;
+		return target && sourceList?.contains(target) ? target : null;
 	}
 	function down(event: PointerEvent) {
 		if (event.pointerType === 'mouse' || !event.isPrimary || event.button !== 0) return;
+		if (!Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) return;
 		finish();
 		ids = options.ids();
-		if (!ids.length || !options.list()) return;
+		sourceList = options.list();
+		if (!ids.length || !sourceList) return;
 		event.preventDefault();
 		pointer = event.pointerId;
 		origin = { x: event.clientX, y: event.clientY };
@@ -92,6 +98,10 @@ export function pointerQueueDrag(node: HTMLElement, initial: QueueDragOptions) {
 	}
 	function move(event: PointerEvent) {
 		if (pointer !== event.pointerId) return;
+		if (!Number.isFinite(event.clientX) || !Number.isFinite(event.clientY) || options.list() !== sourceList) {
+			finish();
+			return;
+		}
 		if (!ghost && Math.hypot(event.clientX - origin.x, event.clientY - origin.y) < 6) return;
 		event.preventDefault();
 		position = { x: event.clientX, y: event.clientY };
@@ -110,8 +120,9 @@ export function pointerQueueDrag(node: HTMLElement, initial: QueueDragOptions) {
 		if (pointer !== event.pointerId) return;
 		const target = ghost ? targetAt(event.clientX, event.clientY) : null;
 		const selected = ids;
+		const list = sourceList, version = options.version;
 		finish();
-		if (target) options.drop(selected, target, event.clientY);
+		if (target && options.list() === list && options.version === version) options.drop(selected, target, event.clientY);
 	}
 	function cancel(event: PointerEvent) { if (pointer === event.pointerId) finish(); }
 	const listeners = [

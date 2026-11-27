@@ -36,12 +36,12 @@ let win: FakeTarget;
 let mod: typeof import('./track-drag.js');
 
 function dragEvent(transfer: FakeTransfer | null = new FakeTransfer()) {
-	return { dataTransfer: transfer, preventDefault: vi.fn() } as unknown as DragEvent & { preventDefault: Mock };
+	return { dataTransfer: transfer, clientX: 0, clientY: 0, preventDefault: vi.fn() } as unknown as DragEvent & { preventDefault: Mock };
 }
 function externalEvent(data: Record<string, string>) {
 	const t = new FakeTransfer();
 	for (const [k, v] of Object.entries(data)) t.setData(k, v);
-	return { dataTransfer: t } as unknown as DragEvent;
+	return { dataTransfer: t, clientX: 0, clientY: 0 } as unknown as DragEvent;
 }
 
 beforeEach(async () => {

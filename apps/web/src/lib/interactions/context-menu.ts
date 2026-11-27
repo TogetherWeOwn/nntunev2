@@ -40,6 +40,10 @@ export function menuAt(invoker: HTMLElement, label: string, actions: MenuAction[
 
 /** Flip above the origin if needed, then clamp both axes inside the viewport. */
 export function menuPosition(x: number, y: number, width: number, height: number, viewportWidth: number, viewportHeight: number) {
+	if (!Number.isFinite(x) || !Number.isFinite(y) ||
+		![width, height, viewportWidth, viewportHeight].every((size) => Number.isFinite(size) && size >= 0)) {
+		return { left: 0, top: 0 };
+	}
 	return {
 		left: Math.max(0, Math.min(x, viewportWidth - width)),
 		top: Math.max(0, Math.min(y + height > viewportHeight ? y - height : y, viewportHeight - height))

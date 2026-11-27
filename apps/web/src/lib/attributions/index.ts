@@ -1,4 +1,5 @@
 import type { Attribution, AttributionInventory } from './contract.js';
+import { validateAttributionInventory } from './contract.js';
 export { validateAttributionInventory } from './contract.js';
 export type { Attribution, AttributionInventory } from './contract.js';
 
@@ -82,6 +83,8 @@ export const attributionInventory: AttributionInventory = {
 };
 
 /** Future UI consumers must not present planned integrations as current sources. */
-export const activeAttributions = attributionInventory.entries.filter((entry) => entry.status === 'active');
-export const plannedAttributions = attributionInventory.entries.filter((entry) => entry.status === 'planned');
+const validatedEntries = validateAttributionInventory(attributionInventory).length === 0
+	? attributionInventory.entries : [];
+export const activeAttributions = validatedEntries.filter((entry) => entry.status === 'active');
+export const plannedAttributions = validatedEntries.filter((entry) => entry.status === 'planned');
 export const fixtureAudioLicenceRecord = 'docs/fixture-audio-licences.md';
