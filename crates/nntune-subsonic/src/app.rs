@@ -22,7 +22,7 @@ pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// allocating the response buffer.
 pub const MAX_PRODUCTION_RESPONSE_BYTES: usize = 256 * 1024;
 use crate::library::Library;
-use crate::routes::{route, Route};
+use crate::routes::{route_request, Route};
 use std::cell::RefCell;
 
 /// Plain HTTP response produced for one Subsonic request.
@@ -76,15 +76,15 @@ impl<S: Library> SubsonicApp<S> {
     pub fn handle(&self, method: &str, path: &str, query: &str, body: &str) -> HttpResponse {
         // v1 caps the body before routing or auth: only the query string is
         // parsed for `f`, since body parameters are untrusted past the cap.
-        if method.eq_ignore_ascii_case("POST") && body.len() > MAX_BODY_BYTES {
+        if method == "POST" && body.len() > MAX_BODY_BYTES {
             return oversized_body_response(query);
         }
-        let merged = Self::merge_query(method, query, body);
-        match route(path) {
+        let parse = || Params::parse(&Self::merge_query(method, query, body));
+        match route_request(method, path) {
             Route::Unknown => HttpResponse::document(404, "text/plain", b"Not Found".to_vec()),
             Route::Hls => HttpResponse::document(410, "text/plain", b"Gone".to_vec()),
             Route::Unsupported(op) => {
-                let params = Params::parse(&merged);
+                let params = parse();
                 let doc = error_document(
                     crate::envelope::code::GENERIC,
                     &format!("The {op} operation is not supported by this server."),
@@ -94,7 +94,7 @@ impl<S: Library> SubsonicApp<S> {
             // Public per the OpenSubsonic spec: body merge and cap apply,
             // authentication is skipped (v1 serves it outside the auth group).
             Route::PublicEndpoint(name) => {
-                let params = Params::parse(&merged);
+                let params = parse();
                 let identity = Identity::for_public_route();
                 let mut store = self.store.borrow_mut();
                 self.render_endpoint(
@@ -103,7 +103,7 @@ impl<S: Library> SubsonicApp<S> {
                 )
             }
             Route::Endpoint(name) => {
-                let params = Params::parse(&merged);
+                let params = parse();
                 // Presence, not the winning value: an empty or duplicate p=
                 // must not be rescued by valid credentials in another field.
                 if self.production && !params.get_all("p").is_empty() {
@@ -124,32 +124,6 @@ impl<S: Library> SubsonicApp<S> {
                         return self.render(&params, &error_document(error_code, &message));
                     }
                 };
-                // These operations have no persistent production backing yet. Do
-                // not acknowledge writes (including podcast no-ops) as saved.
-                if self.production
-                    && matches!(
-                        name,
-                        "createPlaylist"
-                            | "updatePlaylist"
-                            | "deletePlaylist"
-                            | "scrobble"
-                            | "star"
-                            | "unstar"
-                            | "setRating"
-                            | "savePlayQueue"
-                            | "refreshPodcasts"
-                            | "createPodcastChannel"
-                            | "deletePodcastChannel"
-                    )
-                {
-                    return self.render(
-                        &params,
-                        &error_document(
-                            crate::envelope::code::GENERIC,
-                            "This operation is not supported by this server.",
-                        ),
-                    );
-                }
                 self.render_endpoint(
                     &params,
                     handle_endpoint(&mut *store, &identity, name, &params, !self.production),
@@ -166,7 +140,10 @@ impl<S: Library> SubsonicApp<S> {
             }
             EndpointResult::Binary { content_type, body } => {
                 if self.production && body.len() > MAX_PRODUCTION_RESPONSE_BYTES {
-                    return Self::oversized_response(params.get("f"));
+                    return Self::fixed_rejection(
+                        StagingRejection::RequestOrDocumentTooLarge,
+                        params.get("f"),
+                    );
                 }
                 HttpResponse::document(200, &content_type, body)
             }
@@ -174,7 +151,7 @@ impl<S: Library> SubsonicApp<S> {
     }
 
     fn merge_query(method: &str, query: &str, body: &str) -> String {
-        if method.eq_ignore_ascii_case("POST") && !body.is_empty() {
+        if method == "POST" && !body.is_empty() {
             if query.is_empty() {
                 body.to_string()
             } else {
@@ -186,10 +163,14 @@ impl<S: Library> SubsonicApp<S> {
     }
 
     fn render(&self, params: &Params, doc: &crate::value::Value) -> HttpResponse {
+        let selector = params.get("f");
+        if !matches!(selector, Some("json" | "jsonp")) && !doc.has_valid_xml_text() {
+            return Self::fixed_rejection(StagingRejection::Unavailable, selector);
+        }
         if self.production {
             return Self::render_bounded(params, doc, MAX_PRODUCTION_RESPONSE_BYTES);
         }
-        match params.get("f") {
+        match selector {
             Some("json") => HttpResponse::document(200, JSON_CONTENT_TYPE, render_json(doc)),
             Some("jsonp") => {
                 let callback = params.get("callback");
@@ -213,23 +194,25 @@ impl<S: Library> SubsonicApp<S> {
             },
             _ => (Format::Xml, XML_CONTENT_TYPE),
         };
+        let too_large =
+            || Self::fixed_rejection(StagingRejection::RequestOrDocumentTooLarge, selector);
         let Ok(len) = capped_render::encoded_len(doc, format, limit) else {
-            return Self::oversized_response(selector);
+            return too_large();
         };
         let mut body = Vec::new();
         if body.try_reserve_exact(len).is_err() {
-            return Self::oversized_response(selector);
+            return too_large();
         }
         body.resize(len, 0);
         match capped_render::render_into(doc, format, &mut body) {
             Ok(written) if written == len => HttpResponse::document(200, content_type, body),
-            _ => Self::oversized_response(selector),
+            _ => too_large(),
         }
     }
 
-    fn oversized_response(selector: Option<&str>) -> HttpResponse {
+    fn fixed_rejection(rejection: StagingRejection, selector: Option<&str>) -> HttpResponse {
         let format = RejectionFormat::from_safe_selector(selector);
-        let fixed = fixed_staging_rejection(StagingRejection::RequestOrDocumentTooLarge, format);
+        let fixed = fixed_staging_rejection(rejection, format);
         HttpResponse::document(fixed.status, fixed.content_type, fixed.body.to_vec())
     }
 }

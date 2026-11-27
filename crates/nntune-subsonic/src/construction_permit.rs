@@ -84,4 +84,21 @@ mod tests {
         assert!(result.is_err());
         assert!(slot.try_acquire().is_some());
     }
+
+    #[test]
+    fn dropping_pending_construction_releases_slot() {
+        use std::future::{pending, Future};
+        use std::task::{Context, Waker};
+
+        let slot = ConstructionSlot::new();
+        let mut construction = Box::pin(async {
+            let _permit = slot.try_acquire().unwrap();
+            pending::<()>().await;
+        });
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(construction.as_mut().poll(&mut context).is_pending());
+        assert!(slot.try_acquire().is_none());
+        drop(construction);
+        assert!(slot.try_acquire().is_some());
+    }
 }

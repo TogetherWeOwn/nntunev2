@@ -88,6 +88,14 @@ pub enum Route<'a> {
     Unknown,
 }
 
+/// Resolve only registered HTTP methods. Method tokens are case-sensitive.
+pub(crate) fn route_request(method: &str, path: &str) -> Route<'static> {
+    match method {
+        "GET" | "POST" => route(path),
+        _ => Route::Unknown,
+    }
+}
+
 pub fn route(path: &str) -> Route<'static> {
     let rest = path.strip_prefix("/rest/").unwrap_or("\u{0}");
     if rest.contains('\u{0}') {
