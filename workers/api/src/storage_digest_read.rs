@@ -253,13 +253,11 @@ mod tests {
             (target().object.map(|b| b ^ 1), false),
         ] {
             let target = target();
+            let generation = uuid_text(target.generation);
+            let object = uuid_text(object);
             let locator = S3Locator::new(
                 "fixture-bucket".into(),
-                format!(
-                    "media/{}/{}",
-                    uuid_text(object),
-                    uuid_text(target.generation)
-                ),
+                format!("media/{object}/{generation}"),
                 S3Binding::VersionId("media-version".into()),
             )
             .unwrap();
@@ -273,14 +271,11 @@ mod tests {
                 },
             };
             let result = resolve_custody(&mut db, read, &locator, &root, || now).await;
-            if should_query {
-                assert!(
-                    result.is_err(),
-                    "canonical locator reaches the disconnected store"
-                );
-            } else {
-                assert!(matches!(result, Ok(None)));
-            }
+            assert!(match result {
+                Err(_) => should_query,
+                Ok(None) => !should_query,
+                Ok(Some(_)) => false,
+            });
         }
     }
 

@@ -1311,24 +1311,29 @@ pub(crate) async fn verify_cleanup(
     let other_references = reference_count().await;
     let generation = uuid_text(scope.seal);
     let map = uuid_text(prepared.intent.map_id);
-    let set_page_version = async |db: &mut Client, version: &str| {
+    let set_inventory = async |db: &mut Client, media: &str, page: &str| {
         let tx = db.transaction().await.unwrap();
         tx.batch_execute("ALTER TABLE public.storage_digest_inventory_intents DISABLE TRIGGER storage_digest_inventory_intent_append_only").await.unwrap();
         assert_eq!(tx.execute(
-            "UPDATE public.storage_digest_inventory_intents SET page_versions = ARRAY[$2::text] WHERE map_id = $1::text::uuid",
-            &[&map, &version],
+            "UPDATE public.storage_digest_inventory_intents SET media_version = $2, page_versions = ARRAY[$3::text] WHERE map_id = $1::text::uuid",
+            &[&map, &media, &page],
         ).await.unwrap(), 1);
         tx.batch_execute("ALTER TABLE public.storage_digest_inventory_intents ENABLE TRIGGER storage_digest_inventory_intent_append_only").await.unwrap();
         tx.commit().await.unwrap();
     };
-    set_page_version(publication, "invalid,fixture-version").await;
-    assert_eq!(cleanup(publication, &fixture, unexpected).await, Err(TrialError::Unconfirmed));
-    assert!(observer.query_one(
-        "SELECT EXISTS (SELECT FROM public.private_library_admissions WHERE track_id = $1::text::uuid)
-            AND EXISTS (SELECT FROM public.storage_validated_digest_references WHERE reference_id = $1::text::uuid)",
-        &[&track],
-    ).await.unwrap().get::<_, bool>(0));
-    set_page_version(publication, "page-fixture-version").await;
+    let (media_pin, page_pin, invalid) = ("media-fixture-version", "page-fixture-version", "invalid,fixture-version");
+    for (media, page) in [(media_pin, invalid), (invalid, page_pin)] {
+        set_fixture_locator_version(publication, &object_id, media_pin, media).await;
+        set_inventory(publication, media, page).await;
+        assert_eq!(cleanup(publication, &fixture, unexpected).await, Err(TrialError::Unconfirmed));
+        assert!(observer.query_one(
+            "SELECT EXISTS (SELECT FROM public.private_library_admissions WHERE track_id = $1::text::uuid)
+                AND EXISTS (SELECT FROM public.storage_validated_digest_references WHERE reference_id = $1::text::uuid)",
+            &[&track],
+        ).await.unwrap().get::<_, bool>(0));
+        set_fixture_locator_version(publication, &object_id, media, media_pin).await;
+    }
+    set_inventory(publication, media_pin, page_pin).await;
     let media = format!("media/{object_id}/{generation}");
     let page = format!("media-digests/{object_id}/{generation}/{map}/00000000");
     let mut versions = std::collections::BTreeSet::from([
