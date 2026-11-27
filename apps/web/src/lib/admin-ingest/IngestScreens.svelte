@@ -31,7 +31,6 @@
 		event.preventDefault();
 		if (uploading || signal.aborted) return;
 		const files = Array.from(picker.files ?? []);
-		if (files.length === 0) return;
 		picker.value = '';
 		uploads = files.map(({ name }) => ({ name, message: 'Waiting' }));
 		completed = 0;

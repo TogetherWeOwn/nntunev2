@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { onMount } from 'svelte';
 	import { ApiClient, ApiError } from '../api/client.js';
 	import { observeAccountSession } from '../auth-fence.js';
 	import { subscribeLocalAuthTransition } from '../auth-transition.js';
@@ -63,13 +62,13 @@
 		}
 	}
 
-	onMount(() => {
+	$effect(() => {
 		function reset(): void {
 			active?.abort();
 			view = { kind: 'sign-in' };
 		}
 		function onStorage(event: StorageEvent): void {
-			if (event.key === null || event.key === LIBRARY_AUTH_TRANSITION_KEY) reset();
+			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) reset();
 		}
 		const unsubscribe = subscribeLocalAuthTransition(reset);
 		window.addEventListener('storage', onStorage);

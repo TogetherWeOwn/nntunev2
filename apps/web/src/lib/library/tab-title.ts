@@ -4,9 +4,8 @@ import { displayArtist, displayTitle } from './order.js';
 export const LIBRARY_TAB_TITLE = 'Library — NNTune';
 
 function titlePart(value: unknown): string {
-	return typeof value === 'string'
-		? value.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').replace(/\p{Bidi_Control}/gu, '').trim()
-		: '';
+	if (typeof value !== 'string') return '';
+	return value.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').replace(/\p{Bidi_Control}/gu, '').trim();
 }
 
 /** Selection is not playback: the label never claims playing or buffering. */

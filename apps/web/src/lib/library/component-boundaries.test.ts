@@ -26,13 +26,17 @@ function component(path: string, overrides: Record<string, unknown>, expose: str
 
 test('a new binding immediately retires the old liked shelf', async () => {
 	const effect = vi.fn();
+	const observeSession = vi.fn((_clear: () => void) => observe());
 	const items = [{ kind: 'track', targetId: 'old-song' }];
 	const view = component('./AccountLikes.svelte', {
-		$props: () => ({ libraryBinding: 'old' }), $effect: effect,
+		$props: () => ({ libraryBinding: 'old' }), $effect: effect, observeAccountSession: observeSession,
 		loadLikes: async () => ({ binding: 'old', items }), verifyLibrarySession: async () => true
 	}, "{ read, switchBinding: () => { libraryBinding = 'new'; }, state: () => ({ likes, phase }) }");
 	await view.read(new AbortController().signal, owner, 'old');
 	expect(view.state()).toEqual({ likes: items, phase: 'ready' });
+	observeSession.mock.calls[0][0]();
+	expect(view.state()).toEqual({ likes: [], phase: 'error' });
+	await view.read(new AbortController().signal, owner, 'old');
 	view.switchBinding();
 	effect.mock.calls[0][0]();
 	expect(view.state()).toEqual({ likes: [], phase: 'loading' });
@@ -64,6 +68,8 @@ test('opening a stale or contradictory detail never enables retry', async () => 
 		...ingest, $props: () => ({ requests: { detail } }), tick: async () => {}
 	}, '{ openJob, seed: (queuePage, heading) => { queue = queuePage; reviewHeading = heading; }, state: () => job }');
 	view.seed({ jobs: [row] }, { focus: vi.fn() });
+	await view.openJob('not-listed');
+	expect(detail).not.toHaveBeenCalled();
 	for (const invalid of [{ ...row, revision: 3 }, { ...row, status: 'published' }]) {
 		detail.mockResolvedValueOnce({ status: 200, body: invalid });
 		await view.openJob(row.job_id);
@@ -94,6 +100,7 @@ test('changing the selection retires a download, and anchor failure reports refu
 		formatQueueM3U: () => '#EXTM3U', m3uDownloadFailure: () => 'Could not start'
 	}, "{ downloadSelectedM3U, select: () => { selectionKey = 'new'; }, message: () => status }");
 	view.downloadSelectedM3U();
+	effect.mock.calls[0][0]();
 	expect(view.message()).toBe('Download started');
 	release.mockClear();
 	view.select();
