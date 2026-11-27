@@ -619,3 +619,58 @@ test('operator recovers the existing rollback run after the dispatch response is
   assert.deepEqual(runs, [run]);
   assert.equal(dispatches, 1);
 });
+
+test('switch-off preflight refuses missing or corrupted maintenance checksums and module payloads before restore', async (t) => {
+  const transport = finalSmokeFixture(t, fixture);
+  await transport.run('record');
+  transport.shift();
+  const { evidence, fresh } = recoveryFixture(t, transport, 'success');
+  const env = fresh('13');
+  admitRecovery(env, evidence);
+  const allocation = join(env.RUNNER_TEMP, 'production-final-allocation.sealed');
+  const rollout = structuredClone(transport.rows);
+  const before = transport.calls.length;
+  const validDigest = transport.custody.maintenance.module_sha256;
+
+  for (const [label, badDigest] of [
+    ['missing module_sha256', undefined],
+    ['empty module_sha256', ''],
+    ['truncated module_sha256', validDigest.slice(0, 63)],
+    ['non-hex module_sha256', 'z'.repeat(64)],
+  ]) {
+    const badCustody = { ...transport.custody, maintenance: { ...transport.custody.maintenance, module_sha256: badDigest } };
+    await assert.rejects(
+      transport.run('prepare-recovery', { ...env, ROLLBACK_CUSTODY: JSON.stringify(badCustody) }),
+      /Missing or mismatched production rollback custody/,
+      label,
+    );
+    assert.equal(existsSync(allocation), false, label);
+    assert.deepEqual(transport.calls.slice(before), [], label);
+    assert.deepEqual(transport.rows, rollout);
+  }
+
+  const originalMain = transport.seed.main_module;
+  const originalModules = structuredClone(transport.seed.modules);
+  const corruptedPayloads = [
+    ['missing modules array', { modules: undefined }],
+    ['empty modules array', { modules: [] }],
+    ['extra module attached', { modules: [originalModules[0], { ...originalModules[0], name: 'extra.mjs' }] }],
+    ['wrong main_module name', { main_module: 'other.mjs' }],
+    ['wrong module entry name', { modules: [{ ...originalModules[0], name: 'other.mjs' }] }],
+    ['non-canonical base64 content', { modules: [{ ...originalModules[0], content_base64: 'not-canonical-base64!!!' }] }],
+    ['unpadded base64 content', { modules: [{ ...originalModules[0], content_base64: 'Zm9' }] }],
+  ];
+  for (const [label, mutation] of corruptedPayloads) {
+    Object.assign(transport.seed, { main_module: originalMain, modules: structuredClone(originalModules) }, mutation);
+    await assert.rejects(transport.run('prepare-recovery', env), /Maintenance version drifted/, label);
+    assert.equal(existsSync(allocation), false, label);
+    assert.equal(transport.calls.includes('POST'), false, label);
+    assert.deepEqual(transport.rows, rollout);
+  }
+
+  Object.assign(transport.seed, { main_module: originalMain, modules: originalModules });
+  await transport.run('prepare-recovery', env);
+  assert.equal(existsSync(allocation), true);
+  assert.equal(transport.calls.includes('POST'), false);
+  assert.deepEqual(transport.rows, rollout);
+});
