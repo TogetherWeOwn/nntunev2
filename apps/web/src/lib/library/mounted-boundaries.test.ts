@@ -10,11 +10,11 @@ import type { LibraryRefresher } from './refresh.js';
 afterEach(() => vi.unstubAllGlobals());
 
 test('settling a failed refresh suspends only a mounted view', async () => {
-	vi.stubGlobal('window', new EventTarget());
-	const { promise, reject } = Promise.withResolvers<void>();
+	const browser = new EventTarget();
+	vi.stubGlobal('window', browser);
 	const refresher = {
 		state: {} as LibraryRefresher['state'],
-		refresh: vi.fn().mockReturnValueOnce(Promise.reject(new Error('failed'))).mockReturnValueOnce(promise),
+		refresh: vi.fn().mockRejectedValue(new Error('failed')),
 		handleAuthTransition: vi.fn(),
 		handleLocalAuthTransition: vi.fn(),
 		suspendVerification: vi.fn(),
@@ -23,14 +23,17 @@ test('settling a failed refresh suspends only a mounted view', async () => {
 	const stop = mountLibraryRefresher(refresher);
 	await Promise.resolve();
 	expect(refresher.suspendVerification).toHaveBeenCalledOnce();
+	browser.dispatchEvent(new Event('storage'));
 	notifyLocalAuthTransition();
 	stop();
+	stop();
+	browser.dispatchEvent(new Event('storage'));
 	notifyLocalAuthTransition();
+	expect(refresher.handleAuthTransition).toHaveBeenCalledOnce();
 	expect(refresher.handleLocalAuthTransition).toHaveBeenCalledOnce();
 	expect(refresher.dispose).toHaveBeenCalledOnce();
 
 	mountLibraryRefresher(refresher)();
-	reject(new Error('late'));
 	await Promise.resolve();
 	expect(refresher.suspendVerification).toHaveBeenCalledOnce();
 });
@@ -47,6 +50,7 @@ test('tab labels remove control characters and need a usable identity', () => {
 	expect(libraryTabTitle({ id: 't', title: 'Song\nTitle', artist: '\u202e' }))
 		.toBe(`Selected: Song Title — ${LIBRARY_TAB_TITLE}`);
 	expect(libraryTabTitle({ id: '', title: '\u0000', artist: 'Artist' })).toBe(LIBRARY_TAB_TITLE);
+	expect(libraryTabTitle({ id: 't', title: '\u202e', artist: '' })).toBe(`Selected: t — ${LIBRARY_TAB_TITLE}`);
 });
 
 test('a Like control is unavailable until it has confirmed boolean state', () => {

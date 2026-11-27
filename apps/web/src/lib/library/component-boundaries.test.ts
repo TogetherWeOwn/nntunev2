@@ -70,7 +70,7 @@ test('opening a stale or contradictory detail never enables retry', async () => 
 	view.seed({ jobs: [row] }, { focus: vi.fn() });
 	await view.openJob('not-listed');
 	expect(detail).not.toHaveBeenCalled();
-	for (const invalid of [{ ...row, revision: 3 }, { ...row, status: 'published' }]) {
+	for (const invalid of [{ ...row, job_id: 'other' }, { ...row, revision: 3 }, { ...row, status: 'published' }]) {
 		detail.mockResolvedValueOnce({ status: 200, body: invalid });
 		await view.openJob(row.job_id);
 		expect(view.state()).toBeUndefined();
@@ -93,7 +93,7 @@ test('owner suspension is set inside the synchronous page-hide flush', () => {
 test('changing the selection retires a download, and anchor failure reports refusal', () => {
 	const release = vi.fn();
 	const effect = vi.fn();
-	const createElement = vi.fn().mockReturnValueOnce({ remove: vi.fn() }).mockImplementation(() => { throw new Error('Blocked'); });
+	const createElement = vi.fn(() => ({ remove: vi.fn() }));
 	const view = component('./SelectionExport.svelte', {
 		$effect: effect, document: { createElement }, createQueue: vi.fn(), appendSelection: () => ({ queue: { tracks: ['a'] } }),
 		createM3UDownload: () => ({ release, download: () => 'Download started' }),
@@ -103,10 +103,14 @@ test('changing the selection retires a download, and anchor failure reports refu
 	effect.mock.calls[0][0]();
 	expect(view.message()).toBe('Download started');
 	release.mockClear();
+	createElement.mockImplementationOnce(() => { throw new Error('Blocked'); });
+	view.downloadSelectedM3U();
+	expect(view.message()).toBe('Could not start');
+	expect(release).toHaveBeenCalledOnce();
+	view.downloadSelectedM3U();
+	release.mockClear();
 	view.select();
 	effect.mock.calls[0][0]();
 	expect(release).toHaveBeenCalledOnce();
 	expect(view.message()).toBe('');
-	view.downloadSelectedM3U();
-	expect(view.message()).toBe('Could not start');
 });

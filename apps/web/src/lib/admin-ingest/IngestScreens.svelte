@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import {
-		MAX_REVISION, PAGE_SIZE, STATUSES, readDetail, readJob, readQueue, uploadMessage,
+		MAX_REVISION, PAGE_SIZE, STATUSES, readJob, readQueue, uploadMessage,
 		type IngestRequests, type ReviewQueue, type ReviewStatus
 	} from './requests.js';
 
@@ -97,7 +97,12 @@
 			const result = await requests.detail(id, signal);
 			if (signal.aborted) return;
 			if (result.status !== 200) return reviewFailure(result.status);
-			job = readDetail(result.body, listed);
+			const detail = readJob(result.body);
+			if (detail.job_id !== id || detail.revision < listed.revision ||
+				(detail.revision === listed.revision && detail.status !== listed.status)) {
+				throw new Error('Unexpected review job');
+			}
+			job = detail;
 			await tick();
 			if (!signal.aborted) detailHeading?.focus();
 		} catch {

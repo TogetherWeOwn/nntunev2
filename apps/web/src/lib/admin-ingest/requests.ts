@@ -35,9 +35,8 @@ export const MAX_REVISION = 0xffff_ffff;
 export const PAGE_SIZE = 50;
 
 function record(value: unknown, fields: string[]): Record<string, unknown> | undefined {
-	if (value && typeof value === 'object' && !Array.isArray(value) && fields.every((key) => Object.hasOwn(value, key))) {
-		return value as Record<string, unknown>;
-	}
+	if (!value || typeof value !== 'object' || Array.isArray(value) || !fields.every((key) => Object.hasOwn(value, key))) return;
+	return value as Record<string, unknown>;
 }
 
 function u32(value: unknown): value is number {
@@ -77,15 +76,6 @@ export function readQueue(value: unknown, query: QueueRequest): ReviewQueue {
 		throw new Error('Invalid review queue');
 	}
 	return { jobs: rows, limit, offset };
-}
-
-export function readDetail(value: unknown, listed: Job): Job {
-	const detail = readJob(value);
-	if (detail.job_id !== listed.job_id || detail.revision < listed.revision ||
-		(detail.revision === listed.revision && detail.status !== listed.status)) {
-		throw new Error('Unexpected review job');
-	}
-	return detail;
 }
 
 export function uploadMessage(outcome: unknown): string {

@@ -13,5 +13,7 @@ test('accepts only dense, bounded pages with their own fields', () => {
 	}
 	expect(() => readQueue(Object.create(page), query)).toThrow();
 	expect(() => readQueue({ ...page, jobs: Array(1) }, query)).toThrow();
+	expect(() => readQueue({ ...page, jobs: [job, job] }, query)).toThrow();
+	expect(() => readQueue({ ...page, jobs: [] }, { ...query, status: 'invalid' as typeof query.status })).toThrow();
 	expect(() => readJob(Object.create(job))).toThrow();
 });
