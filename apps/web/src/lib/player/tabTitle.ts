@@ -11,6 +11,7 @@ export interface DemoTabTitle {
 }
 
 export const TAB_TITLE_PAUSED_SUFFIX = ' (paused)';
+const titleOwners = new WeakMap<{ title: string }, object>();
 
 /** Blank metadata uses display fallbacks; non-blank text stays verbatim. */
 export function formatNowPlayingTitle(track: TabTitleTrack, playing: boolean): string {
@@ -30,14 +31,18 @@ export function resolveDemoTabTitle(
 /** DOM-free controller: the browser caller supplies its document at mount. */
 export function createDemoTabTitle(target: { title: string }): DemoTabTitle {
 	const originalTitle = target.title;
+	const owner = {};
+	titleOwners.set(target, owner);
 	let restored = false;
 	return {
 		originalTitle,
 		update(track, playing) {
+			if (titleOwners.get(target) !== owner) return;
+			restored = false;
 			target.title = resolveDemoTabTitle(originalTitle, track, playing);
 		},
 		restore() {
-			if (restored) return;
+			if (restored || titleOwners.get(target) !== owner) return;
 			restored = true;
 			target.title = originalTitle;
 		}

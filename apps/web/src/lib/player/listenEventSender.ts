@@ -94,7 +94,8 @@ export function createListenEventSender({ owner, canRecord, grantForStart, fetch
 			}
 			const data = await readCappedJson(result.response) as { context?: unknown } | null;
 			// History context and session binding are distinct MACs with the same encoding.
-			if (allowed(result.requestSignal) && validSessionBinding(data?.context) && data.context.length === 43) {
+			if (data && typeof data === 'object' && Object.keys(data).length === 1 && Object.hasOwn(data, 'context') &&
+				allowed(result.requestSignal) && validSessionBinding(data.context) && data.context.length === 43) {
 				context = data.context;
 			}
 		} catch { /* Missing context leaves recording unavailable. */ }
@@ -109,7 +110,8 @@ export function createListenEventSender({ owner, canRecord, grantForStart, fetch
 				if (response?.status === 200 && allowed(requestSignal)) {
 					try {
 						const data = await readCappedJson(response) as { ok?: unknown } | null;
-						if (!requestSignal.aborted) return data?.ok === true && allowed(requestSignal) && isCurrent();
+						if (!requestSignal.aborted) return data?.ok === true && Object.keys(data).length === 1 &&
+							Object.hasOwn(data, 'ok') && allowed(requestSignal) && isCurrent();
 					} catch (error) {
 						// A broken response stream leaves the write outcome unknown. The
 						// receiver accepts identical replays. Malformed JSON stays final.

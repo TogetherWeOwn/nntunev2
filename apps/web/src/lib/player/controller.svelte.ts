@@ -52,7 +52,7 @@ export function createPlayerController(
 	}
 	let queueAnnouncement = $state.raw<Readonly<{ text: string; version: number }>>({ text: '', version: 0 });
 	let destroyed = false;
-	let accountGeneration = 0;
+	let libraryGeneration = 0;
 	let awaitingLibrary = false;
 	let browseCopyGeneration = 0;
 	let browseCopyFeedback = $state.raw<Readonly<{ status: string; fallbackUrl: string | null }>>({ status: '', fallbackUrl: null });
@@ -111,7 +111,7 @@ export function createPlayerController(
 
 	function purgeAtAuthBoundary(): void {
 		if (destroyed || queue.purging) return;
-		accountGeneration += 1;
+		libraryGeneration += 1;
 		retireBrowserPlayback();
 		// Svelte can deliver nested queue notifications after the purge returns.
 		// Don't accept new queue entries until fresh Library evidence arrives.
@@ -195,12 +195,14 @@ export function createPlayerController(
 		items: Parameters<typeof queue.prepareLibrary>[0], isCurrent: () => boolean,
 		beforeCommit?: (queueChanged: boolean) => void
 	): boolean {
-		const generation = accountGeneration;
-		const ownsSnapshot = () => !queue.purging && isCurrent() && !destroyed && generation === accountGeneration;
-		if (!ownsSnapshot()) return false;
+		if (!isCurrent() || queue.purging || destroyed) return false;
+		const generation = ++libraryGeneration;
+		const base = queue.snapshot;
+		const ownsSnapshot = () => !queue.purging && isCurrent() && !destroyed && generation === libraryGeneration;
 		const { next, sources } = queue.prepareLibrary(items);
 		// The caller's UI work runs inline; the guarded commit rechecks both receipts afterward.
-		beforeCommit?.(next !== queue.snapshot);
+		beforeCommit?.(next !== base);
+		if (queue.snapshot !== base) return false;
 		if (!commitQueue(next, 'replace', { sources, isCurrent: ownsSnapshot })) return false;
 		if (sources.size) awaitingLibrary = false;
 		return true;

@@ -33,8 +33,10 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 					retired = true;
 				};
 				if (!ownsIntent()) return;
-				if (!readAbsoluteSeek(owner.audio).enabled) return unavailable();
-				if (ownsIntent()) owner.dispatch(name, seconds, { active, canReport: () => retired || active(), unavailable });
+				const seekable = readAbsoluteSeek(owner.audio).enabled;
+				if (!ownsIntent()) return;
+				if (!seekable) return unavailable();
+				owner.dispatch(name, seconds, { active, canReport: () => active() || (retired && !signal.aborted && !handlers), unavailable });
 			};
 			const registration = handlers = { onSeekTo: action('seekto'), onSeekForward: action('seekforward'), onSeekBackward: action('seekbackward') };
 		}

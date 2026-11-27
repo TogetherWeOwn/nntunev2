@@ -66,13 +66,14 @@ export function createResumeController() {
 						if (seconds === 0 && lastPosition === undefined && (kind !== 'seeked' || completion)) return;
 						if (kind === 'sample' && Math.abs(seconds - (lastPosition ?? 0)) < 5) return;
 					}
-					if (!matches()) return;
+					const ownsObservation = () => matches() && audio.error === null && !audio.seeking && audio.ended === ended;
+					if (!ownsObservation()) return;
 					if (clearing) {
 						lastPosition = undefined;
 						completion = 'pending';
 					}
 					const storage = getStorage();
-					if (!storage || !matches()) return;
+					if (!storage || !ownsObservation()) return;
 					// A failed or revoked read must not turn into an empty-map write.
 					let read = false;
 					let writeRequested = false;
@@ -80,21 +81,21 @@ export function createResumeController() {
 					const store = createResumeStore({ storageKey, storage: {
 						getItem(key) {
 							const get = storage.getItem;
-							if (!matches()) return null;
+							if (!ownsObservation()) return null;
 							const raw = get.call(storage, key);
-							read = matches();
+							read = ownsObservation();
 							return read ? raw : null;
 						},
 						setItem(key, value) {
 							writeRequested = true;
 							const set = storage.setItem;
-							if (!read || !matches()) return;
+							if (!read || !ownsObservation()) return;
 							set.call(storage, key, value);
 							saved = true;
 						},
 						removeItem(key) {
 							const remove = storage.removeItem;
-							if (read && matches()) remove.call(storage, key);
+							if (read && ownsObservation()) remove.call(storage, key);
 						}
 					} });
 					if (seconds === null) {

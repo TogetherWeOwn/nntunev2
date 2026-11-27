@@ -4,6 +4,7 @@ import type { QueuedPlaySource } from './queueController.js';
 type Target = { readonly trackId: string; readonly playId?: string };
 type Owner = { readonly sessionBinding: string; readonly playbackSessionId: string };
 type Reply = Owner & { trackId: string; playId: string; durationMs: number };
+const REPLY_KEYS = ['sessionBinding', 'playbackSessionId', 'trackId', 'playId', 'durationMs'] as const;
 type Prepare = (request: Owner & Target, signal: AbortSignal) => Promise<{ data: unknown; expired?: () => boolean } | undefined>;
 export type BrowserPlaybackSource = QueuedPlaySource & {
 	readonly trackId: string;
@@ -42,7 +43,8 @@ export function createBrowserPlaybackGrant(owner: AccountSession, sessionBinding
 				if (!dispatched) return false;
 				const prepared = await dispatched.pending;
 				const reply = prepared?.data as Reply | undefined;
-				if (!reply || Object.keys(reply).length !== 5 || reply.sessionBinding !== sessionBinding ||
+				if (!reply || typeof reply !== 'object' || Object.keys(reply).length !== REPLY_KEYS.length ||
+					!REPLY_KEYS.every((key) => Object.hasOwn(reply, key)) || reply.sessionBinding !== sessionBinding ||
 					reply.playbackSessionId !== playbackSessionId || reply.trackId !== trackId || !validId(reply.playId) ||
 					(playId !== undefined && reply.playId !== playId) || !Number.isSafeInteger(reply.durationMs) || reply.durationMs <= 0) return false;
 				const { playId: issuedPlayId, durationMs } = reply;
@@ -53,10 +55,16 @@ export function createBrowserPlaybackGrant(owner: AccountSession, sessionBinding
 						onDiscarded?.();
 						return false;
 					}
+					if (prepared?.expired?.()) {
+						onDiscarded?.();
+						return false;
+					}
 					publish({ streamUrl: `/v1/plays/media/${trackId}/${playbackSessionId}/${issuedPlayId}`, trackId,
 						playId: issuedPlayId, expired: prepared?.expired, isCurrent: ownsAccount }, durationMs);
 					return true;
 				})) ?? false;
+			} catch {
+				return false;
 			} finally {
 				opening = false;
 			}

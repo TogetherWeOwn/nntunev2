@@ -5,6 +5,7 @@ export interface SoundPreference {
 }
 
 export const SOUND_PREFERENCE_STORAGE_KEY = 'nntune:sound-preference:v1';
+const MAX_SOUND_PREFERENCE_CHARS = 1024;
 type SoundStorage = Pick<Storage, 'getItem' | 'setItem'> | null;
 
 function defaults(): SoundPreference {
@@ -20,8 +21,9 @@ function validSound(value: unknown): value is SoundPreference {
 }
 
 export function parseSoundPreference(raw: string | null, fallback = defaults()): SoundPreference {
+	if (raw === null || raw.length > MAX_SOUND_PREFERENCE_CHARS) return fallback;
 	try {
-		const value: unknown = JSON.parse(raw ?? 'null');
+		const value: unknown = JSON.parse(raw);
 		if (validSound(value) && (value as { version?: unknown }).version === 1) {
 			return { volume: value.volume, muted: value.muted };
 		}
@@ -57,6 +59,7 @@ export function applySoundPreference(
 	element: Pick<HTMLMediaElement, 'volume' | 'muted'>,
 	preference: SoundPreference
 ): SoundPreference & { restricted: boolean } {
+	if (!validSound(preference)) return { volume: element.volume, muted: element.muted, restricted: true };
 	try {
 		if (element.volume !== preference.volume) element.volume = preference.volume;
 	} catch {
@@ -67,9 +70,10 @@ export function applySoundPreference(
 	} catch {
 		// Reflect actual mute even on a platform that rejects this setter too.
 	}
+	const volume = element.volume;
 	return {
-		volume: element.volume,
+		volume,
 		muted: element.muted,
-		restricted: element.volume !== preference.volume
+		restricted: volume !== preference.volume
 	};
 }

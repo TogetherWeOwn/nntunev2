@@ -96,7 +96,7 @@ export function actionForShortcutEvent(event: KeyboardEvent, scope: ModalScope):
 	const action = actionForKey(event.key);
 	// The caller can close its own dialog, but must leave other dialogs alone.
 	if (!action || action === 'close-shortcuts') return action;
-	return isTypingTarget(event.target) || isModalOpen(scope) ? null : action;
+	return isTypingTarget(event.target) || event.composedPath?.().some(isTypingTarget) || isModalOpen(scope) ? null : action;
 }
 
 export type ShortcutRow = { key: string; label: string };

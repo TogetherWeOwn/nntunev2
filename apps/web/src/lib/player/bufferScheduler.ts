@@ -20,13 +20,13 @@ export function createBufferScheduler(context: SchedulerContext) {
 	function release(track: ScheduledTrack): void {
 		if (!active.delete(track)) return;
 		track.source.onended = null;
-		track.source.disconnect();
-		track.gain.disconnect();
+		try { track.source.disconnect(); } catch { /* Still disconnect the gain. */ }
+		try { track.gain.disconnect(); } catch { /* Keep releasing the other tracks. */ }
 	}
 
 	function prepare(buffer: AudioBuffer): ScheduledTrack {
-		const source = context.createBufferSource();
 		const gain = context.createGain();
+		const source = context.createBufferSource();
 		const track = { source, gain, started: false };
 		active.add(track);
 		source.onended = () => release(track);
@@ -38,7 +38,7 @@ export function createBufferScheduler(context: SchedulerContext) {
 
 	function stop(): void {
 		for (const track of active) {
-			if (track.started) track.source.stop();
+			try { if (track.started) track.source.stop(); } catch { /* Disconnect even when stop fails. */ }
 			release(track);
 		}
 	}
