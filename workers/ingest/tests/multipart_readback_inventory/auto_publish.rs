@@ -365,39 +365,137 @@ pub(super) async fn exercise(
     assert_counter(&replay, json!({"outcome": "staged"}));
     tx.commit().await.unwrap();
 
-    const PUBLICATION: &str =
-        "SELECT jsonb_agg(jsonb_build_array(t, s, l) ORDER BY t.medium_no, t.track_no)::text
+    // Use a dedicated one-track release so both uploads match a complete
+    // recording list and the committed replacement leaves other fixtures intact.
+    let replacement_release = "ab370000-0000-4000-8000-000000000000";
+    let recordings = json!({
+        "release_mbid": replacement_release,
+        "recordings": [{
+            "release_mbid": replacement_release, "mbid": TRACKS[0], "title": "Synthetic FLAC",
+            "medium_no": 1, "track_no": 1
+        }]
+    })
+    .to_string();
+    let replace =
+        async |tx: &mut Transaction<'_>, index: usize, job_id, error: Option<&PublicationError>| {
+            let file = ExpectedFile {
+                numbering: files[0].numbering,
+                object: &objects[index],
+            };
+            let job = AuthorizedRelease {
+                job_id,
+                files: std::slice::from_ref(&file),
+                ..job
+            };
+            stage_completed_release(
+                tx,
+                &job,
+                &uploads[index..=index],
+                ALBUM,
+                Some(CompleteReleaseCandidates {
+                    lookup: &lookup,
+                    hits: vec![hit(replacement_release)],
+                }),
+                (200, &recordings),
+                async |scope| {
+                    let mut outcome = read_completion(db, scope).await?.unwrap();
+                    match error {
+                        Some(PublicationError::Indeterminate) => {
+                            return Err(PublicationError::Indeterminate);
+                        }
+                        Some(PublicationError::Refused) => outcome.media_version.push('!'),
+                        None => {}
+                    }
+                    Ok(Some(outcome))
+                },
+            )
+            .await
+        };
+    const POINTER: &str = "SELECT t.id::text, s.source_job_id, l.s3_version_id
+        FROM public.tracks t
+        JOIN public.catalogue_s3_sources s ON s.track_id = t.id
+        JOIN public.storage_s3_locator_intents l USING (object_id)
+        WHERE t.release_id = $1::text::uuid";
+    let pointer = |row: tokio_postgres::Row| {
+        (
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+        )
+    };
+    let observed = async || {
+        pointer(
+            db.query_one(POINTER, &[&replacement_release])
+                .await
+                .unwrap(),
+        )
+    };
+
+    let mut tx = writer.transaction().await.unwrap();
+    let StageOutcome::Staged(ids) = replace(&mut tx, 1, job.job_id, None).await.unwrap() else {
+        panic!("the original upload must stage one track");
+    };
+    let [track] = ids.as_slice() else {
+        panic!("the original upload must stage one track");
+    };
+    tx.commit().await.unwrap();
+    let expected = |index: usize, job_id: &str| {
+        let S3Binding::VersionId(version) = both[index].receipt.locator.binding() else {
+            panic!("the upload must have an immutable version");
+        };
+        (track.clone(), job_id.to_owned(), version.clone())
+    };
+    let old = expected(1, job.job_id);
+    let new = expected(0, "catalogue-new");
+    assert_ne!(old.2, new.2);
+    assert_eq!(observed().await, old);
+
+    let mut tx = writer.transaction().await.unwrap();
+    for error in [PublicationError::Indeterminate, PublicationError::Refused] {
+        // Compare within the writer transaction so even uncommitted writes fail.
+        let result = replace(&mut tx, 0, "catalogue-new", Some(&error)).await;
+        assert_eq!(result, Err(error));
+        assert_eq!(
+            pointer(
+                tx.query_one(POINTER, &[&replacement_release])
+                    .await
+                    .unwrap()
+            ),
+            old
+        );
+    }
+    tx.commit().await.unwrap();
+    assert_eq!(observed().await, old);
+
+    let mut tx = writer.transaction().await.unwrap();
+    let replacement = replace(&mut tx, 0, "catalogue-new", None).await.unwrap();
+    assert_eq!(replacement, StageOutcome::Staged(vec![track.clone()]));
+    assert_eq!(
+        pointer(
+            tx.query_one(POINTER, &[&replacement_release])
+                .await
+                .unwrap()
+        ),
+        new
+    );
+    assert_eq!(observed().await, old);
+    tx.commit().await.unwrap();
+    assert_eq!(observed().await, new);
+
+    let publication = async || {
+        db.query_one(
+            "SELECT jsonb_agg(jsonb_build_array(t, s, l) ORDER BY t.medium_no, t.track_no)::text
              FROM public.tracks t
              LEFT JOIN public.catalogue_s3_sources s ON t.id = s.track_id
              LEFT JOIN public.storage_s3_locator_intents l USING (object_id)
-             WHERE t.release_id = $1::text::uuid";
-    let publication = async || {
-        db.query_one(PUBLICATION, &[&RELEASE])
-            .await
-            .unwrap()
-            .get::<_, String>(0)
+             WHERE t.release_id = $1::text::uuid",
+            &[&RELEASE],
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0)
     };
     let before = publication().await;
-
-    // A committed publication already owns both source pointers. A later
-    // upload outcome that is indeterminate or disagrees with its receipt must
-    // stop before the catalogue transaction can move either pointer.
-    let mut tx = writer.transaction().await.unwrap();
-    for (evidence, error) in [
-        (Indeterminate(&uploads), PublicationError::Indeterminate),
-        (Conflicting(&uploads, 5), PublicationError::Refused),
-    ] {
-        assert_eq!(apply(&mut tx, evidence, false, 2).await, Err(error));
-        let staged = tx
-            .query_one(PUBLICATION, &[&RELEASE])
-            .await
-            .unwrap()
-            .get::<_, String>(0);
-        assert_eq!(staged, before);
-    }
-    tx.rollback().await.unwrap();
-    assert_eq!(publication().await, before);
-
     let locator = nntune_core::s3_locator::S3Locator::new(
         both[1].receipt.locator.bucket().into(),
         both[1].receipt.locator.key().into(),
