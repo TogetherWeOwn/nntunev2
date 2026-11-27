@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use nntune_core::par2::scratch::object_key_for_file_name;
+use nntune_core::par2::scratch::{object_key_for_file_name, MAX_SCRATCH_TOTAL_BYTES};
 use nntune_repair_server::{serve, ServerConfig};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -89,11 +89,17 @@ impl Fixture {
     }
 
     fn request(&self, raw: &[u8]) -> (u16, Vec<u8>) {
+        self.exchange(raw, true)
+    }
+
+    fn exchange(&self, raw: &[u8], close_write: bool) -> (u16, Vec<u8>) {
         let mut stream = TcpStream::connect(self.addr).unwrap();
         stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
         stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
         stream.write_all(raw).unwrap();
-        let _ = stream.shutdown(Shutdown::Write);
+        if close_write {
+            let _ = stream.shutdown(Shutdown::Write);
+        }
         let mut response = Vec::new();
         // A refusal (411/413) is sent without consuming already-arrived
         // request body bytes, so the kernel answers the close with RST
@@ -342,4 +348,22 @@ fn malformed_chunked_put_preserves_the_staged_input() {
     let (status, _) = f.request(format!("{head}{body}").as_bytes());
     assert_eq!(status, 201);
     assert_eq!(fs::read(path).unwrap(), b"NEW");
+}
+
+#[test]
+fn declared_upload_over_remaining_capacity_is_rejected_before_body() {
+    let f = Fixture::new("exit 0");
+    let staged = f.staged_path(JOB, 1, &object_key_for_file_name("staged.flac"));
+    fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    fs::File::create(staged)
+        .unwrap()
+        .set_len(MAX_SCRATCH_TOTAL_BYTES)
+        .unwrap();
+    let key = object_key_for_file_name("next.flac");
+    let head = format!(
+        "PUT /jobs/{JOB}/r1/in/{key} HTTP/1.1\r\nHost: container\r\nContent-Length: 1\r\n\r\n"
+    );
+    let (status, body) = f.exchange(head.as_bytes(), false);
+    assert_eq!(status, 413);
+    assert_eq!(body, br#"{"error":"payload_too_large"}"#);
 }

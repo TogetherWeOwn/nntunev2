@@ -353,23 +353,24 @@ fn store_input(
     {
         return Err(ApiError::invalid());
     }
-    let too_large = || ApiError::new(413, "payload_too_large");
-    if declared_len.is_some_and(|len| len > MAX_SCRATCH_TOTAL_BYTES) {
-        return Err(too_large());
+    if let Some(len) = declared_len {
+        if len > MAX_SCRATCH_TOTAL_BYTES {
+            return Err(ApiError::new(413, "payload_too_large"));
+        }
     }
     let dir = job_dir(config, job_id, round).join("in");
     fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!("{key}.tmp"));
-    // The upload replaces this key, so only other entries count against it.
     let mut staged_total: u64 = 0;
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
         if entry.file_name() != key && entry.path() != tmp {
             staged_total = staged_total
                 .checked_add(entry.metadata()?.len())
-                .ok_or_else(too_large)?;
+                .ok_or_else(|| ApiError::new(413, "payload_too_large"))?;
         }
     }
+    let too_large = || ApiError::new(413, "payload_too_large");
     let capacity = MAX_SCRATCH_TOTAL_BYTES
         .checked_sub(staged_total)
         .ok_or_else(too_large)?;
@@ -377,7 +378,6 @@ fn store_input(
         return Err(too_large());
     }
 
-    // Discard a stale upload for this key without following links.
     // Keep the current staged object in place until the new body is complete.
     allow_missing(fs::remove_file(&tmp))?;
     let mut file = fs::File::create_new(&tmp)?;
@@ -412,7 +412,10 @@ fn read_head(stream: &mut impl Read) -> Result<Request, ApiError> {
         if buf.len() == MAX_HEADER_BYTES {
             return Err(ApiError::invalid());
         }
-        stream.read_exact(&mut byte).map_err(body_read_error)?;
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            return Err(ApiError::invalid());
+        }
         buf.push(byte[0]);
         if buf.ends_with(b"\r\n\r\n") {
             break;
@@ -421,12 +424,10 @@ fn read_head(stream: &mut impl Read) -> Result<Request, ApiError> {
     let head = std::str::from_utf8(&buf[..buf.len() - 4]).map_err(|_| ApiError::invalid())?;
     let mut lines = head.split("\r\n");
     let mut first = lines.next().ok_or_else(ApiError::invalid)?.split(' ');
-    let method = first
-        .next()
-        .filter(|s| is_http_token(s))
-        .ok_or_else(ApiError::invalid)?;
-    let path = first.next().ok_or_else(ApiError::invalid)?;
-    if !path.starts_with('/')
+    let method = first.next().ok_or_else(ApiError::invalid)?.to_string();
+    let path = first.next().ok_or_else(ApiError::invalid)?.to_string();
+    if !is_http_token(&method)
+        || !path.starts_with('/')
         || !path.bytes().all(|b| b.is_ascii_graphic())
         || first.next() != Some("HTTP/1.1")
         || first.next().is_some()
@@ -450,15 +451,15 @@ fn read_head(stream: &mut impl Read) -> Result<Request, ApiError> {
         }
     }
     Ok(Request {
-        method: method.to_string(),
-        path: path.to_string(),
+        method,
+        path,
         content_length,
         chunked,
     })
 }
 
-/// Decode fixed-length or chunked bodies. The JSON and upload consumers
-/// enforce their respective limits on decoded bytes.
+/// Body reader over a socket: fixed-length or chunked, always bounded
+/// by the JSON and upload consumers.
 struct BodyReader<'a> {
     stream: &'a mut dyn Read,
     mode: BodyMode,
@@ -499,7 +500,6 @@ impl<'a> BodyReader<'a> {
         let line = read_crlf_line(self.stream, 32)?;
         let text = std::str::from_utf8(&line).map_err(|_| invalid_framing())?;
         let size = match text.split_once(';') {
-            // Chunk extensions are ignored, subject to the line and character limits.
             Some((size, _)) => size.trim_end_matches([' ', '\t']),
             None => text,
         };
