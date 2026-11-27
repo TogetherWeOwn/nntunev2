@@ -29,7 +29,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

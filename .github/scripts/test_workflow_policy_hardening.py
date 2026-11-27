@@ -18,7 +18,7 @@ def job(text, name):
 
 
 class WorkflowPolicyHardeningTests(unittest.TestCase):
-    def test_pr_size_rechecks_exceptions_in_the_same_pr_group(self):
+    def test_pr_size_rechecks_exceptions(self):
         text = (WORKFLOWS / "pr-size.yml").read_text()
         triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)
         self.assertEqual(
@@ -30,12 +30,39 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertRegex(triggers, r"(?m)^  pull_request_review:\n(?:    #.*\n)*"
                          r"    types: \[submitted, dismissed\]$")
         self.assertIn("    - cron: '17 7 * * 1'", triggers)
-        self.assertIn(
-            "concurrency:\n"
-            "  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}\n"
-            "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n",
-            text,
+
+    def test_pr_size_concurrency_groups_are_isolated_by_event(self):
+        text = (WORKFLOWS / "pr-size.yml").read_text()
+        concurrency = re.search(r"(?m)^concurrency:\n((?:  .*\n)+)", text)
+        self.assertIsNotNone(concurrency, "missing workflow concurrency block")
+        self.assertRegex(
+            concurrency[1],
+            r"(?m)^  cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}$",
         )
+        group = re.search(r"(?m)^  group: (.+)$", concurrency[1])
+        self.assertIsNotNone(group, "missing workflow concurrency group")
+
+        # These expressions only use context lookups and first-truthy fallbacks.
+        def expand(match, context):
+            values = (context[key.strip()] for key in match[1].split("||"))
+            return str(next((value for value in values if value), ""))
+
+        groups = {}
+        for number in (42, 43):
+            for event in ("pull_request", "pull_request_review", "workflow_dispatch"):
+                dispatch = event == "workflow_dispatch"
+                context = {
+                    "github.workflow": "pr-size",
+                    "github.event_name": event,
+                    "github.event.pull_request.number": None if dispatch else number,
+                    "inputs.pr_number": str(number) if dispatch else None,
+                }
+                rendered = re.sub(
+                    r"\$\{\{(.*?)\}\}", lambda match: expand(match, context), group[1]
+                )
+                groups[event, number] = rendered.casefold()
+
+        self.assertEqual(len(set(groups.values())), len(groups), groups)
 
     def test_pr_size_gate_and_tally_keep_context_dispatch_and_permissions(self):
         text = (WORKFLOWS / "pr-size.yml").read_text()
