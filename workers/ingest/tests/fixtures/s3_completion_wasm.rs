@@ -170,6 +170,7 @@ async fn run(
         .to_string());
     }
     // The lost-acknowledgement inventory is read only after the failed PUT.
+    let timeout_mode = mode == "multipart-resume-timeout";
     let mut read_page = read_page;
     let (mode, staged_inventory) = if mode == "multipart-resume-lost-ack" {
         let staged_inventory = read_page
@@ -182,7 +183,10 @@ async fn run(
     let readback = mode.starts_with("readback");
     let multipart_resume = matches!(
         mode,
-        "multipart-resume" | "multipart-resume-full" | "multipart-resume-inventory-retry"
+        "multipart-resume"
+            | "multipart-resume-full"
+            | "multipart-resume-inventory-retry"
+            | "multipart-resume-timeout"
     );
     let resume_bytes;
     let plaintext: &[u8] = if matches!(mode, "readback-publish" | "readback-playback") {
@@ -337,6 +341,7 @@ async fn run(
             until,
             staged_inventory,
             mode,
+            timeout_mode,
             read_page,
             observe,
             conflicting_status,
@@ -496,6 +501,7 @@ async fn resume_multipart<'a>(
     until: std::time::SystemTime,
     staged_inventory: Option<Function>,
     mode: &str,
+    timeout_mode: bool,
     read_page: Option<Function>,
     observe: Option<&Function>,
     conflicting_status: bool,
@@ -568,10 +574,15 @@ async fn resume_multipart<'a>(
             ..early_parts[0]
         }];
         let delayed = report("status", status_parts.len())?;
+        let attempt_until = if timeout_mode {
+            now() + Duration::from_millis(500)
+        } else {
+            until
+        };
         let second_result = sender
-            .put_part(binding, context, second, &upload, until)
+            .put_part(binding, context, second, &upload, attempt_until)
             .await;
-        if interrupt_second {
+        if interrupt_second || timeout_mode {
             assert!(matches!(
                 second_result,
                 Err(DispatchError::Unconfirmed(None))
@@ -600,10 +611,15 @@ async fn resume_multipart<'a>(
         }
         report("resumed", receipts.len())?;
     } else {
+        let attempt_until = if timeout_mode {
+            now() + Duration::from_millis(500)
+        } else {
+            until
+        };
         let second_result = sender
-            .put_part(binding, context, second, &upload, until)
+            .put_part(binding, context, second, &upload, attempt_until)
             .await;
-        if interrupt_second {
+        if interrupt_second || timeout_mode {
             assert!(matches!(
                 second_result,
                 Err(DispatchError::Unconfirmed(None))
@@ -635,6 +651,9 @@ async fn resume_multipart<'a>(
                 .map_err(dispatch_error)?,
         };
         receipts.push(receipt);
+    }
+    if timeout_mode {
+        worker::Delay::from(Duration::ZERO).await;
     }
     let etags: Vec<_> = receipts
         .iter()
