@@ -1699,8 +1699,9 @@ class SourceBindingTests(Base):
 
         def different_download():
             world = PrivateWorld()
-            # Keep the published artifact metadata and repackage the same receipt.
+            # Keep the published digest while matching the repackaged ZIP length so the digest check runs.
             world.archive = make_zip([("staging-admission.json", json.dumps(world.receipt, indent=2))])
+            world.artifact["size_in_bytes"] = len(world.archive)
             return world
 
         self.refused("^artifact content digest mismatch$", self.run_main, private=True, mode="promote",
