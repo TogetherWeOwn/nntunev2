@@ -1371,7 +1371,7 @@ class GitFixture(unittest.TestCase):
 
     def test_workflow_trusted_checker_refuses_forged_lineage(self):
         entries = self.chain()
-        entries[0]["source_rename_history"][0]["commit"] = "0" * 40
+        entries[0]["source_rename_history"][0]["commit"] = "1" * 40
         result = self.workflow_checker(entries)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("forged, missing, unreachable", result.stderr)
