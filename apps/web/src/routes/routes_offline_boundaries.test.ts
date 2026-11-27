@@ -105,8 +105,8 @@ it('sets explicit cache policies on operational metadata and public static endpo
 });
 
 it.each([null, {}, { state: 'active' }])('warns on a malformed security snapshot %j', async (body) => {
-	const fetch = vi.fn(async () => Response.json(body));
-	await expect(loadSecurity({ fetch } as Parameters<typeof loadSecurity>[0]))
+	const fetch = vi.fn<typeof globalThis.fetch>(async () => Response.json(body));
+	await expect(loadSecurity({ fetch } as never))
 		.resolves.toEqual({ sessionCheckFailed: true });
 	expect(fetch).toHaveBeenCalledOnce();
 });
@@ -115,8 +115,8 @@ it('checks the configured API without caching or following redirects when Web Lo
 	vi.mocked(captureAuthFence).mockResolvedValueOnce(undefined);
 	vi.stubGlobal('window', {});
 	vi.stubGlobal('navigator', {});
-	const fetch = vi.fn(async () => Response.json(activeSubscription));
-	await expect(loadSecurity({ fetch } as Parameters<typeof loadSecurity>[0]))
+	const fetch = vi.fn<typeof globalThis.fetch>(async () => Response.json(activeSubscription));
+	await expect(loadSecurity({ fetch } as never))
 		.resolves.toEqual({ sessionCheckFailed: false });
 	expect(fetch).toHaveBeenCalledExactlyOnceWith('https://api.example.test/v1/me/subscription', expect.objectContaining({
 		credentials: 'include',
@@ -128,10 +128,10 @@ it('checks the configured API without caching or following redirects when Web Lo
 it.each(['/v1/me/subscription', '/v1/me/usage'])(
 	'discards both billing payloads when %s returns 401',
 	async (deniedPath) => {
-		const fetch = vi.fn(async (path: string) => path === deniedPath
+		const fetch = vi.fn<typeof globalThis.fetch>(async (input) => String(input) === deniedPath
 			? new Response(null, { status: 401 })
-			: Response.json(path.endsWith('/subscription') ? activeSubscription : usage));
-		await expect(loadBilling({ fetch } as Parameters<typeof loadBilling>[0])).resolves.toMatchObject({
+			: Response.json(String(input).endsWith('/subscription') ? activeSubscription : usage));
+		await expect(loadBilling({ fetch } as never)).resolves.toMatchObject({
 			signedOut: true,
 			planUnknown: true,
 			canUpgrade: false,
@@ -147,10 +147,10 @@ it.each([
 	{ ...activeSubscription, status: 'canceled' },
 	{ ...activeSubscription, state: 'lapsed', status: null }
 ])('rejects a %j billing snapshot with contradictory state and live fields', async (subscription) => {
-	const fetch = vi.fn(async (path: string) =>
-		Response.json(path.endsWith('/subscription') ? subscription : usage)
+	const fetch = vi.fn<typeof globalThis.fetch>(async (input) =>
+		Response.json(String(input).endsWith('/subscription') ? subscription : usage)
 	);
-	await expect(loadBilling({ fetch } as Parameters<typeof loadBilling>[0])).resolves.toMatchObject({
+	await expect(loadBilling({ fetch } as never)).resolves.toMatchObject({
 		hadFetchError: true,
 		planUnknown: true,
 		canUpgrade: false,
