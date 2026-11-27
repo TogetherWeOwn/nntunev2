@@ -251,8 +251,20 @@ mod tests {
 
     #[test]
     fn bad_hex_fails_closed() {
-        let rep = verify_rows("{\"oops\": true}\n", &keyring(&[7]), "test");
+        let mut row: serde_json::Value = serde_json::from_str(&row_json(7)).unwrap();
+        row["payload_nonce_hex"] = serde_json::Value::String("gg".repeat(12));
+        let rep = verify_rows(&row.to_string(), &keyring(&[7]), "test");
         assert_eq!((rep.rows, rep.ok, rep.failed), (1, 0, 1));
+    }
+
+    #[test]
+    fn valid_rows_do_not_mask_corrupt_or_missing_evidence() {
+        let valid = row_json(7);
+        let mut incomplete: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        incomplete.as_object_mut().unwrap().remove("ciphertext_hex");
+        let rows = format!("{valid}\n{incomplete}\n{{\n{valid}\n");
+        let rep = verify_rows(&rows, &keyring(&[7]), "test");
+        assert_eq!((rep.rows, rep.ok, rep.failed), (4, 2, 2));
     }
 
     #[test]
