@@ -76,6 +76,19 @@ class DnsOwnershipTest(unittest.TestCase):
                 incomplete = replace(CREATED, **{field: ""})
                 self.assertIsNone(select_owned_record(incomplete, incomplete, (incomplete,)))
 
+    def test_agreement_does_not_validate_a_malformed_or_out_of_scope_record(self):
+        for changes in (
+            {"zone_id": "../other-zone"}, {"record_id": "record?other"},
+            {"name": "fixture..invalid"}, {"content": "::1"},
+            {"record_type": "AAAA"}, {"proxied": False}, {"ttl": 60},
+            {"tags": ("scope:other",)}, {"comment": "another rollout"},
+            {"proxied": 1}, {"ttl": True},
+        ):
+            with self.subTest(changes=changes):
+                malformed = replace(CREATED, **changes)
+                self.assertIsNone(select_owned_record(malformed, malformed, (malformed,)))
+                self.assertIsNone(select_owned_record(CREATED, malformed, (malformed,)))
+
 
 if __name__ == "__main__":
     unittest.main()

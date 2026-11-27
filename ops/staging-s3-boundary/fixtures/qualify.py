@@ -2,9 +2,11 @@
 """Qualify an isolated fixture-only stack on the local Docker engine."""
 
 import argparse
+from ipaddress import IPv4Address
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import signal
 import socket
@@ -26,17 +28,25 @@ DOCKER = ["docker", "--host", "unix:///var/run/docker.sock"]
 
 
 def run(command, env, *, data=None, check=True, timeout=90):
+    executable = Path(command[0]).name
     try:
         result = subprocess.run(command, input=data, capture_output=True, env=env, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{Path(command[0]).name} command exceeded its deadline") from None
+        raise RuntimeError(f"{executable} command exceeded its deadline") from None
+    except OSError:
+        raise RuntimeError(f"{executable} command could not start") from None
     if check and result.returncode:
-        raise RuntimeError(f"{' '.join(command[:2])} command failed with exit {result.returncode}")
+        raise RuntimeError(f"{executable} command failed with exit {result.returncode}")
     return result
 
 
 def credential(prefix):
     return prefix + secrets.token_hex(8), secrets.token_hex(20)
+
+
+def bind_source(path):
+    # Compose interpolates dollar signs even in YAML double-quoted scalars.
+    return json.dumps(str(path).replace("$", "$$"), ensure_ascii=False)
 
 
 def verify_timeout_redaction(env):
@@ -97,7 +107,12 @@ services:
       timeout: 2s
       retries: 20
     volumes: !override
-      - "{RECORDING_CONFIG}:/etc/caddy/Caddyfile:ro"
+      - type: bind
+        source: {bind_source(RECORDING_CONFIG)}
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
 """)
         else:
             audit = scratch / "audit.json"
@@ -115,7 +130,12 @@ services:
       - fixture-audit
     volumes: !override
       - fixture-data:/data
-      - "{audit}:/etc/seaweedfs/audit.json:ro"
+      - type: bind
+        source: {bind_source(audit)}
+        target: /etc/seaweedfs/audit.json
+        read_only: true
+        bind:
+          create_host_path: false
 volumes:
   fixture-data:
 """)
@@ -140,15 +160,18 @@ volumes:
     def start(self):
         self.run("up", "-d", "--wait", "--wait-timeout", "25", timeout=180)
         address = self.run("port", "boundary", "8080").strip()
-        require(address.startswith("127.0.0.1:"), "boundary is not bound to loopback")
-        self.port = int(address.rsplit(":", 1)[1])
+        binding = re.fullmatch(r"127\.0\.0\.1:([1-9][0-9]{0,4})", address)
+        require(binding is not None and int(binding[1]) <= 65535, "invalid boundary loopback port")
+        self.port = int(binding[1])
+        self.verify_isolation()
         wait_for(lambda: exchange(self.port, "GET", "/", [("Host", "fixtures.invalid")])[0] == 403,
                  "boundary did not start")
-        self.verify_isolation()
         return Boundary(self.port, self.scoped)
 
     def verify_isolation(self):
         names = {service: self.run("ps", "-q", service).strip() for service in ("backend", "boundary")}
+        require(len(set(names.values())) == 2 and all(re.fullmatch(r"[0-9a-f]{12,64}", name) for name in names.values()),
+                "invalid disposable container IDs")
         backend, boundary = json.loads(run([*DOCKER, "inspect", *names.values()], self.env).stdout)
         network = self.project + "_storage"
         require(set(backend["NetworkSettings"]["Networks"]) == {network}, "backend joined another network")
@@ -164,8 +187,7 @@ volumes:
             "com.docker.network.bridge.gateway_mode_ipv4") == "isolated", "backend network is not isolated")
         require(set(storage["Containers"]) == {item["Id"] for item in (backend, boundary)},
                 "unexpected container on backend network")
-        backend_ip = backend["NetworkSettings"]["Networks"][network]["IPAddress"]
-        require(bool(backend_ip), "backend network had no address")
+        backend_ip = str(IPv4Address(backend["NetworkSettings"]["Networks"][network]["IPAddress"]))
         for port in (8333, 8888, 9333, 9340):
             try:
                 with socket.create_connection((backend_ip, port), timeout=0.3):

@@ -2,8 +2,9 @@
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
+from math import isfinite
 
 
 POLL_SECONDS = 2
@@ -81,29 +82,38 @@ def check_convergence(
     def finish(verdict: Verdict, reason: str) -> Result:
         return Result(verdict, reason, deleting and verdict is not Verdict.PASSED)
 
-    if (
-        not readback.exact_id or not readback.exact_name
-        or (readback.change, readback.record_id, readback.name) != (change, record_id, name)
-    ):
-        return finish(Verdict.STOPPED, "missing or mismatched REST readback")
-    identities = {server.rstrip(".").lower() for server in servers}
-    if not record_id or not name or len(servers) != 2 or len(identities) != 2 or "" in identities:
-        return finish(Verdict.STOPPED, "exact record and two distinct authorities required")
-
     try:
-        if not readback.at <= monotonic():
+        if (
+            readback.exact_id is not True or readback.exact_name is not True
+            or (readback.change, readback.record_id, readback.name) != (change, record_id, name)
+        ):
+            return finish(Verdict.STOPPED, "missing or mismatched REST readback")
+        identities = {server.rstrip(".").lower() for server in servers}
+        if not record_id or not name or len(servers) != 2 or len(identities) != 2 or "" in identities:
+            return finish(Verdict.STOPPED, "exact record and two distinct authorities required")
+
+        started = monotonic()
+        if not isfinite(readback.at) or not isfinite(started):
+            return finish(Verdict.STOPPED, "invalid DNS check time")
+        if readback.at > started:
             return finish(Verdict.STOPPED, "REST readback time is in the future")
 
         qualify_by = readback.at + QUALIFICATION_SECONDS
         stop_at = readback.at + DELETE_CONTAINMENT_SECONDS if deleting else qualify_by
         streak = dict.fromkeys(servers, 0)
-        while (started := monotonic()) < stop_at:
+        while started < stop_at:
             round_end = min(started + POLL_SECONDS, stop_at)
             replies = read_pair(servers, name, round_end - started)
             received = monotonic()
             for reply in replies:
+                if (type(reply.authoritative) is not bool or type(reply.answer_count) is not int
+                        or type(reply.exact_a_count) is not int or not isinstance(reply.utc, datetime)
+                        or reply.utc.utcoffset() != timedelta(0)):
+                    return finish(Verdict.STOPPED, "invalid DNS observation")
                 record(reply, reply.at - readback.at)
 
+            if not isfinite(received) or received < started:
+                return finish(Verdict.STOPPED, "invalid DNS check time")
             if received >= stop_at:
                 break
             if received > round_end:
@@ -136,6 +146,10 @@ def check_convergence(
             delay = round_end - monotonic()
             if delay > 0:
                 sleep(delay)
+            next_start = monotonic()
+            if not isfinite(next_start) or next_start < round_end or next_start <= started:
+                return finish(Verdict.STOPPED, "DNS check clock did not advance")
+            started = next_start
 
         return finish(Verdict.EXPIRED, "containment deadline missed" if deleting else "qualification deadline missed")
     except Exception:

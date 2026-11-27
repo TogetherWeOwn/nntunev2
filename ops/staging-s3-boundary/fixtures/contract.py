@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from hashlib import md5, sha256
 import json
 from pathlib import Path
+from urllib.parse import quote
+from xml.sax.saxutils import escape
 
 from render import BUCKET, render
 from wire import exchange, response, signed
@@ -29,7 +31,7 @@ class Boundary:
     credential: tuple
 
     def request(self, method, target, body=b"", *, headers=(), identity=None, protocol="HTTP/1.1"):
-        fields = signed(method, target, "fixtures.invalid", identity or self.credential, body)
+        fields = signed(method, target, "fixtures.invalid", self.credential if identity is None else identity, body)
         return exchange(self.port, method, target, fields + list(headers), body, protocol)
 
 
@@ -40,7 +42,7 @@ def require_denial(reply, label):
 
 
 def bulk_body(version):
-    return (f"<Delete><Object><Key>{KEY}</Key><VersionId>{version}</VersionId>"
+    return (f"<Delete><Object><Key>{KEY}</Key><VersionId>{escape(version)}</VersionId>"
             "</Object></Delete>").encode()
 
 
@@ -49,7 +51,7 @@ def bulk_checksum(body):
 
 
 def denied_matrix(boundary, version):
-    target = f"{PATH}?versionId={version}"
+    target = f"{PATH}?versionId={quote(version, safe='')}"
     body = bulk_body(version)
     for label, method, path, payload, headers in (
         ("list all", "GET", "/", b"", ()),
@@ -63,12 +65,12 @@ def denied_matrix(boundary, version):
         ("unversioned GET", "GET", PATH, b"", ()),
         ("unversioned DELETE", "DELETE", PATH, b"", ()),
         ("versioned GET", "GET", target, b"", ()),
-        ("other path", "DELETE", f"{OTHER}?versionId={version}", b"", ()),
+        ("other path", "DELETE", target.replace(PATH, OTHER, 1), b"", ()),
         ("other bucket", "HEAD", target.replace(BUCKET, BUCKET + "-other"), b"", ()),
         ("empty version", "DELETE", f"{PATH}?versionId=", b"", ()),
         ("null version", "DELETE", f"{PATH}?versionId=null", b"", ()),
         ("encoded null version", "DELETE", f"{PATH}?versionId=%6Eull", b"", ()),
-        ("malformed escape", "DELETE", f"{PATH}?versionId={version}%", b"", ()),
+        ("malformed escape", "DELETE", target + "%", b"", ()),
         ("encoded control", "DELETE", f"{PATH}?versionId=%00", b"", ()),
         ("oversized version", "DELETE", f"{PATH}?versionId=" + "a" * 1025, b"", ()),
         ("extra query", "DELETE", target + "&delete", b"", ()),

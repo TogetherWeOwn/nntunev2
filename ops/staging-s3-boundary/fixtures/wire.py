@@ -5,11 +5,15 @@ from hashlib import sha256
 import hmac
 from http.client import HTTPResponse
 from io import BytesIO
+import re
 import socket
 from urllib.parse import parse_qsl, quote
 
 
 REGION = "us-east-1"
+TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+STATUS = re.compile(r"HTTP/1\.[01] ([2-5][0-9]{2})(?: [\x20-\x7e]*)?")
+HEADER_VALUE = re.compile(r"[\t\x20-\x7e\x80-\xff]*")
 
 
 def signed(method, target, host, credential, body=b"", extra=(), service="s3"):
@@ -38,18 +42,24 @@ def signed(method, target, host, credential, body=b"", extra=(), service="s3"):
 
 def response(wire, *, decode_body=False):
     fields, separator, body = wire.partition(b"\r\n\r\n")
-    if not separator or not fields.startswith(b"HTTP/1."):
+    if not separator:
         raise RuntimeError("invalid HTTP response framing")
-    status, *lines = fields.decode("latin1").split("\r\n")
+    status_line, *lines = fields.decode("latin1").split("\r\n")
+    status = STATUS.fullmatch(status_line)
+    if status is None:
+        raise RuntimeError("invalid HTTP response status")
     headers = {}
     for line in lines:
-        name, value = line.split(":", 1)
-        headers.setdefault(name.lower(), []).append(value.strip())
+        name, colon, value = line.partition(":")
+        if not colon or not TOKEN.fullmatch(name) or not HEADER_VALUE.fullmatch(value):
+            raise RuntimeError("invalid HTTP response header")
+        headers.setdefault(name.lower(), []).append(value.strip(" \t"))
     lengths = headers.get("content-length")
     encodings = headers.get("transfer-encoding")
-    if decode_body and lengths is not None:
+    if lengths is not None:
         if (encodings is not None or len(lengths) != 1 or not lengths[0].isascii()
-                or not lengths[0].isdecimal() or (lengths[0].lstrip("0") or "0") != str(len(body))):
+                or not lengths[0].isdecimal()
+                or (decode_body and (lengths[0].lstrip("0") or "0") != str(len(body)))):
             raise RuntimeError("invalid fixed-length HTTP response")
     if decode_body and encodings is not None:
         if encodings != ["chunked"]:
@@ -63,7 +73,7 @@ def response(wire, *, decode_body=False):
         with HTTPResponse(CapturedSocket()) as reply:
             reply.begin()
             body = reply.read()
-    return int(status.split()[1]), headers, body
+    return int(status[1]), headers, body
 
 
 def connect(port):
@@ -80,8 +90,15 @@ def read_to_close(stream):
 
 
 def request_bytes(method, target, headers, body=b"", protocol="HTTP/1.1"):
+    if (not TOKEN.fullmatch(method) or not re.fullmatch(r"[\x21-\x7e]+", target)
+            or protocol not in ("HTTP/1.0", "HTTP/1.1")):
+        raise ValueError("invalid HTTP request line")
     lines = [f"{method} {target} {protocol}", "Connection: close"]
-    lines.extend(f"{name}: {value}" for name, value in headers)
+    headers = tuple(headers)
+    for name, value in headers:
+        if not TOKEN.fullmatch(name) or not value.isascii() or not HEADER_VALUE.fullmatch(value):
+            raise ValueError("invalid HTTP request header")
+        lines.append(f"{name}: {value}")
     if body and not any(name.lower() in ("content-length", "transfer-encoding") for name, _ in headers):
         lines.append(f"Content-Length: {len(body)}")
     return "\r\n".join([*lines, "", ""]).encode("ascii") + body

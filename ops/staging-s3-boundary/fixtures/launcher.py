@@ -5,6 +5,7 @@ from pathlib import Path
 import socketserver
 import ssl
 import threading
+from time import monotonic
 
 from contract import GENERATION, require
 from qualify import run
@@ -13,6 +14,11 @@ from wire import REGION, connect, read_to_close
 
 
 LAUNCHER = Path(__file__).resolve().parents[3] / ".github/scripts/private_trial_provider_preflight.cjs"
+QUALIFIED = (
+    b"Private staging fixture provider preflight: qualified. Matched present HEAD and preserved sibling HEAD. "
+    b"Twice observed empty DELETE 204 and HEAD 404 with optional version headers absent or matching.\n"
+)
+HEADER_LIMIT = 16_384
 
 
 def qualified_launcher(stack, bundle, boundary, selected, sibling):
@@ -28,14 +34,22 @@ def qualified_launcher(stack, bundle, boundary, selected, sibling):
     class Relay(socketserver.BaseRequestHandler):
         def handle(self):
             self.request.settimeout(8)
-            with tls.wrap_socket(self.request, server_side=True) as client, client.makefile("rb") as reader:
+            with tls.wrap_socket(self.request, server_side=True) as client:
+                deadline = monotonic() + 8
                 headers = bytearray()
-                while len(headers) < 16_384:
-                    line = reader.readline(16_384)
-                    if not line:
+                while len(headers) < HEADER_LIMIT:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
                         return
-                    headers.extend(line)
-                    if line == b"\r\n":
+                    client.settimeout(remaining)
+                    chunk = client.recv(HEADER_LIMIT - len(headers))
+                    if not chunk:
+                        return
+                    headers.extend(chunk)
+                    end = headers.find(b"\r\n\r\n")
+                    if end != -1:
+                        if end + 4 != len(headers):
+                            return
                         with connect(boundary.port) as upstream:
                             upstream.sendall(headers)
                             client.sendall(read_to_close(upstream))
@@ -57,9 +71,8 @@ def qualified_launcher(stack, bundle, boundary, selected, sibling):
                 "PRIVATE_TRIAL_PREFLIGHT_S3": json.dumps(dict(zip(("access_key", "secret_key"), boundary.credential))),
             }
             result = run(["node", str(LAUNCHER), "--provider", str(bundle)], env, check=False, timeout=30)
-            require(result.returncode == 0 and result.stdout.startswith(
-                b"Private staging fixture provider preflight: qualified."), "reviewed launcher did not qualify")
-            print(result.stdout.decode().strip(), flush=True)
+            require(result.returncode == 0 and result.stdout == QUALIFIED, "reviewed launcher did not qualify")
+            print(QUALIFIED.decode("ascii").rstrip(), flush=True)
         finally:
             relay.shutdown()
             worker.join()

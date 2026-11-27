@@ -19,7 +19,9 @@ def render(access_id, keys):
         raise ValueError("invalid fixture key")
     # These alphabets have no Caddyfile, CEL or regexp metacharacters.
     paths = "|".join(f"/{BUCKET}/{key}" for key in sorted(keys))
-    template = Path(__file__).with_name("Caddyfile.in").read_text()
+    template = Path(__file__).with_name("Caddyfile.in").read_text(encoding="utf-8")
+    if any(template.count(marker) != 1 for marker in ("@PATHS@", "@ACCESS@")):
+        raise ValueError("invalid Caddyfile template markers")
     return template.replace("@PATHS@", paths).replace("@ACCESS@", access_id)
 
 

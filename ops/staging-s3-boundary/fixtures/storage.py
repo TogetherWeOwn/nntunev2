@@ -34,6 +34,12 @@ def xml(root, name):
     return root.findtext(f".//{{*}}{name}")
 
 
+def inventory_field(row, name):
+    fields = row.findall(f"{{*}}{name}")
+    require(len(fields) == 1 and not len(fields[0]) and fields[0].text, "invalid inventory field")
+    return fields[0].text
+
+
 def expect_status(reply, status, label):
     require(reply[0] == status, f"{label} returned {reply[0]}")
     return reply[2]
@@ -72,7 +78,7 @@ class Storage:
         return ET.fromstring(expect_status(self.iam_reply(action, **fields), 200, action))
 
     def s3(self, method, target, body=b"", *, identity=None, extra=()):
-        fields = signed(method, target, ENDPOINT, identity or self.stack.admin, body, extra)
+        fields = signed(method, target, ENDPOINT, self.stack.admin if identity is None else identity, body, extra)
         return self.request(method, target, fields, body)
 
     def upload(self, body):
@@ -122,13 +128,15 @@ class Storage:
     def inventory(self):
         result = ET.fromstring(expect_status(self.s3("GET", BUCKET_PATH + "?versions"), 200, "version inventory"))
         uploads = ET.fromstring(expect_status(self.s3("GET", BUCKET_PATH + "?uploads"), 200, "multipart inventory"))
-        require(xml(result, "IsTruncated") == "false" and xml(uploads, "IsTruncated") == "false",
-                "inventory incomplete")
+        for root, expected in ((result, "ListVersionsResult"), (uploads, "ListMultipartUploadsResult")):
+            require(root.tag.rsplit("}", 1)[-1] == expected, "unexpected inventory response")
+            require(inventory_field(root, "IsTruncated") == "false", "inventory incomplete")
         return (
-            sorted((xml(item, "Key"), xml(item, "VersionId"), xml(item, "ETag"))
+            sorted((inventory_field(item, "Key"), inventory_field(item, "VersionId"), inventory_field(item, "ETag"))
                    for item in result.findall("{*}Version")),
-            sorted((xml(item, "Key"), xml(item, "VersionId")) for item in result.findall("{*}DeleteMarker")),
-            sorted(xml(item, "UploadId") for item in uploads.findall("{*}Upload")),
+            sorted((inventory_field(item, "Key"), inventory_field(item, "VersionId"))
+                   for item in result.findall("{*}DeleteMarker")),
+            sorted(inventory_field(item, "UploadId") for item in uploads.findall("{*}Upload")),
         )
 
     def audit_barrier(self):

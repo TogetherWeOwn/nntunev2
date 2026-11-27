@@ -160,6 +160,28 @@ class DNSConvergenceTest(unittest.TestCase):
                 self.assertTrue(result.retain_writer)
                 self.assertLessEqual(len(dns.calls), 1)
 
+    def test_malformed_evidence_cannot_close_a_delete(self):
+        for proof in (dict(exact_id="false"), dict(exact_name=1), dict(at=float("-inf"))):
+            with self.subTest(proof=proof):
+                dns = SyntheticDNS(lambda _: (ABSENT, ABSENT))
+                result = dns.run(Change.DELETE, **proof)
+                self.assertEqual((result.verdict, result.retain_writer), (Verdict.STOPPED, True))
+                self.assertFalse(dns.calls)
+        for changes in (dict(authoritative="false"), dict(answer_count=False),
+                        dict(exact_a_count=0.0), dict(utc=None)):
+            with self.subTest(changes=changes):
+                dns = SyntheticDNS(lambda _: (ABSENT, ABSENT))
+                dns.edit = lambda replies: [replace(reply, **changes) for reply in replies]
+                result = dns.run(Change.DELETE)
+                self.assertEqual((result.verdict, result.retain_writer), (Verdict.STOPPED, True))
+
+    def test_stalled_clock_cannot_count_the_same_instant_twice(self):
+        dns = SyntheticDNS(lambda _: (ABSENT, ABSENT))
+        with patch.object(dns, "sleep"):
+            result = dns.run(Change.DELETE)
+        self.assertEqual((result.verdict, result.retain_writer), (Verdict.STOPPED, True))
+        self.assert_rounds(dns, [0])
+
     def test_reply_at_deadline_cannot_pass(self):
         for change, shape, start in ((Change.CREATE, PRESENT, 87), (Change.DELETE, ABSENT, 297)):
             with self.subTest(change=change):
