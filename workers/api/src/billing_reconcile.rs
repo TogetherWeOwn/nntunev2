@@ -151,6 +151,8 @@ pub enum FailClosedReason {
     /// The remote status is not a known Checkout-shape state — including
     /// `trialing`, which the reseed card owns elsewhere.
     UnknownStatus,
+    /// Invoice lines are incomplete or a listed invoice contradicts the stored anchor.
+    InvalidInvoiceEvidence,
 }
 
 /// The subscription row to persist (verbatim remote status by design —
@@ -205,7 +207,7 @@ pub struct ReconcileOutcome {
     pub row: ReconciledRow,
     pub history: Vec<PaidInvoiceRow>,
     pub fail_closed: Option<FailClosedReason>,
-    /// Explicit stale proof suppresses the subscription write, not history.
+    /// Suppresses the subscription write. Refused snapshots also carry no history.
     pub explicit_stale: bool,
     /// The plan the pass read (the stored plan at fold time) and the
     /// anchor it read (the stored anchor at fold time): the write's
@@ -291,7 +293,7 @@ fn qualify_line(
     let period = period?;
     let end = period.end?;
     let start = period.start.unwrap_or(end);
-    Some(QualifiedLine { plan, start, end })
+    (start <= end).then_some(QualifiedLine { plan, start, end })
 }
 
 /// Fold a reconciliation snapshot without borrowing state from another subscription.
@@ -307,7 +309,17 @@ pub(crate) fn reconcile_exact_target(
     local.live = local
         .live
         .filter(|row| row.stripe_subscription_id == requested_id);
-    Some(reconcile_subscription(&local, remote, now_unix))
+    reconcile_complete_snapshot(&local, remote, now_unix)
+}
+
+/// Refused evidence is retryable and must never reach a writer.
+pub(crate) fn reconcile_complete_snapshot(
+    local: &ReconcileInput,
+    remote: &RemoteSubscription,
+    now_unix: i64,
+) -> Option<ReconcileOutcome> {
+    let outcome = reconcile_subscription(local, remote, now_unix);
+    (!outcome.explicit_stale || outcome.fail_closed.is_none()).then_some(outcome)
 }
 
 /// Shared by the webhook and API/inline paths: fold one retrieved remote
@@ -337,10 +349,51 @@ pub fn reconcile_subscription(
             return fail_closed(local, sub, None, None, FailClosedReason::CustomerMismatch);
         }
     }
+    let bound_paid = |invoice: &Invoice| {
+        !invoice.livemode
+            && invoice.status == "paid"
+            && invoice.customer.as_deref() == Some(remote_customer.as_str())
+            && invoice.subscription.as_deref() == Some(sub.id.as_str())
+    };
+    let valid_anchor = |invoice: &Invoice| bound_paid(invoice) && invoice.paid_at().is_some();
+    let read_anchor = local
+        .live
+        .as_ref()
+        .filter(|row| row.stripe_subscription_id == sub.id)
+        .and_then(|row| row.paid_invoice_id.as_deref());
+    if remote.invoices.iter().any(|invoice| {
+        (read_anchor == Some(invoice.id.as_str()) && !valid_anchor(invoice))
+            || (bound_paid(invoice) && invoice.lines.as_ref().is_none_or(|lines| lines.has_more))
+    }) {
+        return fail_closed(
+            local,
+            sub,
+            Some(remote_customer),
+            None,
+            FailClosedReason::InvalidInvoiceEvidence,
+        );
+    }
+    let anchor_invoice_in_snapshot = |anchor: &str| {
+        remote
+            .invoices
+            .iter()
+            .find(|invoice| invoice.id == anchor && valid_anchor(invoice))
+    };
+    let status = sub.status.as_str();
+    let previous = local.live.as_ref();
+    if is_terminal_status(status) || is_held_status(status) {
+        if let Some(kept) = previous.filter(|_| {
+            read_anchor.is_some_and(|anchor| anchor_invoice_in_snapshot(anchor).is_none())
+        }) {
+            return stale_snapshot(sub, remote_customer, kept, None, Vec::new());
+        }
+    }
     // Exactly one priced item: zero or several is unresolvable, never
     // first-picked.
     let (item_id, price_id) = match sub.single_item() {
-        Some((item_id, Some(price_id))) => (item_id.to_string(), price_id.to_string()),
+        Some((item_id, Some(price_id))) if !item_id.trim().is_empty() => {
+            (item_id.to_string(), price_id.to_string())
+        }
         _ => {
             return fail_closed(
                 local,
@@ -363,21 +416,6 @@ pub fn reconcile_subscription(
         );
     };
 
-    let status = sub.status.as_str();
-    let previous = local.live.as_ref();
-    if is_terminal_status(status) || is_held_status(status) {
-        if let Some(kept) = previous.filter(|row| {
-            row.stripe_subscription_id == sub.id
-                && row.paid_invoice_id.as_ref().is_some_and(|anchor| {
-                    !remote.invoices.iter().any(|invoice| &invoice.id == anchor)
-                })
-        }) {
-            // The exhausted listing proves staleness even without folding
-            // money. Do not re-pin an equal-end anchor: the write must still
-            // recognize this evidence after another pass changes status/grace.
-            return stale_snapshot(sub, remote_customer, kept, None, Vec::new());
-        }
-    }
     // Every non-stale branch below re-pins the stored anchor when it keeps
     // the stored coverage: the write guard reads an anchor-less equal-end
     // write against an anchored stored row as stale evidence, and only the
@@ -451,8 +489,7 @@ pub fn reconcile_subscription(
     }
 
     // Advance path (`active` / `past_due`): fold every bound paid invoice.
-    // A live or misbound invoice fails the pass; a merely unhelpful one
-    // (wrong sub, unpaid, unanchored, no qualifying line) is skipped.
+    // Reject live invoices. Skip foreign, unpaid or unanchored invoices.
     //
     // Coverage advances ONLY from lines resolving to the subscription
     // item's plan; history rows cover every confirmed paid service invoice
@@ -475,12 +512,7 @@ pub fn reconcile_subscription(
                 FailClosedReason::WrongLivemode,
             );
         }
-        if invoice.status != "paid" {
-            continue;
-        }
-        if invoice.customer.as_deref() != Some(remote_customer.as_str())
-            || invoice.subscription.as_deref() != Some(sub.id.as_str())
-        {
+        if !bound_paid(invoice) || invoice.id.trim().is_empty() {
             continue;
         }
         let Some(paid_at) = invoice.paid_at() else {
@@ -493,8 +525,6 @@ pub fn reconcile_subscription(
             continue;
         };
         let exact_coverage = invoice.amount_paid > 0
-            && !invoice.id.trim().is_empty()
-            && !lines.has_more
             && currency.len() == 3
             && currency.bytes().all(|b| b.is_ascii_lowercase());
         let mut covered_periods = Vec::new();
@@ -601,7 +631,7 @@ pub fn reconcile_subscription(
     // write (the guard keeps the greatest confirmed end), and the
     // retained plan/anchor are kept with it there.
     let stale = match stored_anchor {
-        Some(ref anchor) => !remote.invoices.iter().any(|inv| &inv.id == anchor),
+        Some(ref anchor) => anchor_invoice_in_snapshot(anchor).is_none(),
         None => matches!((new_end, previous_end), (Some(end), Some(prev)) if end < prev),
     };
     if stale {
@@ -625,13 +655,10 @@ pub fn reconcile_subscription(
     // older is unreachable here (stale returns above).
     let recovered = new_end.is_some_and(|end| previous_end.is_none_or(|prev| end > prev));
     let tied = !recovered && new_end.is_some() && new_end == previous_end;
-    let stored_anchor_paid_at = stored_anchor.as_deref().and_then(|anchor| {
-        remote
-            .invoices
-            .iter()
-            .find(|inv| inv.id == anchor)
-            .and_then(|inv| inv.paid_at())
-    });
+    let stored_anchor_paid_at = stored_anchor
+        .as_deref()
+        .and_then(anchor_invoice_in_snapshot)
+        .and_then(Invoice::paid_at);
     let relabels = tied
         && anchor_invoice.is_some()
         && match (&stored_anchor, anchor_paid_at, stored_anchor_paid_at) {
@@ -734,9 +761,8 @@ fn stale_snapshot(
     }
 }
 
-/// Fail-closed outcome: the observed remote state is recorded (verbatim
-/// status, verbatim item/price bindings when present), nothing advances,
-/// and the caller disables new purchases plus raises the alert.
+/// Invalid observations never advance coverage. Refused snapshots retry
+/// without writing, and accepted observations retain the failure marker.
 fn fail_closed(
     local: &ReconcileInput,
     sub: &Subscription,
@@ -745,6 +771,7 @@ fn fail_closed(
     reason: FailClosedReason,
 ) -> ReconcileOutcome {
     let previous = local.live.as_ref();
+    let terminal = is_terminal_status(&sub.status);
     let (item_id, price_id) = item.unwrap_or_default();
     ReconcileOutcome {
         row: ReconciledRow {
@@ -777,11 +804,16 @@ fn fail_closed(
             // Fresh observation, not stale evidence: re-pin the stored
             // anchor so the write guard applies the verbatim status.
             paid_invoice_id: previous.and_then(|row| row.paid_invoice_id.clone()),
-            grace_until_unix: previous.and_then(|row| row.grace_until_unix),
+            grace_until_unix: previous.and_then(|row| row.grace_until_unix.filter(|_| !terminal)),
         },
         history: Vec::new(),
         fail_closed: Some(reason),
-        explicit_stale: false,
+        explicit_stale: reason == FailClosedReason::InvalidInvoiceEvidence
+            || (terminal
+                && matches!(
+                    reason,
+                    FailClosedReason::WrongLivemode | FailClosedReason::CustomerMismatch
+                )),
         read_plan: previous.map(|row| row.plan_id.clone()),
         read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
     }

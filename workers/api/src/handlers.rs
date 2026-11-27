@@ -7525,7 +7525,7 @@ where
 /// `billing_reconcile::reconcile_subscription`. `Err(())` is a Stripe or
 /// store failure (the caller 500s so the delivery retries); fail-closed
 /// passes still persist their observed row and return `Ok` with the
-/// marker set, so the caller can alert and disable.
+/// marker set, except for refused snapshots, which alert and retry.
 ///
 /// Future invite review belongs after `store_reconcile_outcome` succeeds:
 /// select the relevant confirmed paid invoice from `outcome.history` and use
@@ -7569,7 +7569,7 @@ where
     {
         return Err(());
     }
-    let listed = ctx
+    let Ok(listed) = ctx
         .stripe
         .list_invoices(crate::stripe::ListInvoices {
             customer_id: subscription.customer.clone(),
@@ -7581,7 +7581,10 @@ where
             starting_after: None,
         })
         .await
-        .map_err(|_| ())?;
+    else {
+        billing_alert(ctx, user_id, BILLING_FAIL_CLOSED_ACTION).await;
+        return Err(());
+    };
     let mut invoices = Vec::with_capacity(listed.len());
     for mut invoice in listed {
         let mut pages = 0;
@@ -7638,9 +7641,12 @@ where
     let now = billing_now_i64(ctx.now);
     let outcome = if exact {
         crate::billing_reconcile::reconcile_exact_target(subscription_id, input, &remote, now)
-            .ok_or(())?
     } else {
-        crate::billing_reconcile::reconcile_subscription(&input, &remote, now)
+        crate::billing_reconcile::reconcile_complete_snapshot(&input, &remote, now)
+    };
+    let Some(outcome) = outcome else {
+        billing_alert(ctx, user_id, BILLING_FAIL_CLOSED_ACTION).await;
+        return Err(());
     };
     if ctx.cfg.paid_billing_enabled() {
         ctx.store
@@ -13927,7 +13933,7 @@ pub(crate) mod tests {
         h.config.paid_invite_billing = true;
         seed_billing_user(&h, "u1");
         seed_user(&h, "u2", "u2@example.com");
-        deliver_first_period(&h, "evt_u1_initial");
+        let checkout = deliver_first_period(&h, "evt_u1_initial");
         let (first_end, ren_end) = (
             BILLING_NOW + BILLING_PERIOD,
             BILLING_NOW + 2 * BILLING_PERIOD,
@@ -14019,6 +14025,8 @@ pub(crate) mod tests {
         unchanged(&h);
         // 3. Retrieved subscription reporting another account's customer or livemode=true fails closed.
         let u1_sub = h.stripe.subscriptions.borrow()[s1].clone();
+        let mut canceled = u1_sub.clone();
+        canceled.status = "canceled".into();
         let u1_evt = inv_evt("evt_u1_guard", "in_ren", c1, s1);
         for bad in [
             crate::stripe::Subscription {
@@ -14039,9 +14047,9 @@ pub(crate) mod tests {
         h.stripe
             .subscriptions
             .borrow_mut()
-            .insert(s1.into(), u1_sub);
+            .insert(s1.into(), canceled);
         h.stripe.forbid_invoice_reads = false;
-        // 4. Renewal invoice listing carrying another account's customer never advances u1.
+        // 4. Missing line evidence is retryable. A foreign invoice cannot advance u1.
         let scope = crate::stripe::ListInvoices {
             customer_id: Some(c1.into()),
             subscription_id: Some(s1.into()),
@@ -14049,6 +14057,27 @@ pub(crate) mod tests {
             limit: 100,
             starting_after: None,
         };
+        let mut missing = inv("in_missing_lines", c1, s1, first_end, ren_end);
+        missing.lines = None;
+        let writes = h.store.reconcile_outcome_attempts.get();
+        for (paid, body) in [(false, &checkout), (true, &u1_evt)] {
+            h.config.paid_invite_billing = paid;
+            h.stripe
+                .scripted_invoice_list
+                .replace(Some((scope.clone(), missing.clone())));
+            assert_eq!(deliver(&h, body).status, 500);
+            assert_eq!(h.store.reconcile_outcome_attempts.get(), writes);
+        }
+        h.stripe.fail.borrow_mut().insert("list_invoices".into());
+        assert_eq!(deliver(&h, &u1_evt).status, 500);
+        h.stripe.fail.borrow_mut().clear();
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .insert(s1.into(), u1_sub);
+        assert!(!h.store.webhook_events.borrow().contains("evt_u1_guard"));
+        assert_eq!(h.store.paid_reconcile_attempts.get(), attempts_before);
+        unchanged(&h);
         let foreign = inv("in_foreign_cus", c2, s1, first_end, ren_end);
         h.stripe
             .scripted_invoice_list
@@ -14066,7 +14095,9 @@ pub(crate) mod tests {
         let live_evt = inv_evt("evt_u1_live_inv", "in_live_ren", c1, s1);
         assert_eq!(deliver(&h, &live_evt).status, 500);
         assert!(!h.store.webhook_events.borrow().contains("evt_u1_live_inv"));
-        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
+        let alerts = audits_with_action(&h, BILLING_FAIL_CLOSED_ACTION);
+        assert_eq!(alerts.len(), 4);
+        assert!(alerts.iter().all(|event| event.user_id == "u1"));
         unchanged(&h);
         assert!(block_on(reconcile_paid_targets(&h.ctx(), vec![("u1", Some(s1))])).is_err());
         unchanged(&h);
