@@ -461,6 +461,12 @@ fn stream_grant_user(secret: &[u8], bearer: &str, now: u64) -> Option<String> {
     Some(user.into())
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "../tests/support/private_playback_offline_client.rs"]
+mod offline;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+use crate::postgres::PgClient;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +490,48 @@ mod tests {
         let extra_field =
             mint_grant(&key, "member|other", "track", &play, 1, 120, &digest).unwrap();
         assert!(stream_grant_user(&key, &extra_field.token, 119).is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn stream_receipt_authenticates_before_querying_storage() {
+        let db = offline::offline_client().await;
+        let key = [42; 32];
+        let service = PrivatePlayback {
+            policy: None,
+            grant_secret: &key,
+        };
+        let scope = BrowserScope {
+            publication: PublicationScope {
+                environment: [1; 16],
+                library: [2; 16],
+                provider_configuration: [3; 16],
+                bucket: "test-bucket",
+            },
+            root_version: [4; 16],
+        };
+        let load = async |signing_key: &[u8]| {
+            let play = format!("{PREFIX}{}", "A".repeat(22));
+            let grant = mint_grant(
+                signing_key,
+                "member",
+                "track",
+                &play,
+                1,
+                120,
+                &"a".repeat(64),
+            )
+            .unwrap();
+            service
+                .load_for_stream(&db, &grant.token, scope, || {
+                    UNIX_EPOCH + Duration::from_secs(119)
+                })
+                .await
+        };
+        assert!(
+            load(&key).await.is_err(),
+            "a valid grant reaches the offline store"
+        );
+        assert!(matches!(load(&[17; 32]).await, Ok(None)));
     }
 }

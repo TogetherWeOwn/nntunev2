@@ -16,29 +16,10 @@ use nntune_api::{
     storage_digest_read::{protect_digest_read, DigestReadTarget},
 };
 use sha2::Sha256;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_postgres::{Config, NoTls};
 
-// Complete only the driver's startup over an in-memory pipe. Every database
-// operation on the returned client fails because its driver is gone.
-async fn offline_client() -> PgClient {
-    let (client, mut server) = tokio::io::duplex(256);
-    let mut config = Config::new();
-    config.user("synthetic");
-    let (connected, ()) = tokio::join!(config.connect_raw(client, NoTls), async {
-        let len = server.read_u32().await.unwrap();
-        server
-            .read_exact(&mut vec![0; len as usize - 4])
-            .await
-            .unwrap();
-        server
-            .write_all(b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x05I")
-            .await
-            .unwrap();
-    });
-    let (client, _) = connected.unwrap();
-    PgClient::new(client)
-}
+#[path = "support/private_playback_offline_client.rs"]
+mod support;
+use support::offline_client;
 
 #[tokio::test]
 async fn invalid_digest_geometry_never_requests_authority_or_storage() {
@@ -130,21 +111,14 @@ async fn signed_grant_cannot_outlive_its_receipt_lease() {
         version: "media-version",
     };
     let now = || UNIX_EPOCH + Duration::from_secs(100);
+    let resolve = async |db: &mut PgClient, receipt: &BrowserReceipt| {
+        private_catalogue_read::resolve(db, receipt, &pins, SECRET, now).await
+    };
     // The consistent receipt reaches the deliberately disconnected store.
-    assert!(
-        private_catalogue_read::resolve(&mut db, &receipt, &pins, SECRET, now)
-            .await
-            .is_err()
-    );
+    assert!(resolve(&mut db, &receipt).await.is_err());
     receipt.lease.expires_at -= 1;
-    assert!(matches!(
-        private_catalogue_read::resolve(&mut db, &receipt, &pins, SECRET, now).await,
-        Ok(None)
-    ));
+    assert!(matches!(resolve(&mut db, &receipt).await, Ok(None)));
     receipt.lease.expires_at += 1;
     receipt.lease.continuation_deadline -= 1;
-    assert!(matches!(
-        private_catalogue_read::resolve(&mut db, &receipt, &pins, SECRET, now).await,
-        Ok(None)
-    ));
+    assert!(matches!(resolve(&mut db, &receipt).await, Ok(None)));
 }
