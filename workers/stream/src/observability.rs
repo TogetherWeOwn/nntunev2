@@ -51,9 +51,7 @@
 //! [`STAGING_QUERY_TEMPLATE`]).
 
 use crate::grant::sha256;
-use crate::meter::is_valid_key_field;
 use crate::play::PlayError;
-use crate::trace::{check_str_value, REDACTED};
 
 /// Whether the play was served from the R2 cache. Stale is its own value:
 /// a stale serve carries `Cache-Status: STALE` on the wire, so the row must
@@ -108,13 +106,8 @@ impl CacheObserveEvent {
         bytes: u64,
         pool_error_code: Option<String>,
     ) -> Self {
-        let request_id = request_id.into();
         Self {
-            request_id: if request_id == user_id || safe_request_id(&request_id) == REDACTED {
-                REDACTED.to_owned()
-            } else {
-                request_id
-            },
+            request_id: safe_request_id(&request_id.into(), Some(user_id)).to_owned(),
             user_hash: hash_user(user_id),
             cache_status,
             ttft_ms,
@@ -151,18 +144,18 @@ impl CacheObserveEvent {
     /// Carries the request id, the hashed (never raw) user identity and the
     /// cache status alongside TTFT, bytes and the pool error code.
     pub fn to_json_log(&self) -> String {
-        let pool_error = match self.safe_pool_error() {
+        let pool_error_code = match self.safe_pool_error() {
             Some(code) => format!("\"{}\"", escape_json_str(code)),
             None => "null".to_string(),
         };
         format!(
             "{{\"request_id\":\"{}\",\"user_hash\":\"{}\",\"cache_status\":\"{}\",\"ttft_ms\":{},\"bytes\":{},\"pool_error_code\":{}}}",
-            escape_json_str(safe_request_id(&self.request_id)),
+            escape_json_str(safe_request_id(&self.request_id, None)),
             escape_json_str(self.analytics_index()),
             self.cache_status.as_str(),
             self.ttft_ms,
             self.bytes,
-            pool_error,
+            pool_error_code,
         )
     }
 
@@ -174,7 +167,7 @@ impl CacheObserveEvent {
         vec![
             self.cache_status.as_str().to_string(),
             self.analytics_index().to_owned(),
-            safe_request_id(&self.request_id).to_owned(),
+            safe_request_id(&self.request_id, None).to_owned(),
             self.safe_pool_error().unwrap_or_default().to_owned(),
         ]
     }
@@ -189,22 +182,17 @@ impl CacheObserveEvent {
     /// per-user hash. Never `cache_status` — a low-cardinality index makes
     /// Analytics Engine sample all hits as a single bucket (see module docs).
     pub fn analytics_index(&self) -> &str {
-        if self.user_hash.len() == 64
-            && self
-                .user_hash
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
-            &self.user_hash
+        let hash = &self.user_hash;
+        if hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            hash
         } else {
-            REDACTED
+            crate::trace::REDACTED
         }
     }
 
     fn safe_pool_error(&self) -> Option<&str> {
-        self.pool_error_code
-            .as_deref()
-            .filter(|code| valid_pool_error(code))
+        let code = self.pool_error_code.as_deref()?;
+        valid_pool_error(code).then_some(code)
     }
 }
 
@@ -214,11 +202,14 @@ impl std::fmt::Debug for CacheObserveEvent {
     }
 }
 
-fn safe_request_id(id: &str) -> &str {
-    if is_valid_key_field(id, 128) && check_str_value(id).is_ok() {
+/// Check the request label at construction and at each export.
+/// Construction also rejects labels that repeat the raw user ID.
+fn safe_request_id<'a>(id: &'a str, user_id: Option<&str>) -> &'a str {
+    use crate::{meter::is_valid_key_field, trace::check_str_value};
+    if user_id != Some(id) && is_valid_key_field(id, 128) && check_str_value(id).is_ok() {
         id
     } else {
-        REDACTED
+        crate::trace::REDACTED
     }
 }
 

@@ -200,16 +200,8 @@ const SECRET_VALUE_PREFIXES: &[&str] = &[
     "sk-", "sk_live_", "sk_test_", "tok_", "ghp_", "gho_", "ghu_", "xoxb-", "xoxp-",
 ];
 
-const SECRET_VALUE_MARKERS: &[&str] = &[
-    "password=",
-    "password:",
-    "secret=",
-    "secret:",
-    "apikey=",
-    "api_key=",
-    "authorization:",
-    "authorization=",
-];
+const SECRET_VALUE_MARKERS: &str =
+    "password= password: secret= secret: apikey= api_key= authorization: authorization=";
 
 /// Reject known credential prefixes and inline credential markers.
 #[must_use]
@@ -221,12 +213,11 @@ pub fn looks_like_secret_value(value: &str) -> bool {
                 .iter()
                 .any(|marker| word.starts_with(marker))
     }) || SECRET_VALUE_MARKERS
-        .iter()
+        .split_whitespace()
         .any(|marker| lower.contains(marker))
 }
 
-/// A dotted-quad of valid octets is an IP address and is rejected;
-/// out-of-range quads are not IPs.
+/// True for dotted-quad IPv4 values with in-range octets.
 #[must_use]
 pub fn looks_like_ipv4_value(value: &str) -> bool {
     let parts: Vec<&str> = value.split('.').collect();
@@ -245,8 +236,7 @@ pub fn looks_like_email_value(value: &str) -> bool {
     }
 }
 
-/// A hex-colon IP literal (`::1`, `2001:db8::1`, full 8-group form) is an IP
-/// address and is rejected; colon-joined operational refs pass.
+/// True for IPv6 literals, including IPv4-mapped addresses.
 #[must_use]
 pub fn looks_like_ipv6_value(value: &str) -> bool {
     value.parse::<std::net::Ipv6Addr>().is_ok()
@@ -262,10 +252,6 @@ pub enum FieldRejection {
     Limit,
 }
 
-const MAX_LOG_FIELDS: usize = 32;
-const MAX_FIELD_KEY_BYTES: usize = 96;
-const MAX_FIELD_VALUE_BYTES: usize = 1024;
-
 /// A flat `fields` value: strings, integers, booleans, or null. No nesting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FieldValue {
@@ -276,8 +262,7 @@ pub enum FieldValue {
     Null,
 }
 
-/// Validated flat field map. Insertions run the privacy backstop, so a
-/// `LogFields` that exists is already safe to render.
+/// A flat field map validated at insertion.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogFields {
     fields: Vec<(String, FieldValue)>,
@@ -290,7 +275,7 @@ impl LogFields {
     }
 
     pub fn insert_str(&mut self, key: &str, value: &str) -> Result<(), FieldRejection> {
-        self.check_key(key)?;
+        check_key(key, self.fields.len())?;
         check_str_value(value)?;
         self.fields
             .push((key.to_string(), FieldValue::Str(value.to_string())));
@@ -298,37 +283,27 @@ impl LogFields {
     }
 
     pub fn insert_uint(&mut self, key: &str, value: u64) -> Result<(), FieldRejection> {
-        self.check_key(key)?;
+        check_key(key, self.fields.len())?;
         self.fields.push((key.to_string(), FieldValue::UInt(value)));
         Ok(())
     }
 
     pub fn insert_int(&mut self, key: &str, value: i64) -> Result<(), FieldRejection> {
-        self.check_key(key)?;
+        check_key(key, self.fields.len())?;
         self.fields.push((key.to_string(), FieldValue::Int(value)));
         Ok(())
     }
 
     pub fn insert_bool(&mut self, key: &str, value: bool) -> Result<(), FieldRejection> {
-        self.check_key(key)?;
+        check_key(key, self.fields.len())?;
         self.fields.push((key.to_string(), FieldValue::Bool(value)));
         Ok(())
     }
 
     pub fn insert_null(&mut self, key: &str) -> Result<(), FieldRejection> {
-        self.check_key(key)?;
+        check_key(key, self.fields.len())?;
         self.fields.push((key.to_string(), FieldValue::Null));
         Ok(())
-    }
-
-    fn check_key(&self, key: &str) -> Result<(), FieldRejection> {
-        if self.fields.len() >= MAX_LOG_FIELDS {
-            return Err(FieldRejection::Limit);
-        }
-        if key.is_empty() || key.len() > MAX_FIELD_KEY_BYTES || is_banned_field_key(key) {
-            return Err(FieldRejection::BannedKey(REDACTED.to_owned()));
-        }
-        check_str_value(key)
     }
 
     #[must_use]
@@ -362,8 +337,18 @@ impl LogFields {
     }
 }
 
+fn check_key(key: &str, field_count: usize) -> Result<(), FieldRejection> {
+    if field_count >= 32 {
+        return Err(FieldRejection::Limit);
+    }
+    if key.is_empty() || key.len() > 96 || is_banned_field_key(key) {
+        return Err(FieldRejection::BannedKey(REDACTED.to_owned()));
+    }
+    check_str_value(key)
+}
+
 pub(crate) fn check_str_value(value: &str) -> Result<(), FieldRejection> {
-    if value.len() > MAX_FIELD_VALUE_BYTES {
+    if value.len() > 1024 {
         return Err(FieldRejection::Limit);
     }
     if looks_like_secret_value(value) {

@@ -102,10 +102,9 @@ fn meter_refuses_invalid_acks_and_oversized_windows() {
         let ack = serde_json::json!({"accepted": &ids[..count]}).to_string();
         assert_eq!(parse_ack(ack.as_bytes()).is_some(), count == 64);
     }
-    let mut ack = b"{}".to_vec();
-    ack.resize(64 * 1024, b' ');
-    assert!(parse_ack(&ack).is_some());
-    ack.push(b' ');
+    let mut ack = vec![b' '; 64 * 1024 + 1];
+    ack[..2].copy_from_slice(b"{}");
+    assert!(parse_ack(&ack[..64 * 1024]).is_some());
     assert!(parse_ack(&ack).is_none());
     let mut book = MeterBook::new("user");
     let mut interval: DeliveredInterval = serde_json::from_str(
@@ -126,11 +125,8 @@ fn meter_refuses_invalid_acks_and_oversized_windows() {
 #[test]
 fn trace_rejects_sensitive_and_unbounded_fields() {
     let mut fields = LogFields::new();
-    for value in [
-        "[::ffff:192.0.2.1]:563",
-        "proxy Bearer sample",
-        &"x".repeat(1025),
-    ] {
+    let oversized = "x".repeat(1025);
+    for value in ["[::ffff:192.0.2.1]:563", "proxy Bearer sample", &oversized] {
         assert!(fields.insert_str("detail", value).is_err());
     }
     assert!(!format!("{:?}", fields.insert_uint("password=sample", 1)).contains("sample"));
