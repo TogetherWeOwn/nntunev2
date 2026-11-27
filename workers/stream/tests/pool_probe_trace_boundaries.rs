@@ -33,12 +33,12 @@ fn foreign_release_and_superseded_probe_cannot_open_admission() {
     assert!(pool.record_probe_success_for(probe.id));
 }
 
-struct TimeoutAfterGreeting(bool);
+struct TimeoutAfterHandshake(bool);
 
-impl Transport for TimeoutAfterGreeting {
+impl Transport for TimeoutAfterHandshake {
     async fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
         if std::mem::replace(&mut self.0, false) {
-            io::Write::write(&mut buf, b"200 ready\r\n")
+            io::Write::write(&mut buf, b"200 ready\r\n200 reader mode\r\n")
         } else {
             Err(io::ErrorKind::TimedOut.into())
         }
@@ -54,7 +54,7 @@ impl Transport for TimeoutAfterGreeting {
 #[tokio::test]
 async fn typed_probe_refuses_bad_batches_and_never_redials_a_timeout() {
     let pool = RefCell::new(Pool::new(2));
-    let client = NntpClient::connect(TimeoutAfterGreeting(true), &Default::default())
+    let client = NntpClient::connect(TimeoutAfterHandshake(true), &Default::default())
         .await
         .unwrap();
     let lease = pool.borrow_mut().try_acquire(Lane::Ingest).unwrap();
