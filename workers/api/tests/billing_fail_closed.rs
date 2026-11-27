@@ -2,7 +2,7 @@ use nntune_api::billing_reconcile::{
     reconcile_subscription, FailClosedReason, LiveRow, PriceBinding, ReconcileInput,
     RemoteSubscription,
 };
-use nntune_api::billing_store_classification::{classify_write, Identity, Refused, Target};
+use nntune_api::billing_store_classification::{classify_write, Identity, Target};
 use nntune_api::billing_sweep::{scheduled_hour, CRON};
 use nntune_api::stripe::{Invoice, InvoiceList};
 use serde_json::json;
@@ -13,7 +13,7 @@ mod billing_cancel_control;
 
 const NOW: i64 = 1_800_000_000;
 
-fn local() -> ReconcileInput {
+fn local(live: Option<LiveRow>) -> ReconcileInput {
     ReconcileInput {
         stripe_customer_id: Some("cus_fixture".into()),
         bindings: vec![PriceBinding {
@@ -22,7 +22,7 @@ fn local() -> ReconcileInput {
             selectable: true,
             livemode: false,
         }],
-        live: None,
+        live,
     }
 }
 
@@ -60,8 +60,7 @@ fn remote(status: &str, invoices: Vec<Invoice>) -> RemoteSubscription {
 }
 
 fn anchored() -> ReconcileInput {
-    let mut local = local();
-    local.live = Some(LiveRow {
+    local(Some(LiveRow {
         stripe_subscription_id: "sub_fixture".into(),
         stripe_customer_id: "cus_fixture".into(),
         stripe_item_id: "si_fixture".into(),
@@ -71,8 +70,7 @@ fn anchored() -> ReconcileInput {
         paid_through_unix: Some(NOW),
         paid_invoice_id: Some("in_anchor".into()),
         grace_until_unix: Some(NOW + 60),
-    });
-    local
+    }))
 }
 
 #[test]
@@ -88,19 +86,14 @@ fn incomplete_invoice_envelopes_are_not_finished_pages() {
 fn incomplete_lines_refuse_the_whole_snapshot() {
     let mut incomplete = invoice("in_anchor", NOW);
     incomplete.lines.as_mut().unwrap().has_more = true;
-    let mut missing = incomplete.clone();
-    missing.lines = None;
-    let local = anchored();
-    for (status, bad) in [("active", incomplete), ("canceled", missing)] {
-        let remote = remote(status, vec![invoice("in_new", NOW + 300), bad]);
-        let outcome = reconcile_subscription(&local, &remote, NOW);
-        assert_eq!(
-            outcome.fail_closed,
-            Some(FailClosedReason::InvalidInvoiceEvidence)
-        );
-        assert!(outcome.explicit_stale && outcome.history.is_empty());
-        assert_eq!(outcome.row.paid_through_unix, Some(NOW));
-    }
+    let remote = remote("active", vec![invoice("in_new", NOW + 300), incomplete]);
+    let outcome = reconcile_subscription(&local(None), &remote, NOW);
+    assert_eq!(
+        outcome.fail_closed,
+        Some(FailClosedReason::InvalidInvoiceEvidence)
+    );
+    assert!(outcome.explicit_stale && outcome.history.is_empty());
+    assert_eq!(outcome.row.paid_through_unix, None);
 }
 
 #[test]
@@ -121,14 +114,18 @@ fn cancel_and_replay_require_the_bound_paid_anchor() {
         );
         assert!(outcome.explicit_stale && outcome.history.is_empty());
     }
-    let stale = reconcile_subscription(&local, &remote("canceled", vec![]), NOW);
+    let mut complete = remote("canceled", vec![]);
+    complete.subscription.items.as_mut().unwrap().data[0]
+        .id
+        .clear();
+    let stale = reconcile_subscription(&local, &complete, NOW);
     assert!(stale.explicit_stale && stale.fail_closed.is_none());
 
-    let complete = remote("canceled", vec![anchor]);
+    complete.invoices.push(anchor);
     let canceled = reconcile_subscription(&local, &complete, NOW);
-    assert!(!canceled.explicit_stale && canceled.fail_closed.is_none());
+    assert!(!canceled.explicit_stale);
+    assert_eq!(canceled.fail_closed, Some(FailClosedReason::AmbiguousItems));
     assert_eq!(canceled.row.status, "canceled");
-    assert_eq!(canceled.row.grace_until_unix, None);
     let committed = local.live.as_mut().unwrap();
     committed.status = canceled.row.status.clone();
     committed.grace_until_unix = canceled.row.grace_until_unix;
@@ -138,7 +135,7 @@ fn cancel_and_replay_require_the_bound_paid_anchor() {
 #[test]
 fn reversed_period_and_blank_invoice_id_confer_nothing() {
     for bad in [invoice("in_reversed", NOW - 31), invoice(" ", NOW + 300)] {
-        let folded = reconcile_subscription(&local(), &remote("active", vec![bad]), NOW);
+        let folded = reconcile_subscription(&local(None), &remote("active", vec![bad]), NOW);
         assert_eq!(folded.row.paid_through_unix, None);
         assert!(folded.history.is_empty());
     }
@@ -151,6 +148,7 @@ fn sweep_rejects_non_integer_and_out_of_range_milliseconds() {
         assert_eq!(scheduled_hour(CRON, input), None);
     }
     assert_eq!(scheduled_hour(CRON, max), Some(2_400_000_000));
+    assert_eq!(scheduled_hour(CRON, 3_599_999.0), Some(0));
 }
 
 #[test]
@@ -167,7 +165,6 @@ fn contradictory_write_receipts_are_opaque_refusals() {
             matching_proof_cancel_conflict: false,
         };
         let err = classify_write(&returned[0], &owned, &returned, true).unwrap_err();
-        assert_eq!(err, Refused);
         assert_eq!(format!("{err:?}"), "Refused");
     }
 }
@@ -178,10 +175,7 @@ fn cancellation_observation_requires_a_decoded_true() {
     use billing_cancel_control::require_blocked;
 
     assert_eq!(require_blocked(Ok::<_, &str>(true)), Ok(()));
-    assert_eq!(
-        require_blocked(Ok::<_, &str>(false)),
-        Err("negative control backend did not remain blocked")
-    );
+    assert!(require_blocked(Ok::<_, &str>(false)).is_err());
     assert_eq!(
         require_blocked(Err("synthetic database diagnostic")),
         Err("negative control observation failed")

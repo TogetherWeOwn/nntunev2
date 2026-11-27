@@ -139,21 +139,26 @@ pub fn classify_write(
     returned: &[Identity<'_>],
     slot_suppression_proof: bool,
 ) -> Result<Accepted, Refused> {
-    // A returned row contradicts either suppression under table exclusion.
-    let suppressed = match target {
-        Target::Owned {
-            predicate_stale: true,
-            ..
-        } => Some(Accepted::PredicateStaleOwned),
-        Target::Owned {
-            other_live_holder: true,
-            ..
-        } if slot_suppression_proof => Some(Accepted::LiveSlotSuppressedOwned),
-        _ => None,
-    };
-    match (returned, suppressed) {
-        ([identity], None) if identity == requested => Ok(Accepted::AppliedOwned),
-        ([], Some(reason)) => Ok(reason),
+    match returned {
+        [identity] if identity == requested => match target {
+            Target::Owned {
+                predicate_stale,
+                other_live_holder,
+                ..
+            } if *predicate_stale || (*other_live_holder && slot_suppression_proof) => Err(Refused),
+            _ => Ok(Accepted::AppliedOwned),
+        },
+        [] => match target {
+            Target::Owned {
+                predicate_stale: true,
+                ..
+            } => Ok(Accepted::PredicateStaleOwned),
+            Target::Owned {
+                other_live_holder: true,
+                ..
+            } if slot_suppression_proof => Ok(Accepted::LiveSlotSuppressedOwned),
+            _ => Err(Refused),
+        },
         _ => Err(Refused),
     }
 }

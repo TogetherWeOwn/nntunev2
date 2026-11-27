@@ -373,6 +373,21 @@ pub fn reconcile_subscription(
             FailClosedReason::InvalidInvoiceEvidence,
         );
     }
+    let anchor_invoice_in_snapshot = |anchor: &str| {
+        remote
+            .invoices
+            .iter()
+            .find(|invoice| invoice.id == anchor && valid_anchor(invoice))
+    };
+    let status = sub.status.as_str();
+    let previous = local.live.as_ref();
+    if is_terminal_status(status) || is_held_status(status) {
+        if let Some(kept) = previous.filter(|_| {
+            read_anchor.is_some_and(|anchor| anchor_invoice_in_snapshot(anchor).is_none())
+        }) {
+            return stale_snapshot(sub, remote_customer, kept, None, Vec::new());
+        }
+    }
     // Exactly one priced item: zero or several is unresolvable, never
     // first-picked.
     let (item_id, price_id) = match sub.single_item() {
@@ -401,29 +416,6 @@ pub fn reconcile_subscription(
         );
     };
 
-    let anchor_invoice_in_snapshot = |anchor: &str| {
-        remote
-            .invoices
-            .iter()
-            .find(|invoice| invoice.id == anchor && valid_anchor(invoice))
-    };
-
-    let status = sub.status.as_str();
-    let previous = local.live.as_ref();
-    if is_terminal_status(status) || is_held_status(status) {
-        if let Some(kept) = previous.filter(|row| {
-            row.stripe_subscription_id == sub.id
-                && row
-                    .paid_invoice_id
-                    .as_ref()
-                    .is_some_and(|anchor| anchor_invoice_in_snapshot(anchor).is_none())
-        }) {
-            // The exhausted listing proves staleness even without folding
-            // money. Do not re-pin an equal-end anchor: the write must still
-            // recognize this evidence after another pass changes status/grace.
-            return stale_snapshot(sub, remote_customer, kept, None, Vec::new());
-        }
-    }
     // Every non-stale branch below re-pins the stored anchor when it keeps
     // the stored coverage: the write guard reads an anchor-less equal-end
     // write against an anchored stored row as stale evidence, and only the
@@ -770,9 +762,8 @@ fn stale_snapshot(
     }
 }
 
-/// Fail-closed outcome: the observed remote state is recorded (verbatim
-/// status, verbatim item/price bindings when present), nothing advances,
-/// and the caller disables new purchases plus raises the alert.
+/// Invalid observations never advance coverage. Refused snapshots retry
+/// without writing, and accepted observations retain the failure marker.
 fn fail_closed(
     local: &ReconcileInput,
     sub: &Subscription,
@@ -817,9 +808,12 @@ fn fail_closed(
         },
         history: Vec::new(),
         fail_closed: Some(reason),
-        // Invalid evidence cannot release a live slot on a terminal status.
-        explicit_stale: is_terminal_status(&sub.status)
-            || reason == FailClosedReason::InvalidInvoiceEvidence,
+        explicit_stale: reason == FailClosedReason::InvalidInvoiceEvidence
+            || (is_terminal_status(&sub.status)
+                && matches!(
+                    reason,
+                    FailClosedReason::WrongLivemode | FailClosedReason::CustomerMismatch
+                )),
         read_plan: previous.map(|row| row.plan_id.clone()),
         read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
     }
@@ -2293,8 +2287,10 @@ mod tests {
                     invoices: vec![paid_invoice("in_target", PRICE_PLUS, NOW, NOW + 50, NOW)],
                 };
                 assert_eq!(
-                    reconcile_exact_target("sub_123", foreign.clone(), &remote, NOW),
-                    reconcile_exact_target("sub_123", absent.clone(), &remote, NOW),
+                    reconcile_exact_target("sub_123", foreign.clone(), &remote, NOW)
+                        .expect("requested target"),
+                    reconcile_exact_target("sub_123", absent.clone(), &remote, NOW)
+                        .expect("requested target"),
                     "foreign row affected {status} / {price}"
                 );
             }

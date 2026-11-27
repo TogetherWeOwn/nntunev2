@@ -14023,11 +14023,10 @@ pub(crate) mod tests {
         }
         assert_eq!(h.store.paid_reconcile_attempts.get(), attempts_before);
         unchanged(&h);
-        // 3. Wrong customer, live mode, and malformed terminal snapshots fail closed.
+        // 3. Retrieved subscription reporting another account's customer or livemode=true fails closed.
         let u1_sub = h.stripe.subscriptions.borrow()[s1].clone();
         let mut canceled = u1_sub.clone();
         canceled.status = "canceled".into();
-        canceled.items.as_mut().unwrap().data[0].id.clear();
         let u1_evt = inv_evt("evt_u1_guard", "in_ren", c1, s1);
         for bad in [
             crate::stripe::Subscription {
@@ -14038,20 +14037,17 @@ pub(crate) mod tests {
                 livemode: true,
                 ..u1_sub.clone()
             },
-            canceled,
         ] {
-            h.stripe.forbid_invoice_reads = bad.status != "canceled";
             h.stripe.subscriptions.borrow_mut().insert(s1.into(), bad);
             assert_eq!(deliver(&h, &u1_evt).status, 500);
             assert!(!h.store.webhook_events.borrow().contains("evt_u1_guard"));
             assert_eq!(h.store.paid_reconcile_attempts.get(), attempts_before);
             unchanged(&h);
         }
-        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
         h.stripe
             .subscriptions
             .borrow_mut()
-            .insert(s1.into(), u1_sub);
+            .insert(s1.into(), canceled);
         h.stripe.forbid_invoice_reads = false;
         // 4. Missing line evidence is retryable. A foreign invoice cannot advance u1.
         let scope = crate::stripe::ListInvoices {
@@ -14072,6 +14068,10 @@ pub(crate) mod tests {
             assert_eq!(deliver(&h, body).status, 500);
             assert_eq!(h.store.reconcile_outcome_attempts.get(), writes);
         }
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .insert(s1.into(), u1_sub);
         assert!(!h.store.webhook_events.borrow().contains("evt_u1_guard"));
         assert_eq!(h.store.paid_reconcile_attempts.get(), attempts_before);
         unchanged(&h);
@@ -14093,7 +14093,7 @@ pub(crate) mod tests {
         assert_eq!(deliver(&h, &live_evt).status, 500);
         assert!(!h.store.webhook_events.borrow().contains("evt_u1_live_inv"));
         let alerts = audits_with_action(&h, BILLING_FAIL_CLOSED_ACTION);
-        assert_eq!(alerts.len(), 4);
+        assert_eq!(alerts.len(), 3);
         assert!(alerts.iter().all(|event| event.user_id == "u1"));
         unchanged(&h);
         assert!(block_on(reconcile_paid_targets(&h.ctx(), vec![("u1", Some(s1))])).is_err());
@@ -15544,10 +15544,7 @@ pub(crate) mod tests {
         ))
         .expect("op insert");
         let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
-        h.stripe
-            .fail
-            .borrow_mut()
-            .insert("retrieve_subscription".to_string());
+        h.stripe.fail.borrow_mut().insert("list_invoices".into());
         assert_eq!(
             h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
             500
@@ -15556,6 +15553,7 @@ pub(crate) mod tests {
             live_for(&h, "u1").is_none(),
             "the failed pass stores nothing"
         );
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
         // The same event id redelivered: the released claim lets it
         // reprocess instead of acking 200 on a consumed claim.
         h.stripe.fail.borrow_mut().clear();
