@@ -8275,6 +8275,16 @@ fn construct_production_subsonic_snapshot(
     .map_err(|_| subsonic_catalogue_error(query))
 }
 
+fn parse_subsonic_mount_credentials(
+    method: &str,
+    query: &str,
+    body: &str,
+) -> Result<nntune_subsonic::auth::Credentials, crate::subsonic_http::CredentialParseError> {
+    let form_body =
+        (method.eq_ignore_ascii_case("POST") && !body.is_empty()).then_some(body.as_bytes());
+    crate::subsonic_http::parse_credentials(Some(query), form_body)
+}
+
 /// Authenticate before constructing the member-scoped dispatch store.
 /// Playback remains unavailable until an occurrence has a trusted binding
 /// to an application track; the dispatcher never receives audio bytes.
@@ -8318,8 +8328,7 @@ pub async fn subsonic_mount(
             ))
         }
     };
-    let form_body = (!body.is_empty()).then_some(body.as_bytes());
-    let credentials = match crate::subsonic_http::parse_credentials(Some(query), form_body) {
+    let credentials = match parse_subsonic_mount_credentials(method, query, body) {
         Ok(credentials) => credentials,
         Err(err) => return respond_document(&core::parse_error_response(&merged, err)),
     };
@@ -9102,6 +9111,136 @@ mod tests {
         })
         .await;
         assert_eq!(catalogue, Err("mirror unavailable"));
+    }
+
+    #[test]
+    fn production_snapshot_and_response_ceiling_fail_closed_without_catalogue_leak() {
+        use crate::catalogue::{ReleaseDbRow, TrackDbRow};
+        use crate::subsonic_dispatch::ProductionStore;
+        use nntune_subsonic::{Identity, SubsonicApp, UserAccount};
+
+        let releases = [ReleaseDbRow {
+            mbid: "release".into(),
+            title: "Canary Album".into(),
+            release_type: None,
+            year: Some(2026),
+            artist_mbid: None,
+            artist_name: Some("Canary Artist".into()),
+        }];
+        let base = snapshot_track();
+        let over_row = TrackDbRow {
+            title: format!(
+                "Canary Track {}",
+                "z".repeat(PRODUCTION_SNAPSHOT_LIMITS.row_text_bytes)
+            ),
+            ..base.clone()
+        };
+        let lim = PRODUCTION_SNAPSHOT_LIMITS;
+        let refused =
+            construct_production_subsonic_snapshot(&[], &releases, &[over_row], "f=json", lim)
+                .unwrap_err();
+        let txt = String::from_utf8(refused.body.clone()).unwrap();
+        assert_snapshot_refusal(refused);
+        assert!(!txt.contains("Canary") && !txt.contains("release"));
+
+        let tracks: Vec<_> = (0..300)
+            .map(|i| TrackDbRow {
+                recording_mbid: format!("rec-{i}"),
+                title: format!("Canary Track <&>\" {}", "x".repeat(600)),
+                track_no: Some((i + 1) as i16),
+                ..base.clone()
+            })
+            .collect();
+        let (a, al, s) =
+            construct_production_subsonic_snapshot(&[], &releases, &tracks, "f=json", lim).unwrap();
+        let id = Identity {
+            username: "nsu_synth".into(),
+            email: "s@example.invalid".into(),
+            is_admin: false,
+        };
+        let acct = UserAccount {
+            email: "s@example.invalid".into(),
+            is_admin: false,
+            is_manager: false,
+        };
+        let app = SubsonicApp::production(ProductionStore::new(id, acct, a, al, s, tracks, 1));
+        for (sel, ct) in [
+            ("f=json", "application/json"),
+            ("f=xml", "application/xml"),
+            ("f=jsonp&callback=safe.cb", "application/json"),
+        ] {
+            let q = format!("apiKey=ok&id=release&{sel}");
+            let res = app.handle("GET", "/rest/getAlbum", &q, "");
+            let txt = String::from_utf8(res.body).unwrap();
+            assert!((res.status, res.content_type.as_str()) == (413, ct) && txt.len() <= 1024);
+            assert!(!txt.starts_with("/**/") && !txt.contains("safe.cb"));
+            assert!(!txt.contains("Canary") && !txt.contains("release"));
+        }
+        let ok = app.handle(
+            "GET",
+            "/rest/getAlbumList2",
+            "apiKey=ok&type=newest&f=json",
+            "",
+        );
+        assert!(
+            ok.status == 200 && ok.body.len() <= nntune_subsonic::MAX_PRODUCTION_RESPONSE_BYTES
+        );
+        let json: serde_json::Value = serde_json::from_slice(&ok.body).unwrap();
+        let response = &json["subsonic-response"];
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["albumList2"]["album"][0]["id"], "release");
+        assert_eq!(response["albumList2"]["album"][0]["name"], "Canary Album");
+    }
+
+    #[tokio::test]
+    async fn dormant_auth_refusals_block_catalogue_load_and_adapter_stays_unmounted() {
+        use crate::subsonic_auth::AuthError;
+        use crate::subsonic_dispatch::{auth_error_response, parse_error_response};
+        use crate::subsonic_http::CredentialParseError;
+
+        for (err, code) in [
+            (AuthError::Unsupported, 42),
+            (AuthError::Conflicting, 43),
+            (AuthError::MissingSalt, 10),
+            (AuthError::InvalidKey, 44),
+            (AuthError::InvalidToken, 40),
+            (AuthError::Unavailable, 0),
+        ] {
+            let loads = std::cell::Cell::new(0usize);
+            let loads_ref = &loads;
+            let res = after_auth(
+                async { Err::<(), _>(auth_error_response("f=json&apiKey=nsk_synth", err)) },
+                |_| async {
+                    loads_ref.set(loads_ref.get() + 1);
+                    Ok("Canary")
+                },
+            )
+            .await
+            .unwrap_err();
+            let txt = String::from_utf8(res.body).unwrap();
+            assert!(
+                loads.get() == 0 && txt.len() <= 1024 && txt.contains(&format!("\"code\":{code}"))
+            );
+            assert!(!txt.contains("Canary") && !txt.contains("nsk_synth"));
+        }
+        for bad in ["apiKey=a&apiKey=b", "apiKey=%ZZ", "u[]=nsu_synth"] {
+            let err = parse_subsonic_mount_credentials("GET", bad, "").unwrap_err();
+            let txt = String::from_utf8(parse_error_response("f=json", err).body).unwrap();
+            assert!(txt.len() <= 1024 && txt.contains("\"code\":0") && !txt.contains("nsu_synth"));
+        }
+        let query = "apiKey=query-synthetic";
+        let body = "apiKey=body-synthetic";
+        let get = parse_subsonic_mount_credentials("GET", query, body).unwrap();
+        assert_eq!(get.api_key.as_deref(), Some("query-synthetic"));
+        assert_eq!(
+            parse_subsonic_mount_credentials("POST", query, body).unwrap_err(),
+            CredentialParseError::DuplicateCredential,
+        );
+        // The existing compatibility route serves an empty store. It must
+        // never dispatch to the authenticated adapter.
+        let lib_src = include_str!("lib.rs");
+        assert!(lib_src.contains("SubsonicApp::production(MemStore::empty())"));
+        assert!(!lib_src.contains("subsonic_mount"));
     }
 
     const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";

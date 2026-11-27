@@ -22,6 +22,7 @@ pub mod value;
 
 pub use app::{
     oversized_body_response, unreadable_body_response, HttpResponse, SubsonicApp, MAX_BODY_BYTES,
+    MAX_PRODUCTION_RESPONSE_BYTES,
 };
 pub use auth::{AuthStore, Credentials, Identity};
 pub use body::{BodyFault, FormBody};

@@ -5,16 +5,22 @@
 //! Mutations go through `RefCell` so `handle` stays `&self`.
 
 use crate::auth::{authenticate, Credentials, Identity};
+use crate::capped_render::{self, Format};
 use crate::endpoints::{handle_endpoint, EndpointResult, Params};
 use crate::envelope::{
-    error_document, ok_document, render_json, render_jsonp, render_xml, JSON_CONTENT_TYPE,
-    XML_CONTENT_TYPE,
+    error_document, is_valid_jsonp_callback, ok_document, render_json, render_jsonp, render_xml,
+    JSONP_CONTENT_TYPE, JSON_CONTENT_TYPE, XML_CONTENT_TYPE,
 };
+use crate::staging_rejection::{fixed_staging_rejection, RejectionFormat, StagingRejection};
 
 /// v1 `MergeFormPostParams::MAX_BODY_BYTES`: a POST body over 10 MB is
 /// refused with error 10 before any parsing — its parameters cannot be
 /// trusted, so nothing downstream may act on a prefix of them.
 pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Serialized response body ceiling for production mode (256 KiB), matching
+/// the staging bounded document ceiling. Oversized responses fail closed before
+/// allocating the response buffer.
+pub const MAX_PRODUCTION_RESPONSE_BYTES: usize = 256 * 1024;
 use crate::library::Library;
 use crate::routes::{route, Route};
 use std::cell::RefCell;
@@ -83,7 +89,7 @@ impl<S: Library> SubsonicApp<S> {
                     crate::envelope::code::GENERIC,
                     &format!("The {op} operation is not supported by this server."),
                 );
-                Self::render(&params, &doc)
+                self.render(&params, &doc)
             }
             // Public per the OpenSubsonic spec: body merge and cap apply,
             // authentication is skipped (v1 serves it outside the auth group).
@@ -91,7 +97,7 @@ impl<S: Library> SubsonicApp<S> {
                 let params = Params::parse(&merged);
                 let identity = Identity::for_public_route();
                 let mut store = self.store.borrow_mut();
-                Self::render_endpoint(
+                self.render_endpoint(
                     &params,
                     handle_endpoint(&mut *store, &identity, name, &params, !self.production),
                 )
@@ -101,7 +107,7 @@ impl<S: Library> SubsonicApp<S> {
                 // Presence, not the winning value: an empty or duplicate p=
                 // must not be rescued by valid credentials in another field.
                 if self.production && !params.get_all("p").is_empty() {
-                    return Self::render(
+                    return self.render(
                         &params,
                         &error_document(
                             crate::envelope::code::UNSUPPORTED_AUTH,
@@ -115,7 +121,7 @@ impl<S: Library> SubsonicApp<S> {
                 let identity = match authenticate(&*store, &creds) {
                     Ok(identity) => identity,
                     Err((error_code, message)) => {
-                        return Self::render(&params, &error_document(error_code, &message));
+                        return self.render(&params, &error_document(error_code, &message));
                     }
                 };
                 // These operations have no persistent production backing yet. Do
@@ -136,7 +142,7 @@ impl<S: Library> SubsonicApp<S> {
                             | "deletePodcastChannel"
                     )
                 {
-                    return Self::render(
+                    return self.render(
                         &params,
                         &error_document(
                             crate::envelope::code::GENERIC,
@@ -144,7 +150,7 @@ impl<S: Library> SubsonicApp<S> {
                         ),
                     );
                 }
-                Self::render_endpoint(
+                self.render_endpoint(
                     &params,
                     handle_endpoint(&mut *store, &identity, name, &params, !self.production),
                 )
@@ -152,13 +158,16 @@ impl<S: Library> SubsonicApp<S> {
         }
     }
 
-    fn render_endpoint(params: &Params, result: EndpointResult) -> HttpResponse {
+    fn render_endpoint(&self, params: &Params, result: EndpointResult) -> HttpResponse {
         match result {
-            EndpointResult::Doc(payload) => Self::render(params, &ok_document(payload)),
+            EndpointResult::Doc(payload) => self.render(params, &ok_document(payload)),
             EndpointResult::Err(error_code, message) => {
-                Self::render(params, &error_document(error_code, &message))
+                self.render(params, &error_document(error_code, &message))
             }
             EndpointResult::Binary { content_type, body } => {
+                if self.production && body.len() > MAX_PRODUCTION_RESPONSE_BYTES {
+                    return Self::oversized_response(params.get("f"));
+                }
                 HttpResponse::document(200, &content_type, body)
             }
         }
@@ -176,7 +185,10 @@ impl<S: Library> SubsonicApp<S> {
         }
     }
 
-    fn render(params: &Params, doc: &crate::value::Value) -> HttpResponse {
+    fn render(&self, params: &Params, doc: &crate::value::Value) -> HttpResponse {
+        if self.production {
+            return Self::render_bounded(params, doc, MAX_PRODUCTION_RESPONSE_BYTES);
+        }
         match params.get("f") {
             Some("json") => HttpResponse::document(200, JSON_CONTENT_TYPE, render_json(doc)),
             Some("jsonp") => {
@@ -186,6 +198,39 @@ impl<S: Library> SubsonicApp<S> {
             }
             _ => HttpResponse::document(200, XML_CONTENT_TYPE, render_xml(doc)),
         }
+    }
+
+    fn render_bounded(params: &Params, doc: &crate::value::Value, limit: usize) -> HttpResponse {
+        let selector = params.get("f");
+        let (format, content_type) = match selector {
+            Some("json") => (Format::Json, JSON_CONTENT_TYPE),
+            Some("jsonp") => match params.get("callback") {
+                Some(cb) if is_valid_jsonp_callback(cb) => (Format::Jsonp(cb), JSONP_CONTENT_TYPE),
+                _ => {
+                    let (body, content_type) = render_jsonp(doc, None);
+                    return HttpResponse::document(200, content_type, body);
+                }
+            },
+            _ => (Format::Xml, XML_CONTENT_TYPE),
+        };
+        let Ok(len) = capped_render::encoded_len(doc, format, limit) else {
+            return Self::oversized_response(selector);
+        };
+        let mut body = Vec::new();
+        if body.try_reserve_exact(len).is_err() {
+            return Self::oversized_response(selector);
+        }
+        body.resize(len, 0);
+        match capped_render::render_into(doc, format, &mut body) {
+            Ok(written) if written == len => HttpResponse::document(200, content_type, body),
+            _ => Self::oversized_response(selector),
+        }
+    }
+
+    fn oversized_response(selector: Option<&str>) -> HttpResponse {
+        let format = RejectionFormat::from_safe_selector(selector);
+        let fixed = fixed_staging_rejection(StagingRejection::RequestOrDocumentTooLarge, format);
+        HttpResponse::document(fixed.status, fixed.content_type, fixed.body.to_vec())
     }
 }
 
@@ -444,5 +489,142 @@ mod tests {
         assert!(String::from_utf8(res.body)
             .unwrap()
             .contains("status=\"ok\""));
+    }
+
+    #[test]
+    fn production_response_ceiling_fails_closed_at_exact_boundary() {
+        let seeded = MemStore::seeded();
+        let template = seeded.song("so-1").unwrap();
+        let album_app = |extra: usize| {
+            let songs = (0..256)
+                .map(|i| {
+                    let mut song = template.clone();
+                    song.id = format!("so-canary-{i}");
+                    let pad = "x".repeat(extra / 256 + usize::from(i < extra % 256));
+                    song.title = format!("<&>\"{pad}");
+                    song
+                })
+                .collect();
+            let store = MemStore::empty_with_test_auth().with_catalogue(
+                seeded.artists(),
+                seeded.all_albums(),
+                songs,
+            );
+            SubsonicApp::production(store)
+        };
+        let base = album_app(0);
+        for (sel, ok_ct, err_ct) in [
+            ("f=json", JSON_CONTENT_TYPE, JSON_CONTENT_TYPE),
+            ("f=xml", XML_CONTENT_TYPE, XML_CONTENT_TYPE),
+            (
+                "f=jsonp&callback=safe.cb",
+                JSONP_CONTENT_TYPE,
+                JSON_CONTENT_TYPE,
+            ),
+        ] {
+            let q = format!("apiKey=test-key-1&id=al-1&{sel}");
+            let delta = MAX_PRODUCTION_RESPONSE_BYTES - get(&base, "/rest/getAlbum", &q).body.len();
+            let ok = get(&album_app(delta), "/rest/getAlbum", &q);
+            assert!(ok.status == 200 && ok.content_type == ok_ct);
+            assert_eq!(ok.body.len(), MAX_PRODUCTION_RESPONSE_BYTES);
+            let over_app = album_app(delta + 1);
+            let over = get(&over_app, "/rest/getAlbum", &q);
+            let txt = String::from_utf8(over.body).unwrap();
+            assert!(over.status == 413 && over.content_type == err_ct && txt.len() <= 1024);
+            assert!(txt.contains("too large") && !txt.starts_with("/**/"));
+            for s in ["safe.cb", "Test Artist", "Test Album", "al-1", "so-canary"] {
+                assert!(!txt.contains(s), "{sel} leaked {s}");
+            }
+            if sel.starts_with("f=jsonp") {
+                let bad = get(
+                    &over_app,
+                    "/rest/getAlbum",
+                    "apiKey=test-key-1&id=al-1&f=jsonp&callback=bad()",
+                );
+                let txt = String::from_utf8(bad.body).unwrap();
+                assert!(bad.status == 200 && bad.content_type == JSON_CONTENT_TYPE);
+                assert!(
+                    txt.contains("\"code\":10") && !txt.contains("bad()") && !txt.contains("Test")
+                );
+            }
+        }
+        let bin = base.render_endpoint(
+            &Params::parse("f=json"),
+            EndpointResult::Binary {
+                content_type: "image/png".into(),
+                body: vec![0u8; MAX_PRODUCTION_RESPONSE_BYTES + 1],
+            },
+        );
+        assert!(
+            bin.status == 413 && bin.content_type == JSON_CONTENT_TYPE && bin.body.len() <= 1024
+        );
+    }
+
+    #[test]
+    fn production_invalid_or_missing_credentials_refuse_without_leaking_catalogue() {
+        let app = SubsonicApp::production(MemStore::seeded());
+        let bad_creds = [
+            ("", 40),
+            ("apiKey=wrong-synth-key", 44),
+            ("u=test&t=00000000000000000000000000000000&s=abc", 40),
+            ("u=test&t=00000000000000000000000000000000", 10),
+            ("apiKey=test-key-1&u=test", 43),
+            ("u=test&p=test-pass", 42),
+            ("apiKey=test-key-1&p=", 42),
+        ];
+        let leaked = |txt: &str| {
+            [
+                "Test ",
+                "ar-1",
+                "al-1",
+                "so-1",
+                "La la",
+                "wrong-synth",
+                "test-pass",
+                "test-key-1",
+            ]
+            .iter()
+            .any(|c| txt.contains(c))
+        };
+        for (path, extra) in [
+            ("/rest/getArtists", ""),
+            ("/rest/getAlbum", "id=al-1"),
+            ("/rest/getSong", "id=so-1"),
+            ("/rest/getAlbumList2", "type=newest"),
+            ("/rest/search3", "query=Test"),
+            ("/rest/getLyrics", "artist=Test+Artist&title=Test+Song"),
+        ] {
+            for (creds, code) in bad_creds {
+                for (m, sel, j) in [
+                    ("GET", "f=json", true),
+                    ("POST", "f=xml", false),
+                    ("GET", "f=jsonp&callback=safe.cb", true),
+                ] {
+                    let q = if m == "POST" {
+                        format!("{sel}&{extra}")
+                    } else {
+                        format!("{sel}&{creds}&{extra}")
+                    };
+                    let res = app.handle(m, path, &q, if m == "POST" { creds } else { "" });
+                    let txt = String::from_utf8(res.body).unwrap();
+                    let n = if j {
+                        format!("\"code\":{code}")
+                    } else {
+                        format!("code=\"{code}\"")
+                    };
+                    assert!(
+                        res.status == 200 && txt.contains(&n) && !leaked(&txt),
+                        "{path}: {txt}"
+                    );
+                }
+            }
+        }
+        let empty = SubsonicApp::production(MemStore::empty());
+        let tok = format!("u=test&t={}&s=abc", crate::auth::md5_hex(b"test-passabc"));
+        for (creds, code) in [("apiKey=test-key-1", 44), (tok.as_str(), 40)] {
+            let r = get(&empty, "/rest/getArtists", &format!("{creds}&f=json"));
+            let txt = String::from_utf8(r.body).unwrap();
+            assert!(txt.contains(&format!("\"code\":{code}")) && !leaked(&txt));
+        }
     }
 }

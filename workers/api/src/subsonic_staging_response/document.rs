@@ -6,7 +6,7 @@ use nntune_subsonic::envelope::{JSONP_CONTENT_TYPE, JSON_CONTENT_TYPE, XML_CONTE
 use nntune_subsonic::staging_rejection::{RejectionFormat, StagingRejection};
 use nntune_subsonic::value::Value;
 
-pub const DOCUMENT_BYTES: usize = 256 * 1024;
+pub const DOCUMENT_BYTES: usize = nntune_subsonic::MAX_PRODUCTION_RESPONSE_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentError {
