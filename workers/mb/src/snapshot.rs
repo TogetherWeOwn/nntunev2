@@ -848,8 +848,10 @@ mod worker_entry {
         let api = match segments.as_slice() {
             ["v1", "mb", "search"] => {
                 let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
-                let limit = query.get("limit").and_then(|v| v.parse::<u32>().ok());
-                let offset = query.get("offset").and_then(|v| v.parse::<u32>().ok());
+                let (limit, offset) = match crate::search_pagination(&query) {
+                    Ok(page) => page,
+                    Err(err) => return render(crate::error_response(err), started, 0),
+                };
                 let raw_q = query.get("q").map(String::as_str).unwrap_or("");
                 handle_search_paged(
                     &repo,

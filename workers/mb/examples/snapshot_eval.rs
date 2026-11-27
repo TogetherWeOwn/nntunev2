@@ -67,10 +67,11 @@ fn block_on<F: Future>(future: F) -> F::Output {
 /// The HTTP layer's search normalization (trim, lowercase, collapse runs
 /// of whitespace) — the repository receives this form.
 fn normalize_query(raw: &str) -> String {
-    raw.split_whitespace()
+    raw.trim()
+        .to_lowercase()
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_lowercase()
 }
 
 fn clean(field: &str) -> String {
@@ -78,7 +79,7 @@ fn clean(field: &str) -> String {
 }
 
 fn validate_lookup_sample(found: u64, missing: u64) -> Result<(), String> {
-    if found == 0 && missing == 0 {
+    if found + missing == 0 {
         return Err("no nonblank sampled MBIDs".to_owned());
     }
     if missing > 0 {
@@ -94,7 +95,7 @@ fn run(args: &[String], stdin: impl BufRead) -> Result<(), String> {
     let repo = SnapshotRepo::new(DirSource { dir }, "");
     let mut stdout = std::io::BufWriter::new(std::io::stdout());
     match mode.as_str() {
-        "search" if args.len() == 3 => {
+        "search" => {
             let mut queries = 0u64;
             for line in stdin.lines() {
                 let line = line.map_err(|e| e.to_string())?;
@@ -130,7 +131,7 @@ fn run(args: &[String], stdin: impl BufRead) -> Result<(), String> {
             }
             eprintln!("snapshot_eval: {queries} queries");
         }
-        "lookup" if args.len() == 4 => {
+        "lookup" => {
             let kind = Kind::parse(args.get(3).cloned()).ok_or(usage)?;
             let (mut found, mut missing) = (0u64, 0u64);
             for line in stdin.lines() {

@@ -5,6 +5,7 @@ Run: python3 workers/mb/spike/test_bench.py
 """
 
 import sys
+import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
@@ -32,6 +33,12 @@ def report(search: dict | None = None) -> dict:
 
 
 class GateTest(unittest.TestCase):
+    def test_golden_query_preserves_unicode_line_separator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            golden = Path(tmp) / "golden.tsv"
+            golden.write_text("1\tAlbum\u2028Live\tplain\n", encoding="utf-8")
+            self.assertEqual(bench.golden_queries(golden), ["Album\u2028Live"])
+
     def test_http_error_status_survives_a_broken_error_body(self):
         error = urllib.error.HTTPError("https://mb.test", 503, "unavailable", {}, None)
         with patch.object(error, "read", side_effect=OSError), patch.object(

@@ -26,6 +26,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from golden import read_tsv
+
 REQUESTS = 1000
 CONCURRENCY = 50
 TIMING = re.compile(r'snapshot;dur=([0-9]{1,16}(?:\.[0-9]+)?);desc="reads=([0-9]{1,16})"')
@@ -93,6 +95,10 @@ def run(urls: list[str], token: str) -> dict:
 ENDPOINTS = ("lookup:artist", "lookup:release", "lookup:recording", "search:release")
 
 
+def golden_queries(path: Path) -> list[str]:
+    return [row[1] for row in read_tsv(path)][:REQUESTS]
+
+
 def gate(report: dict) -> dict:
     """Gate 2 verdict. Percentiles cover status-200 results only, so a pass
     also needs every endpoint to have run all REQUESTS and all of them to
@@ -121,7 +127,7 @@ def main() -> int:
     for kind in ("artist", "release", "recording"):
         mbids = mbids_dir.joinpath(f"{kind}.txt").read_text().split()[:REQUESTS]
         report[f"lookup:{kind}"] = run([f"{base}/v1/mb/{kind}/{m}" for m in mbids], token)
-    queries = [line.split("\t")[1] for line in golden.read_text(encoding="utf-8").splitlines()][:REQUESTS]
+    queries = golden_queries(golden)
     report["search:release"] = run(
         [f"{base}/v1/mb/search?type=release&q={urllib.parse.quote(q)}" for q in queries], token)
     report["gate_2"] = gate(report)

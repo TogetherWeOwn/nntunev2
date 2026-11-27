@@ -720,8 +720,7 @@ fn mismatched_repository_entity_is_never_served_or_cached() {
     let cache = SeededCache::empty();
     let repo = FakeRepo::found(fresh_entity(Kind::Recording));
     let resp = run_lookup(Kind::Release, MBID, &repo, &cache);
-    assert_eq!(resp.status, 500);
-    assert_eq!(resp.cache_ttl, None);
+    assert_eq!((resp.status, resp.cache_ttl), (500, None));
     assert!(cache.puts.borrow().is_empty());
 }
 

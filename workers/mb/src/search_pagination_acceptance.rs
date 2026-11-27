@@ -23,7 +23,6 @@
 //!    - `offset`: `None` defaults to `0`; an offset past the end
 //!      of the result set is a 200 with `"results": []`, never an error and
 //!      never a scan. The effective value is echoed as `offset`.
-//!    - The HTTP route rejects malformed and overflowing page parameters.
 //!    - Success body: `{"q", "type", "limit", "offset", "results"}` — the
 //!      existing `q` (normalized)/`type`/`results` keys plus the echoes.
 //! 3. `MbRepo::search` gains the page: `async fn search(&self, kind: Kind,
@@ -166,24 +165,25 @@ fn result_mbids(body: &serde_json::Value) -> Vec<String> {
 
 #[test]
 fn malformed_pagination_coordinates_are_client_errors() {
-    let route = include_str!("lib.rs")
-        .split_once("pub async fn search_route(")
-        .unwrap()
-        .1;
+    let source = include_str!("lib.rs");
+    let route = &source[source.find("pub async fn search_route(").unwrap()..];
     let parse = route.find("match search_pagination(&query) {").unwrap();
-    let empty = route.find("empty_query_response()").unwrap();
-    let reject = route
-        .find("return serve(url.to_string(), api, &trace_id)")
-        .unwrap();
-    let edge = route.find("edge_hit(req,").unwrap();
-    assert!(parse < empty && empty < reject && reject < edge);
+    assert!(parse < route.find("edge_hit(req,").unwrap());
+    assert!(include_str!("snapshot.rs").contains("match crate::search_pagination(&query) {"));
     for key in ["limit", "offset"] {
         for raw in ["", "-1", "invalid", "4294967296"] {
-            let params = [(key.to_owned(), raw.to_owned())].into();
+            let params = [
+                (key.to_owned(), raw.to_owned()),
+                ("q".into(), "album".into()),
+            ]
+            .into();
             let error = super::search_pagination(&params).unwrap_err();
             assert_eq!(error.status, 400, "{key}={raw}");
         }
     }
+    let blank = [("limit".into(), "bad".into()), ("q".into(), " ".into())].into();
+    let resp = super::error_response(super::search_pagination(&blank).unwrap_err());
+    assert!(resp.body.contains("MB_SEARCH_EMPTY_QUERY"));
 }
 
 #[test]

@@ -57,7 +57,6 @@ def copy_text(field: str) -> str | None:
 
     return COPY_ESCAPE.sub(decode, field.encode("utf-8")).decode("utf-8")
 
-
 def normalize_match_text(raw: str) -> str:
     """Proxy ingest normalization; Python alnum omits some Alphabetic marks.
 

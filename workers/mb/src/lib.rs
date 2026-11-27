@@ -111,7 +111,7 @@ pub const MAX_PAGE_SIZE: usize = 25;
 /// part of the documented contract in `README.md`.
 pub const MAX_SEARCH_OFFSET: u32 = 1_000;
 
-/// Upper bound on trimmed `q` length, in chars. Bounds trigram work and KV keys.
+/// Upper bound on `q` length, in chars. Bounds trigram work and KV keys.
 pub const MAX_QUERY_CHARS: usize = 100;
 
 /// Hyperdrive / KV binding names: must match `wrangler.toml`.
@@ -428,17 +428,20 @@ fn form_encode_component(value: &str) -> String {
 fn search_pagination(
     params: &std::collections::HashMap<String, String>,
 ) -> Result<(Option<u32>, Option<u32>), ApiError> {
-    let parse = |key, message| {
+    let parse = |key| {
         params
             .get(key)
             .map(|raw| raw.parse::<u32>())
             .transpose()
-            .map_err(|_| ApiError::invalid_request(message))
+            .map_err(|_| {
+                if params.get("q").is_none_or(|q| q.trim().is_empty()) {
+                    empty_query_error()
+                } else {
+                    ApiError::invalid_request("limit and offset must be unsigned 32-bit integers")
+                }
+            })
     };
-    Ok((
-        parse("limit", "limit must be an unsigned 32-bit integer")?,
-        parse("offset", "offset must be an unsigned 32-bit integer")?,
-    ))
+    Ok((parse("limit")?, parse("offset")?))
 }
 
 /// Canonical edge-cache key for a request URL.
@@ -625,10 +628,10 @@ fn number_fits_i32(n: &serde_json::Number) -> bool {
 /// or mistyped fields) is a miss so the poisoned entry is overwritten by
 /// the success-only cache path.
 fn cached_lookup_body_is_fresh_shape(kind: Kind, mbid: &str, body: &str) -> bool {
-    serde_json::from_str(body).is_ok_and(|value| lookup_value_has_fresh_shape(kind, mbid, &value))
-}
-
-fn lookup_value_has_fresh_shape(kind: Kind, mbid: &str, value: &serde_json::Value) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
     let obj = match value.as_object() {
         Some(obj) => obj,
         None => return false,
@@ -638,7 +641,8 @@ fn lookup_value_has_fresh_shape(kind: Kind, mbid: &str, value: &serde_json::Valu
         _ => return false,
     }
     match obj.get("mbid") {
-        Some(serde_json::Value::String(cached)) if cached.eq_ignore_ascii_case(mbid) => {}
+        Some(serde_json::Value::String(cached)) if cached.to_lowercase() == mbid.to_lowercase() => {
+        }
         _ => return false,
     }
     fn required_str(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
@@ -733,20 +737,23 @@ pub enum Entity {
 }
 
 impl Entity {
-    fn to_json(&self) -> serde_json::Result<serde_json::Value> {
-        let (kind, value) = match self {
-            Entity::Artist(a) => (Kind::Artist, serde_json::to_value(a)),
-            Entity::Release(r) => (Kind::Release, serde_json::to_value(r)),
-            Entity::Recording(r) => (Kind::Recording, serde_json::to_value(r)),
+    fn to_json(&self, kind: Kind, mbid: &str) -> Option<serde_json::Value> {
+        let (actual, id, value) = match self {
+            Entity::Artist(a) => (Kind::Artist, &a.mbid, serde_json::to_value(a)),
+            Entity::Release(r) => (Kind::Release, &r.mbid, serde_json::to_value(r)),
+            Entity::Recording(r) => (Kind::Recording, &r.mbid, serde_json::to_value(r)),
         };
-        let mut value = value?;
+        if actual != kind || !id.eq_ignore_ascii_case(mbid) {
+            return None;
+        }
+        let mut value = value.ok()?;
         if let serde_json::Value::Object(map) = &mut value {
             map.insert(
                 "kind".to_string(),
                 serde_json::Value::String(kind.as_str().to_string()),
             );
         }
-        Ok(value)
+        Some(value)
     }
 }
 
@@ -1176,12 +1183,9 @@ pub async fn handle_lookup<R: MbRepo, C: SuccessCache>(
     }
     match repo.lookup(kind, &mbid.to_lowercase()).await {
         Ok(Some(entity)) => {
-            let Ok(value) = entity.to_json() else {
+            let Some(value) = entity.to_json(kind, mbid) else {
                 return error_response(ApiError::internal_error());
             };
-            if !lookup_value_has_fresh_shape(kind, mbid, &value) {
-                return error_response(ApiError::internal_error());
-            }
             let body = value.to_string();
             cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
             success_response(body, LOOKUP_CACHE_TTL_S)
@@ -1710,11 +1714,8 @@ pub async fn handle_recording_isrcs<R: MbRepo, C: SuccessCache>(
 /// Stable 4xx for empty/whitespace search queries: 400 with the registered
 /// `MB_SEARCH_EMPTY_QUERY` code (see `docs/api-errors.md`), `no-store`,
 /// without touching the repo (never a scan) or the cache.
-fn empty_query_response() -> ApiResponse {
-    error_response(ApiError::by_code(
-        "MB_SEARCH_EMPTY_QUERY",
-        "search query must not be empty",
-    ))
+fn empty_query_error() -> ApiError {
+    ApiError::by_code("MB_SEARCH_EMPTY_QUERY", "search query must not be empty")
 }
 
 /// Stable KV key for a paged search success. Page coordinates are part of the
@@ -1827,7 +1828,7 @@ pub async fn handle_search_paged<R: MbRepo, C: SuccessCache>(
     // Empty check first: before `type` validation so the code is stable
     // regardless of `type`, and before cache/repo so it is never a scan.
     if raw_q.trim().is_empty() {
-        return empty_query_response();
+        return error_response(empty_query_error());
     }
     let q = raw_q.trim();
     let q_chars = q.chars().count();
@@ -2829,13 +2830,8 @@ mod http_layer {
         let (limit, offset) = match search_pagination(&query) {
             Ok(page) => page,
             Err(err) => {
-                let api = if raw_q.trim().is_empty() {
-                    empty_query_response()
-                } else {
-                    error_response(err)
-                };
-                log_outcome(api.status);
-                return serve(url.to_string(), api, &trace_id).await;
+                log_outcome(err.status);
+                return serve(url.to_string(), error_response(err), &trace_id).await;
             }
         };
         if let Some(hit) = edge_hit(req, |body| {
