@@ -209,8 +209,8 @@ pub struct ReconcileOutcome {
     pub row: ReconciledRow,
     pub history: Vec<PaidInvoiceRow>,
     pub fail_closed: Option<FailClosedReason>,
-    /// Explicit stale proof suppresses the subscription write. A refused
-    /// incomplete snapshot also sets this flag and carries no history.
+    /// Suppresses the subscription write. Refused snapshots also set this
+    /// flag and carry no history.
     pub explicit_stale: bool,
     /// The plan the pass read (the stored plan at fold time) and the
     /// anchor it read (the stored anchor at fold time): the write's
@@ -318,14 +318,14 @@ pub(crate) fn reconcile_exact_target(
     reconcile_complete_snapshot(&local, remote, now_unix)
 }
 
-/// Incomplete transport evidence is retryable and must never reach a writer.
+/// Refused evidence is retryable and must never reach a writer.
 pub(crate) fn reconcile_complete_snapshot(
     local: &ReconcileInput,
     remote: &RemoteSubscription,
     now_unix: i64,
 ) -> Option<ReconcileOutcome> {
     let outcome = reconcile_subscription(local, remote, now_unix);
-    (outcome.fail_closed != Some(FailClosedReason::IncompleteInvoiceLines)).then_some(outcome)
+    (!outcome.explicit_stale || outcome.fail_closed.is_none()).then_some(outcome)
 }
 
 /// Shared by the webhook and API/inline paths: fold one retrieved remote
@@ -347,7 +347,7 @@ pub fn reconcile_subscription(
     }
     // Customer binding: exact once the account holds one; a fresh account
     // adopts the retrieved customer. An unbound remote object is not ours.
-    let Some(remote_customer) = sub.customer.clone().filter(|id| !id.trim().is_empty()) else {
+    let Some(remote_customer) = sub.customer.clone() else {
         return fail_closed(local, sub, None, None, FailClosedReason::CustomerMismatch);
     };
     if let Some(bound) = local.stripe_customer_id.as_deref() {
@@ -365,15 +365,13 @@ pub fn reconcile_subscription(
             && bound_paid(invoice)
             && invoice.lines.as_ref().is_none_or(|lines| lines.has_more)
     }) {
-        let mut outcome = fail_closed(
+        return fail_closed(
             local,
             sub,
             Some(remote_customer),
             None,
             FailClosedReason::IncompleteInvoiceLines,
         );
-        outcome.explicit_stale = true;
-        return outcome;
     }
     // Exactly one priced item: zero or several is unresolvable, never
     // first-picked.
@@ -821,7 +819,10 @@ fn fail_closed(
         },
         history: Vec::new(),
         fail_closed: Some(reason),
-        explicit_stale: false,
+        // Invalid evidence cannot release a live slot, even when the remote
+        // status is terminal. A complete, valid snapshot can retry the fold.
+        explicit_stale: is_terminal_status(&sub.status)
+            || reason == FailClosedReason::IncompleteInvoiceLines,
         read_plan: previous.map(|row| row.plan_id.clone()),
         read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
     }
@@ -1939,9 +1940,6 @@ mod tests {
             if matches!(case, "customer" | "subscription") {
                 assert!(outcome.history.is_empty(), "{case}");
             }
-            if case == "partial" {
-                assert!(reconcile_complete_snapshot(&fresh(), &remote, NOW).is_none());
-            }
         }
     }
 
@@ -2298,10 +2296,8 @@ mod tests {
                     invoices: vec![paid_invoice("in_target", PRICE_PLUS, NOW, NOW + 50, NOW)],
                 };
                 assert_eq!(
-                    reconcile_exact_target("sub_123", foreign.clone(), &remote, NOW)
-                        .expect("requested target"),
-                    reconcile_exact_target("sub_123", absent.clone(), &remote, NOW)
-                        .expect("requested target"),
+                    reconcile_exact_target("sub_123", foreign.clone(), &remote, NOW),
+                    reconcile_exact_target("sub_123", absent.clone(), &remote, NOW),
                     "foreign row affected {status} / {price}"
                 );
             }

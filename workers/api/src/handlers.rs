@@ -14041,7 +14041,7 @@ pub(crate) mod tests {
             .borrow_mut()
             .insert(s1.into(), u1_sub);
         h.stripe.forbid_invoice_reads = false;
-        // 4. Renewal invoice listing carrying another account's customer never advances u1.
+        // 4. Missing line evidence is retryable. A foreign invoice cannot advance u1.
         let scope = crate::stripe::ListInvoices {
             customer_id: Some(c1.into()),
             subscription_id: Some(s1.into()),
@@ -14049,6 +14049,14 @@ pub(crate) mod tests {
             limit: 100,
             starting_after: None,
         };
+        let mut missing = inv("in_missing_lines", c1, s1, first_end, ren_end);
+        missing.lines = None;
+        h.stripe
+            .scripted_invoice_list
+            .replace(Some((scope.clone(), missing)));
+        assert_eq!(deliver(&h, &u1_evt).status, 500);
+        assert_eq!(h.store.paid_reconcile_attempts.get(), attempts_before);
+        unchanged(&h);
         let foreign = inv("in_foreign_cus", c2, s1, first_end, ren_end);
         h.stripe
             .scripted_invoice_list
