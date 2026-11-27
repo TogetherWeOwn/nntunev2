@@ -3,7 +3,7 @@
 //! The caller must account for every raw row and every output copy before it
 //! constructs them, and discard all partial output on any error.
 
-use nntune_subsonic::construction_budget::BudgetExceeded;
+use nntune_subsonic::construction_budget::{BudgetExceeded, ConstructionBudget};
 
 use crate::catalogue::{ArtistDbRow, ReleaseDbRow, TrackDbRow};
 
@@ -16,6 +16,7 @@ pub(super) struct SnapshotBytes {
     per_row: usize,
     total_limit: usize,
     total: usize,
+    raw_allocations: ConstructionBudget,
 }
 
 #[allow(dead_code)]
@@ -25,11 +26,12 @@ impl SnapshotBytes {
             per_row,
             total_limit,
             total: 0,
+            raw_allocations: ConstructionBudget::new(usize::MAX),
         }
     }
 
     pub(super) fn artist(&mut self, row: &ArtistDbRow) -> Result<(), BudgetExceeded> {
-        self.row(&[
+        self.raw_row(&[
             row.mbid.len(),
             row.name.len(),
             row.sort_name.len(),
@@ -39,7 +41,7 @@ impl SnapshotBytes {
     }
 
     pub(super) fn release(&mut self, row: &ReleaseDbRow) -> Result<(), BudgetExceeded> {
-        self.row(&[
+        self.raw_row(&[
             row.mbid.len(),
             row.title.len(),
             optional_len(&row.release_type),
@@ -49,7 +51,10 @@ impl SnapshotBytes {
     }
 
     pub(super) fn track(&mut self, row: &TrackDbRow) -> Result<(), BudgetExceeded> {
-        self.row(&[
+        if row.duration_ms.is_some_and(|duration| duration < 0) {
+            return Err(BudgetExceeded);
+        }
+        self.raw_row(&[
             row.release_mbid.len(),
             row.recording_mbid.len(),
             row.title.len(),
@@ -98,7 +103,7 @@ impl SnapshotBytes {
         artists: &[ArtistDbRow],
         releases: &[ReleaseDbRow],
         tracks: &[TrackDbRow],
-    ) -> Result<(), BudgetExceeded> {
+    ) -> Result<usize, BudgetExceeded> {
         for artist in artists {
             self.artist(artist)?;
         }
@@ -108,7 +113,16 @@ impl SnapshotBytes {
         for track in tracks {
             self.track(track)?;
         }
-        self.output(artists, releases, tracks)
+        self.output(artists, releases, tracks)?;
+        Ok(self.raw_allocations.charged())
+    }
+
+    fn raw_row(&mut self, fields: &[usize]) -> Result<(), BudgetExceeded> {
+        self.row(fields)?;
+        for &len in fields {
+            super::string(&mut self.raw_allocations, len)?;
+        }
+        Ok(())
     }
 
     pub(super) fn output(

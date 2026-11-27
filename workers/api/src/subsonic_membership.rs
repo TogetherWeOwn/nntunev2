@@ -1,6 +1,6 @@
 //! Unmounted membership read. The app and mirror have separate snapshots.
 
-use super::{with_deadline, StoreError};
+use super::{subsonic_pg_page::debit_admission, with_deadline, StoreError};
 use crate::catalogue::{
     catalogue_member_releases_statement, catalogue_member_track_pairs_statement, is_catalogue_mbid,
 };
@@ -46,19 +46,16 @@ const PROJECT_RELEASE: &str =
 const PROJECT_RECORDING: &str =
     ", CASE WHEN octet_length(recording_mbid) <= 36 THEN recording_mbid ELSE '' END";
 
-async fn preflight(
-    tx: &PgTransaction<'_>,
+fn admission_sql(
     budget: &mut ConstructionBudget,
     statement: &str,
-    user_id: &str,
-    limit: i64,
     pairs: bool,
-    remaining: &mut i32,
-) -> Result<usize, StoreError> {
-    let query = sql(
+) -> Result<String, StoreError> {
+    sql(
         budget,
         &[
-            "SELECT CASE WHEN row_count < $2 AND fields_ok AND used <= $3 THEN row_count END, used::int \
+            "SELECT CASE WHEN row_count < $2 AND fields_ok AND used <= $3 AND \
+             getdatabaseencoding() = 'UTF8' AND pg_client_encoding() = 'UTF8' THEN row_count END, used::int \
              FROM (SELECT count(*) AS row_count, COALESCE(bool_and(octet_length(release_mbid) <= 1024",
             if pairs { " AND COALESCE(octet_length(recording_mbid), 0) <= 1024" } else { "" },
             "), true) AS fields_ok, COALESCE(sum(",
@@ -68,7 +65,19 @@ async fn preflight(
             statement,
             " LIMIT $2) AS membership) AS admission",
         ],
-    )?;
+    )
+}
+
+async fn preflight(
+    tx: &PgTransaction<'_>,
+    budget: &mut ConstructionBudget,
+    statement: &str,
+    user_id: &str,
+    limit: i64,
+    pairs: bool,
+    remaining: &mut i32,
+) -> Result<usize, StoreError> {
+    let query = admission_sql(budget, statement, pairs)?;
     let row = tx
         .query_typed_one(
             &query,
@@ -82,11 +91,7 @@ async fn preflight(
         .map_err(|_| StoreError)?;
     let count: i64 = row.try_get(0).map_err(|_| StoreError)?;
     let used: i32 = row.try_get(1).map_err(|_| StoreError)?;
-    *remaining = remaining
-        .checked_sub(used)
-        .filter(|n| *n >= 0 && used >= 0)
-        .ok_or(StoreError)?;
-    usize::try_from(count).map_err(|_| StoreError)
+    debit_admission(count, used, limit, remaining)
 }
 
 async fn fetch<T: Ord>(
@@ -163,7 +168,9 @@ pub(super) async fn read_membership(
 ) -> Result<StagingMembership, StoreError> {
     let limit = cap
         .checked_add(1)
-        .filter(|_| (0..=MEMBERSHIP_ROWS).contains(&cap))
+        .filter(|_| {
+            (0..=MEMBERSHIP_ROWS).contains(&cap) && (0..=SOURCE_TEXT_BYTES).contains(&remaining)
+        })
         .ok_or(StoreError)?;
     let tx = client.read_only_snapshot().await.map_err(|_| StoreError)?;
     tx.set_local_subsonic_timeouts()
@@ -217,6 +224,21 @@ pub(super) async fn read_membership(
         pairs,
         remaining_text_bytes: remaining,
     })
+}
+
+#[cfg(test)]
+#[test]
+fn both_membership_probes_require_utf8_before_returning_a_count() {
+    let mut budget = ConstructionBudget::new(4096);
+    for (statement, pairs) in [
+        (catalogue_member_releases_statement(), false),
+        (catalogue_member_track_pairs_statement(), true),
+    ] {
+        let query = admission_sql(&mut budget, statement, pairs).unwrap();
+        assert!(query.contains(
+            "getdatabaseencoding() = 'UTF8' AND pg_client_encoding() = 'UTF8' THEN row_count END"
+        ));
+    }
 }
 
 pub(crate) async fn load_staging_membership(

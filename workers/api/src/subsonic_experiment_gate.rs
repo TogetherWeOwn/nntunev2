@@ -24,8 +24,8 @@ impl<'a> Lease<'a> {
         raw: Option<&'a str>,
     ) -> Option<Self> {
         if !deployment.is_staging
-            || deployment.staging_host.is_empty()
             || https_host != Some(deployment.staging_host)
+            || !valid_host(deployment.staging_host)
             || enable != Some("1")
         {
             return None;
@@ -66,6 +66,22 @@ impl<'a> Lease<'a> {
     pub fn allows_principal(&self, authenticated_user_id: &str) -> bool {
         self.synthetic_principal == authenticated_user_id
     }
+}
+
+fn valid_host(host: &str) -> bool {
+    // The binding is an RP ID, so accept a bare DNS name in the same
+    // lowercase form as the request URL's host.
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        && matches!(url::Host::parse(host), Ok(url::Host::Domain(name)) if name == host)
 }
 
 fn epoch(value: &str) -> Option<u64> {

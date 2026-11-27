@@ -22,10 +22,13 @@ use crate::{
     field_envelope::{self, Context},
     native_rest::{credential_hmac, Pepper},
     subsonic_auth::{AuthMode, CredentialRecord, TokenEnvelope},
+    subsonic_config::{MAX_KEY_BYTES, MIN_KEY_BYTES},
 };
 
 const MAX_USER_ID_BYTES: usize = 128;
 const MAX_LABEL_BYTES: usize = 64;
+// The last whole Unix second in year 9999, matching the API's timestamp range.
+const MAX_CREATED_AT: u64 = 253_402_300_799;
 const API_KEY_PREFIX: &str = "nsk_";
 const TOKEN_SECRET_PREFIX: &str = "nst_";
 const USERNAME_PREFIX: &str = "nsu_";
@@ -151,16 +154,24 @@ pub fn issue(
     kek_version: u32,
     kek: &[u8; 32],
 ) -> Result<IssuedCredential, LifecycleError> {
-    if user_id.is_empty() || user_id.len() > MAX_USER_ID_BYTES || !no_controls(user_id) {
+    if user_id.is_empty()
+        || user_id.len() > MAX_USER_ID_BYTES
+        || !no_controls(user_id)
+        || !no_controls(label)
+        || now > MAX_CREATED_AT
+    {
         return Err(LifecycleError::Invalid);
     }
     let label = label.trim();
-    if label.is_empty() || label.len() > MAX_LABEL_BYTES || !no_controls(label) {
+    if label.is_empty() || label.len() > MAX_LABEL_BYTES {
         return Err(LifecycleError::Invalid);
     }
     let wants_key = matches!(mode, AuthMode::ApiKey | AuthMode::Both);
     let wants_token = matches!(mode, AuthMode::Token | AuthMode::Both);
-    if wants_key && (!valid_version(pepper.version) || pepper.bytes.len() < 32) {
+    if wants_key
+        && (!valid_version(pepper.version)
+            || !(MIN_KEY_BYTES..=MAX_KEY_BYTES).contains(&pepper.bytes.len()))
+    {
         return Err(LifecycleError::Invalid);
     }
     if wants_token && !valid_version(kek_version) {

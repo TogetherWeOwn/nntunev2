@@ -8,7 +8,7 @@ pub(super) fn check_order_work(
     releases: usize,
     tracks: usize,
     work: OrderWork,
-) -> Result<(), BudgetExceeded> {
+) -> Result<OrderWork, BudgetExceeded> {
     let needed = order_work(artists, releases, tracks, artists).ok_or(BudgetExceeded)?;
     // Byte preflight, output planning and mapping each scan artists for every
     // release. Mapping also scans tracks per release and releases per track.
@@ -17,14 +17,17 @@ pub(super) fn check_order_work(
         .and_then(|n| n.checked_mul(3))
         .and_then(|n| releases.checked_mul(tracks)?.checked_mul(2)?.checked_add(n))
         .ok_or(BudgetExceeded)?;
-    let comparisons = needed
+    let comparisons = work
         .comparisons
-        .checked_add(lookups)
+        .checked_sub(lookups)
         .ok_or(BudgetExceeded)?;
-    if comparisons > work.comparisons || needed.artist_row_probes > work.artist_row_probes {
+    if needed.comparisons > comparisons || needed.artist_row_probes > work.artist_row_probes {
         return Err(BudgetExceeded);
     }
-    Ok(())
+    Ok(OrderWork {
+        comparisons,
+        ..work
+    })
 }
 
 #[cfg(test)]
@@ -49,7 +52,7 @@ mod tests {
             comparisons: ordering.comparisons + 3 * 2 + 2,
             artist_row_probes: ordering.artist_row_probes,
         };
-        assert!(check_order_work(2, 1, 1, exact).is_ok());
+        assert_eq!(check_order_work(2, 1, 1, exact), Ok(ordering));
         assert!(check_order_work(
             2,
             1,

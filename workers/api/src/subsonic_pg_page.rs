@@ -19,20 +19,36 @@ pub(super) async fn admit_page(
     limit: i64,
     remaining: &mut i32,
 ) -> Result<usize, StoreError> {
+    if limit <= 0 || *remaining < 0 {
+        return Err(StoreError);
+    }
     let row = tx
         .query_typed_one(query, params)
         .await
         .map_err(|_| StoreError)?;
     let count: i64 = row.try_get(0).map_err(|_| StoreError)?;
     let used: i32 = row.try_get(1).map_err(|_| StoreError)?;
+    debit_admission(count, used, limit, remaining)
+}
+
+pub(super) fn debit_admission(
+    count: i64,
+    used: i32,
+    limit: i64,
+    remaining: &mut i32,
+) -> Result<usize, StoreError> {
     if !(0..limit).contains(&count) {
+        return Err(StoreError);
+    }
+    let count = usize::try_from(count).map_err(|_| StoreError)?;
+    if count == 0 && used != 0 {
         return Err(StoreError);
     }
     *remaining = remaining
         .checked_sub(used)
         .filter(|n| *n >= 0 && used >= 0)
         .ok_or(StoreError)?;
-    usize::try_from(count).map_err(|_| StoreError)
+    Ok(count)
 }
 
 // The count must come from a probe over the same rows in the same snapshot.
@@ -82,6 +98,19 @@ where
         return Err(StoreError);
     }
     Ok(output)
+}
+
+#[cfg(test)]
+#[test]
+fn admission_rejects_inconsistent_receipts_without_debiting() {
+    let mut remaining = 72;
+    for (count, used) in [(-1, 0), (3, 0), (0, 1), (1, -1), (2, 73)] {
+        assert!(debit_admission(count, used, 3, &mut remaining).is_err());
+        assert_eq!(remaining, 72);
+    }
+    assert_eq!(debit_admission(0, 0, 3, &mut remaining).unwrap(), 0);
+    assert_eq!(debit_admission(2, 72, 3, &mut remaining).unwrap(), 2);
+    assert_eq!(remaining, 0);
 }
 
 #[cfg(any(test, all(target_arch = "wasm32", feature = "ledger-wasm-test")))]
