@@ -11,7 +11,7 @@ ADVISORY = "RUSTSEC-2026-0543"
 # Conservative boundary at the start of the recorded review date, UTC.
 EXPIRY = dt.datetime(2027, 2, 17, tzinfo=dt.timezone.utc)
 
-_REVIEW_BY_RE = re.compile(r"\breview(\s+)by(?:(\s+)(\S+))?", re.IGNORECASE)
+_REVIEW_BY_RE = re.compile(r"\breview(\s+)by\b(?:(\s+)(\S+))?", re.IGNORECASE)
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -23,6 +23,7 @@ def _validate_now(now: dt.datetime) -> dt.datetime:
 
 
 def parse_review_deadline(reason: str) -> dt.datetime:
+    """Read a deadline terminated by punctuation or the end of the reason."""
     if not isinstance(reason, str):
         raise ValueError(f"{ADVISORY} ignore reason must be a string")
     matches = list(_REVIEW_BY_RE.finditer(reason))
@@ -30,7 +31,8 @@ def parse_review_deadline(reason: str) -> dt.datetime:
         raise ValueError(
             f"{ADVISORY} ignore reason must declare exactly one 'review by YYYY-MM-DD' deadline"
         )
-    between, sep, raw = matches[0].groups()
+    marker = matches[0]
+    between, sep, raw = marker.groups()
     if (
         not raw
         or not sep
@@ -41,6 +43,8 @@ def parse_review_deadline(reason: str) -> dt.datetime:
             f"{ADVISORY} ignore reason must declare a single-line 'review by YYYY-MM-DD' deadline"
         )
     token = re.sub(r"\)?[.,;]?$", "", raw)
+    if raw == token and reason[marker.end():].strip():
+        raise ValueError(f"{ADVISORY} review deadline requires punctuation before trailing text")
     if _DATE_RE.fullmatch(token):
         parsed_date = dt.date.fromisoformat(token)
         return dt.datetime(
@@ -51,7 +55,7 @@ def parse_review_deadline(reason: str) -> dt.datetime:
         )
     if _UTC_TIMESTAMP_RE.fullmatch(token):
         return dt.datetime.fromisoformat(token).astimezone(dt.timezone.utc)
-    raise ValueError(f"malformed {ADVISORY} review deadline: {raw!r}")
+    raise ValueError(f"malformed {ADVISORY} review deadline")
 
 
 def check(policy: dict, now: dt.datetime) -> None:

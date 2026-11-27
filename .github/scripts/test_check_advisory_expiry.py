@@ -45,7 +45,7 @@ class AdvisoryExpiryTests(unittest.TestCase):
 
     def test_earlier_recorded_review_deadline_is_enforced(self):
         earlier = dt.datetime(2027, 1, 15, 0, 0, 0, tzinfo=dt.timezone.utc)
-        policy = _policy_with_reason("owner exception; review by 2027-01-15")
+        policy = _policy_with_reason("dependency review bypass approved; review by 2027-01-15")
         check(policy, earlier - dt.timedelta(microseconds=1))
         with self.assertRaisesRegex(ValueError, "expired"):
             check(policy, earlier)
@@ -74,6 +74,10 @@ class AdvisoryExpiryTests(unittest.TestCase):
             "review by 2027-02-17T00:00:00",
             "review by 2027-02-17T00:00:00+00:00",
             "review by 2027-02-17T25:00:00Z",
+            "review by 2027-02-17 00:00:01Z",
+            "review by 2027-02-17\t00:00:00",
+            "review by 2027-02-17\n00:00:00Z",
+            "review by 2027-02-17 00 :00:00Z",
             "review by 2027-02-17..",
             "review by 2027-02-17; review by 2027-02-17",
             "review by 2027-02-17; review by 2028-01-01",
@@ -101,6 +105,10 @@ class AdvisoryExpiryTests(unittest.TestCase):
         )
         self.assertEqual(
             parse_review_deadline("owner exception (review by 2027-02-17)."),
+            HARD_EXPIRY,
+        )
+        self.assertEqual(
+            parse_review_deadline("review by 2027-02-17; owner exception"),
             HARD_EXPIRY,
         )
         self.assertEqual(
