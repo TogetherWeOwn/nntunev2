@@ -3,11 +3,29 @@ import { setup } from './fixtures/browserPlayback.js';
 
 function simulateConnectivity() {
 	const network = new EventTarget();
-	let online = true;
-	vi.stubGlobal('addEventListener', network.addEventListener.bind(network));
+	let online = true, onlineListeners = 0;
+	vi.stubGlobal('addEventListener', (type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) => {
+		if (type === 'online') {
+			const signal = typeof options === 'object' ? options?.signal : undefined;
+			if (signal?.aborted) return;
+			onlineListeners += 1;
+			let active = true;
+			const release = () => { if (active) { active = false; onlineListeners -= 1; } };
+			signal?.addEventListener('abort', release, { once: true });
+			const wrapped: EventListener = (event) => {
+				if (typeof options === 'object' && options?.once) release();
+				if (typeof listener === 'function') listener(event);
+				else listener.handleEvent(event);
+			};
+			network.addEventListener(type, wrapped, options);
+			return;
+		}
+		network.addEventListener(type, listener, options);
+	});
 	vi.stubGlobal('removeEventListener', network.removeEventListener.bind(network));
 	Object.defineProperty(globalThis.navigator, 'onLine', { configurable: true, get: () => online });
 	return {
+		get onlineListeners() { return onlineListeners; },
 		drop() { online = false; },
 		restore() { online = true; network.dispatchEvent(new Event('online')); },
 		cleanup() { Reflect.deleteProperty(globalThis.navigator, 'onLine'); vi.unstubAllGlobals(); }
@@ -142,10 +160,11 @@ test('native replay during a stalled online grant prevents a late reconnect retr
 		ended.dispatchEvent(new Event('play'));
 		network.drop();
 		fail.reject(new TypeError('Failed to fetch'));
-		await vi.waitFor(() => expect(player.queueAnnouncement.text).toBe('Could not start the next track. Choose a track to continue.'));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(player.queueAnnouncement.text).toBe('');
 
 		network.restore();
-		await Promise.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect([requests().length, queue.snapshot.currentIndex, src(), media.audio, ended.ended, ended.paused])
 			.toEqual([3, 0, first, ended, false, false]);
 	} finally {
@@ -206,6 +225,59 @@ test('clearing audio.ended before a queued native play cancels the armed reconne
 		await Promise.resolve();
 		expect([requests().length, queue.snapshot.currentIndex, src(), media.audio, ended.ended, ended.paused])
 			.toEqual([3, 0, first, ended, false, false]);
+	} finally {
+		network.cleanup();
+	}
+});
+
+test('native replay while the reconnect retry grant is in flight prevents successor replacement', async () => {
+	const network = simulateConnectivity();
+	try {
+		const { player, media, queue, fetchFn, src, attach, delayGrant, toggleDuringFirstPlay, requests } = setup();
+		await toggleDuringFirstPlay();
+		const first = src();
+		const ended = attach(false);
+		network.drop();
+		fetchFn.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+		ended.finish();
+		await vi.waitFor(() => expect(player.queueAnnouncement.text).toBe('Could not start the next track. Choose a track to continue.'));
+
+		const retryGrant = delayGrant();
+		network.restore();
+		await retryGrant.started;
+		// User replays the ended track natively while the reconnect grant is still pending.
+		ended.ended = false;
+		ended.paused = false;
+		ended.dispatchEvent(new Event('play'));
+		retryGrant.reply(undefined);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect([requests().length, queue.snapshot.currentIndex, src(), media.audio, ended.ended, ended.paused])
+			.toEqual([4, 0, first, ended, false, false]);
+	} finally {
+		network.cleanup();
+	}
+});
+
+test('replaying the ended track offline aborts the superseded reconnect listener without accumulating listeners', async () => {
+	const network = simulateConnectivity();
+	try {
+		const { player, media, queue, fetchFn, src, attach, toggleDuringFirstPlay } = setup();
+		await toggleDuringFirstPlay();
+		const first = src();
+		const ended = attach(false);
+		network.drop();
+		for (let round = 0; round < 3; round++) {
+			fetchFn.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+			ended.finish();
+			await vi.waitFor(() => expect(network.onlineListeners).toBe(1));
+			await vi.waitFor(() => expect(player.queueAnnouncement.text).toBe('Could not start the next track. Choose a track to continue.'));
+			ended.ended = false;
+			ended.paused = false;
+			ended.dispatchEvent(new Event('play'));
+			expect(network.onlineListeners).toBe(0);
+		}
+		expect([queue.snapshot.currentIndex, src(), media.audio]).toEqual([0, first, ended]);
 	} finally {
 		network.cleanup();
 	}

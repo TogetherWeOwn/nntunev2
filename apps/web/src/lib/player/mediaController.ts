@@ -88,7 +88,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	let applyingShare: { revision: number; retry: boolean } | undefined;
 	let positioning = false;
 	let nextPosition: (() => void) | undefined;
-	let reconnectHandoffAudio: HTMLAudioElement | undefined;
+	let pendingReconnect: { audio: HTMLAudioElement; abort: () => void } | undefined;
+
+	function cancelPendingReconnect(audio?: HTMLAudioElement): void {
+		if (!pendingReconnect || (audio && pendingReconnect.audio !== audio)) return;
+		const active = pendingReconnect;
+		pendingReconnect = undefined;
+		active.abort();
+	}
 
 	function pause(audio: HTMLAudioElement | undefined): void {
 		if (audio && !audio.paused) audio.pause();
@@ -106,6 +113,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 
 	function invalidatePlay(): void {
 		++playIntent;
+		cancelPendingReconnect();
 		settlePlay();
 	}
 
@@ -144,6 +152,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			return preparePlay(trackId, matches, () => startCurrent(true, true), { retry: true });
 		}
 		++playIntent;
+		cancelPendingReconnect();
 		if (retry) ++endGeneration;
 		let finish!: (outcome: PlayOutcome) => void;
 		const result = new Promise<PlayOutcome>((resolve) => { finish = resolve; });
@@ -323,7 +332,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	function retire(): HTMLAudioElement | undefined {
 		pausedTransport?.abort();
 		const previous = current;
-		if (previous?.audio === reconnectHandoffAudio) reconnectHandoffAudio = undefined;
+		cancelPendingReconnect(previous?.audio);
 		current = undefined;
 		// Retire the native receipt without imposing replacement's share-clear policy on remove/clear.
 		attachmentVersion += 1;
@@ -688,7 +697,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			const failureMessage = index !== base.currentIndex
 				? 'Could not start the next track. Choose a track to continue.' : undefined;
 			// Keep the ended track selected until the successor has a grant.
-			const handoff = () => preparePlay(track.id, () => evidence.isCurrent() && ownsOrigin(),
+			const handoff = () => preparePlay(track.id, () => audio.ended && evidence.isCurrent() && ownsOrigin(),
 				(grant) => playSelected(result.queue, index, grant, '', grant), { failureMessage });
 			// Arm before the first grant settles so a reconnect during a stalled request is retained.
 			const armed = playIntent;
@@ -696,16 +705,24 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			const canRetry = () => !!failureMessage && !!listeners && !listeners.aborted &&
 				playIntent === armed && audio.ended && evidence.isCurrent() && ownsOrigin();
 			const armReconnect = () => {
-				if (retryStarted || listenerArmed || globalThis.navigator?.onLine !== false || !canRetry()) return;
+				if (!listeners || retryStarted || listenerArmed || globalThis.navigator?.onLine !== false || !canRetry()) return;
+				cancelPendingReconnect();
+				const reconnect = new AbortController();
+				const entry = { audio, abort: () => reconnect.abort() };
+				const release = () => { if (pendingReconnect === entry) pendingReconnect = undefined; };
+				pendingReconnect = entry;
 				listenerArmed = true;
 				onlineSeen = false;
-				reconnectHandoffAudio = audio;
 				globalThis.addEventListener?.('online', () => {
 					listenerArmed = false;
 					onlineSeen = true;
-					reconnectHandoffAudio = undefined;
-					if (!pendingGrant && !retryStarted && canRetry()) { retryStarted = true; void handoff(); }
-				}, { once: true, signal: listeners });
+					if (!pendingGrant && !retryStarted && canRetry()) {
+						retryStarted = true;
+						void handoff().finally(release);
+					} else {
+						release();
+					}
+				}, { once: true, signal: AbortSignal.any([listeners, reconnect.signal]) });
 			};
 			armReconnect();
 			const inflight = !listenerArmed && failureMessage && listeners ? new AbortController() : undefined;
@@ -814,7 +831,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (mountedAudio.has(audio)) throw new Error('Native observations require a fresh audio element');
 			mountedAudio.add(audio);
 			const previous = current;
-			if (previous?.audio === reconnectHandoffAudio) reconnectHandoffAudio = undefined;
+			cancelPendingReconnect(previous?.audio);
 			if (previous) pendingShare.clear();
 			attachmentVersion += 1;
 			// Node identity is not attachment identity, even for the same source.
@@ -856,10 +873,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					}
 					switch (event.type) {
 						case 'play':
-							if (event.type === 'play' && reconnectHandoffAudio === audio) {
-								reconnectHandoffAudio = undefined;
-								invalidatePlay();
-							}
+							if (event.type === 'play' && pendingReconnect?.audio === audio) invalidatePlay();
 						case 'playing':
 							if (!audio.paused && !audio.ended && matches()) {
 								receipt.playing = true;
@@ -875,10 +889,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 							return;
 						case 'pause':
 							// Native completion pauses before `ended`; retain that intent.
-							if (reconnectHandoffAudio === audio && !audio.ended) {
-								reconnectHandoffAudio = undefined;
-								invalidatePlay();
-							}
+							if (pendingReconnect?.audio === audio && !audio.ended) invalidatePlay();
 							if (!audio.paused || audio.ended) return;
 							break;
 						case 'error':
