@@ -30,13 +30,15 @@ pub struct SidecarPut<'a> {
 
 /// Authenticated transport must correlate this reply to the exact request,
 /// using its actual configured bucket, logical key and configuration, not
-/// provider-echoed or user fields. Supply raw version header occurrences.
+/// provider-echoed or user fields. Supply the full response body, its declared
+/// length if present, and raw version header occurrences.
 pub struct SidecarPutReply<'a> {
     pub configuration: [u8; 16],
     pub bucket: &'a str,
     pub key: &'a str,
     pub status: u16,
     pub body: &'a [u8],
+    pub content_length: Option<u64>,
     pub version_headers: &'a [&'a str],
 }
 
@@ -108,7 +110,7 @@ impl<'a> SidecarPut<'a> {
         {
             return Err(SidecarError::Target);
         }
-        if reply.status != 200 || !reply.body.is_empty() {
+        if reply.status != 200 || !reply.body.is_empty() || reply.content_length.unwrap_or(0) != 0 {
             return Err(SidecarError::Response);
         }
         let [version] = reply.version_headers else {
@@ -203,6 +205,7 @@ mod tests {
         let mut changed = page.clone();
         changed[92] ^= 1;
         let cases = [
+            (id(7), 0, &[][..]),
             (id(7), 0, changed.as_slice()),
             (id(7), 0, &page[..123]),
             (id(8), 0, &page),
@@ -218,6 +221,7 @@ mod tests {
             key,
             status: 200,
             body: b"",
+            content_length: None,
             version_headers: &["A%2Fb+/="],
         };
         let mut completed = put().verify_reply(reply()).unwrap();
@@ -268,6 +272,17 @@ mod tests {
         rejects!(Target, key: "another");
         rejects!(Response, status: 204);
         rejects!(Response, body: b"<Error/>");
+        rejects!(Response, content_length: Some(1));
+        rejects!(Response, content_length: Some(u64::MAX));
+        let max_version = "A%2Fb+/=".repeat(128);
+        let max_pin = put()
+            .verify_reply(SidecarPutReply {
+                content_length: Some(0),
+                version_headers: &[&max_version],
+                ..reply()
+            })
+            .unwrap();
+        assert_eq!(max_pin.pin().1, max_version);
         rejects!(Version, version_headers: &[]);
         rejects!(Version, version_headers: &["v", "v"]);
         let long = "v".repeat(1025);

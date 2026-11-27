@@ -349,12 +349,15 @@ impl S3CompletionSender {
             .headers
             .get("x-amz-version-id")
             .map_err(|_| SidecarDispatchError::Receipt(SidecarError::Version))?;
+        let content_length = content_length(&reply.headers)
+            .map_err(|()| SidecarDispatchError::Receipt(SidecarError::Response))?;
         put.verify_reply(SidecarPutReply {
             configuration: self.configuration,
             bucket: &self.bucket,
             key: &key,
             status: reply.status,
             body: &reply.body,
+            content_length,
             version_headers: version.as_deref().as_slice(),
         })
         .map_err(SidecarDispatchError::Receipt)
