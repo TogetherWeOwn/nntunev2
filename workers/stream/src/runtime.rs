@@ -49,7 +49,7 @@ use crate::api_error::ApiError;
 use crate::body::{parse_body_request, run_body, BodyReply, MAX_BODY_REQUEST_BYTES};
 use crate::delivered::{parse_delivered_report, DeliveredInterval, MAX_DELIVERED_REQUEST_BYTES};
 use crate::meter_sink::{self, MeterBook};
-use crate::play_route::{self, TRACK_MANIFEST_SUFFIX};
+use crate::play_route::{self, MeteredBody, TRACK_MANIFEST_SUFFIX};
 use crate::pool::Pool;
 use crate::probe::{
     parse_request, run_probe, PoolProvider, ProbeError, ProbeReply, WallClock, MAX_PROBE_BODY_BYTES,
@@ -93,7 +93,8 @@ const MAX_POINTER_BYTES: u64 = 256;
 /// 404 (the Durable Object routes have no public path).
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    match routes::decide_public_route(req.method().as_ref(), &req.path()) {
+    // The SDK's Method conversion defaults unknown verbs to GET.
+    match routes::decide_public_route(&req.inner().method(), &req.path()) {
         PublicRoute::Play { track_id } => play_fetch(req, env, ctx, &track_id).await,
         PublicRoute::NotFound => {
             let (status, body) = routes::decide_public_fetch();
@@ -241,40 +242,31 @@ async fn serve_blob(
         end: start,
         file_bytes: Some(blob_len),
     };
-    let metered = MeteredStream {
-        inner: Box::pin(stream),
-        delivery: r2_play::Delivery::new(expected, move |written| {
-            let mut interval = interval;
-            interval.end += written;
-            ctx.wait_until(report_delivered(env, interval));
-        }),
-    };
+    let metered = MeteredBody::new(Box::pin(stream), expected, move |written| {
+        let mut interval = interval;
+        interval.end += written;
+        ctx.wait_until(report_delivered(env, interval));
+    });
     Response::builder()
         .with_headers(headers)
         .with_status(status)
-        .from_stream(metered)
+        .from_stream(MeteredStream(metered))
 }
 
 /// Response-stream wrapper that counts bytes actually pulled toward the
 /// client and, when the stream settles (completed, errored, or dropped
 /// on client abort), reports the written interval exactly once. The
 /// report rides `wait_until`, so it survives the response finishing.
-struct MeteredStream<F: FnOnce(u64)> {
-    inner: Pin<Box<ByteStream>>,
-    delivery: r2_play::Delivery<F>,
-}
+struct MeteredStream<F: FnOnce(u64)>(MeteredBody<Pin<Box<ByteStream>>, F>);
 
 impl<F: FnOnce(u64) + Unpin> Stream for MeteredStream<F> {
     type Item = Result<Vec<u8>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                self.delivery.record(chunk.len());
-                Poll::Ready(Some(Ok(chunk)))
-            }
-            other => other,
-        }
+        self.0.poll_chunk(
+            |reader| reader.as_mut().poll_next(cx),
+            || worker::Error::RustError("playback body length mismatch".into()),
+        )
     }
 }
 
@@ -364,7 +356,7 @@ impl DurableObject for NntpPool {
     /// Serves `POST /probe`, `POST /body` and `POST /delivered`; any other method or path is a 404.
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let has_owner_name = self.state.id().name().is_some();
-        match routes::decide_pool_action(req.method().as_ref(), &req.path(), has_owner_name) {
+        match routes::decide_pool_action(&req.inner().method(), &req.path(), has_owner_name) {
             PoolAction::Respond(ProbeDecision::NotFound) => Response::error(
                 ProbeDecision::NotFound.body(),
                 ProbeDecision::NotFound.status(),
@@ -390,6 +382,14 @@ impl DurableObject for NntpPool {
             )),
         }
     }
+}
+
+/// Bound the complete NNTP greeting and authentication exchange.
+/// A timeout follows the existing provider failure and lease-release path.
+async fn dial_with_deadline<T>(
+    dial: impl std::future::Future<Output = nntune_core::Result<T>>,
+) -> nntune_core::Result<T> {
+    routes::dial_before_deadline(Delay::from(Duration::from_secs(20)), dial).await
 }
 
 impl NntpPool {
@@ -428,7 +428,7 @@ impl NntpPool {
             async move {
                 let transport = WorkerTransport::connect_pinned(&config)
                     .map_err(|e| nntune_core::Error::Io(std::io::Error::other(e.to_string())))?;
-                NntpClient::connect(transport, &config).await
+                dial_with_deadline(NntpClient::connect(transport, &config)).await
             }
         };
         let clock = &self.clock;
@@ -464,7 +464,7 @@ impl NntpPool {
             async move {
                 let transport = WorkerTransport::connect_pinned(&config)
                     .map_err(|e| nntune_core::Error::Io(std::io::Error::other(e.to_string())))?;
-                NntpClient::connect(transport, &config).await
+                dial_with_deadline(NntpClient::connect(transport, &config)).await
             }
         };
         let clock = &self.clock;
