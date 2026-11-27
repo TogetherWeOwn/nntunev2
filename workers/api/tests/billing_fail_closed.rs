@@ -126,6 +126,7 @@ fn cancel_and_replay_require_the_bound_paid_anchor() {
     assert!(!canceled.explicit_stale);
     assert_eq!(canceled.fail_closed, Some(FailClosedReason::AmbiguousItems));
     assert_eq!(canceled.row.status, "canceled");
+    assert_eq!(canceled.row.grace_until_unix, None);
     let committed = local.live.as_mut().unwrap();
     committed.status = canceled.row.status.clone();
     committed.grace_until_unix = canceled.row.grace_until_unix;

@@ -772,6 +772,7 @@ fn fail_closed(
     reason: FailClosedReason,
 ) -> ReconcileOutcome {
     let previous = local.live.as_ref();
+    let terminal = is_terminal_status(&sub.status);
     let (item_id, price_id) = item.unwrap_or_default();
     ReconcileOutcome {
         row: ReconciledRow {
@@ -804,12 +805,12 @@ fn fail_closed(
             // Fresh observation, not stale evidence: re-pin the stored
             // anchor so the write guard applies the verbatim status.
             paid_invoice_id: previous.and_then(|row| row.paid_invoice_id.clone()),
-            grace_until_unix: previous.and_then(|row| row.grace_until_unix),
+            grace_until_unix: previous.and_then(|row| row.grace_until_unix.filter(|_| !terminal)),
         },
         history: Vec::new(),
         fail_closed: Some(reason),
         explicit_stale: reason == FailClosedReason::InvalidInvoiceEvidence
-            || (is_terminal_status(&sub.status)
+            || (terminal
                 && matches!(
                     reason,
                     FailClosedReason::WrongLivemode | FailClosedReason::CustomerMismatch
