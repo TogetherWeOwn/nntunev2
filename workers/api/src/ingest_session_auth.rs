@@ -44,8 +44,8 @@ pub fn authorize(
     let (credential, secret) = bearer;
     let record = credential.ok_or(CredentialError::Unauthenticated)?;
     let secret = secret.ok_or(CredentialError::Unauthenticated)?;
-    // This contract expires at the deadline, unlike legacy bearer auth.
-    if now >= record.expires_at {
+    // Legacy bearer auth checks only the upper bound and includes the deadline.
+    if secret.is_empty() || !(record.created_at..record.expires_at).contains(&now) {
         return Err(CredentialError::Unauthenticated);
     }
     native_rest::authorize(

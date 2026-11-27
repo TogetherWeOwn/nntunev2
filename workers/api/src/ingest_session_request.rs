@@ -46,7 +46,7 @@ impl Request<'_> {
             || fields
                 .iter()
                 .flatten()
-                .any(|s| s.len() > MAX_REQUEST_METADATA_BYTES)
+                .any(|s| s.len() > MAX_REQUEST_METADATA_BYTES || s.contains('\0'))
             || fields.iter().flatten().map(|s| s.len()).sum::<usize>() > MAX_REQUEST_METADATA_BYTES
         {
             return Err(RequestError::InvalidMetadata);
@@ -83,7 +83,9 @@ pub fn replay<'a>(
     match existing {
         None => Ok(None),
         Some((previous, _)) if previous != request => Err(RequestError::Conflict),
-        Some((_, "")) => Err(RequestError::InvalidStoredIdentity),
+        Some((_, identity)) if identity.trim().is_empty() || identity.contains('\0') => {
+            Err(RequestError::InvalidStoredIdentity)
+        }
         Some((_, identity)) => Ok(Some(identity)),
     }
 }
