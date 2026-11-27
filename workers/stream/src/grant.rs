@@ -45,6 +45,11 @@ pub const MAX_GRANT_TTL: u64 = 900;
 /// the verifier's still verifies, up to 60 s over the cap.
 pub const CLOCK_SKEW_SECS: u64 = 60;
 
+// Fits the longest rendition grant (1,261 payload bytes, a version prefix,
+// and a 32-byte HMAC). Bound input before scanning or allocating from it.
+const MAX_GRANT_TOKEN_BYTES: usize = 1_800;
+const HMAC_ENCODED_BYTES: usize = 43;
+
 /// A verified play grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
@@ -176,7 +181,7 @@ pub(crate) fn verify_private(
     secret: &[u8],
     now_unix: u64,
 ) -> Result<(Grant, String), GrantError> {
-    if !token.starts_with("v4.") || token.len() > 1800 || secret.len() < 32 {
+    if !token.starts_with("v4.") || secret.len() < 32 {
         return Err(GrantError::Malformed);
     }
     let (grant, digest) = verify_signed(token, secret, now_unix).map_err(|(e, _)| e)?;
@@ -188,6 +193,9 @@ fn verify_signed(
     secret: &[u8],
     now_unix: u64,
 ) -> Result<(Grant, Option<String>), (GrantError, Option<String>)> {
+    if token.len() > MAX_GRANT_TOKEN_BYTES || secret.is_empty() {
+        return Err((GrantError::Malformed, None));
+    }
     // The version prefix selects an exact payload grammar.
     let (version, rest) = match token
         .strip_prefix("v1.")
@@ -200,17 +208,20 @@ fn verify_signed(
         None => return Err((GrantError::Malformed, None)),
     };
     let (payload_b64, sig_b64) = rest.split_once('.').ok_or((GrantError::Malformed, None))?;
-    if payload_b64.is_empty() || sig_b64.is_empty() {
+    if payload_b64.is_empty() || sig_b64.is_empty() || sig_b64.len() > HMAC_ENCODED_BYTES {
         return Err((GrantError::Malformed, None));
     }
     let sig = base64url_decode(sig_b64).ok_or((GrantError::Malformed, None))?;
+    if sig.len() != 32 {
+        return Err((GrantError::BadSignature, None));
+    }
     let mac_input = if version >= 3 {
         &token[..3 + payload_b64.len()]
     } else {
         payload_b64
     };
     let expected = hmac_sha256(secret, mac_input.as_bytes());
-    if sig.len() != expected.len() || !constant_time_eq(&sig, &expected) {
+    if !constant_time_eq(&sig, &expected) {
         return Err((GrantError::BadSignature, None));
     }
     let payload = base64url_decode(payload_b64).ok_or((GrantError::Malformed, None))?;
@@ -230,7 +241,9 @@ fn verify_signed(
     let mut parts = identity.split('|');
     let (user_id, track_id, play_id, lease_epoch, exp) = match version {
         1 => match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(u), Some(t), Some(e), None) => (u, t, None, None, e),
+            (Some(u), Some(t), Some(e), None) if !u.is_empty() && !t.is_empty() => {
+                (u, t, None, None, e)
+            }
             _ => return Err((GrantError::Malformed, None)),
         },
         _ => match (
@@ -253,13 +266,13 @@ fn verify_signed(
                 {
                     return Err((GrantError::Malformed, None));
                 }
-                let epoch: u64 = epoch.parse().map_err(|_| (GrantError::Malformed, None))?;
+                let epoch = parse_decimal(epoch).ok_or((GrantError::Malformed, None))?;
                 (u, t, Some(p.to_string()), Some(epoch), e)
             }
             _ => return Err((GrantError::Malformed, None)),
         },
     };
-    let exp_unix: u64 = exp.parse().map_err(|_| (GrantError::Malformed, None))?;
+    let exp_unix = parse_decimal(exp).ok_or((GrantError::Malformed, None))?;
     let user_id = user_id.to_string();
     if now_unix >= exp_unix {
         return Err((GrantError::Expired, Some(user_id)));
@@ -278,6 +291,13 @@ fn verify_signed(
         exp_unix,
     };
     Ok((grant, artifact_sha256))
+}
+
+fn parse_decimal(s: &str) -> Option<u64> {
+    if s.len() > 20 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -472,6 +492,93 @@ mod tests {
 
     const SECRET: &[u8] = b"test-secret-please-ignore";
     const OTHER_SECRET: &[u8] = b"another-secret";
+
+    fn sign_payload(version: &str, payload: &str, secret: &[u8]) -> String {
+        let encoded = base64url_encode(payload.as_bytes());
+        let signed = format!("{version}.{encoded}");
+        let mac_input = if matches!(version, "v1" | "v2") {
+            &encoded
+        } else {
+            &signed
+        };
+        let sig = base64url_encode(&hmac_sha256(secret, mac_input.as_bytes()));
+        format!("{signed}.{sig}")
+    }
+
+    #[test]
+    fn malformed_signed_fields_have_no_metering_attribution() {
+        for (version, payload) in [
+            ("v1", "|track|10"),
+            ("v1", "user||10"),
+            ("v1", "user|track|+10"),
+            ("v2", "user|track|play|+1|10"),
+            ("v2", "user|track|play|18446744073709551616|10"),
+            ("v2", "user|track|play|1|000000000000000000010"),
+            ("v2", "user|track|play|1|18446744073709551616"),
+        ] {
+            let token = sign_payload(version, payload, SECRET);
+            assert_eq!(
+                verify_with_user(&token, SECRET, 10),
+                Err((GrantError::Malformed, None))
+            );
+        }
+        let token = issue("user", "track", 10, &[]);
+        assert_eq!(
+            verify_with_user(&token, &[], 9),
+            Err((GrantError::Malformed, None))
+        );
+    }
+
+    #[test]
+    fn verification_bounds_the_wire_before_authentication() {
+        let oversized_payload = format!(
+            "v2.{}.{}",
+            "A".repeat(MAX_GRANT_TOKEN_BYTES),
+            "A".repeat(43)
+        );
+        let oversized_signature = format!("v2.AAA.{}", "A".repeat(44));
+        for token in [oversized_payload, oversized_signature] {
+            assert_eq!(
+                verify_with_user(&token, SECRET, 0),
+                Err((GrantError::Malformed, None))
+            );
+        }
+    }
+
+    #[test]
+    fn clamped_and_signed_grants_preserve_exact_expiry_edges() {
+        let now = u64::MAX - 10;
+        let token = issue_v2_at("user", "track", "play", u64::MAX, now, u64::MAX, SECRET);
+        assert_eq!(verify(&token, SECRET, now).unwrap().exp_unix, u64::MAX);
+        assert_eq!(verify(&token, SECRET, u64::MAX), Err(GrantError::Expired));
+        let zero = issue_v2_at("user", "track", "play", 0, now, 0, SECRET);
+        assert_eq!(verify(&zero, SECRET, now), Err(GrantError::Expired));
+
+        let secret = [0xa5; 32];
+        let digest = "a".repeat(64);
+        let payload = format!(
+            "{}|{}|{}|{max}|{max}|{digest}",
+            "u".repeat(128),
+            "t".repeat(512),
+            "p".repeat(512),
+            max = u64::MAX
+        );
+        let token = sign_payload("v4", &payload, &secret);
+        let cap = MAX_GRANT_TTL + CLOCK_SKEW_SECS;
+        let (grant, hash) = verify_private(&token, &secret, u64::MAX - cap).unwrap();
+        assert_eq!(
+            (grant.lease_epoch, grant.exp_unix, hash),
+            (Some(u64::MAX), u64::MAX, digest)
+        );
+        assert_eq!(
+            verify_private(&token, &secret, u64::MAX - cap - 1),
+            Err(GrantError::TtlTooLong)
+        );
+        assert_eq!(
+            verify_private(&token, &secret, u64::MAX),
+            Err(GrantError::Expired)
+        );
+    }
 
     #[test]
     fn sha256_matches_published_test_vector() {
