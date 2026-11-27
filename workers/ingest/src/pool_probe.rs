@@ -99,16 +99,13 @@ pub fn classify_reply(
 }
 
 fn check_request(req: &ProbeRequest) -> Result<(), PoolProbeError> {
-    use crate::probe::{validate_message_id, MAX_SEGMENT_BYTES};
+    use crate::probe::{validate_message_id, MAX_PROBE_SEGMENTS, MAX_SEGMENT_BYTES};
 
-    if !(1..=crate::probe::MAX_PROBE_SEGMENTS).contains(&req.segment_ids.len())
+    let mut known_sizes = req.segment_bytes.iter().flatten();
+    if !(1..=MAX_PROBE_SEGMENTS).contains(&req.segment_ids.len())
         || req.segment_bytes.len() != req.segment_ids.len()
         || req.segment_ids.iter().any(|id| !validate_message_id(id))
-        || req
-            .segment_bytes
-            .iter()
-            .flatten()
-            .any(|bytes| !(1..=MAX_SEGMENT_BYTES).contains(bytes))
+        || known_sizes.any(|bytes| !(1..=MAX_SEGMENT_BYTES).contains(bytes))
     {
         return Err(PoolProbeError::Rejected);
     }

@@ -96,9 +96,7 @@ pub fn retry_delay_secs(attempt: u32) -> u32 {
 /// Parse a delta-seconds header without letting integer overflow shorten
 /// the delay. A malformed header falls back to the caller's default.
 pub(crate) fn pool_retry_after(header: Option<&str>, default: u32, cap: u32) -> u32 {
-    let Some(digits) = header.map(|value| value.trim_matches([' ', '\t'])) else {
-        return default;
-    };
+    let digits = header.unwrap_or_default().trim_matches([' ', '\t']);
     if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
         return default;
     }

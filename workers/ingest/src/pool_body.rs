@@ -86,7 +86,12 @@ pub fn classify_body_reply(
     retry_after: Option<&str>,
     body: &[u8],
 ) -> Result<BodyFetch, PoolBodyError> {
-    use crate::retry::pool_retry_after;
+    let retry = || PoolBodyError::Retry {
+        after_secs: crate::retry::pool_retry_after(retry_after, DEFAULT_RETRY_SECS, MAX_RETRY_SECS),
+    };
+    if status == 413 && body != br#"{"error":"too_large"}"# {
+        return Err(retry());
+    }
 
     match status {
         200 => {
@@ -103,7 +108,7 @@ pub fn classify_body_reply(
         404 => Err(PoolBodyError::Retry {
             after_secs: DEFAULT_RETRY_SECS,
         }),
-        413 if body == br#"{"error":"too_large"}"# => Ok(BodyFetch::TooLarge),
+        413 => Ok(BodyFetch::TooLarge),
         400 => Err(PoolBodyError::Rejected),
         // The pool wire never emits 401/403 today (auth collapses to 502
         // `provider_error`), but a refusal of this caller can never be
@@ -111,9 +116,7 @@ pub fn classify_body_reply(
         // not burn all 5 job attempts plus DLQ. Any `Retry-After` is
         // deliberately unread here.
         401 | 403 => Err(PoolBodyError::Rejected),
-        _ => Err(PoolBodyError::Retry {
-            after_secs: pool_retry_after(retry_after, DEFAULT_RETRY_SECS, MAX_RETRY_SECS),
-        }),
+        _ => Err(retry()),
     }
 }
 
