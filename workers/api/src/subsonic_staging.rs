@@ -28,32 +28,60 @@ pub use request::InputError;
 #[cfg(target_arch = "wasm32")]
 const CONSTRUCTION_BYTES: usize = 8 * 1024 * 1024;
 
-fn admits_form_media_type(mut units: impl Iterator<Item = u16>) -> bool {
-    let syntax = |unit| u8::try_from(unit).ok();
-    for byte in b"application/x-www-form-urlencoded" {
-        if units.next().and_then(syntax) != Some(*byte) {
+fn admits_form_media_type(units: impl Iterator<Item = u16>) -> bool {
+    fn skip_ows(bytes: &mut std::iter::Peekable<impl Iterator<Item = u8>>) {
+        while bytes.next_if(|b| matches!(b, b' ' | b'\t')).is_some() {}
+    }
+
+    fn take_token(bytes: &mut std::iter::Peekable<impl Iterator<Item = u8>>) -> bool {
+        let is_token = |b: &u8| {
+            b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b)
+        };
+        let nonempty = bytes.next_if(is_token).is_some();
+        while bytes.next_if(is_token).is_some() {}
+        nonempty
+    }
+
+    let form = b"application/x-www-form-urlencoded";
+    let mut bytes = units.map(|unit| u8::try_from(unit).unwrap_or(0)).peekable();
+    if !bytes.by_ref().take(form.len()).eq(form.iter().copied()) {
+        return false;
+    }
+    loop {
+        skip_ows(&mut bytes);
+        match bytes.next() {
+            None => return true,
+            Some(b';') => {}
+            _ => return false,
+        }
+        skip_ows(&mut bytes);
+        if matches!(bytes.peek(), None | Some(b';')) {
+            continue;
+        }
+        if !take_token(&mut bytes) {
+            return false;
+        }
+        skip_ows(&mut bytes);
+        if bytes.next() != Some(b'=') {
+            return false;
+        }
+        skip_ows(&mut bytes);
+        if bytes.next_if_eq(&b'"').is_some() {
+            loop {
+                match bytes.next() {
+                    Some(b'"') => break,
+                    Some(b'\\') => match bytes.next() {
+                        Some(b'\t' | b' '..=b'~' | 0x80..=0xff) => {}
+                        _ => return false,
+                    },
+                    Some(b'\t' | b' '..=b'~' | 0x80..=0xff) => {}
+                    _ => return false,
+                }
+            }
+        } else if !take_token(&mut bytes) {
             return false;
         }
     }
-    match units.find(|&unit| !matches!(syntax(unit), Some(b' ' | b'\t'))) {
-        None => return true,
-        Some(unit) if syntax(unit) == Some(b';') => {}
-        _ => return false,
-    }
-    let mut quoted = false;
-    while let Some(unit) = units.next() {
-        match syntax(unit) {
-            Some(b'"') => quoted = !quoted,
-            Some(b'\\') if quoted => {
-                if units.next().is_none() {
-                    return false;
-                }
-            }
-            Some(b',') if !quoted => return false,
-            _ => {}
-        }
-    }
-    !quoted
 }
 
 /// Validated input and the ledger that paid for its backing storage.
@@ -124,6 +152,7 @@ mod tests {
             format!("{form}, text/plain"),
             format!("{form}; charset=utf-8, text/plain"),
             format!(r#"{form}; name="one,two"#),
+            format!(r#"{form}; name=one",two""#),
             format!(r#"{form}; name="one,two", text/plain"#),
             format!("{form}\u{a0}; charset=utf-8"),
         ] {

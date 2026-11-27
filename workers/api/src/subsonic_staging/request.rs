@@ -80,10 +80,12 @@ mod wasm_test {
     use crate::subsonic_staging::StagingConstruction;
     use worker::wasm_bindgen::{self, prelude::*};
 
-    async fn check_form_refusals() -> Result<(), JsValue> {
-        for content_type in [
-            "text/plain; hint=application/x-www-form-urlencoded",
-            "application/x-www-form-urlencoded, text/plain",
+    async fn check_form_media_types() -> Result<(), JsValue> {
+        for (content_type, accepted) in [
+            ("text/plain; hint=application/x-www-form-urlencoded", false),
+            ("application/x-www-form-urlencoded, text/plain", false),
+            (r#"application/x-www-form-urlencoded; name=one",two""#, false),
+            (r#"application/x-www-form-urlencoded; name="one,two""#, true),
         ] {
             let headers = web_sys::Headers::new()?;
             headers.set("content-type", content_type)?;
@@ -95,11 +97,13 @@ mod wasm_test {
                 "https://fixture.example/rest/ping",
                 &init,
             )?;
-            assert_eq!(
-                StagingInput::collect(&request).await.err(),
-                Some(InputError::Unreadable)
-            );
-            assert!(!request.body_used());
+            let result = StagingInput::collect(&request).await;
+            if accepted {
+                assert_eq!(result.unwrap().form, "u=fixture");
+            } else {
+                assert_eq!(result.err(), Some(InputError::Unreadable));
+            }
+            assert_eq!(request.body_used(), accepted);
         }
         Ok(())
     }
@@ -110,7 +114,7 @@ mod wasm_test {
         limit: Option<u32>,
     ) -> Result<u32, JsValue> {
         // The Node suite reaches the raw Worker collector through this adapter.
-        check_form_refusals().await?;
+        check_form_media_types().await?;
         let input = if let Some(limit) = limit {
             StagingInput::collect_with_budget(&request, ConstructionBudget::new(limit as usize))
                 .await
