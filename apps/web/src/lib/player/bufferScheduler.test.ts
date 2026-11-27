@@ -164,4 +164,42 @@ describe('decoded buffer scheduler', () => {
 			expect(gains[index].disconnect).toHaveBeenCalledOnce();
 		}
 	});
+
+	it('finishes the first buffer once during crossfade while keeping the successor active until its own end', () => {
+		const { context, sources, gains, scheduler } = setup();
+		scheduler.play(syntheticBuffer(4), syntheticBuffer(4), 1);
+		const [first, next] = sources;
+		const [[firstStart]] = first.start.mock.calls;
+		expect(next.start).toHaveBeenCalledExactlyOnceWith(firstStart + 3);
+		context.currentTime = firstStart + 4;
+		const firstEnded = first.onended;
+		firstEnded?.(); firstEnded?.();
+		expect([first.onended, first.stop.mock.calls.length, first.disconnect.mock.calls.length, gains[0].disconnect.mock.calls.length]).toEqual([null, 0, 1, 1]);
+		expect([next.stop.mock.calls.length, next.disconnect.mock.calls.length, gains[1].disconnect.mock.calls.length]).toEqual([0, 0, 0]);
+		const nextEnded = next.onended;
+		nextEnded?.(); nextEnded?.(); scheduler.stop();
+		expect([next.onended, next.stop.mock.calls.length, next.disconnect.mock.calls.length, gains[1].disconnect.mock.calls.length]).toEqual([null, 0, 1, 1]);
+	});
+
+	it('stops and disconnects both overlapping sources on a rapid skip during crossfade', () => {
+		const { context, sources, gains, scheduler } = setup();
+		scheduler.play(syntheticBuffer(4), syntheticBuffer(4), 1);
+		const oldEnded = sources.map((source) => source.onended);
+		const [[firstStart]] = sources[0].start.mock.calls;
+		const [[nextStart]] = sources[1].start.mock.calls;
+		context.currentTime = nextStart + 0.5;
+		expect(context.currentTime).toBeGreaterThan(firstStart);
+		expect(context.currentTime).toBeLessThan(firstStart + 4);
+		const replacement = syntheticBuffer(2);
+		scheduler.play(replacement);
+		for (const callback of oldEnded) callback?.();
+		const [first, next, current] = sources;
+		for (const [index, source] of [first, next].entries()) {
+			expect([source.stop.mock.calls.length, source.onended, source.disconnect.mock.calls.length, gains[index].disconnect.mock.calls.length]).toEqual([1, null, 1, 1]);
+		}
+		expect([current.buffer, current.stop.mock.calls.length, current.disconnect.mock.calls.length]).toEqual([replacement, 0, 0]);
+		const currentEnded = current.onended;
+		currentEnded?.(); currentEnded?.();
+		expect([current.disconnect.mock.calls.length, gains[2].disconnect.mock.calls.length]).toEqual([1, 1]);
+	});
 });
