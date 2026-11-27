@@ -9,7 +9,9 @@ use nntune_core::{
 };
 
 use super::{EnrolledPlayback, OpenPart, PlaybackError, S3RangeResponse, S3RangeResponseError};
-use crate::s3_range_response::{read_exact, require_eof, validate_s3_range_metadata};
+use crate::s3_range_response::{
+    read_exact, require_eof, valid_version, validate_s3_range_metadata,
+};
 
 pub struct S3Get<'a> {
     pub configuration: [u8; 16],
@@ -65,8 +67,7 @@ impl<'a> EnrolledPlayback<'a> {
         };
         let range = start..end;
         let locator = self.locator;
-        let version = self.pins.media_version;
-        if version.contains(',') {
+        if !valid_version(self.pins.media_version) {
             return Err(PlaybackError::Binding);
         }
         let reply = get(S3Get {

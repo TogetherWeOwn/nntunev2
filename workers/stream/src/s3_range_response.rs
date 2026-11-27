@@ -110,7 +110,7 @@ pub(super) async fn require_eof(
     }
 }
 
-/// Check one completed response against the trusted plan and pinned version or ETag.
+/// Check one completed response against the trusted plan and pinned version.
 /// `body_bytes` must be the measured byte count through EOF, not a header or a
 /// truncated count. A future caller must enforce the planned bound while reading.
 /// Success is not authentication: the existing digest range reader must still
@@ -151,7 +151,9 @@ pub(super) fn validate_s3_range_metadata(
     if response.content_range != Some(expected_range.as_str()) {
         return Err(ContentRange);
     }
-    if response.binding != Some(expected_binding) {
+    if !matches!(expected_binding, S3Binding::VersionId(version) if valid_version(version))
+        || response.binding != Some(expected_binding)
+    {
         return Err(ObjectIdentity);
     }
     let expected_len = range.len();
@@ -159,6 +161,14 @@ pub(super) fn validate_s3_range_metadata(
         return Err(Length);
     }
     Ok(expected_len)
+}
+
+pub(crate) fn valid_version(version: &str) -> bool {
+    !matches!(version, "" | "null")
+        && version.len() <= 1024
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b',')
 }
 
 #[cfg(test)]
@@ -344,7 +354,7 @@ mod tests {
                 "bytes=65536-65536",
                 "bytes 65600-65616/65617",
                 17,
-                S3Binding::Etag("\"tag\"".into()),
+                S3Binding::VersionId("v2".into()),
             ),
         ] {
             let plan = plan_encrypted_range(Some(request), geometry).1.unwrap();
@@ -358,6 +368,42 @@ mod tests {
             let result = validate_s3_range_response(plan, &binding, response, body.len() as u64);
             assert_eq!(result, Ok(()), "{request}");
         }
+    }
+
+    #[tokio::test]
+    async fn matching_etag_is_rejected_before_reading_ciphertext() {
+        let binding = S3Binding::Etag("\"tag\"".into());
+        let locator = S3Locator::new(
+            "fixture-media".into(),
+            "media/03030303030340038003030303030303/04040404040440048004040404040404".into(),
+            binding,
+        )
+        .unwrap();
+        let plan = DigestGeometry::new(65_537)
+            .unwrap()
+            .range(65_536, 65_537)
+            .unwrap();
+        let response = S3RangeResponse {
+            status: 206,
+            content_range: Some("bytes 65600-65616/65617"),
+            content_length: Some(17),
+            binding: Some(locator.binding()),
+        };
+        let reads = Cell::new(0);
+        assert_eq!(
+            read_s3_range_chunk(
+                plan,
+                1,
+                &locator,
+                &locator,
+                response,
+                SliceBody(&[0; 17], &reads),
+                || true,
+            )
+            .await,
+            Err(S3RangeResponseError::ObjectIdentity)
+        );
+        assert_eq!(reads.get(), 0);
     }
 
     #[test]
@@ -396,6 +442,17 @@ mod tests {
         for binding in [None, Some(&other_version), Some(&wrong_kind)] {
             let response = S3RangeResponse { binding, ..valid };
             assert_eq!(validate(response, 17), Err(ObjectIdentity));
+        }
+        for version in ["", "null", "v1,v2", "v1 v2"] {
+            let binding = S3Binding::VersionId(version.into());
+            let response = S3RangeResponse {
+                binding: Some(&binding),
+                ..valid
+            };
+            assert_eq!(
+                validate_s3_range_response(plan, &binding, response, 17),
+                Err(ObjectIdentity)
+            );
         }
         for content_length in [None, Some(16), Some(18)] {
             let response = S3RangeResponse {
