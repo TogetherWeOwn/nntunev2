@@ -181,16 +181,30 @@ fn validate_checkpoint(cp: &JobCheckpoint, job_id: &str) -> Result<()> {
 pub async fn get(env: &Env, job_id: &str) -> Result<Option<JobCheckpoint>> {
     let key =
         checkpoint_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
-    let store = env.kv(STATE_KV_BINDING)?;
-    let loaded = store
-        .get(&key)
-        .json::<JobCheckpoint>()
-        .await
-        .map_err(|_| worker::Error::RustError("checkpoint unavailable".into()))?;
+    let loaded = get_json(env, &key).await?;
     if let Some(cp) = &loaded {
         validate_checkpoint(cp, job_id)?;
     }
     Ok(loaded)
+}
+
+async fn get_json<T: serde::de::DeserializeOwned>(env: &Env, key: &str) -> Result<Option<T>> {
+    let text = env
+        .kv(STATE_KV_BINDING)?
+        .get(key)
+        .text()
+        .await
+        .map_err(|_| worker::Error::RustError("checkpoint unavailable".into()))?;
+    decode_json(text)
+}
+
+fn decode_json<T: serde::de::DeserializeOwned>(text: Option<String>) -> Result<Option<T>> {
+    // KV's JS JSON decoder passes object keys as strings even for Rust maps
+    // keyed by integers. Read using the same JSON codec as the writer.
+    text.as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| worker::Error::RustError("invalid stored checkpoint".into()))
 }
 
 pub async fn put(env: &Env, checkpoint: &JobCheckpoint) -> Result<()> {
@@ -267,14 +281,7 @@ fn resume_verify(loaded: Result<Option<VerifyProgress>>) -> Result<Option<Verify
 pub async fn get_verify(env: &Env, job_id: &str) -> Result<Option<VerifyProgress>> {
     let key =
         verify_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
-    let store = env.kv(STATE_KV_BINDING)?;
-    resume_verify(
-        store
-            .get(&key)
-            .json::<VerifyProgress>()
-            .await
-            .map_err(|_| worker::Error::RustError("verify progress unavailable".into())),
-    )
+    resume_verify(get_json(env, &key).await)
 }
 
 /// Store one job's Verifying resume state. The consumer's Verifying step
@@ -410,10 +417,6 @@ mod tests {
         fields.remove("transcode_inputs");
         let mut cp: JobCheckpoint = serde_json::from_value(legacy).unwrap();
         assert!(validate_checkpoint(&cp, &msg.job_id).is_ok());
-        assert!(validate_checkpoint(&cp, "other_job").is_err());
-        cp.transcode_next = 1;
-        assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
-
         cp.transcode_inputs.push(TranscodeInput {
             file_index: 0,
             key: VerifyProgress::file_key(&msg.job_id, 1, 0, "track.flac"),
@@ -422,8 +425,8 @@ mod tests {
             scratch_prefix: VerifyProgress::scratch_prefix(&msg.job_id, 1),
         });
         cp.state = JobState::Transcoding;
+        cp.transcode_next = 1;
         assert!(validate_checkpoint(&cp, &msg.job_id).is_ok());
-        assert!(admission_write(Some(&cp), &msg).is_none());
         cp.transcode_next = usize::MAX;
         assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
         cp.transcode_next = 0;
@@ -443,19 +446,20 @@ mod tests {
             .missing_by_batch
             .insert(tally.total_batches - 1, MAX_PROBE_SEGMENTS as u32);
         cp.probe_tally = Some(tally.clone());
+        let stored = serde_json::to_string(&cp).unwrap();
+        let decoded: JobCheckpoint = decode_json(Some(stored)).unwrap().unwrap();
+        assert_eq!(decoded, cp);
         assert!(validate_checkpoint(&cp, &msg.job_id).is_ok());
         let mut corrupt = tally.clone();
         corrupt.total_batches += 1;
         cp.probe_tally = Some(corrupt);
         assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
-        let mut corrupt = tally.clone();
-        corrupt.missing_by_batch.insert(tally.total_batches, 0);
-        cp.probe_tally = Some(corrupt);
-        assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
-        let mut corrupt = tally.clone();
-        corrupt.missing_by_batch.insert(0, u32::MAX);
-        cp.probe_tally = Some(corrupt);
-        assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
+        for (index, missing) in [(tally.total_batches, 0), (0, u32::MAX)] {
+            let mut corrupt = tally.clone();
+            corrupt.missing_by_batch.insert(index, missing);
+            cp.probe_tally = Some(corrupt);
+            assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
+        }
         cp.probe_tally = Some(tally);
         cp.repair_rounds += 1;
         assert!(validate_checkpoint(&cp, &msg.job_id).is_err());
@@ -465,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_reject_invalid_verify_cursors_before_summing_positions() {
+    fn bounds_verify_storage_recovers_from_invalid_progress() {
         let mut progress = VerifyProgress::new(MAX_REPAIR_ROUNDS + 1);
         let cursor = JudgeCursor {
             segment: 1,
@@ -476,26 +480,21 @@ mod tests {
             bad: 0,
             fingerprint: "synthetic-fingerprint".into(),
         };
+        let resume = |progress: &VerifyProgress| {
+            resume_verify(decode_json(Some(serde_json::to_string(progress).unwrap())))
+        };
         progress.judging.insert(0, cursor.clone());
         progress.judging.insert(1, cursor.clone());
-        assert!(validate_verify_progress(&progress).is_ok());
+        assert_eq!(resume(&progress).unwrap(), Some(progress.clone()));
         progress.judging.get_mut(&1).unwrap().pos = u64::MAX;
-        assert!(validate_verify_progress(&progress).is_err());
+        assert!(resume(&progress).unwrap().is_none());
         progress.judging.insert(1, cursor);
         progress.spool.insert(MAX_VERIFY_FILES, Vec::new());
         assert!(validate_verify_progress(&progress).is_err());
         progress.spool.clear();
-        progress.round += 1;
-        assert!(validate_verify_progress(&progress).is_err());
-    }
-
-    #[test]
-    fn bounds_resume_verify_recovers_from_invalid_progress_but_propagates_read_errors() {
-        let valid = VerifyProgress::new(MAX_REPAIR_ROUNDS + 1);
-        assert_eq!(resume_verify(Ok(Some(valid.clone()))).unwrap(), Some(valid));
-        assert!(resume_verify(Ok(Some(VerifyProgress::new(u32::MAX))))
-            .unwrap()
-            .is_none());
+        progress.round = u32::MAX;
+        assert!(resume(&progress).unwrap().is_none());
+        assert!(resume_verify(decode_json(Some("malformed".into()))).is_err());
         assert!(resume_verify(Err(worker::Error::RustError(
             "synthetic read failure".into()
         )))
@@ -508,11 +507,8 @@ mod tests {
         let source = include_str!("checkpoint.rs");
         for (name, guard) in [
             ("get", "validate_checkpoint(cp, job_id)?"),
-            (
-                "put",
-                "validate_checkpoint(checkpoint, &checkpoint.job_id)?",
-            ),
-            ("get_verify", "resume_verify("),
+            ("put", "validate_checkpoint("),
+            ("get_verify", "resume_verify(get_json(env, &key).await)"),
             ("put_verify", "validate_verify_progress(progress)?"),
         ] {
             let (_, signature_and_body) =

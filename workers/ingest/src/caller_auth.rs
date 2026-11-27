@@ -354,15 +354,13 @@ mod tests {
 
         let header = bearer("user_01", INGEST_WRITE_SCOPE, NOW + 1);
         let (prefix, signature) = header.rsplit_once('.').unwrap();
+        let oversized = "aa".repeat(MAX_AUTHORIZATION_BYTES);
         for malformed in [
             format!("{header}, {header}"),
             format!("{header} "),
             format!("{prefix}.{}", &signature[..signature.len() - 2]),
-            format!("{prefix}.{}", "aa".repeat(MAX_AUTHORIZATION_BYTES)),
-            format!(
-                "Bearer v1.{}.{signature}",
-                "aa".repeat(MAX_AUTHORIZATION_BYTES)
-            ),
+            format!("{prefix}.{oversized}"),
+            format!("Bearer v1.{oversized}.{signature}"),
         ] {
             assert_eq!(
                 authenticate(Some(&malformed), Some(SECRET), NOW),
