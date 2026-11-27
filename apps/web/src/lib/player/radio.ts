@@ -13,8 +13,9 @@ import type { Track } from './queue.js';
 export const DEFAULT_RADIO_SEED = 1;
 
 export function parseRadioSeed(raw: string | null): number {
-	if (raw === null) return DEFAULT_RADIO_SEED;
-	const parsed = Number.parseInt(raw, 10);
+	const decimal = raw?.trim();
+	if (!decimal || !/^[+-]?\d+$/.test(decimal)) return DEFAULT_RADIO_SEED;
+	const parsed = Number(decimal);
 	return Number.isSafeInteger(parsed) ? parsed : DEFAULT_RADIO_SEED;
 }
 

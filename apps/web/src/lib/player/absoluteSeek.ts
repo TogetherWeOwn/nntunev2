@@ -9,7 +9,9 @@ export function seekable(media: Pick<SeekMedia, 'seekable'>, duration: number, t
 	const ranges = media.seekable;
 	let available = false;
 	for (let i = 0; i < ranges.length; i++) {
-		const start = Math.max(0, ranges.start(i)), end = Math.min(duration, ranges.end(i));
+		const lower = ranges.start(i), upper = ranges.end(i);
+		if (!Number.isFinite(lower) || !Number.isFinite(upper)) continue;
+		const start = Math.max(0, lower), end = Math.min(duration, upper);
 		available ||= end > start;
 		if (end > start && (target === undefined || (target >= start && target <= end))) return true;
 	}
@@ -31,6 +33,7 @@ export function readAbsoluteSeek(media: SeekMedia): typeof emptyObservation {
 }
 
 export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: () => boolean, unavailable?: () => void, landed?: (target: number, duration: number, observed: number) => void): string {
+	if (!Number.isFinite(seconds)) return 'The player did not accept that seek.';
 	let validating = true;
 	try {
 		const { duration, currentTime, error } = media;

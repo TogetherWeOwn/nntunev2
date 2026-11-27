@@ -129,20 +129,23 @@ export function createPlayback({
 			if (intent !== latestIntent) return;
 			const element = audio();
 			if (!element) return;
-			observe(element);
+			const source = element.getAttribute('src');
+			const receipt = observe(element);
+			const isCurrent = () => intent === latestIntent && receipt === release &&
+				observed === element && element === audio() && element.getAttribute('src') === source;
 			intended = true;
 			try {
 				await element.play();
 			} catch {
 				// Navigation still resolves, but only the current attempt may
 				// expose a failure. A pause/source change often rejects old plays.
-				if (intent === latestIntent && element === audio()) {
+				if (isCurrent()) {
 					reset();
 					onPlaybackFailure?.();
 				}
 				return;
 			}
-			if (intent === latestIntent && element === audio()) onPlaybackStarted?.();
+			if (isCurrent()) onPlaybackStarted?.();
 		},
 		pause() {
 			++latestIntent;

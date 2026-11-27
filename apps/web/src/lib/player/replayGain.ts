@@ -122,10 +122,10 @@ export function resolveTrackLinearGain(tags: LevelingTags, opts: LevelingOptions
 	const preampDb = typeof opts.preampDb === 'number' && Number.isFinite(opts.preampDb) ? opts.preampDb : 0;
 	const linear = gainDbToLinear(tagDb + preampDb);
 	const peak = parsePeak(tags.trackPeak) ?? parsePeak(tags.albumPeak);
-	if (peak === null) {
-		return linear;
-	}
-	return applyClippingGuard(linear, peak);
+	const resolved = applyClippingGuard(linear, peak);
+	// AudioParam values must survive conversion to a finite, nonzero float.
+	const nativeGain = Math.fround(resolved);
+	return Number.isFinite(nativeGain) && nativeGain > 0 ? resolved : 1;
 }
 
 /** Drive a GainNode-like with the resolved linear gain. */
