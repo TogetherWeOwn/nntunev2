@@ -1,3 +1,6 @@
+import { access, copyFile, mkdir } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
+import type { FullResult, TestCase, TestResult } from '@playwright/test/reporter';
 import { expect, test, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 import { demoTrackSalt, expectedSyntheticBody, firstByteDifference } from '../../helpers/demo-audio.js';
 import { mediaSessionFailure } from '../../helpers/media-session.js';
@@ -94,4 +97,41 @@ test('probe disposes a redirect and spends no budget on a follow-up request', as
       else process.env[key] = value;
     }
   }
+});
+
+test('admission rejects conflicting proof and clears the previous report', async () => {
+  // Give the real reporter its own output directory, away from private staging.
+  const moduleUrl = pathToFileURL(test.info().outputPath('helpers', 'admission-reporter.mts'));
+  await mkdir(new URL('.', moduleUrl), { recursive: true });
+  await copyFile(new URL('../../helpers/private-staging-admission-reporter.ts', import.meta.url), moduleUrl);
+  const { default: Reporter } = await import(moduleUrl.href) as typeof import('../../helpers/private-staging-admission-reporter.js');
+  const proof = { track_id: '00000000-0000-4000-8000-000000000001', sha256: 'b'.repeat(64),
+    ...privateRunIdentity('a'.repeat(40), '1', '2') };
+  const cases = {
+    'build-identity': [], 'build-identity-final': [], 'invite redemption and Library arrival': [],
+    'upload-to-library': ['private-publication', 'private-library'], play: ['private-play'], seek: [], queue: [],
+    'anonymous-refused': ['private-anonymous-refusal'], 'unlisted-refused': ['private-unlisted-refusal'],
+    'revoked-or-expired-refused': ['private-cutoff-refusal'], 'video-off': [],
+  };
+  const run = async (conflict: boolean) => {
+    const annotations = ['build-identity', 'build-identity-final'].map((phase) => ({
+      type: 'candidate-identity', description: JSON.stringify({ phase, web: proof.build_sha,
+        api: proof.build_sha, expected: proof.build_sha, observed_at: '2025-01-01T00:00:00.000Z' }),
+    }));
+    for (const type of Object.values(cases).flat()) annotations.push({
+      type, description: JSON.stringify({ ...proof,
+        sha256: conflict && type === 'private-play' ? 'c'.repeat(64) : proof.sha256,
+        cutoff_listener: proof.track_id, refused_listener: proof.track_id }),
+    });
+    const steps = Object.keys(cases).map((title) => ({ title, category: 'test.step', duration: 1, annotations: [], steps: [] }));
+    const reporter = new Reporter();
+    const result = { status: 'passed', retry: 0, annotations, steps } as unknown as TestResult;
+    reporter.onTestEnd({ expectedStatus: 'passed' } as TestCase, result);
+    return reporter.onEnd({ status: 'passed' } as FullResult);
+  };
+  const report = new URL('../private-staging-results/admission.xml', moduleUrl);
+  await expect(run(false)).resolves.toBeUndefined();
+  await expect(access(report)).resolves.toBeUndefined();
+  await expect(run(true)).resolves.toEqual({ status: 'failed' });
+  await expect(access(report)).rejects.toMatchObject({ code: 'ENOENT' });
 });
