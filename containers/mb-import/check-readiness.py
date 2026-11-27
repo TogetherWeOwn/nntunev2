@@ -6,7 +6,10 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import subprocess
+import tempfile
+import time
 import unicodedata
 
 
@@ -17,16 +20,24 @@ TABLES = (
 SQL = Path(__file__).resolve().parents[2] / "workers/mb/src"
 SHA256 = re.compile(r"[0-9a-f]{64}")
 MBID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+MAX_PAYLOAD = 512 * 1024
+PSQL_TIMEOUT = 600
 
 
 def matches(pattern, value):
     return isinstance(value, str) and pattern.fullmatch(value) is not None
 
 
+def track_row(track):
+    return (isinstance(track, list) and len(track) == 3
+            and all(type(pos) is int and 0 <= pos <= 32767 for pos in track[:2])
+            and matches(MBID, track[2]))
+
+
 def load_evidence(path):
     with path.open("rb") as source:
-        raw = source.read(512 * 1024 + 1)
-    if len(raw) > 512 * 1024:
+        raw = source.read(MAX_PAYLOAD + 1)
+    if len(raw) > MAX_PAYLOAD:
         raise ValueError
     evidence = json.loads(raw.decode("utf-8"))
     tables, probes = evidence["tables"], evidence["probes"]
@@ -49,11 +60,8 @@ def load_evidence(path):
                 or not isinstance(tracks, list) or not 1 <= len(tracks) <= 1000):
             raise ValueError
         query.encode("utf-8")  # Refuse unpaired surrogates before connecting.
-        for track in tracks:
-            if (not isinstance(track, list) or len(track) != 3
-                    or any(type(pos) is not int or not 0 <= pos <= 32767 for pos in track[:2])
-                    or not matches(MBID, track[2])):
-                raise ValueError
+        if not all(map(track_row, tracks)):
+            raise ValueError
     return tables, probes
 
 
@@ -86,17 +94,51 @@ def read_snapshot(tables, probes):
         statements.append(f"EXECUTE release_search(convert_from(decode('{query_hex}', 'hex'), 'UTF8'));")
         statements.append(f"EXECUTE release_recordings('{probe['release_mbid']}');")
     statements.append("ROLLBACK;")
-    result = subprocess.run(
-        ["psql", "-XwqAt", "-v", "ON_ERROR_STOP=1"],
-        input="\n".join(statements), capture_output=True, text=True, check=True,
-        env={**os.environ, "PGCONNECT_TIMEOUT": "10"},
-    )
-    return [json.loads(line) for line in result.stdout.splitlines()]
+    raw = capture_psql("\n".join(statements))
+    lines = raw.decode("utf-8").splitlines()
+    if len(lines) != len(TABLES) + 2 * len(probes):
+        raise ValueError
+    return [json.loads(line) for line in lines]
+
+
+def capture_psql(sql):
+    argv = ["psql", "-XwqAt", "-v", "ON_ERROR_STOP=1"]
+    deadline = time.monotonic() + PSQL_TIMEOUT
+    payload = bytearray()
+    # A file for stdin avoids a write/read deadlock. Stderr can contain
+    # connection details and is neither collected nor shown.
+    with tempfile.TemporaryFile() as query, selectors.DefaultSelector() as selector:
+        query.write(sql.encode("utf-8"))
+        query.seek(0)
+        with subprocess.Popen(argv, stdin=query, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              env={**os.environ, "PGCONNECT_TIMEOUT": "10"}) as process:
+            try:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise subprocess.TimeoutExpired(argv, PSQL_TIMEOUT)
+                    chunk = os.read(process.stdout.fileno(), min(65536, MAX_PAYLOAD + 1 - len(payload)))
+                    if not chunk:
+                        break
+                    payload.extend(chunk)
+                    if len(payload) > MAX_PAYLOAD:
+                        raise ValueError
+                status = process.wait(timeout=max(0, deadline - time.monotonic()))
+                if status:
+                    raise subprocess.CalledProcessError(status, argv)
+            finally:
+                if process.returncode is None:
+                    process.kill()
+    return payload
 
 
 def report(tables, probes, snapshot):
     ready = True
     for table, (cursor, rows, dlq) in zip(TABLES, snapshot[:len(TABLES)], strict=True):
+        counts = (rows, dlq) if cursor is None else (cursor, rows, dlq)
+        if any(type(count) is not int or not 0 <= count < 2**63 for count in counts):
+            raise ValueError
         expected = tables[table]
         lines = expected["lines"]
         passed = (cursor, rows, dlq) == (lines, expected["rows"], lines - expected["rows"])
@@ -104,6 +146,13 @@ def report(tables, probes, snapshot):
         ready &= passed
     results = snapshot[len(TABLES):]
     for index, (probe, hits, tracks) in enumerate(zip(probes, results[::2], results[1::2], strict=True), 1):
+        if (not isinstance(hits, list) or len(hits) > 25 or not isinstance(tracks, list) or len(tracks) > 1000
+                or not all(map(track_row, tracks))):
+            raise ValueError
+        for hit in hits:
+            if (not isinstance(hit, list) or len(hit) != 3 or not matches(MBID, hit[0])
+                    or (hit[1] is not None and not matches(MBID, hit[1])) or type(hit[2]) is not bool):
+                raise ValueError
         search_ok = [probe["release_mbid"], probe["artist_mbid"], True] in hits
         tracks_ok = probe["tracks"] == tracks
         print(f"probe {index}: search={'ok' if search_ok else 'mismatch'} "
@@ -123,7 +172,7 @@ def main():
         parser.exit(2, "readiness: could not read valid import evidence\n")
     try:
         return report(tables, probes, read_snapshot(tables, probes))
-    except (OSError, ValueError, TypeError, subprocess.CalledProcessError):
+    except (OSError, ValueError, TypeError, RecursionError, subprocess.SubprocessError):
         # libpq and SQL errors can carry connection details or catalogue data.
         parser.exit(2, "readiness: could not complete PostgreSQL evidence read\n")
 

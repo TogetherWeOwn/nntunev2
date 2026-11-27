@@ -14,6 +14,22 @@ ETL = TEST_DIR.parent / "etl.sh"
 
 
 class TimestampBoundsTests(unittest.TestCase):
+    def test_unrepresentable_precision_and_controls_are_refused(self):
+        for timestamp in (
+            "2026-10-18\n12:00:00Z",
+            "2026-10-18T12:00:00.1234567Z",
+            "2026-10-18T12:00:00+00:00:00.5",
+        ):
+            with self.subTest(timestamp=timestamp), tempfile.TemporaryDirectory() as work:
+                raw = Path(work) / "mbdump"
+                shutil.copytree(TEST_DIR / "fixtures" / "mbdump", raw)
+                result = subprocess.run(["bash", str(ETL), str(raw)],
+                                        env=dict(os.environ, DUMP_TS=timestamp),
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("DUMP_TS", result.stderr)
+                self.assertFalse((raw / "curated").exists())
+
     def test_utc_overflow_is_cleanly_refused_before_publication(self):
         for timestamp in (
             "0001-01-01T00:00:00+15:00",

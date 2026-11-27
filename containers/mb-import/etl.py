@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import tempfile
 import uuid
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -116,6 +117,7 @@ MUSIC_VIDEO_LINK_GID = "ce3de655-7451-44d1-9224-87eb948c205d"
 VIDEO_ATTR_GID = "112054d5-e706-4dd8-99ea-09aabee36cd6"
 NULL = r"\N"
 BATCH_SIZE = 5000
+MAX_COPY_ROW = 1 << 20  # Bytes, including the line ending.
 
 
 def get(row: list[str], position: int) -> str:
@@ -130,10 +132,11 @@ def required_int(field: str, context: str) -> int:
     parsed = value(field)
     if parsed is None:
         raise ValueError(f"{context}: required integer is NULL")
-    try:
-        return int(parsed)
-    except ValueError as exc:
-        raise ValueError(f"{context}: invalid integer {parsed!r}") from exc
+    if re.fullmatch(r"[+-]?[0-9]{1,10}", parsed):
+        number = int(parsed)
+        if -(2**31) <= number < 2**31:
+            return number
+    raise ValueError(f"{context}: invalid 32-bit integer")
 
 
 # Disk-bounded mode (R2 snapshot spike, `stream_extract.py`): inputs may be
@@ -161,8 +164,8 @@ def resolve_input(path: Path) -> Path:
 def open_input(path: Path):
     actual = resolve_input(path)
     if actual == path:
-        return actual, actual.open("r", encoding="utf-8", newline="")
-    return actual, gzip.open(actual, "rt", encoding="utf-8", newline="")
+        return actual, actual.open("rb")
+    return actual, gzip.open(actual, "rb")
 
 
 def open_output(path: Path):
@@ -180,12 +183,13 @@ def curated_name(table: str) -> str:
 def rows(path: Path, expected: int):
     actual, source = open_input(path)
     with source:
-        for line_number, line in enumerate(source, 1):
-            if line.endswith("\n"):
-                line = line[:-1]
-            if line.endswith("\r"):
-                line = line[:-1]
-            fields = line.split("\t")
+        for line_number, line in enumerate(iter(lambda: source.readline(MAX_COPY_ROW + 1), b""), 1):
+            if len(line) > MAX_COPY_ROW or not line.endswith(b"\n"):
+                raise ValueError(f"{path}: row {line_number}: oversized or unterminated COPY row")
+            line = line[:-1].removesuffix(b"\r")
+            if b"\r" in line or b"\0" in line:
+                raise ValueError(f"{path}: row {line_number}: invalid raw COPY character")
+            fields = line.decode("utf-8").split("\t", expected)
             if len(fields) != expected:
                 raise ValueError(
                     f"{path}: row {line_number}: expected {expected} fields, got {len(fields)}"
@@ -258,6 +262,11 @@ def as_ints(context: str, integer_fields: tuple[int, ...], nullable_fields: tupl
 
 
 def validate_timestamp(timestamp: str) -> str:
+    offset = re.search(r"[+-][0-9:]+(?:[.,][0-9]+)?$", timestamp[-64:])
+    if (len(timestamp) > 64 or not timestamp.isprintable()
+            or re.search(r"[.,][0-9]{7}", timestamp)
+            or (offset and not re.fullmatch(r"[+-][0-9]{2}(?::?[0-5][0-9](?::?[0-5][0-9])?)?", offset[0]))):
+        raise ValueError("DUMP_TS must be an ISO-8601 timestamp with a supported separator, precision and UTC offset")
     try:
         parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -1243,6 +1252,9 @@ def main() -> int:
         return 0
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"etl: {exc}", file=sys.stderr)
+        return 1
+    except (EOFError, zlib.error):
+        print("etl: truncated or invalid gzip input", file=sys.stderr)
         return 1
 
 
