@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type APIRequestContext } from '@playwright/test';
+import { API } from '../helpers/contract.js';
 import {
   accessHeaders,
   assertAccessWall,
@@ -8,8 +9,8 @@ import {
 import { anonymousApiGet, anonymousApiOptions, apiGet, apiPost } from '../helpers/accounts.js';
 
 // Anonymous API Worker contract (no app session by construction): liveness
-// answers 200, plans/session routes answer the generic 401, and unknown
-// paths answer the 404 envelope.
+// answers 200, plans, Library and session routes answer the generic 401, and
+// unknown paths answer the 404 envelope.
 //
 // Preflight is an edge concern on staging (TWO-411, option 2): Cloudflare
 // Access answers every OPTIONS itself with a bare 403 and never passes it
@@ -43,8 +44,8 @@ import { anonymousApiGet, anonymousApiOptions, apiGet, apiPost } from '../helper
 /** Liveness probe: unauthenticated at the Worker, Access pair only at the edge. */
 const HEALTHZ_PATH = '/healthz';
 
-/** Anonymous 401 probes: one plans read plus the session mutation family. */
-const ANONYMOUS_401_GET_PATHS = ['/v1/plans'] as const;
+/** Anonymous 401 probes: plans and Library reads plus session mutations. */
+const ANONYMOUS_401_GET_PATHS = ['/v1/plans', API.library] as const;
 const ANONYMOUS_401_POST_PATHS = ['/v1/session/refresh', '/v1/session/revoke-all'] as const;
 
 /** Unknown-path probe: served by no Worker route, so the catch-all 404 owns it. */
@@ -154,6 +155,26 @@ export function assertGenericAnonymous401(probe: DenialProbe): void {
   }
 }
 
+async function assertAnonymousWorkerGet(
+  request: APIRequestContext,
+  url: string,
+  headers: Record<string, string>,
+  context: string,
+): Promise<void> {
+  const response = await apiGet(request, url, headers, context);
+  const probe = {
+    status: response.status(),
+    headers: response.headers(),
+    bodyText: await response.text().catch(() => ''),
+  };
+  assertNoAccessWall({ ...probe, url }, context);
+  assertGenericAnonymous401({ ...probe, context });
+  expect(
+    Object.keys(probe.headers).some((name) => name.toLowerCase() === 'x-nntune-session-binding'),
+    'anonymous response must not carry a session binding',
+  ).toBe(false);
+}
+
 /**
  * The staging edge preflight verdict: Cloudflare Access's bare 403 for an
  * anonymous OPTIONS, which never reaches the Worker. The Worker has no 403
@@ -261,6 +282,37 @@ export function assertNotFoundEnvelope(probe: DenialProbe): void {
 }
 
 test.describe('anonymous worker verdicts (offline, no staging)', () => {
+  test('requires the application 401 without Library data or a session binding', async () => {
+    const origin = 'https://library.example.test';
+    const url = `${origin}${API.library}`;
+    const body = '{"error":"check your email and try again"}';
+    const access = { 'CF-Access-Client-Id': 'fixture-id', 'CF-Access-Client-Secret': 'fixture-secret' };
+    const probe = (status: number, text: string, headers: Record<string, string> = {}) => {
+      const request = {
+        async get(requestUrl: string, options: Parameters<APIRequestContext['get']>[1]) {
+          expect(requestUrl).toBe(origin + '/api/library');
+          expect(options).toEqual({ headers: access, maxRedirects: 0, timeout: 30_000 });
+          return { status: () => status, text: async () => text, headers: () => headers };
+        },
+      } as APIRequestContext;
+      return assertAnonymousWorkerGet(request, url, access, 'demo-library-api-gate');
+    };
+
+    await probe(401, body, { 'set-cookie': 'CF_Authorization=fixture' });
+    await expect(probe(302, '', { location: '/login' })).rejects.toThrow(/unexpected redirect/);
+    await expect(probe(403, '', { 'cf-access-denied': 'fixture' })).rejects.toThrow(/Cloudflare Access wall/);
+    for (const status of [200, 403, 404, 500]) {
+      await expect(probe(status, '{"result":{"track":{"id":"fixture"}}}')).rejects.toThrow(
+        /expected the generic anonymous 401/,
+      );
+    }
+    await expect(probe(401, '<html>Not found</html>')).rejects.toThrow(/not JSON/);
+    await expect(
+      probe(401, '{"error":"check your email and try again","items":[{"id":"fixture"}]}'),
+    ).rejects.toThrow(/single error key/);
+    await expect(probe(401, body, { 'X-NNTune-Session-Binding': 'fixture' })).rejects.toThrow(/session binding/);
+  });
+
   test('generic 401 verdict accepts the documented shape and rejects the rest', () => {
     const ok = {
       status: 401,
@@ -514,7 +566,7 @@ test.describe('anonymous worker verdicts (offline, no staging)', () => {
     // These assertions pin the paths used by the live probes.
     // Configured staging legs check them against the served Worker.
     expect(HEALTHZ_PATH).toBe('/healthz');
-    expect([...ANONYMOUS_401_GET_PATHS]).toEqual(['/v1/plans']);
+    expect([...ANONYMOUS_401_GET_PATHS]).toEqual(['/v1/plans', '/api/library']);
     expect([...ANONYMOUS_401_POST_PATHS]).toEqual([
       '/v1/session/refresh',
       '/v1/session/revoke-all',
@@ -562,26 +614,19 @@ test.describe('anonymous API Worker contract (staging)', () => {
     ).toBe(true);
   });
 
-  test('anonymous GET /v1/plans answers the generic 401', async ({ request }) => {
-    const baseURL = stagingBaseUrl('skip', 'api-worker-plans-anonymous');
-    if (!baseURL) {
-      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
-      return;
-    }
-    const headers = accessHeaders();
-    expect(headers['Authorization'], 'worker probe must carry no app session').toBeUndefined();
-
-    for (const path of ANONYMOUS_401_GET_PATHS) {
-      const context = `api-worker-plans-anonymous ${path}`;
-      const res = await apiGet(request, `${baseURL}${path}`, headers, context);
-      const bodyText = await res.text().catch(() => '');
-      assertNoAccessWall(
-        { status: res.status(), headers: res.headers(), bodyText, url: `${baseURL}${path}` },
-        context,
-      );
-      assertGenericAnonymous401({ status: res.status(), headers: res.headers(), bodyText, context });
-    }
-  });
+  for (const path of ANONYMOUS_401_GET_PATHS) {
+    test(`anonymous GET ${path} answers the generic 401`, async ({ request }) => {
+      const context = `api-worker-anonymous ${path}`;
+      const baseURL = stagingBaseUrl('skip', context);
+      if (!baseURL) {
+        test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+        return;
+      }
+      const headers = accessHeaders();
+      expect(headers['Authorization'], 'worker probe must carry no app session').toBeUndefined();
+      await assertAnonymousWorkerGet(request, `${baseURL}${path}`, headers, context);
+    });
+  }
 
   test('anonymous POST /v1/session/refresh answers the generic 401', async ({ request }) => {
     const baseURL = stagingBaseUrl('skip', 'api-worker-session-refresh-anonymous');

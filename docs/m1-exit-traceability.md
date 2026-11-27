@@ -241,21 +241,22 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
 - `e2e/tests/api-worker-anonymous.spec.ts` pins the anonymous API Worker
   contract both offline and live: the offline describe pins the verdict
   shapes on every PR via `test:unit` with no staging
-  (`e2e/tests/api-worker-anonymous.spec.ts:264` "generic 401 verdict accepts the documented shape and rejects the rest",
-  `e2e/tests/api-worker-anonymous.spec.ts:386` "not_found verdict accepts the envelope and rejects the rest",
-  `e2e/tests/api-worker-anonymous.spec.ts:442` "edge preflight verdict accepts the bare Access 403 and rejects Worker answers",
-  `e2e/tests/api-worker-anonymous.spec.ts:513` "probe paths stay pinned to the anonymous Worker contract",
-  `e2e/tests/api-worker-anonymous.spec.ts:525` "preflight probes cover liveness and the authed surface"),
+  (`e2e/tests/api-worker-anonymous.spec.ts:316` "generic 401 verdict accepts the documented shape and rejects the rest",
+  `e2e/tests/api-worker-anonymous.spec.ts:438` "not_found verdict accepts the envelope and rejects the rest",
+  `e2e/tests/api-worker-anonymous.spec.ts:494` "edge preflight verdict accepts the bare Access 403 and rejects Worker answers",
+  `e2e/tests/api-worker-anonymous.spec.ts:565` "probe paths stay pinned to the anonymous Worker contract",
+  `e2e/tests/api-worker-anonymous.spec.ts:577` "preflight probes cover liveness and the authed surface"),
   while the staging legs prove liveness and fail-closed denial behind the
   Access edge with the Access pair only and no app session
-  (`e2e/tests/api-worker-anonymous.spec.ts:531` "GET /healthz answers 200 with ok:true and no session",
-  `e2e/tests/api-worker-anonymous.spec.ts:565` "anonymous GET /v1/plans answers the generic 401",
-  `e2e/tests/api-worker-anonymous.spec.ts:586` "anonymous POST /v1/session/refresh answers the generic 401",
-  `e2e/tests/api-worker-anonymous.spec.ts:613` "anonymous POST /v1/session/revoke-all answers the generic 401",
-  `e2e/tests/api-worker-anonymous.spec.ts:637` "GET unknown worker path answers the 404 not_found envelope",
-  `e2e/tests/api-worker-anonymous.spec.ts:656` "anonymous OPTIONS preflight is answered by Access and never reaches the Worker"):
-  `GET /healthz` answers 200 with ok true, the plans read and both session
-  mutations answer the generic 401 with no cookie set, and the unknown path
+  (`e2e/tests/api-worker-anonymous.spec.ts:583` "GET /healthz answers 200 with ok:true and no session",
+  `e2e/tests/api-worker-anonymous.spec.ts:618` "anonymous GET /v1/plans answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:618` "anonymous GET /api/library answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:631` "anonymous POST /v1/session/refresh answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:658` "anonymous POST /v1/session/revoke-all answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:682` "GET unknown worker path answers the 404 not_found envelope",
+  `e2e/tests/api-worker-anonymous.spec.ts:701` "anonymous OPTIONS preflight is answered by Access and never reaches the Worker"):
+  `GET /healthz` answers 200 with ok true, the plans and Library reads and both
+  session mutations answer the generic 401 without an app cookie, and the unknown path
   answers the not_found envelope — each leg first clears the Access-wall
   check so an edge denial can never masquerade as Worker evidence, with
   names-only diagnostics throughout. Preflight is an edge concern on
@@ -267,13 +268,13 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   `workers/api/src/worker_entry.rs`. The legs skip green without staging
   and fail closed once
   configured. Worker hardening, not journey coverage.
-- `e2e/tests/demo-media-sessionless.spec.ts` pins the sessionless invariant
-  live: `e2e/tests/demo-media-sessionless.spec.ts:25` "sessionless GET
-  /api/demo/audio serves synthetic bytes (200; 206 for Range)" plus the
-  same-identity library-gated probes at `/library` and `/api/library`.
-  Demo routes serve synthetic bytes with no app session (Access pair only,
-  never an Authorization bearer or cookies) while the real library surface
-  stays gated. Demo hardening, not journey coverage.
+- `e2e/tests/demo-media-sessionless.spec.ts` checks that sessionless
+  `GET /api/demo/audio` serves synthetic bytes with 200 and 206 for Range.
+  The anonymous `/library` browser probe requires the signed-out gate or a
+  same-origin sign-in page, with zero Library items and lists. Offline fixtures
+  reject unrelated routes, Access walls, generic empty states and rendered rows.
+  The separate Worker probe above requires `/api/library` to return the
+  generic 401 without a session binding. These are route contract checks.
 - `e2e/tests/demo-audio-contract.spec.ts` pins the synthetic demo-audio
   contract both offline and live: `e2e/tests/demo-audio-contract.spec.ts:24`
   "default body is a 256 KiB deterministic WAV" plus the sample-formula

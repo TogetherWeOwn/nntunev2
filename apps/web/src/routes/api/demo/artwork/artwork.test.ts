@@ -10,4 +10,7 @@ it('serves SVG artwork with public immutable caching', async () => {
 	const cacheControl = response.headers.get('cache-control');
 	expect(cacheControl).toMatch(/^public/);
 	expect(cacheControl).toContain('immutable');
+	const svg = await response.text();
+	expect(svg.startsWith('<svg')).toBe(true);
+	expect(svg).toContain('aria-label="Placeholder artwork"');
 });

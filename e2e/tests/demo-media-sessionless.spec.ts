@@ -1,12 +1,18 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import { TESTIDS } from '../helpers/contract.js';
-import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
+import {
+  accessHeaders,
+  assertNoAccessWall,
+  isStagingOrigin,
+  stagingBaseUrl,
+  type WallProbe,
+} from '../helpers/access.js';
 import { apiGet, applyAccountToPage } from '../helpers/accounts.js';
 
 // Demo-media sessionless invariant (demo routes are no-auth-by-design):
 // demo routes serve synthetic bytes with no app session, while the real
-// library surface stays gated (redirect to /login, or the implemented
-// signed-out gate with zero library items — either way, no library content).
+// Library serves its signed-out gate or redirects to sign-in. The API denial
+// is covered independently in api-worker-anonymous.spec.ts.
 //
 // Sessionless construction: API calls carry ONLY the Cloudflare Access pair
 // (no Authorization bearer, no cookies — the Playwright `request` fixture
@@ -14,14 +20,38 @@ import { apiGet, applyAccountToPage } from '../helpers/accounts.js';
 // applyAccountToPage(page, null, ...) (Access pair only) on a fresh context
 // with cookies explicitly cleared.
 //
-// File-level skip: pre-deploy (no STAGING_BASE_URL) the whole file skips
-// without launching a browser. See health.spec.ts.
-test.skip(
-  !process.env.STAGING_BASE_URL,
-  'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.',
-);
+const SIGNED_OUT_LIBRARY = /^You are signed out or do not have access to this library\.$/;
+
+function anonymousLibraryPagePath(probe: WallProbe, baseURL: string): '/login' | '/library' {
+  assertNoAccessWall(probe, 'demo-library-gate');
+  if (probe.status === 200 && isStagingOrigin(probe.url, baseURL)) {
+    const { pathname } = new URL(probe.url);
+    if (pathname === '/login' || pathname === '/library') return pathname;
+  }
+  throw new Error('[demo-library-gate] expected the Library or sign-in page on the staging origin');
+}
+
+async function assertRenderedLibraryDenial(
+  page: Page,
+  path: '/login' | '/library',
+  timeout?: number,
+): Promise<void> {
+  const check = expect.configure({ timeout });
+  if (path === '/login') {
+    await check(page.getByRole('heading', { name: 'Sign in', exact: true })).toBeVisible();
+  } else {
+    await check(page.getByRole('alert').filter({ hasText: SIGNED_OUT_LIBRARY })).toBeVisible();
+    await check(page.getByRole('link', { name: 'Sign in', exact: true })).toBeVisible();
+  }
+  await check(page.getByTestId(TESTIDS.libraryList)).toHaveCount(0);
+  await check(page.getByTestId(TESTIDS.libraryItem)).toHaveCount(0);
+}
 
 test.describe('demo media serves sessionless; library stays gated', () => {
+  test.skip(
+    !process.env.STAGING_BASE_URL,
+    'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.',
+  );
   test('sessionless GET /api/demo/audio serves synthetic bytes (200; 206 for Range)', async ({
     request,
   }) => {
@@ -95,111 +125,62 @@ test.describe('demo media serves sessionless; library stays gated', () => {
       waitUntil: 'domcontentloaded',
       timeout: 30_000,
     });
-    expect(response, 'no HTTP response for sessionless /library').not.toBeNull();
-    const headers: Record<string, string> = {};
-    for (const [k, v] of Object.entries(response?.headers() ?? {})) headers[k] = v;
-    assertNoAccessWall(
+    if (!response) throw new Error('[demo-library-gate] no HTTP response for /library');
+    const path = anonymousLibraryPagePath(
       {
-        status: response?.status() ?? 0,
-        headers,
+        status: response.status(),
+        headers: response.headers(),
         bodyText: await page.content().catch(() => ''),
-        url: `${baseURL}/library`,
+        url: response.url(),
       },
-      'demo-library-gate',
+      baseURL,
     );
 
-    // Redirect mechanism: a login redirect gates the surface. Accept any 3xx
-    // landing on /login (the browser followed it); the content assertions
-    // below additionally prove no library items leaked through.
-    if (/\/login/.test(page.url())) {
-      await expect(
-        page.getByTestId(TESTIDS.libraryItem),
-        'sessionless /library redirect to login still rendered library items',
-      ).toHaveCount(0);
-      return;
+    await assertRenderedLibraryDenial(page, path);
+  });
+});
+
+test.describe('anonymous Library denial (offline fixtures)', () => {
+  const origin = 'https://library.example.test';
+
+  test('requires an exact same-origin Library or sign-in page', () => {
+    const probe: WallProbe = { status: 200, headers: {}, bodyText: '', url: origin + '/library' };
+    expect(anonymousLibraryPagePath(probe, origin)).toBe('/library');
+    expect(anonymousLibraryPagePath({ ...probe, url: origin + '/login?next=%2Flibrary' }, origin)).toBe('/login');
+    for (const url of [
+      origin + '/logins',
+      origin + '/other?next=/login',
+      'https://elsewhere.example.test/login',
+    ]) {
+      expect(() => anonymousLibraryPagePath({ ...probe, url }, origin)).toThrow(
+        /expected the Library or sign-in/,
+      );
     }
-
-    // Implemented gate (current app): 200 app shell with a signed-out / empty /
-    // unavailable state and zero library items — never library content.
-    expect(response?.status(), 'sessionless /library did not answer 200 or redirect to login').toBe(
-      200,
-    );
-    await expect(
-      page.getByTestId(TESTIDS.libraryItem),
-      'sessionless /library served library items without an app session',
-    ).toHaveCount(0);
-    await expect(
-      page.getByTestId(TESTIDS.libraryList),
-      'sessionless /library rendered a library list without an app session',
-    ).toHaveCount(0);
-    const gated = page.getByRole('alert').or(page.getByRole('status'));
-    await expect(
-      gated.first(),
-      'sessionless /library shows neither a redirect to login nor a signed-out/empty gate',
-    ).toContainText(/signed out|do not have access|empty|import|not available|not reachable/i, {
-      timeout: 15_000,
-    });
+    expect(() => anonymousLibraryPagePath({ ...probe, status: 404 }, origin)).toThrow(/expected the Library or sign-in/);
+    expect(() => anonymousLibraryPagePath({
+      ...probe, status: 403, headers: { 'cf-access-denied': 'fixture' },
+    }, origin)).toThrow(/Cloudflare Access wall/);
   });
 
-  test('same sessionless identity does not receive library content at /api/library', async ({
-    request,
-  }) => {
-    const baseURL = stagingBaseUrl('skip', 'demo-library-api-gate');
-    if (!baseURL) {
-      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
-      return;
-    }
-    const headers = accessHeaders();
-    expect(headers['Authorization'], 'library API probe must carry no app session').toBeUndefined();
+  test('requires visible denial and no Library lists or items in the rendered page', async ({ page }) => {
+    const alert = '<p role="alert">You are signed out or do not have access to this library.</p>';
+    const link = '<a href="/login">Sign in</a>';
+    await page.setContent(alert + link);
+    await assertRenderedLibraryDenial(page, '/library');
+    await page.setContent('<h1>Sign in</h1>');
+    await assertRenderedLibraryDenial(page, '/login');
 
-    const url = `${baseURL}/api/library`;
-    let res;
-    try {
-      res = await apiGet(request, url, headers, 'demo-library-api-gate');
-    } catch (error) {
-      const message = (error as Error).message;
-      // No-follow wrapper throws on 3xx: a redirect gates the surface (never
-      // followed with credentials). The Access wall stays a hard failure.
-      if (/Access wall/i.test(message)) throw error;
-      expect(message, 'sessionless /api/library failed without a redirect diagnostic').toMatch(
-        /unexpected redirect/i,
-      );
-      return;
+    for (const html of [
+      '<p role="alert">Your library is empty.</p>' + link,
+      '<div hidden>' + alert + '</div>' + link,
+      alert,
+      alert + link + '<div data-testid="library-list"></div>',
+      alert + link + '<div data-testid="library-item">Fixture track</div>',
+    ]) {
+      await page.setContent(html);
+      await expect(assertRenderedLibraryDenial(page, '/library', 300)).rejects.toThrow();
     }
-    const bodyText = await res.text().catch(() => '');
-    assertNoAccessWall(
-      { status: res.status(), headers: res.headers(), bodyText, url },
-      'demo-library-api-gate',
-    );
-    // Gated statuses prove the surface stays closed; 404 means the endpoint
-    // has not landed (also not serving content). Only a 200 needs a leak check.
-    if (res.status() === 401 || res.status() === 403 || res.status() === 404) return;
-    expect(res.status(), 'sessionless /api/library answered an unexpected status').toBe(200);
-    // A 200 at an /api/* route must be JSON library content (or an empty
-    // equivalent) — HTML/a misroute here fails by name instead of passing.
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(bodyText) as unknown;
-    } catch {
-      expect(
-        bodyText,
-        'sessionless /api/library answered 200 with a non-JSON body (misroute?)',
-      ).toBe('');
-      return;
-    }
-    const record = (parsed as Record<string, unknown>) ?? {};
-    const containers = [
-      parsed,
-      record['items'],
-      record['tracks'],
-      record['library'],
-      record['data'],
-    ].filter(Array.isArray);
-    for (const items of containers) {
-      expect(
-        (items as unknown[]).length,
-        'sessionless /api/library served library items without an app session',
-      ).toBe(0);
-    }
+    await page.setContent('<h1>Library</h1>');
+    await expect(assertRenderedLibraryDenial(page, '/login', 300)).rejects.toThrow();
   });
 });
