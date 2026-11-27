@@ -99,17 +99,17 @@ it.each([true, false])('checks the origin of the document base (same origin: %s)
 	}
 });
 
-it('cancels a stalled body reader when the request deadline expires', async () => {
+it.each(['fetch', 'body'])('times out when an ordinary GET stalls during %s', async (phase) => {
 	vi.useFakeTimers();
 	try {
 		const cancel = vi.fn();
 		const body = new ReadableStream<Uint8Array>({ cancel });
-		const fetchFn = vi.fn(async () => new Response(body));
-		const client = new ApiClient({ baseUrl: '', fetchFn });
-		const failure = client.get('/health').catch((error: unknown) => error);
+		const fetchFn = vi.fn(async () => phase === 'fetch' ? new Promise<Response>(() => {}) : new Response(body));
+		const failure = vi.fn();
+		void new ApiClient({ baseUrl: '', fetchFn }).get('/health').catch(failure);
 		await vi.advanceTimersByTimeAsync(API_REQUEST_TIMEOUT_MS);
-		expect(await failure).toMatchObject({ code: 'request_timeout' });
-		expect(cancel).toHaveBeenCalledOnce();
+		expect(failure).toHaveBeenCalledWith(expect.objectContaining({ code: 'request_timeout' }));
+		expect(cancel).toHaveBeenCalledTimes(phase === 'body' ? 1 : 0);
 		expect(body.locked).toBe(false);
 	} finally {
 		vi.useRealTimers();
