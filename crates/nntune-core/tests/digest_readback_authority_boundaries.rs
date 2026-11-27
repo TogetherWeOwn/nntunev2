@@ -57,6 +57,7 @@ fn manifest_boundaries_reject_malformed_committed_pins() {
     let valid_pages = ["page-v1".into()];
     let extra_pages = ["page-v1".into(), "page-v2".into()];
     let invalid_pages = ["v1,v2".into()];
+    let null_pages = ["null".into()];
     let pins = DigestReadSnapshot {
         environment_id: id(1),
         library_id: id(2),
@@ -88,14 +89,6 @@ fn manifest_boundaries_reject_malformed_committed_pins() {
             ..pins
         },
         DigestReadSnapshot {
-            page_versions: &invalid_pages,
-            ..pins
-        },
-        DigestReadSnapshot {
-            media_version: "null",
-            ..pins
-        },
-        DigestReadSnapshot {
             root_version_id: [0; 16],
             ..pins
         },
@@ -110,6 +103,25 @@ fn manifest_boundaries_reject_malformed_committed_pins() {
         assert!(manifests
             .iter()
             .all(|manifest| !manifest.matches(&bad, &matching_context)));
+    }
+    for bad in [
+        DigestReadSnapshot {
+            page_versions: &invalid_pages,
+            ..pins
+        },
+        DigestReadSnapshot {
+            page_versions: &null_pages,
+            ..pins
+        },
+        DigestReadSnapshot {
+            media_version: "null",
+            ..pins
+        },
+    ] {
+        assert!(StoredManifest::from_committed_storage(&bad, header, rows.to_vec()).is_none());
+        assert!(manifests
+            .iter()
+            .all(|manifest| manifest.matches(&bad, &context)));
     }
 }
 
