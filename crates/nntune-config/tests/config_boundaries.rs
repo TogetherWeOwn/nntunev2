@@ -176,7 +176,7 @@ fn origin_errors_redact_input_in_display_and_debug() {
     let mut config = Config::load(&identity("example.test", "https://example.test")).unwrap();
     let invalid_identity = identity("example.test", &origin);
     let env = values(&[("RP_ORIGIN", &origin)]);
-    let kv_error = Config::load(&invalid_identity).err().expect("userinfo");
+    let kv_error = Config::load(&invalid_identity).expect_err("userinfo");
     let env_error = config.apply_env(&env).expect_err("userinfo override");
     for err in [kv_error, env_error] {
         for rendered in [err.to_string(), format!("{err:?}")] {
