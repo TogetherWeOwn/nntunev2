@@ -13,6 +13,7 @@ pub(crate) struct FlacStream {
     header: [u8; 16],
     filled: usize,
     frame: Option<FrameReader>,
+    frame_bytes: u64,
     pcm_md5: Option<md5::Context>,
     pcm_scratch: Option<Vec<i32>>,
     collect_seek: bool,
@@ -57,10 +58,21 @@ impl FlacStream {
             }
         }
         let continuity = self.continuity.as_mut().ok_or(())?;
+        let frame_sizes = self.preamble.frame_sizes();
         while let Some((&byte, rest)) = input.split_first() {
             if let Some(frame) = &mut self.frame {
-                if !frame.read(&mut input)? {
+                // Limit what the frame reader can consume, including its footer.
+                let available = (*frame_sizes.end() - self.frame_bytes).min(input.len() as u64);
+                let mut frame_input = &input[..available as usize];
+                let complete = frame.read(&mut frame_input)?;
+                let consumed = available as usize - frame_input.len();
+                self.frame_bytes += consumed as u64;
+                input = &input[consumed..];
+                if !complete && self.frame_bytes < *frame_sizes.end() {
                     return Ok(());
+                }
+                if !complete || !frame_sizes.contains(&self.frame_bytes) {
+                    return Err(());
                 }
                 let (header, pcm) = continuity.accept_with_pcm(self.frame.take().ok_or(())?)?;
                 if let Some(md5) = &mut self.pcm_md5 {
@@ -84,9 +96,10 @@ impl FlacStream {
                     continuity.stream_info(),
                     &mut self.pcm_scratch,
                 )? {
-                    if !header.is_empty() {
+                    if !header.is_empty() || self.filled as u64 >= *frame_sizes.end() {
                         return Err(());
                     }
+                    self.frame_bytes = self.filled as u64;
                     self.frame = Some(frame);
                     self.filled = 0;
                 } else if self.filled == self.header.len() {

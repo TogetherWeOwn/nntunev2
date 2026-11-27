@@ -1,6 +1,8 @@
 //! Incremental native FLAC metadata framing (RFC 9639). Ancillary payloads
 //! are opaque here. Reaching audio is not proof of even one valid frame.
 
+use std::ops::RangeInclusive;
+
 #[derive(Clone, Copy)]
 pub(crate) struct StreamInfo {
     pub(crate) min_block: u16,
@@ -24,6 +26,7 @@ pub(crate) struct FlacPreamble {
     scratch: [u8; 42],
     filled: usize,
     info: Option<StreamInfo>,
+    frame_sizes: RangeInclusive<u64>,
     state: State,
 }
 
@@ -33,6 +36,7 @@ impl Default for FlacPreamble {
             scratch: [0; 42],
             filled: 0,
             info: None,
+            frame_sizes: 0..=u64::MAX,
             state: State::StreamInfo,
         }
     }
@@ -47,6 +51,12 @@ fn fill(input: &mut &[u8], dst: &mut [u8], filled: &mut usize) -> bool {
 }
 
 impl FlacPreamble {
+    /// STREAMINFO byte bounds are available once the preamble reaches audio.
+    /// Zero in either size field means that bound is unknown.
+    pub(crate) fn frame_sizes(&self) -> &RangeInclusive<u64> {
+        &self.frame_sizes
+    }
+
     /// `None` means more metadata is needed; EOF in this state is invalid.
     /// The returned audio tail borrows the original input, including on the
     /// call where the final metadata block ends. No payload is buffered.
@@ -72,16 +82,23 @@ impl FlacPreamble {
                     };
                     let min_block = u16::from_be_bytes([info[0], info[1]]);
                     let max_block = u16::from_be_bytes([info[2], info[3]]);
+                    let min_frame = u64::from(u32::from_be_bytes([0, info[4], info[5], info[6]]));
+                    let max_frame = match u32::from_be_bytes([0, info[7], info[8], info[9]]) {
+                        0 => u64::MAX,
+                        size => u64::from(size),
+                    };
                     let packed = u64::from_be_bytes(info[10..18].try_into().map_err(|_| ())?);
                     let sample_rate = (packed >> 44) as u32;
                     let bits_per_sample = (((packed >> 36) & 31) + 1) as u8;
                     if min_block < 16
                         || max_block < min_block
+                        || min_frame > max_frame
                         || sample_rate == 0
                         || bits_per_sample < 4
                     {
                         return Err(());
                     }
+                    self.frame_sizes = min_frame..=max_frame;
                     self.info = Some(StreamInfo {
                         min_block,
                         max_block,

@@ -43,6 +43,11 @@ impl FrameHeader {
         if channel_assignment > 10 {
             return Err(());
         }
+        let channels = if channel_assignment <= 7 {
+            channel_assignment + 1
+        } else {
+            2
+        };
         let bits_per_sample = match (format >> 1) & 7 {
             0 => info.bits_per_sample,
             1 => 8,
@@ -53,6 +58,10 @@ impl FrameHeader {
             6 => 24,
             _ => 32,
         };
+        // This stream uses a single PCM format and a single seek timebase.
+        if channels != info.channels || bits_per_sample != info.bits_per_sample {
+            return Err(());
+        }
         let width = match first.leading_ones() as usize {
             0 => 1,
             n @ 2..=6 => n,
@@ -113,7 +122,7 @@ impl FrameHeader {
             14 => u32::from(u16::from_be_bytes([rate[0], rate[1]])) * 10,
             _ => return Err(()),
         };
-        if block_size > info.max_block || sample_rate == 0 {
+        if block_size > info.max_block || sample_rate == 0 || sample_rate != info.sample_rate {
             return Err(());
         }
         let position = if strategy == 0xf8 {
@@ -152,31 +161,42 @@ mod tests {
 
     #[test]
     fn exact_header_boundary_and_numbering() {
-        for (header, position, size, assignment, format) in [
-            (FIXED.as_slice(), Position::Frame(0), 256, 0, (24, 48000)),
+        for (header, position, size, assignment, info) in [
+            (FIXED.as_slice(), Position::Frame(0), 256, 0, INFO),
             (
                 VARIABLE.as_slice(),
                 Position::Sample(0xa3d25da7),
                 16,
                 10,
-                (16, 44100),
+                StreamInfo {
+                    sample_rate: 44_100,
+                    channels: 2,
+                    bits_per_sample: 16,
+                    ..INFO
+                },
             ),
         ] {
             for i in 0..header.len() {
-                assert_eq!(FrameHeader::parse(&header[..i], &INFO), Ok(None));
+                assert_eq!(FrameHeader::parse(&header[..i], &info), Ok(None));
             }
             let with_tail = [header, &[0x80, 0xff, 0xf8]].concat();
-            let parsed = FrameHeader::parse(&with_tail, &INFO).unwrap().unwrap();
+            let parsed = FrameHeader::parse(&with_tail, &info).unwrap().unwrap();
             assert_eq!(parsed.len, header.len());
             assert_eq!(parsed.position, position);
             assert_eq!(parsed.block_size, size);
             assert_eq!(parsed.channel_assignment, assignment);
-            assert_eq!((parsed.bits_per_sample, parsed.sample_rate), format);
+            assert_eq!(parsed.bits_per_sample, info.bits_per_sample);
+            assert_eq!(parsed.sample_rate, info.sample_rate);
         }
     }
 
     #[test]
     fn malformed_headers_are_not_resynchronized() {
+        let info = StreamInfo {
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            ..INFO
+        };
         let mut corrupt = FIXED;
         corrupt[5] ^= 1;
         assert_eq!(FrameHeader::parse(&corrupt, &INFO), Err(()));
@@ -192,7 +212,7 @@ mod tests {
         ] {
             bad.push(crc8(&bad));
             bad.extend_from_slice(&FIXED);
-            assert_eq!(FrameHeader::parse(&bad, &INFO), Err(()));
+            assert_eq!(FrameHeader::parse(&bad, &info), Err(()));
         }
     }
 }
