@@ -260,3 +260,18 @@ fn choice_is_deterministic() {
     let miss_second = choose_profile_artifact(empty, StreamProfile::Opus64);
     assert_eq!(miss_first, miss_second);
 }
+
+#[test]
+fn malformed_exacts_do_not_shadow_the_first_valid_exact() {
+    let padded_hash = format!("{OPUS_64_HASH}\n");
+    let rows = [
+        row("opus", 64, &padded_hash),
+        row("OPUS", 64, FLAC_HASH),
+        row("opus", 128, OPUS_128_HASH),
+        row("opus", 64, OPUS_64_HASH),
+        row("opus", 64, OPUS_32_HASH),
+    ];
+    let chosen = choose_profile_artifact(&rows, StreamProfile::Opus64).unwrap();
+    assert_eq!(chosen.content_hash, OPUS_64_HASH);
+    assert_eq!(chosen.match_level, MatchLevel::Exact);
+}

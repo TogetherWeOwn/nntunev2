@@ -12,6 +12,10 @@
 //! Pure index arithmetic: no sockets, providers, or Durable Objects.
 
 use nntune_stream::prefetch::next_track;
+use nntune_stream::{
+    pool::{Lane, Pool, HARD_MAX_CONNS},
+    prefetch::should_prefetch,
+};
 
 fn queue() -> Vec<String> {
     vec!["a".to_string(), "b".to_string(), "c".to_string()]
@@ -35,4 +39,25 @@ fn last_index_returns_none() {
 fn second_last_index_returns_last_track() {
     let q = queue();
     assert_eq!(next_track(&q, q.len() - 2), Some("c"));
+}
+
+#[test]
+fn empty_and_out_of_bounds_queues_have_no_successor() {
+    assert_eq!(next_track(&[], 0), None);
+    let q = queue();
+    assert_eq!(next_track(&q, q.len()), None);
+}
+
+#[test]
+fn prefetch_reserves_playback_at_the_hard_pool_ceiling() {
+    let mut pool = Pool::<()>::new(u32::MAX);
+    let leases: Vec<_> = (0..HARD_MAX_CONNS - 2)
+        .map(|_| pool.try_acquire(Lane::Playback).unwrap())
+        .collect();
+    assert!(should_prefetch(&pool));
+    let _prefetch = pool.try_acquire(Lane::Prefetch).unwrap();
+    assert!(!should_prefetch(&pool));
+    let _playback = pool.try_acquire(Lane::Playback).unwrap();
+    assert!(!pool.can_acquire(Lane::Playback));
+    drop(leases);
 }

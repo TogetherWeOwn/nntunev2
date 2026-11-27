@@ -115,6 +115,31 @@ fn mirror_pins_public_controls_admit() {
     admit("2606:4700:4700::1111");
 }
 
+#[test]
+fn literal_host_requires_every_answer_to_match() {
+    let host = v4(93, 184, 216, 34);
+    let other = v4(93, 184, 216, 35);
+    let plan = vet_dial_plan(&request(&host, &[&host, &host])).expect("exact literal accepted");
+    assert_eq!(plan.peer().ip().to_string(), host);
+    for candidates in [&[other.as_str()][..], &[host.as_str(), other.as_str()][..]] {
+        assert_eq!(
+            vet_dial_plan(&request(&host, candidates)).err(),
+            Some(LoaderDenial::ProviderUnavailable)
+        );
+    }
+}
+
+#[test]
+fn control_bytes_in_host_deny_with_a_public_candidate() {
+    let candidate = v4(93, 184, 216, 34);
+    for host in ["news\0.example.invalid", "news\x7f.example.invalid"] {
+        assert_eq!(
+            vet_dial_plan(&request(host, &[&candidate])).err(),
+            Some(LoaderDenial::ProviderUnavailable)
+        );
+    }
+}
+
 // ---- UUIDv4 variant strictness (oracle: only a valid lowercase UUIDv4 echoes) ----
 
 const FRESH: &str = "123e4567-e89b-42d3-a456-426614174999";

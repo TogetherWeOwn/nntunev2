@@ -7,7 +7,8 @@
 //! Parsing is NOT authorization: no runtime wiring, no authority handle.
 
 use nntune_stream::provider_response::{
-    validate_provider_response, ExpectedProviderResponse, KeyBinding, ProviderResponseError,
+    validate_provider_http_response, validate_provider_response, ExpectedProviderResponse,
+    KeyBinding, ProviderResponseError, MAX_PROVIDER_RESPONSE_BYTES,
 };
 use serde_json::{json, Value};
 
@@ -144,5 +145,72 @@ fn binding_mismatch_denies_with_authorization_denied_while_malformed_is_unavaila
     assert_eq!(
         deny_exact(&oversize, &expected()),
         ProviderResponseError::ProviderUnavailable
+    );
+}
+
+#[test]
+fn http_envelope_requires_complete_json_success_metadata() {
+    let body = escaped_wire();
+    let expected = expected();
+    let json = ("Content-Type", " Application/JSON\t");
+    let length = body.len().to_string();
+    let exact_length = ("Content-Length", length.as_str());
+    assert!(validate_provider_http_response(200, &[json, exact_length], &body, &expected).is_ok());
+    for status in [201, 204, 206, 302, 403, 503] {
+        assert_eq!(
+            validate_provider_http_response(status, &[json], &body, &expected).err(),
+            Some(ProviderResponseError::ProviderUnavailable)
+        );
+    }
+    let longer = (body.len() + 1).to_string();
+    let shorter = (body.len() - 1).to_string();
+    let signed = format!("+{length}");
+    let cases: &[&[(&str, &str)]] = &[
+        &[],
+        &[("Content-Type", "text/plain")],
+        &[json, ("content-type", "application/json")],
+        &[json, exact_length, exact_length],
+        &[json, ("content-length", &longer)],
+        &[json, ("content-length", &shorter)],
+        &[json, ("content-length", &signed)],
+        &[json, ("content-encoding", "gzip")],
+        &[
+            json,
+            ("content-encoding", "identity"),
+            ("Content-Encoding", "identity"),
+        ],
+        &[json, ("content-range", "bytes */8192")],
+    ];
+    for headers in cases {
+        assert_eq!(
+            validate_provider_http_response(200, headers, &body, &expected).err(),
+            Some(ProviderResponseError::ProviderUnavailable)
+        );
+    }
+}
+
+#[test]
+fn http_body_validation_checks_the_entire_slice_before_acceptance() {
+    let mut body = escaped_wire();
+    let headers = [
+        ("content-type", "application/json"),
+        ("content-encoding", "identity"),
+    ];
+    let mut binding = expected();
+    assert_eq!(
+        validate_provider_http_response(200, &headers, &body[..body.len() - 1], &binding).err(),
+        Some(ProviderResponseError::ProviderUnavailable)
+    );
+    body.resize(MAX_PROVIDER_RESPONSE_BYTES, b' ');
+    assert!(validate_provider_http_response(200, &headers, &body, &binding).is_ok());
+    binding.lease_until += 1;
+    assert_eq!(
+        validate_provider_http_response(200, &headers, &body, &binding).err(),
+        Some(ProviderResponseError::AuthorizationDenied)
+    );
+    body.push(b' ');
+    assert_eq!(
+        validate_provider_http_response(200, &headers, &body, &expected()).err(),
+        Some(ProviderResponseError::ProviderUnavailable)
     );
 }

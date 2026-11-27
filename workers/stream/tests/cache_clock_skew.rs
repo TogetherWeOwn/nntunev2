@@ -12,10 +12,35 @@
 //! In-memory cache only: no sockets, providers, or Durable Objects.
 
 use nntune_stream::cache::{
-    CacheServe, CacheStatus, ContentCache, CACHE_FRESH_TTL_SECS, CACHE_SWR_WINDOW_SECS,
+    blob_key_for_pointer, CacheServe, CacheStatus, ContentCache, CACHE_FRESH_TTL_SECS,
+    CACHE_SWR_WINDOW_SECS,
 };
 
 const BYTES: &[u8] = b"clock-skew-bytes";
+
+#[test]
+fn expiry_discards_the_track_claim_and_keeps_the_shared_blob() {
+    let mut cache = ContentCache::new();
+    cache.put_track_at("old", BYTES.to_vec(), 1_000);
+    let last_stale = 1_000 + CACHE_FRESH_TTL_SECS + CACHE_SWR_WINDOW_SECS;
+    cache.put_track_at("other", BYTES.to_vec(), last_stale);
+    assert!(cache.try_begin_revalidate("old", last_stale));
+    assert!(cache.get_track_at("old", last_stale + 1).is_none());
+    assert!(cache.try_begin_revalidate("old", last_stale + 1));
+    assert_eq!(cache.get_track("other").as_deref(), Some(BYTES));
+    assert_eq!(cache.blob_count(), 1);
+}
+
+#[test]
+fn pointer_requires_canonical_hash_within_whole_object_cap() {
+    let hash = ContentCache::hex_hash(BYTES);
+    assert!(blob_key_for_pointer(hash.to_ascii_uppercase().as_bytes()).is_none());
+    let mut padded = hash.as_bytes().to_vec();
+    padded.resize(256, b' ');
+    assert_eq!(blob_key_for_pointer(&padded), Some(format!("audio/{hash}")));
+    padded.push(b' ');
+    assert!(blob_key_for_pointer(&padded).is_none());
+}
 
 /// Future-stamped read (writer at 2_000, reader at 1_000) serves Fresh at
 /// age 0 with no revalidation owed and a Hit status.

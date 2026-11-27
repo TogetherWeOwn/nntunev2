@@ -160,6 +160,55 @@ impl fmt::Display for ProviderResponseError {
 
 impl std::error::Error for ProviderResponseError {}
 
+/// Validate an inert HTTP success envelope before decoding its complete body.
+/// Supply parsed header fields separately, preserving repeated occurrences.
+/// This seam accepts 200 with one `application/json` content type and an
+/// unencoded, non-partial body. If present, Content-Length must be a single
+/// decimal byte count that matches the body. The transport must still bound
+/// the read and verify message completion before passing the body here.
+pub fn validate_provider_http_response(
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    expected: &ExpectedProviderResponse,
+) -> Result<Provider3Success, ProviderResponseError> {
+    use ProviderResponseError::ProviderUnavailable;
+    if status != 200 || body.len() > MAX_PROVIDER_RESPONSE_BYTES {
+        return Err(ProviderUnavailable);
+    }
+    let mut content_type_seen = false;
+    let mut content_length_seen = false;
+    let mut content_encoding_seen = false;
+    for (name, value) in headers {
+        let value = value.trim_matches([' ', '\t']);
+        if name.eq_ignore_ascii_case("content-type") {
+            if content_type_seen || !value.eq_ignore_ascii_case("application/json") {
+                return Err(ProviderUnavailable);
+            }
+            content_type_seen = true;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            if content_length_seen
+                || !value.bytes().all(|b| b.is_ascii_digit())
+                || value.parse::<usize>().ok() != Some(body.len())
+            {
+                return Err(ProviderUnavailable);
+            }
+            content_length_seen = true;
+        } else if name.eq_ignore_ascii_case("content-encoding") {
+            if content_encoding_seen || !value.eq_ignore_ascii_case("identity") {
+                return Err(ProviderUnavailable);
+            }
+            content_encoding_seen = true;
+        } else if name.eq_ignore_ascii_case("content-range") {
+            return Err(ProviderUnavailable);
+        }
+    }
+    if !content_type_seen {
+        return Err(ProviderUnavailable);
+    }
+    validate_provider_response(body, expected)
+}
+
 /// Validate raw response bytes against supplied expected bindings.
 ///
 /// Accepts only exact closed v3 shapes; see the module documentation for

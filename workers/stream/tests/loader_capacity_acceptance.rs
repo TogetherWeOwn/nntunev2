@@ -154,7 +154,6 @@ fn effective_cap_is_the_minimum_clamped_to_fifty() {
         (1, 1, 1),
         (50, 50, 50),
         (50, 10_000, 50),
-        (10_000, 50, 50),
     ] {
         let mut req = request();
         req.provider_cap = provider;
@@ -183,11 +182,22 @@ fn nonpositive_or_oversize_caps_deny_before_any_clamp() {
             deny_unavailable(&req);
         }
     }
-    for provider in [51, 100, i64::MAX] {
+    for (provider, plan) in [(51, 5), (51, 50), (100, 51), (i64::MAX, i64::MAX)] {
         let mut req = request();
         req.provider_cap = provider;
+        req.plan_cap = plan;
         deny_unavailable(&req);
     }
+}
+
+#[test]
+fn whole_object_bound_compares_the_full_width() {
+    let mut req = request();
+    req.bound_bytes = MAX_PROVIDER_REQUEST_BYTES;
+    req.object_bytes = req.bound_bytes;
+    assert_eq!(grant(&req).object_bytes(), req.bound_bytes);
+    req.object_bytes += 1_u64 << 32;
+    deny_unavailable(&req);
 }
 
 #[test]
