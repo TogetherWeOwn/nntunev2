@@ -312,17 +312,10 @@ where
                 pool.release(lease, Some(client));
                 return Ok(outcome(req, found));
             }
-            // Only a disconnected socket before the first reply gets a redial.
+            // Workers sockets can report a disconnect as `Other`.
             Err(nntune_core::Error::Io(e))
                 if !response_seen
-                    && matches!(
-                        e.kind(),
-                        ErrorKind::UnexpectedEof
-                            | ErrorKind::ConnectionReset
-                            | ErrorKind::ConnectionAborted
-                            | ErrorKind::BrokenPipe
-                            | ErrorKind::NotConnected
-                    ) => {}
+                    && !matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::InvalidData) => {}
             Err(_) => return Err(provider_failed(pool, &tick, lease)),
         }
     }

@@ -33,14 +33,14 @@ fn foreign_release_and_superseded_probe_cannot_open_admission() {
     assert!(pool.record_probe_success_for(probe.id));
 }
 
-struct TimeoutAfterHandshake(bool);
+struct ProbeSocket(&'static [u8], io::ErrorKind);
 
-impl Transport for TimeoutAfterHandshake {
-    async fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
-        if std::mem::replace(&mut self.0, false) {
-            io::Write::write(&mut buf, b"200 ready\r\n200 reader mode\r\n")
+impl Transport for ProbeSocket {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.0.is_empty() {
+            Err(self.1.into())
         } else {
-            Err(io::ErrorKind::TimedOut.into())
+            io::Read::read(&mut self.0, buf)
         }
     }
     async fn write_all(&mut self, _: &[u8]) -> io::Result<()> {
@@ -54,38 +54,59 @@ impl Transport for TimeoutAfterHandshake {
 #[tokio::test]
 async fn typed_probe_refuses_bad_batches_and_never_redials_a_timeout() {
     let pool = RefCell::new(Pool::new(2));
-    let client = NntpClient::connect(TimeoutAfterHandshake(true), &Default::default())
-        .await
-        .unwrap();
-    let lease = pool.borrow_mut().try_acquire(Lane::Ingest).unwrap();
-    pool.borrow_mut().release(lease, Some(client));
     let mut req: ProbeRequest = serde_json::from_str(
         r#"{"job_id":"job","user_id":"user","idempotency_key":"key","batch_index":0,"segment_ids":[]}"#,
     ).unwrap();
     let dial = || async { panic!("this probe must not dial") };
-    for batch in [
-        vec![],
-        vec!["id@example.test".into(); MAX_PROBE_SEGMENTS + 1],
-        vec!["bad id".into()],
-    ] {
+    let oversized = vec!["id@example.test".into(); MAX_PROBE_SEGMENTS + 1];
+    for batch in [vec![], oversized, vec!["bad id".into()]] {
         req.segment_ids = batch;
         assert!(matches!(
             run_probe(&pool, dial, |_| {}, &req).await,
             Err(ProbeError::BadRequest(_))
         ));
-        assert_eq!(pool.borrow().idle(), 1);
+        assert_eq!(pool.borrow().in_use(), 0);
     }
-    req.segment_ids = vec!["id@example.test".into()];
-    assert_eq!(
-        run_probe(&pool, dial, |_| {}, &req).await,
-        Err(ProbeError::Provider)
-    );
-    assert_eq!((pool.borrow().idle(), pool.borrow().in_use()), (0, 0));
+    req.segment_ids = vec!["id@example.test".into(); 2];
+    let handshake = b"200 ready\r\n200 reader mode\r\n".as_slice();
+    let partial = b"200 ready\r\n200 reader mode\r\n430 missing\r\n".as_slice();
+    for (replies, kind, retries) in [
+        (handshake, io::ErrorKind::TimedOut, 0),
+        (partial, io::ErrorKind::UnexpectedEof, 0),
+        (handshake, io::ErrorKind::Other, 1),
+    ] {
+        let socket = ProbeSocket(replies, kind);
+        let client = NntpClient::connect(socket, &Default::default())
+            .await
+            .unwrap();
+        let lease = pool.borrow_mut().try_acquire(Lane::Ingest).unwrap();
+        pool.borrow_mut().release(lease, Some(client));
+        let mut dials = 0;
+        let dial = || {
+            dials += 1;
+            std::future::ready(Err(io::Error::from(io::ErrorKind::TimedOut).into()))
+        };
+        let result = run_probe(&pool, dial, |_| {}, &req).await;
+        assert_eq!(result, Err(ProbeError::Provider));
+        assert_eq!((pool.borrow().idle(), pool.borrow().in_use()), (0, 0));
+        assert_eq!(dials, retries);
+    }
 }
 
 #[test]
 fn meter_refuses_invalid_acks_and_oversized_windows() {
     assert!(parse_ack(br#"{"accepted":["p"],"rejected":["p"]}"#).is_none());
+    assert!(parse_ack(br#"{"accepted":["bad id"]}"#).is_none());
+    let ids: Vec<_> = (0..65).map(|id| id.to_string()).collect();
+    for count in [64, 65] {
+        let ack = serde_json::json!({"accepted": &ids[..count]}).to_string();
+        assert_eq!(parse_ack(ack.as_bytes()).is_some(), count == 64);
+    }
+    let mut ack = b"{}".to_vec();
+    ack.resize(64 * 1024, b' ');
+    assert!(parse_ack(&ack).is_some());
+    ack.push(b' ');
+    assert!(parse_ack(&ack).is_none());
     let mut book = MeterBook::new("user");
     let mut interval: DeliveredInterval = serde_json::from_str(
         r#"{"user_id":"user","play_id":"p","track_id":"t","start":0,"end":10,"file_bytes":9}"#,
@@ -113,7 +134,12 @@ fn trace_rejects_sensitive_and_unbounded_fields() {
         assert!(fields.insert_str("detail", value).is_err());
     }
     assert!(!format!("{:?}", fields.insert_uint("password=sample", 1)).contains("sample"));
-    assert!(fields.is_empty());
+    assert!(fields.insert_null(&"k".repeat(97)).is_err());
+    let prefix = "k".repeat(90);
+    for i in 0..32 {
+        fields.insert_null(&format!("{prefix}{i:06}")).unwrap();
+    }
+    assert!(fields.insert_null("extra").is_err());
 }
 
 #[test]

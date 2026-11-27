@@ -296,26 +296,25 @@ impl<C> Pool<C> {
     /// Dropping the lease without `release` also frees the slot (via the
     /// guard) but never re-parks the connection.
     pub fn release(&mut self, mut lease: Lease, conn: Option<C>) {
-        let Some(guard) = lease.guard.take() else {
-            return;
-        };
-        if !guard
-            .slots
-            .as_ref()
-            .is_some_and(|s| Arc::ptr_eq(s, &self.slots))
-        {
-            return;
+        if let Some(guard) = lease.guard.take() {
+            if !matches!(&guard.slots, Some(owner) if Arc::ptr_eq(owner, &self.slots)) {
+                return;
+            }
+            let id = guard.id;
+            guard.disarm();
+            if let Ok(mut state) = self.slots.lock() {
+                debug_assert!(state.in_use > 0, "released without a matching acquire");
+                state.in_use = state.in_use.saturating_sub(1);
+                if state.probe_in_flight == Some(id) {
+                    state.probe_in_flight = None;
+                }
+            } else {
+                return;
+            }
         }
-        let Ok(mut state) = self.slots.lock() else {
-            return;
-        };
-        if state.probe_in_flight == Some(guard.id) {
-            state.probe_in_flight = None;
-        }
-        guard.disarm();
-        state.in_use -= 1;
         if let Some(conn) = conn {
-            if self.idle.len() + (state.in_use as usize) < self.capacity as usize {
+            // Never hold more warm connections than the cap allows.
+            if (self.idle.len() as u32) < self.capacity {
                 self.idle.push(conn);
             }
         }

@@ -368,7 +368,7 @@ mod tests {
             track_id: track.to_string(),
             start,
             end,
-            file_bytes: Some(1_000),
+            file_bytes: Some(100_000),
         }
     }
 
