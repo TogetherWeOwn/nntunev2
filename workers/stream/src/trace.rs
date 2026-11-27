@@ -197,8 +197,7 @@ pub fn is_banned_field_key(key: &str) -> bool {
 }
 
 const SECRET_VALUE_PREFIXES: &[&str] = &[
-    "bearer ", "token ", "sk-", "sk_live_", "sk_test_", "tok_", "ghp_", "gho_", "ghu_", "xoxb-",
-    "xoxp-",
+    "sk-", "sk_live_", "sk_test_", "tok_", "ghp_", "gho_", "ghu_", "xoxb-", "xoxp-",
 ];
 
 const SECRET_VALUE_MARKERS: &[&str] = &[
@@ -208,20 +207,22 @@ const SECRET_VALUE_MARKERS: &[&str] = &[
     "secret:",
     "apikey=",
     "api_key=",
+    "authorization:",
+    "authorization=",
 ];
 
-/// A string value is rejected when it opens with a known credential prefix or
-/// embeds a `key=value` credential marker. Benign labels (`task-queued`)
-/// pass, including the [`REDACTED`] marker itself.
+/// Reject known credential prefixes and inline credential markers.
 #[must_use]
 pub fn looks_like_secret_value(value: &str) -> bool {
-    let lower = value.trim_start().to_ascii_lowercase();
-    SECRET_VALUE_PREFIXES
+    let lower = value.to_ascii_lowercase();
+    lower.split_whitespace().any(|word| {
+        matches!(word, "bearer" | "token")
+            || SECRET_VALUE_PREFIXES
+                .iter()
+                .any(|marker| word.starts_with(marker))
+    }) || SECRET_VALUE_MARKERS
         .iter()
-        .any(|marker| lower.starts_with(marker))
-        || SECRET_VALUE_MARKERS
-            .iter()
-            .any(|marker| lower.contains(marker))
+        .any(|marker| lower.contains(marker))
 }
 
 /// A dotted-quad of valid octets is an IP address and is rejected;
@@ -248,21 +249,22 @@ pub fn looks_like_email_value(value: &str) -> bool {
 /// address and is rejected; colon-joined operational refs pass.
 #[must_use]
 pub fn looks_like_ipv6_value(value: &str) -> bool {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_hexdigit() || b == b':') {
-        return false;
-    }
-    value.contains("::") || value.split(':').count() == 8
+    value.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
-/// Why a field was refused. Names the key for banned/nested cases only;
-/// values are never echoed, so an error path cannot leak what it rejected.
+/// Why a field was refused, without echoing rejected input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FieldRejection {
     BannedKey(String),
     SecretValue,
     PiiValue,
     IpValue,
+    Limit,
 }
+
+const MAX_LOG_FIELDS: usize = 32;
+const MAX_FIELD_KEY_BYTES: usize = 96;
+const MAX_FIELD_VALUE_BYTES: usize = 1024;
 
 /// A flat `fields` value: strings, integers, booleans, or null. No nesting.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -288,7 +290,7 @@ impl LogFields {
     }
 
     pub fn insert_str(&mut self, key: &str, value: &str) -> Result<(), FieldRejection> {
-        check_key(key)?;
+        self.check_key(key)?;
         check_str_value(value)?;
         self.fields
             .push((key.to_string(), FieldValue::Str(value.to_string())));
@@ -296,27 +298,37 @@ impl LogFields {
     }
 
     pub fn insert_uint(&mut self, key: &str, value: u64) -> Result<(), FieldRejection> {
-        check_key(key)?;
+        self.check_key(key)?;
         self.fields.push((key.to_string(), FieldValue::UInt(value)));
         Ok(())
     }
 
     pub fn insert_int(&mut self, key: &str, value: i64) -> Result<(), FieldRejection> {
-        check_key(key)?;
+        self.check_key(key)?;
         self.fields.push((key.to_string(), FieldValue::Int(value)));
         Ok(())
     }
 
     pub fn insert_bool(&mut self, key: &str, value: bool) -> Result<(), FieldRejection> {
-        check_key(key)?;
+        self.check_key(key)?;
         self.fields.push((key.to_string(), FieldValue::Bool(value)));
         Ok(())
     }
 
     pub fn insert_null(&mut self, key: &str) -> Result<(), FieldRejection> {
-        check_key(key)?;
+        self.check_key(key)?;
         self.fields.push((key.to_string(), FieldValue::Null));
         Ok(())
+    }
+
+    fn check_key(&self, key: &str) -> Result<(), FieldRejection> {
+        if self.fields.len() >= MAX_LOG_FIELDS {
+            return Err(FieldRejection::Limit);
+        }
+        if key.is_empty() || key.len() > MAX_FIELD_KEY_BYTES || is_banned_field_key(key) {
+            return Err(FieldRejection::BannedKey(REDACTED.to_owned()));
+        }
+        check_str_value(key)
     }
 
     #[must_use]
@@ -350,21 +362,24 @@ impl LogFields {
     }
 }
 
-fn check_key(key: &str) -> Result<(), FieldRejection> {
-    if key.is_empty() || is_banned_field_key(key) {
-        return Err(FieldRejection::BannedKey(key.to_string()));
+pub(crate) fn check_str_value(value: &str) -> Result<(), FieldRejection> {
+    if value.len() > MAX_FIELD_VALUE_BYTES {
+        return Err(FieldRejection::Limit);
     }
-    Ok(())
-}
-
-fn check_str_value(value: &str) -> Result<(), FieldRejection> {
     if looks_like_secret_value(value) {
         return Err(FieldRejection::SecretValue);
     }
     if looks_like_email_value(value) {
         return Err(FieldRejection::PiiValue);
     }
-    if looks_like_ipv4_value(value) || looks_like_ipv6_value(value) {
+    if value
+        .split(|c: char| c.is_whitespace() || "/,;()=\"".contains(c))
+        .any(|part| {
+            looks_like_ipv4_value(part.trim_matches(['[', ']']))
+                || looks_like_ipv6_value(part.trim_matches(['[', ']']))
+                || part.parse::<std::net::SocketAddr>().is_ok()
+        })
+    {
         return Err(FieldRejection::IpValue);
     }
     Ok(())

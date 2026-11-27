@@ -51,7 +51,9 @@
 //! [`STAGING_QUERY_TEMPLATE`]).
 
 use crate::grant::sha256;
+use crate::meter::is_valid_key_field;
 use crate::play::PlayError;
+use crate::trace::{check_str_value, REDACTED};
 
 /// Whether the play was served from the R2 cache. Stale is its own value:
 /// a stale serve carries `Cache-Status: STALE` on the wire, so the row must
@@ -80,7 +82,7 @@ impl CacheStatus {
 ///
 /// Only the hashed user identity is stored — there is no raw-id field to
 /// leak through `Debug`, logs or Analytics Engine columns.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CacheObserveEvent {
     pub request_id: String,
     /// Lowercase hex SHA-256 of the raw user id (see [`hash_user`]).
@@ -106,13 +108,18 @@ impl CacheObserveEvent {
         bytes: u64,
         pool_error_code: Option<String>,
     ) -> Self {
+        let request_id = request_id.into();
         Self {
-            request_id: request_id.into(),
+            request_id: if request_id == user_id || safe_request_id(&request_id) == REDACTED {
+                REDACTED.to_owned()
+            } else {
+                request_id
+            },
             user_hash: hash_user(user_id),
             cache_status,
             ttft_ms,
             bytes,
-            pool_error_code,
+            pool_error_code: pool_error_code.filter(|code| valid_pool_error(code)),
         }
     }
 
@@ -144,14 +151,14 @@ impl CacheObserveEvent {
     /// Carries the request id, the hashed (never raw) user identity and the
     /// cache status alongside TTFT, bytes and the pool error code.
     pub fn to_json_log(&self) -> String {
-        let pool_error = match &self.pool_error_code {
+        let pool_error = match self.safe_pool_error() {
             Some(code) => format!("\"{}\"", escape_json_str(code)),
             None => "null".to_string(),
         };
         format!(
             "{{\"request_id\":\"{}\",\"user_hash\":\"{}\",\"cache_status\":\"{}\",\"ttft_ms\":{},\"bytes\":{},\"pool_error_code\":{}}}",
-            escape_json_str(&self.request_id),
-            escape_json_str(&self.user_hash),
+            escape_json_str(safe_request_id(&self.request_id)),
+            escape_json_str(self.analytics_index()),
             self.cache_status.as_str(),
             self.ttft_ms,
             self.bytes,
@@ -166,9 +173,9 @@ impl CacheObserveEvent {
     pub fn analytics_blobs(&self) -> Vec<String> {
         vec![
             self.cache_status.as_str().to_string(),
-            self.user_hash.clone(),
-            self.request_id.clone(),
-            self.pool_error_code.clone().unwrap_or_default(),
+            self.analytics_index().to_owned(),
+            safe_request_id(&self.request_id).to_owned(),
+            self.safe_pool_error().unwrap_or_default().to_owned(),
         ]
     }
 
@@ -182,8 +189,41 @@ impl CacheObserveEvent {
     /// per-user hash. Never `cache_status` — a low-cardinality index makes
     /// Analytics Engine sample all hits as a single bucket (see module docs).
     pub fn analytics_index(&self) -> &str {
-        &self.user_hash
+        if self.user_hash.len() == 64
+            && self
+                .user_hash
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            &self.user_hash
+        } else {
+            REDACTED
+        }
     }
+
+    fn safe_pool_error(&self) -> Option<&str> {
+        self.pool_error_code
+            .as_deref()
+            .filter(|code| valid_pool_error(code))
+    }
+}
+
+impl std::fmt::Debug for CacheObserveEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_json_log())
+    }
+}
+
+fn safe_request_id(id: &str) -> &str {
+    if is_valid_key_field(id, 128) && check_str_value(id).is_ok() {
+        id
+    } else {
+        REDACTED
+    }
+}
+
+fn valid_pool_error(code: &str) -> bool {
+    matches!(code, "POOL_QUARANTINED" | "POOL_EXHAUSTED")
 }
 
 /// Hash a raw user id to lowercase hex SHA-256 (64 chars). Deterministic per
@@ -321,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn json_log_escapes_quote_backslash_newline_and_control_chars() {
+    fn json_log_redacts_freeform_labels() {
         let ev = CacheObserveEvent::new(
             "a\"b\\c\nd\u{0001}e",
             "user-1",
@@ -334,7 +374,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "{{\"request_id\":\"a\\\"b\\\\c\\nd\\u0001e\",\"user_hash\":\"{}\",\"cache_status\":\"hit\",\"ttft_ms\":1,\"bytes\":2,\"pool_error_code\":\"x\\\"y\"}}",
+                "{{\"request_id\":\"[REDACTED]\",\"user_hash\":\"{}\",\"cache_status\":\"hit\",\"ttft_ms\":1,\"bytes\":2,\"pool_error_code\":null}}",
                 ev.user_hash
             )
         );

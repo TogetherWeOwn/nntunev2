@@ -296,19 +296,26 @@ impl<C> Pool<C> {
     /// Dropping the lease without `release` also frees the slot (via the
     /// guard) but never re-parks the connection.
     pub fn release(&mut self, mut lease: Lease, conn: Option<C>) {
-        if let Some(guard) = lease.guard.take() {
-            guard.disarm();
-            if let Ok(mut state) = self.slots.lock() {
-                debug_assert!(state.in_use > 0, "released without a matching acquire");
-                state.in_use = state.in_use.saturating_sub(1);
-                if state.probe_in_flight == Some(lease.id) {
-                    state.probe_in_flight = None;
-                }
-            }
+        let Some(guard) = lease.guard.take() else {
+            return;
+        };
+        if !guard
+            .slots
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(s, &self.slots))
+        {
+            return;
         }
+        let Ok(mut state) = self.slots.lock() else {
+            return;
+        };
+        if state.probe_in_flight == Some(guard.id) {
+            state.probe_in_flight = None;
+        }
+        guard.disarm();
+        state.in_use -= 1;
         if let Some(conn) = conn {
-            // Never hold more warm connections than the cap allows.
-            if (self.idle.len() as u32) < self.capacity {
+            if self.idle.len() + (state.in_use as usize) < self.capacity as usize {
                 self.idle.push(conn);
             }
         }
@@ -417,6 +424,9 @@ impl<C> Pool<C> {
     fn reopen_after_probe(&mut self) {
         self.consecutive_errors = self.consecutive_errors.max(CIRCUIT_FAILURE_THRESHOLD);
         self.quarantined_until_ms = Some(self.now_ms.saturating_add(CIRCUIT_OPEN_MS));
+        if let Ok(mut state) = self.slots.lock() {
+            state.probe_in_flight = None;
+        }
     }
 
     fn clear_probe(&self, lease_id: u64) -> bool {

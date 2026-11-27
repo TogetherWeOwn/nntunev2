@@ -25,6 +25,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::io::ErrorKind;
 
 use nntune_core::nntp::{NntpClient, NntpConfig};
 use nntune_core::transport::Transport;
@@ -185,17 +186,22 @@ pub fn parse_request(body: &[u8], pool_user: &str) -> Result<ProbeRequest, Probe
     if req.user_id != pool_user {
         return Err(ProbeError::BadRequest("request is for another user's pool"));
     }
-    if req.segment_ids.is_empty() || req.segment_ids.len() > MAX_PROBE_SEGMENTS {
+    validate_batch(&req.segment_ids)?;
+    Ok(req)
+}
+
+fn validate_batch(ids: &[String]) -> Result<(), ProbeError> {
+    if ids.is_empty() || ids.len() > MAX_PROBE_SEGMENTS {
         return Err(ProbeError::BadRequest(
             "probe batch must be 1..=500 segments",
         ));
     }
-    if !req.segment_ids.iter().all(|id| valid_probe_id(id)) {
+    if !ids.iter().all(|id| valid_probe_id(id)) {
         return Err(ProbeError::BadRequest(
             "segment ids must be valid message-ids",
         ));
     }
-    Ok(req)
+    Ok(())
 }
 
 /// `STAT` every id in order on one connection: `223` is present, `430`
@@ -204,6 +210,7 @@ pub async fn stat_batch<T: Transport>(
     client: &mut NntpClient<T>,
     ids: &[String],
 ) -> nntune_core::Result<(Vec<String>, Vec<String>)> {
+    validate_batch(ids).map_err(|_| nntune_core::Error::Malformed("invalid STAT batch".into()))?;
     stat_batch_with_response(client, ids, || {}).await
 }
 
@@ -244,7 +251,7 @@ where
     Ok((present, missing))
 }
 
-/// Run one validated probe on `pool`'s ingest lane. `dial` opens and
+/// Validate the segment batch and run it on `pool`'s ingest lane. `dial` opens and
 /// authenticates a fresh provider connection; it is called at most once per
 /// probe (none when a warm connection answers).
 ///
@@ -265,6 +272,7 @@ where
     F: Future<Output = nntune_core::Result<NntpClient<T>>>,
     S: Fn(&mut Pool<NntpClient<T>>),
 {
+    validate_batch(&req.segment_ids)?;
     let (lease, warm, success_epoch, is_probe) = {
         let mut pool = pool.borrow_mut();
         tick(&mut pool);
@@ -286,7 +294,9 @@ where
     if let Some(mut client) = warm {
         let pool_ref = pool;
         let lease_id = lease.id;
+        let mut response_seen = false;
         match stat_batch_with_response(&mut client, &req.segment_ids, || {
+            response_seen = true;
             if is_probe {
                 pool_ref
                     .borrow_mut()
@@ -302,8 +312,17 @@ where
                 pool.release(lease, Some(client));
                 return Ok(outcome(req, found));
             }
-            // Closed while idle: drop it and redial once below.
-            Err(nntune_core::Error::Io(_)) => {}
+            // Only a disconnected socket before the first reply gets a redial.
+            Err(nntune_core::Error::Io(e))
+                if !response_seen
+                    && matches!(
+                        e.kind(),
+                        ErrorKind::UnexpectedEof
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                            | ErrorKind::BrokenPipe
+                            | ErrorKind::NotConnected
+                    ) => {}
             Err(_) => return Err(provider_failed(pool, &tick, lease)),
         }
     }

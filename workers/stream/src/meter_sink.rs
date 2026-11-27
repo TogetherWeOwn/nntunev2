@@ -25,12 +25,13 @@
 //! exist only for bytes actually written to a client
 //! ([`crate::delivered`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::delivered::DeliveredInterval;
 use crate::grant::hmac_sha256;
+use crate::meter::{derive_play_idempotency_key, is_valid_key_field};
 
 /// Internal api endpoint the DO flushes cumulative windows to.
 pub const SINK_PATH: &str = "/internal/v1/play-windows";
@@ -54,6 +55,7 @@ pub const MAX_BATCH_WINDOWS: usize = 64;
 /// cap. One window is at most ~1.5 KiB serialized, so a byte-packed
 /// batch always advances.
 pub const MAX_BATCH_BODY_BYTES: usize = 16 * 1024;
+const MAX_ACK_BODY_BYTES: usize = 64 * 1024;
 /// In-flight plays retained per user. One user holds one live lease,
 /// so real concurrency is a handful of plays; the cap only bounds a
 /// report flood. Beyond it, fully-flushed plays are evicted first,
@@ -157,7 +159,12 @@ impl MeterBook {
     /// per (user, track) at grant issuance, so a mismatch is a bug or
     /// a forgery and must not smear bytes across tracks.
     pub fn record(&mut self, interval: &DeliveredInterval, now_unix: u64) -> bool {
-        if interval.user_id != self.user_id {
+        if interval.user_id != self.user_id
+            || interval.is_empty()
+            || interval.file_bytes.is_some_and(|size| size < interval.end)
+            || derive_play_idempotency_key(&interval.user_id, &interval.track_id, &interval.play_id)
+                .is_err()
+        {
             return false;
         }
         if let Some(play) = self.plays.get_mut(&interval.play_id) {
@@ -195,16 +202,17 @@ impl MeterBook {
 
     /// Cumulative windows not yet acknowledged, oldest first, packed
     /// for one request: at most [`MAX_BATCH_WINDOWS`] windows whose
-    /// serialized batch stays within [`MAX_BATCH_BODY_BYTES`]. Always
-    /// returns at least the oldest pending window when one exists, so
-    /// every flush makes progress; the rest stay pending for the
-    /// continuation alarm.
+    /// serialized batch stays within [`MAX_BATCH_BODY_BYTES`]. Invalid
+    /// persisted identifiers are skipped so other windows can advance.
     pub fn pending_windows(&self) -> Vec<WindowReport> {
         let mut pending: Vec<(&String, &PlayMeter)> =
             self.plays.iter().filter(|(_, p)| p.pending()).collect();
         pending.sort_by_key(|(_, p)| p.started_at);
         let mut windows: Vec<WindowReport> = Vec::new();
-        for (play_id, play) in pending.into_iter().take(MAX_BATCH_WINDOWS) {
+        for (play_id, play) in pending {
+            if derive_play_idempotency_key(&self.user_id, &play.track_id, play_id).is_err() {
+                continue;
+            }
             let window = WindowReport {
                 user_id: self.user_id.clone(),
                 track_id: play.track_id.clone(),
@@ -213,23 +221,10 @@ impl MeterBook {
                 file_bytes: play.file_bytes,
                 started_at: play.started_at,
             };
-            if windows.is_empty() {
-                // Always pack at least the oldest window so the flush
-                // advances; one window is ~1.5 KiB at worst, far under
-                // the cap.
-                windows.push(window);
-                continue;
-            }
-            // Exact by construction: measure the body the flush would
-            // sign with this window added, not an estimate. A
-            // serialization failure is unreachable for these
-            // plain-data structs; treat it as "does not fit" and the
-            // window simply waits for a later batch.
-            let mut candidate = windows.clone();
-            candidate.push(window);
-            match batch_body(&candidate) {
-                Some(body) if body.len() <= MAX_BATCH_BODY_BYTES => windows = candidate,
-                _ => break,
+            windows.push(window);
+            if batch_body(&windows).is_none() {
+                windows.pop();
+                break;
             }
         }
         windows
@@ -245,10 +240,13 @@ impl MeterBook {
     /// pending).
     pub fn mark_flushed(&mut self, sent: &[WindowReport], terminal_play_ids: &[String]) {
         for window in sent {
-            if !terminal_play_ids.contains(&window.play_id) {
+            if window.user_id != self.user_id || !terminal_play_ids.contains(&window.play_id) {
                 continue;
             }
             if let Some(play) = self.plays.get_mut(&window.play_id) {
+                if play.track_id != window.track_id || play.started_at != window.started_at {
+                    continue;
+                }
                 play.flushed_bytes = play
                     .flushed_bytes
                     .max(window.union_bytes.min(play.union.total_bytes()));
@@ -331,16 +329,30 @@ pub fn authorization_header(secret: Option<&[u8]>, now_unix: u64, body: &[u8]) -
 
 /// Serialize one flush batch for signing and sending.
 pub fn batch_body(windows: &[WindowReport]) -> Option<Vec<u8>> {
-    serde_json::to_vec(&FlushBatch {
+    if windows.len() > MAX_BATCH_WINDOWS {
+        return None;
+    }
+    let body = serde_json::to_vec(&FlushBatch {
         windows: windows.to_vec(),
     })
-    .ok()
+    .ok()?;
+    (body.len() <= MAX_BATCH_BODY_BYTES).then_some(body)
 }
 
 /// Parse the api ack body. Anything unreadable is a failed flush:
 /// the windows stay pending and the alarm retries.
 pub fn parse_ack(body: &[u8]) -> Option<FlushAck> {
-    serde_json::from_slice(body).ok()
+    if body.len() > MAX_ACK_BODY_BYTES {
+        return None;
+    }
+    let ack: FlushAck = serde_json::from_slice(body).ok()?;
+    let mut ids = BTreeSet::new();
+    for id in ack.accepted.iter().chain(&ack.fenced).chain(&ack.rejected) {
+        if ids.len() == MAX_BATCH_WINDOWS || !is_valid_key_field(id, 512) || !ids.insert(id) {
+            return None;
+        }
+    }
+    Some(ack)
 }
 
 #[cfg(test)]
