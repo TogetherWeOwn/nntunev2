@@ -33,9 +33,8 @@ export interface PlaybackEvidence {
   hasSource: boolean;
 }
 
-type AudioWithPlaybackRecorder = HTMLAudioElement & {
-  __nnPlayback?: { source: string; sawPlaying: boolean; maxCurrentTime: number };
-};
+type PlaybackRecorder = { source: string; sawPlaying: boolean; maxCurrentTime: number; seekFloor?: number };
+type AudioWithPlaybackRecorder = HTMLAudioElement & { __nnPlayback?: PlaybackRecorder };
 
 /** Runs inside Locator.evaluate. Only the numeric and boolean sample leaves the page. */
 export function observePlayback(element: Element, mode: 'arm' | 'reset' | 'sample'): PlaybackEvidence {
@@ -45,9 +44,11 @@ export function observePlayback(element: Element, mode: 'arm' | 'reset' | 'sampl
   const player = element as AudioWithPlaybackRecorder;
   // The staging player uses a direct src. currentSrc can still describe the
   // outgoing media while the browser is selecting the newly assigned src.
-  const readSource = () => !player.seeking && player.currentSrc === player.src ? player.currentSrc : '';
+  const readSource = () => player.currentSrc === player.src ? player.currentSrc : '';
+  const canCountPosition = (recorder?: PlaybackRecorder) => !player.seeking &&
+    (recorder?.seekFloor === undefined || player.currentTime > recorder.seekFloor);
   const reset = (source: string) => {
-    const recorder = { source, sawPlaying: false, maxCurrentTime: 0 };
+    const recorder: PlaybackRecorder = { source, sawPlaying: false, maxCurrentTime: 0 };
     player.__nnPlayback = recorder;
     return recorder;
   };
@@ -62,24 +63,30 @@ export function observePlayback(element: Element, mode: 'arm' | 'reset' | 'sampl
       const recorder = forSource(source);
       if (!source) return;
       recorder.sawPlaying ||= event.type === 'playing';
-      recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+      if (canCountPosition(recorder)) recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime);
     };
     player.addEventListener('playing', record);
     player.addEventListener('timeupdate', record);
     player.addEventListener('emptied', () => reset(''));
-    player.addEventListener('seeking', () => reset(''));
+    player.addEventListener('seeking', () => {
+      // play() can seek an ended element back to zero before playback resumes.
+      const recorder = forSource(readSource());
+      recorder.seekFloor = player.currentTime;
+      recorder.maxCurrentTime = 0;
+    });
     recorder = reset(source);
   } else if (recorder && (mode === 'reset' || recorder.source !== source)) {
     recorder = reset(source);
   }
 
-  if (mode === 'arm' && recorder && source) {
+  const canCount = Boolean(source) && canCountPosition(recorder);
+  if (mode === 'arm' && recorder && canCount) {
     recorder.sawPlaying ||= !player.paused && !player.ended && player.readyState >= 2;
-    recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+    recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime);
   }
   return {
     sawPlaying: recorder?.sawPlaying ?? false,
-    maxCurrentTime: source ? Math.max(recorder?.maxCurrentTime ?? 0, player.currentTime || 0) : 0,
+    maxCurrentTime: canCount ? Math.max(recorder?.maxCurrentTime ?? 0, player.currentTime) : 0,
     paused: player.paused,
     ended: player.ended,
     currentTime: player.currentTime,

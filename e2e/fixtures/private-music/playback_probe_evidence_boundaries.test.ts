@@ -4,7 +4,7 @@ import type { FullResult, TestCase, TestResult } from '@playwright/test/reporter
 import { expect, test, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 import { demoTrackSalt, expectedSyntheticBody, firstByteDifference } from '../../helpers/demo-audio.js';
 import { mediaSessionFailure } from '../../helpers/media-session.js';
-import { playbackFailure, type PlaybackEvidence } from '../../helpers/playback.js';
+import { observePlayback, playbackFailure, type PlaybackEvidence } from '../../helpers/playback.js';
 import { seekProofFailure, seekViaPlayerUi, waitForPaused } from '../../helpers/player-ui.js';
 import { assertPrivateMeteredPlay } from '../../helpers/private-music-journey.js';
 import { privateStagingAudio } from '../../helpers/private-staging-fixture.js';
@@ -37,6 +37,43 @@ test('playback and seek require bounded positions and actual state', () => {
   expect(seekProofFailure(paused, 0.5, true)).toBeNull();
   expect(seekProofFailure({ ...paused, currentTime: NaN }, 0.5, true)).not.toBeNull();
   expect(seekProofFailure(paused, NaN, true)).not.toBeNull();
+});
+
+test('replay can advance through a seek without crediting the seek jump', () => {
+  class Audio extends EventTarget {
+    src = 'fixture.wav';
+    currentSrc = this.src;
+    duration = 0.1;
+    currentTime = this.duration;
+    readyState = 4;
+    paused = true;
+    ended = true;
+    seeking = false;
+  }
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'HTMLAudioElement');
+  Object.defineProperty(globalThis, 'HTMLAudioElement', { value: Audio, configurable: true });
+  try {
+    const audio = new Audio();
+    const element = audio as unknown as Element;
+    const seek = (position: number) => {
+      Object.assign(audio, { seeking: true, currentTime: position });
+      audio.dispatchEvent(new Event('seeking'));
+    };
+    const verdict = () => playbackFailure(observePlayback(element, 'sample'), 0);
+    observePlayback(element, 'arm');
+    seek(0);
+    Object.assign(audio, { paused: false, ended: false });
+    audio.dispatchEvent(new Event('playing'));
+    expect(verdict()).not.toBeNull();
+    Object.assign(audio, { seeking: false, paused: true, ended: true, currentTime: audio.duration });
+    expect(verdict()).toBeNull();
+    seek(audio.duration);
+    audio.seeking = false;
+    expect(verdict()).not.toBeNull();
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'HTMLAudioElement', original);
+    else Reflect.deleteProperty(globalThis, 'HTMLAudioElement');
+  }
 });
 
 test('invalid and ambiguous controls fail before any action', async () => {
@@ -113,25 +150,28 @@ test('admission rejects conflicting proof and clears the previous report', async
     'anonymous-refused': ['private-anonymous-refusal'], 'unlisted-refused': ['private-unlisted-refusal'],
     'revoked-or-expired-refused': ['private-cutoff-refusal'], 'video-off': [],
   };
-  const run = async (conflict: boolean) => {
-    const annotations = ['build-identity', 'build-identity-final'].map((phase) => ({
+  const run = async (conflict: 'track' | 'time' | 'build' | 'failed' | null) => {
+    const annotations = ['build-identity', 'build-identity-final'].map((phase, index) => ({
       type: 'candidate-identity', description: JSON.stringify({ phase, web: proof.build_sha,
-        api: proof.build_sha, expected: proof.build_sha, observed_at: '2025-01-01T00:00:00.000Z' }),
+        api: conflict === 'build' && index === 1 ? 'c'.repeat(40) : proof.build_sha, expected: proof.build_sha,
+        observed_at: `2025-01-01T00:00:0${conflict === 'time' ? 1 - index : index}.000Z` }),
     }));
     for (const type of Object.values(cases).flat()) annotations.push({
       type, description: JSON.stringify({ ...proof,
-        sha256: conflict && type === 'private-play' ? 'c'.repeat(64) : proof.sha256,
+        sha256: conflict === 'track' && type === 'private-play' ? 'c'.repeat(64) : proof.sha256,
         cutoff_listener: proof.track_id, refused_listener: proof.track_id }),
     });
     const steps = Object.keys(cases).map((title) => ({ title, category: 'test.step', duration: 1, annotations: [], steps: [] }));
     const reporter = new Reporter();
     const result = { status: 'passed', retry: 0, annotations, steps } as unknown as TestResult;
     reporter.onTestEnd({ expectedStatus: 'passed' } as TestCase, result);
-    return reporter.onEnd({ status: 'passed' } as FullResult);
+    return reporter.onEnd({ status: conflict === 'failed' ? 'failed' : 'passed' } as FullResult);
   };
   const report = new URL('../private-staging-results/admission.xml', moduleUrl);
-  await expect(run(false)).resolves.toBeUndefined();
-  await expect(access(report)).resolves.toBeUndefined();
-  await expect(run(true)).resolves.toEqual({ status: 'failed' });
-  await expect(access(report)).rejects.toMatchObject({ code: 'ENOENT' });
+  for (const conflict of ['track', 'time', 'build', 'failed'] as const) {
+    await expect(run(null)).resolves.toBeUndefined();
+    await expect(access(report)).resolves.toBeUndefined();
+    await expect(run(conflict)).resolves.toEqual(conflict === 'failed' ? undefined : { status: 'failed' });
+    await expect(access(report)).rejects.toMatchObject({ code: 'ENOENT' });
+  }
 });
