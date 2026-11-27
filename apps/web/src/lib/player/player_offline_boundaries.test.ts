@@ -16,7 +16,9 @@ import { createResumeStore } from './resume.js';
 import { SeekController } from './seekController.js';
 import { buildShareQuery, parseTimestampParam } from './shareTimestamp.js';
 
-function media(start = 0, end = 100) {
+type TestMedia = Pick<HTMLAudioElement, 'currentTime' | 'duration' | 'seeking' | 'error' | 'seekable'>;
+
+function media(start = 0, end = 100): TestMedia {
 	return { currentTime: 10, duration: 100, seeking: false, error: null,
 		seekable: { length: 1, start: () => start, end: () => end } };
 }
