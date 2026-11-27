@@ -116,6 +116,7 @@ SESSION_TTL_SECS = "86400"
 # [env.staging.observability]
 # enabled = true
 # head_sampling_rate = 1
+# redact_query_string = true
 
 # Same-host staging routes. The `staging-api` lane in
 # `.github/workflows/deploy.yml` generates these into its staging config

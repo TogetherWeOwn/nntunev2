@@ -239,13 +239,13 @@ pub async fn main(
     // Admit measurement on the raw request before the SDK copies its URL.
     #[cfg(target_arch = "wasm32")]
     if let Some(response) = subsonic_measurement::mount(&req, &env).await {
-        return response;
+        return opaque_subsonic_result(response);
     }
     let req = worker::Request::from(req);
     #[cfg(target_arch = "wasm32")]
     if is_subsonic_request(&req) {
         let mut req = req;
-        return subsonic_response(&mut req).await;
+        return opaque_subsonic_result(subsonic_response(&mut req).await);
     }
     worker_entry::dispatch(req, env).await
 }
@@ -463,9 +463,39 @@ fn is_subsonic_path(path: &str) -> bool {
     path == "/rest" || path.starts_with("/rest/")
 }
 
+// The fetch macro logs returned errors. A runtime error may carry request
+// input, so expose only a fixed diagnostic for either Subsonic branch.
+#[cfg(any(test, target_arch = "wasm32"))]
+fn opaque_subsonic_result<T>(result: worker::Result<T>) -> worker::Result<T> {
+    result.map_err(|_| worker::Error::RustError("Subsonic request failed".into()))
+}
+
 #[cfg(test)]
 mod subsonic_routing_tests {
-    use super::is_subsonic_path;
+    use super::{is_subsonic_path, opaque_subsonic_result};
+
+    #[test]
+    fn subsonic_fetch_errors_are_opaque() {
+        let raw_error = worker::Error::RustError(
+            "/rest/ping?p=canary1&t=canary2&s=canary3&u=canary4&apiKey=canary5&password=canary6&token=canary7"
+                .into(),
+        );
+        let safe = opaque_subsonic_result::<()>(Err(raw_error)).unwrap_err();
+        assert_eq!(safe.to_string(), "Subsonic request failed");
+        assert_eq!(opaque_subsonic_result(Ok(42)).unwrap(), 42);
+
+        // The native test can't run the wasm-only fetch branches. Pin each
+        // return so bypassing the error mapping fails here too.
+        let fetch = include_str!("lib.rs")
+            .split_once("pub async fn main(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(fetch.contains("return opaque_subsonic_result(response);"));
+        assert!(fetch.contains("return opaque_subsonic_result(subsonic_response(&mut req).await);"));
+    }
 
     #[test]
     fn rest_prefix_claims_subsonic_paths_only() {

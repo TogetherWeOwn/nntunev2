@@ -39,6 +39,13 @@ def steps(section):
 
 
 class WorkerBuildWorkflowTests(unittest.TestCase):
+    def test_api_wrangler_example_requires_query_redaction(self):
+        example = (ROOT / "workers/api/wrangler.toml.example").read_text()
+        _, _, block = example.partition("# [env.staging.observability]\n")
+        block = block.split("\n\n", 1)[0]
+        observability = tomllib.loads("\n".join(line.removeprefix("# ") for line in block.splitlines()))
+        self.assertIs(observability.get("redact_query_string"), True)
+
     def test_synthetic_invocation_record(self):
         probe_id = uuid4().hex
         clean_url = "https://staging.example.test/v1/plans"
@@ -60,6 +67,7 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         self.assertEqual((passed.returncode, passed.stdout, passed.stderr),
                          (0, b"check_worker_upload: synthetic invocation redaction ok\n", b""))
 
+        url_error = "synthetic invocation URL is missing or differs from the redacted URL"
         for case, raw, diagnostic in (
             ("missing event", b"", "missing synthetic invocation record"),
             ("empty event", b"{}", "missing or malformed synthetic invocation record"),
@@ -71,12 +79,14 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
              "unexpected synthetic invocation Worker"),
             ("stale marker", json.dumps(event | {"probe_id": uuid4().hex}).encode(),
              "synthetic invocation does not match this probe"),
-            ("missing URL", json.dumps(event | {"url": None}).encode(),
-             "synthetic invocation URL is missing or differs from the redacted URL"),
-            ("retained query", json.dumps(event | {"url": probe_url}).encode(),
-             "synthetic invocation URL is missing or differs from the redacted URL"),
-            ("query delimiter", json.dumps(event | {"url": clean_url + "?"}).encode(),
-             "synthetic invocation URL is missing or differs from the redacted URL"),
+            ("missing URL", json.dumps(event | {"url": None}).encode(), url_error),
+            ("retained query", json.dumps(event | {"url": probe_url}).encode(), url_error),
+            ("query delimiter", json.dumps(event | {"url": clean_url + "?"}).encode(), url_error),
+            *((
+                f"retained {key}",
+                json.dumps(event | {"url": f"{clean_url}?{key}=synthetic-canary"}).encode(),
+                url_error,
+            ) for key in ("p", "t", "s", "u", "apiKey", "password", "token")),
             ("duplicate field", b'{"url":"synthetic-duplicate",' + record[1:],
              "synthetic invocation record has duplicate fields"),
             ("two records", record + b"\n" + record, "invalid synthetic invocation record JSON"),
