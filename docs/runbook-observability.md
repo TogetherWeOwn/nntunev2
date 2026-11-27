@@ -38,8 +38,16 @@ inspect or paste. A missing/invalid webhook or `LOGS_URL` disables delivery whil
 cleanup continues. Consumer logs/traces must stay disabled to avoid secret URL
 capture in automatic subrequest spans. Public HTTP is always empty 404.
 
-The deployment guard freezes four runtime modules to
-`818e57680414c4414cc3c96e2f3f9a6ca38d80bf` and rejects config drift before deploying.
+Before deploying, the guard compares the exact bytes of the four runtime modules
+against their individual SHA-256 pins in
+[`FROZEN_MODULE_SHA256`](../.github/scripts/alerts_staging.py). It reads the
+checked-out files directly, so the result is independent of Git history.
+Changed bytes, missing or unreadable files, symlinks, or missing or malformed
+pins stop the check with `FROZEN_RUNTIME_MISMATCH`. When reviewing an intentional
+module update, calculate its new digest with `sha256sum <module-path>` and
+review the source and its updated pin in the same PR.
+
+The guard also rejects config drift before deploying.
 The generated config disables consumer observability/logs/invocation logs/traces,
 workers.dev and preview URLs; it has no routes and only the `v1` SQLite
 `ErrorRateAlerts` migration. Verification lists every namespace page, matches the

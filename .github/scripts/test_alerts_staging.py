@@ -2,10 +2,10 @@
 """Builder-owned offline regression fixtures for the staging deployment lane."""
 
 import copy
+import hashlib
 import io
 import json
 from pathlib import Path
-import subprocess
 import tempfile
 import tomllib
 import unittest
@@ -387,36 +387,71 @@ class ConfigAndFreezeTests(unittest.TestCase):
             with self.subTest(drift=True), self.assertRaisesRegex(guard.GuardError, "CONFIG_DRIFT"):
                 guard.generate_config(ACCOUNT, text)
 
-    def test_frozen_guard_rejects_each_changed_or_missing_module_and_missing_commit(self):
-        with tempfile.TemporaryDirectory(prefix="alerts-freeze-fixture-") as directory:
-            repo = Path(directory)
-            def git(*args):
-                return subprocess.check_output(["git", *args], cwd=repo, stderr=subprocess.DEVNULL).decode().strip()
-            git("init", "-q")
-            git("config", "user.name", "Fixture")
-            git("config", "user.email", "fixture@example.invalid")
-            for module in guard.MODULES:
-                path = repo / module
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("// frozen fixture\n")
-            git("add", ".")
-            git("commit", "-qm", "fixture\n\nCo-Authored-By: Paperclip <noreply@paperclip.ing>")
-            frozen = git("rev-parse", "HEAD")
-            guard.check_frozen(repo, frozen)
-            for module in guard.MODULES:
-                path = repo / module
-                for deleted in (False, True):
-                    if deleted:
-                        path.unlink()
-                    else:
-                        path.write_text("// changed fixture\n")
-                    with self.subTest(module=module, deleted=deleted), self.assertRaisesRegex(
-                        guard.GuardError, "FROZEN_RUNTIME_MISMATCH"
-                    ):
-                        guard.check_frozen(repo, frozen)
-                    path.write_text("// frozen fixture\n")
-            with self.assertRaisesRegex(guard.GuardError, "FROZEN_RUNTIME_MISMATCH"):
-                guard.check_frozen(repo, "0" * 40)
+    def frozen_fixture(self):
+        repo = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="alerts-freeze-fixture-")))
+        pins = {}
+        for module in guard.MODULES:
+            path = repo / module
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = f"// {path.name}\n".encode()
+            path.write_bytes(content)
+            pins[module] = hashlib.sha256(content).hexdigest()
+        return repo, pins
+
+    def test_frozen_guard_accepts_only_expected_bytes_without_git_history(self):
+        repo, pins = self.frozen_fixture()
+        guard.check_frozen(repo, pins)
+        for module in guard.MODULES:
+            path = repo / module
+            original = path.read_bytes()
+            updated = original.replace(b"\n", b"\r\n")
+            with self.subTest(module=module):
+                path.write_bytes(updated)
+                with self.assertRaisesRegex(guard.GuardError, "^FROZEN_RUNTIME_MISMATCH$"):
+                    guard.check_frozen(repo, pins)
+                guard.check_frozen(repo, {**pins, module: hashlib.sha256(updated).hexdigest()})
+                path.unlink()
+                with self.assertRaisesRegex(guard.GuardError, "^FROZEN_RUNTIME_MISMATCH$"):
+                    guard.check_frozen(repo, pins)
+                path.write_bytes(original)
+
+    def test_frozen_guard_rejects_unreadable_or_symlinked_modules(self):
+        repo, pins = self.frozen_fixture()
+        with patch.object(Path, "open", side_effect=PermissionError("private-canary")), \
+             self.assertRaisesRegex(guard.GuardError, "^FROZEN_RUNTIME_MISMATCH$"):
+            guard.check_frozen(repo, pins)
+
+        path = repo / guard.MODULES[0]
+        target = path.rename(repo / "matching-bytes.mjs")
+        path.symlink_to(target)
+        with self.assertRaisesRegex(guard.GuardError, "^FROZEN_RUNTIME_MISMATCH$"):
+            guard.check_frozen(repo, pins)
+
+    def test_frozen_guard_rejects_missing_extra_or_invalid_pins(self):
+        repo, pins = self.frozen_fixture()
+        module = guard.MODULES[0]
+        missing_pin = pins.copy()
+        del missing_pin[module]
+        invalid_maps = [missing_pin, {**pins, "extra.mjs": "0" * 64}]
+        invalid_maps.extend(
+            {**pins, module: pin} for pin in (None, "0" * 63, "0" * 65, "g" * 64, pins[module] + "\n")
+        )
+        for invalid in invalid_maps:
+            with self.subTest(pins=invalid), self.assertRaisesRegex(
+                guard.GuardError, "^FROZEN_RUNTIME_MISMATCH$"
+            ):
+                guard.check_frozen(repo, invalid)
+
+    def test_freeze_cli_reports_sanitized_failure(self):
+        with patch.object(Path, "open", side_effect=PermissionError("private-canary")), \
+             patch.object(guard.sys, "argv", ["alerts_staging.py", "freeze"]), \
+             patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(guard.main(), 1)
+        result = json.loads(output.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "FROZEN_RUNTIME_MISMATCH")
+        self.assertFalse(result["retryable"])
+        self.assertNotIn("private-canary", output.getvalue())
 
     def test_ci_and_deploy_use_the_tested_entrypoints(self):
         workflow = (guard.ROOT / ".github/workflows/deploy-alerts-staging.yml").read_text()

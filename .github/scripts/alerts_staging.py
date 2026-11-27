@@ -2,11 +2,11 @@
 """Frozen staging alert deployment guards. Verification uses GET requests only."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 import tomllib
 import urllib.error
@@ -14,11 +14,16 @@ import urllib.parse
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
-FROZEN_SHA = "818e57680414c4414cc3c96e2f3f9a6ca38d80bf"
 MODULES = tuple(
     f"workers/observability/{name}.mjs"
     for name in ("runtime", "project-tail-event", "evaluate-error-window", "render-verdict-alert")
 )
+FROZEN_MODULE_SHA256 = {
+    "workers/observability/runtime.mjs": "cc1f2f8060658bee685d132bc570e1c164e688ae7a4e06867b05549428fb250c",
+    "workers/observability/project-tail-event.mjs": "ecb40e1758cdd9f4bdd4098ad296e0874cf695709b246042def1cf46bdc3ab82",
+    "workers/observability/evaluate-error-window.mjs": "ee9254ea085f58da15ef0e12d162a5c3d2c78f6e3db475998295be8d43179d3c",
+    "workers/observability/render-verdict-alert.mjs": "63c9880886adc1bfdcea4e8796e54555eb3810bb2f2b7676162d7e9cdd25b023",
+}
 WORKER = "nntune-alerts-staging"
 PRODUCER = "nntune-api-staging"
 COMPATIBILITY_DATE = "2026-10-01"
@@ -35,14 +40,21 @@ def require(condition, code):
         raise GuardError(code)
 
 
-def check_frozen(repo=ROOT, frozen=FROZEN_SHA):
-    for args in (("cat-file", "-e", f"{frozen}^{{commit}}"),
-                 ("diff", "--quiet", frozen, "--", *MODULES)):
-        result = subprocess.run(
-            ["git", *args], cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        require(result.returncode == 0, "FROZEN_RUNTIME_MISMATCH")
+def check_frozen(repo=ROOT, pins=FROZEN_MODULE_SHA256):
+    mismatch = "FROZEN_RUNTIME_MISMATCH"
+    require(isinstance(pins, dict) and pins.keys() == set(MODULES), mismatch)
+    try:
+        repo = Path(repo).resolve(strict=True)
+        for module in MODULES:
+            pin = pins[module]
+            require(isinstance(pin, str) and re.fullmatch(r"[0-9a-fA-F]{64}", pin), mismatch)
+            path = repo / module
+            require(path.resolve(strict=True) == path and path.is_file(), mismatch)
+            with path.open("rb") as source:
+                actual = hashlib.file_digest(source, "sha256").hexdigest()
+            require(actual == pin.lower(), mismatch)
+    except (OSError, RuntimeError):
+        raise GuardError(mismatch) from None
 
 
 def validate_logs_url(url):
@@ -215,7 +227,7 @@ def main():
     try:
         if args.command == "freeze":
             check_frozen()
-            result = {"frozen_sha": FROZEN_SHA, "modules": len(MODULES)}
+            result = {"modules": len(MODULES)}
         elif args.command == "config":
             text = generate_config(os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""))
             (ROOT / "workers/observability/wrangler.staging.toml").write_text(text)
