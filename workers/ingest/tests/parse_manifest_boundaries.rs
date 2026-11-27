@@ -3,12 +3,12 @@ use nntune_ingest::{
         classify_entries, ClassError, ClassificationCheckpoint, MirrorEvidence,
     },
     audio_grouping::{prepare_manifest, GroupingError},
-    audio_manifest::{AcceptedAudioManifest, AudioHints, ManifestError},
+    audio_manifest::{AcceptedAudioManifest, AudioHints, ManifestError, MAX_AUDIO_ENTRIES},
     audio_selection::{AudioSelectionPlan, ExtractedAudio},
     audio_tags::{read_flac_hints, TagReadError},
     dispatch::content_sha256_hex,
     fixtures::SMALL_NZB,
-    nzb_intake::{estimate_nzb, DEFAULT_LIMITS},
+    nzb_intake::{estimate_nzb, IntakeEstimate, DEFAULT_LIMITS},
     parse::{parse_upload, parse_upload_files, ParseRejection},
 };
 use serde_json::json;
@@ -51,6 +51,34 @@ fn nzb_projections_enforce_the_intake_document_cap() {
         parse_upload_files(xml.as_bytes(), &estimate),
         Err(ParseRejection::TooLarge)
     );
+}
+
+#[test]
+fn nzb_projections_refuse_over_limit_estimates() {
+    let estimate = estimate_nzb(SMALL_NZB).unwrap();
+    for over_limit in [
+        IntakeEstimate {
+            file_count: DEFAULT_LIMITS.max_files + 1,
+            ..estimate
+        },
+        IntakeEstimate {
+            segment_count: DEFAULT_LIMITS.max_segments + 1,
+            ..estimate
+        },
+        IntakeEstimate {
+            declared_bytes: DEFAULT_LIMITS.max_declared_bytes + 1,
+            ..estimate
+        },
+    ] {
+        assert_eq!(
+            parse_upload(SMALL_NZB.as_bytes(), &over_limit),
+            Err(ParseRejection::TooLarge)
+        );
+        assert_eq!(
+            parse_upload_files(SMALL_NZB.as_bytes(), &over_limit),
+            Err(ParseRejection::TooLarge)
+        );
+    }
 }
 
 #[test]
@@ -178,4 +206,28 @@ fn classification_readback_enforces_byte_cap() {
         ClassificationCheckpoint::parse(&raw),
         Err(ClassError::Evidence)
     );
+}
+
+#[test]
+fn classification_readback_refuses_invalid_identity_and_entry_count() {
+    let checkpoint = classify_entries(&manifest(), &[None, None]).unwrap();
+    let valid = serde_json::to_value(checkpoint).unwrap();
+    for (field, bad) in [
+        ("job_id", json!("job/other")),
+        ("user_id", json!("owner:other")),
+        ("original_content_sha256", json!("z".repeat(64))),
+        ("entries", json!([])),
+        (
+            "entries",
+            json!(vec![valid["entries"][0].clone(); MAX_AUDIO_ENTRIES + 1]),
+        ),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[field] = bad;
+        assert_eq!(
+            ClassificationCheckpoint::parse(&invalid.to_string()),
+            Err(ClassError::Evidence)
+        );
+        assert!(serde_json::from_value::<ClassificationCheckpoint>(invalid).is_err());
+    }
 }
