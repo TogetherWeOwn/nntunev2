@@ -507,6 +507,10 @@ an identical retry skips the DDL and any conflicting prior install fails.
 Ordinary staging and production deploys do not invoke the overlay. It leaves
 the app migration ledger and serving arms unchanged.
 
+For disposal of a dedicated PostgreSQL instance and its private trial routes,
+follow [Retire the attempt by exact ID](ops/private-staging-trial-recovery.md#retire-the-attempt-by-exact-id)
+and see the synthetic [Stage C disposal preview](staging-trial-disposal.md).
+
 For a separately authorized observation, `migrations-staging-readback` accepts
 an exact data commit, app migration basename and expected SHA256, dispatched
 from protected `main` under the same staging environment policy. It checks the
