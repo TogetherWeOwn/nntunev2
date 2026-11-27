@@ -180,3 +180,9 @@ that ID as `PRIVATE_TRIAL_ENROLL_DB_STAGING_ID` for the staging binding
 renderer and omits an `ENROLL` create. If the same ID is linked only to a
 different request, preparation remains pending. The fixture uses synthetic
 records and ends at configuration preparation.
+
+The [offline recovery fixture](../../.github/scripts/test_private_trial_setup_recovery.py)
+checks complete pre- and post-apply states, holds partial state, and requires a
+unique request and config before skipping a create. Cleanup targets must match
+the original attempt and account. Run it with
+`python3 -I .github/scripts/test_private_trial_setup_recovery.py`.
