@@ -15,6 +15,10 @@ def require_sha(value):
     return value
 
 
+def _field(record, key):
+    return record.get(key) if isinstance(record, dict) else None
+
+
 def validate_context(number, expected_base, execution_sha, control_sha, live_base, pr):
     if number != str(PR_NUMBER):
         raise ValueError("unexpected pull request")
@@ -22,10 +26,12 @@ def validate_context(number, expected_base, execution_sha, control_sha, live_bas
         require_sha(value)
     if len({expected_base, execution_sha, control_sha, live_base}) != 1:
         raise ValueError("trusted main revision changed or does not match execution")
-    if (pr.get("number") != PR_NUMBER or pr.get("state") != "open"
-            or pr.get("draft") is not True
-            or (pr.get("base") or {}).get("ref") != "main"
-            or ((pr.get("base") or {}).get("repo") or {}).get("full_name") != REPOSITORY
-            or (pr.get("head") or {}).get("sha") != HEAD
-            or ((pr.get("head") or {}).get("repo") or {}).get("full_name") != REPOSITORY):
+    actual_number = _field(pr, "number")
+    base, head = _field(pr, "base"), _field(pr, "head")
+    if (type(actual_number) is not int or actual_number != PR_NUMBER
+            or _field(pr, "state") != "open" or _field(pr, "draft") is not True
+            or _field(base, "ref") != "main"
+            or _field(_field(base, "repo"), "full_name") != REPOSITORY
+            or _field(head, "sha") != HEAD
+            or _field(_field(head, "repo"), "full_name") != REPOSITORY):
         raise ValueError("source pull request identity changed")

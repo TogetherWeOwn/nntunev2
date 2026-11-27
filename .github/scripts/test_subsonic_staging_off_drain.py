@@ -27,7 +27,7 @@ ACCOUNT = "a" * 32
 ENV = {
     "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
     READ_TOKEN: "synthetic-read-token",
-    OBSERVER: "synthetic-observer-config",
+    OBSERVER: "postgresql://nntune_staging_observer.branch:synthetic@db.example.test/postgres",
     "EXPECTED_STAGING_DEPLOYMENT_ID": PIN.deployment_id,
     "EXPECTED_STAGING_VERSION_ID": PIN.version_id,
     "EXPECTED_STAGING_BUILD_SHA": PIN.build_sha,
@@ -132,6 +132,17 @@ class ReadbackTests(unittest.TestCase):
                 )
                 self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0, 0))
                 self.assertIs(signal.getsignal(signal.SIGALRM), previous)
+
+    def test_malformed_observer_config_or_headroom_mode_never_dispatches(self):
+        for env, mode in ((ENV | {OBSERVER: "malformed"}, False), (ENV, 0)):
+            with (
+                self.subTest(mode=mode),
+                patch.object(adapter, "provider_result", return_value=deployment()) as provider,
+                patch.object(adapter, "sample_pressure") as observer,
+            ):
+                self.assertEqual(adapter.readback(env, require_headroom=mode), "readback-config-unavailable")
+                provider.assert_not_called()
+                observer.assert_not_called()
 
     def test_readback_workflow_binds_only_read_secrets_in_the_protected_step(self):
         path = Path(__file__).parents[1] / "workflows/subsonic-staging-off-drain.yml"

@@ -12,9 +12,11 @@ from graph_qualification_context import require_sha
 
 
 def _git(root, *args, input_data=None):
+    root = Path(root).resolve()
     result = subprocess.run(
         ["git", "--no-lazy-fetch", "--no-replace-objects", "-C", str(root),
-         "--work-tree", str(root), "-c", "core.hooksPath=/dev/null",
+         "--git-dir", str(root / ".git"), "--work-tree", str(root),
+         "-c", "core.hooksPath=/dev/null",
          "-c", "core.fsmonitor=false", *args],
         input=input_data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env=git_environment(), check=False,
@@ -47,6 +49,8 @@ def construct(root, base, head, trusted_paths):
     root = Path(root).resolve()
     require_sha(base)
     require_sha(head)
+    if base == head:
+        raise ValueError("integration requires distinct parents")
     if not trusted_paths:
         raise ValueError("expected trusted input paths")
     # Attributes may select configured commands during merge or checkout. Reject

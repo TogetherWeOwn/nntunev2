@@ -65,6 +65,7 @@ class TelemetryTests(unittest.TestCase):
 
     def test_db_slots_require_drain_except_for_an_admissible_pair(self):
         gate = Gate(OPEN, VERSION)
+        self.assertFalse(gate.observe(NOW, DB, HEALTH, COVERED, overlapping_pair=True))
         self.assertTrue(gate.observe(NOW, DB, HEALTH, COVERED))
         one = Pressure(NOW, 1, 1)
         self.assertFalse(gate.observe(NOW, one, HEALTH, COVERED))
@@ -84,9 +85,16 @@ class TelemetryTests(unittest.TestCase):
                 self.assertFalse(
                     gate.observe(ended + 1, Pressure(stamp, 0, 2), HEALTH, COVERED)
                 )
+                self.assertFalse(gate.observe(
+                    ended + 1, Pressure(stamp, 0, 2), HEALTH, COVERED,
+                    overlapping_pair=True,
+                ))
         self.assertFalse(
             gate.observe(ended + 1, Pressure(ended + 1, 1, 1), HEALTH, COVERED)
         )
+        self.assertFalse(gate.observe(
+            ended + 1, Pressure(ended + 1, 1, 1), HEALTH, COVERED, overlapping_pair=True
+        ))
         self.assertTrue(
             gate.observe(ended + 2, Pressure(ended + 2, 0, 2), HEALTH, COVERED)
         )

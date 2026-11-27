@@ -36,10 +36,10 @@ class ContextTests(unittest.TestCase):
 
     def test_rejects_changed_pr_metadata(self):
         changes = (
-            ("number", 1073), ("state", "closed"), ("draft", False),
+            ("number", 1073), ("number", 1072.0), ("state", "closed"), ("draft", False),
             ("base.ref", "other"), ("base.repo.full_name", "other/repo"),
             ("head.sha", "d" * 40), ("head.repo.full_name", "other/repo"),
-            ("head.repo", None),
+            ("head.repo", None), ("head.repo", ["malformed"]), ("base", "main"),
         )
         for path, value in changes:
             pr = pull_request()
@@ -50,6 +50,9 @@ class ContextTests(unittest.TestCase):
             node[parts[-1]] = value
             with self.subTest(path=path), self.assertRaises(ValueError):
                 self.validate(pr=pr)
+
+        with self.assertRaises(ValueError):
+            self.validate(pr=["malformed"])
 
 
 if __name__ == "__main__":

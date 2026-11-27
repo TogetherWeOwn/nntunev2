@@ -24,18 +24,24 @@ def git_environment():
 
 
 def guard(root, commits, trusted_paths):
+    commits = tuple(commits or ())
+    trusted_paths = tuple(trusted_paths or ())
     if not commits or any(not SHA.fullmatch(oid) for oid in commits):
         raise ValueError("expected full commit object IDs")
-    if not trusted_paths or any(not p or p.startswith("-") for p in trusted_paths):
+    if not trusted_paths or any(
+        not isinstance(p, str) or not p or p.startswith(("-", "/")) or "\0" in p
+        or ".." in p.split("/")
+        for p in trusted_paths
+    ):
         raise ValueError("expected trusted input paths")
 
     root = Path(root).resolve()
 
     def git(*args):
         result = subprocess.run(
-            ["git", "--no-lazy-fetch", "--no-replace-objects",
+            ["git", "--no-lazy-fetch", "--no-replace-objects", "--literal-pathspecs",
              "-c", "core.fsmonitor=false", "-c", "core.ignoreCase=false", "-C", str(root),
-             "--work-tree", str(root), *args],
+             "--git-dir", str(root / ".git"), "--work-tree", str(root), *args],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
             env=git_environment(),
         )

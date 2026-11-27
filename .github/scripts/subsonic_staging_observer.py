@@ -1,6 +1,7 @@
 """Read one uncached, aggregate-only PostgreSQL pressure sample for staging."""
 
 import datetime as dt
+import math
 import os
 import re
 import subprocess
@@ -48,7 +49,10 @@ class Sample(NamedTuple):
 
 def connection_env(env):
     try:
-        url = urlsplit(env.get("PLANETSCALE_OBSERVER_URL_STAGING", ""))
+        raw = env.get("PLANETSCALE_OBSERVER_URL_STAGING", "")
+        if not isinstance(raw, str) or re.search(r"[\x00-\x20\x7f\s#]|%(?![0-9a-fA-F]{2})", raw):
+            raise ValueError
+        url = urlsplit(raw)
         query = parse_qs(url.query, strict_parsing=True, keep_blank_values=True)
         login = unquote(url.username or "", errors="strict")
         password = unquote(url.password or "", errors="strict")
@@ -62,7 +66,7 @@ def connection_env(env):
             or unquote(url.path) != f"/{DATABASE}"
             or not password
             or "\0" in password
-            or url.fragment
+            or url.netloc.endswith(":")
             or set(query) - {"sslmode", "sslrootcert"}
             or query.get("sslmode", ["verify-full"]) != ["verify-full"]
             or query.get("sslrootcert", ["system"]) != ["system"]
@@ -121,6 +125,8 @@ class PressureObservation(NamedTuple):
 def _sample(env, run, wall, monotonic, deadline_ms=None):
     child = connection_env(env)
     started = monotonic()
+    if not math.isfinite(started):
+        raise UnsafeSample("deadline")
     started_ms = started * 1000
     timeout = DEADLINE_SECONDS
     if deadline_ms is None:
@@ -159,7 +165,7 @@ def _sample(env, run, wall, monotonic, deadline_ms=None):
     finished = monotonic()
     if deadline_ms is None:
         # Keep the smoke CLI's original inclusive elapsed-time limit.
-        if finished - started > DEADLINE_SECONDS:
+        if not 0 <= finished - started <= DEADLINE_SECONDS:
             raise UnsafeSample("deadline")
     elif not dispatch_ms <= finished * 1000 < cutoff_ms:
         raise UnsafeSample("deadline")

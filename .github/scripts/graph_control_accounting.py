@@ -17,13 +17,16 @@ CONTROLS = (
 
 
 def run_controls(names=CONTROLS):
+    names = tuple(names)
+    if not names or len(set(names)) != len(names):
+        raise ValueError("expected a nonempty list of distinct graph controls")
     counts = {}
     for name in names:
-        suite = unittest.defaultTestLoader.loadTestsFromName(name)
-        matched = suite.countTestCases()
-        if not matched:
-            raise ValueError(f"{name}: no tests matched")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            suite = unittest.defaultTestLoader.loadTestsFromName(name)
+            matched = suite.countTestCases()
+            if not matched:
+                raise ValueError(f"{name}: no tests matched")
             result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
         if (result.testsRun != matched or result.failures or result.errors or result.skipped
                 or result.expectedFailures or result.unexpectedSuccesses):

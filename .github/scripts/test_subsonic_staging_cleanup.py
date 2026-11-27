@@ -168,6 +168,8 @@ class CleanupTest(unittest.TestCase):
             (PressureObservation(1300, 0, 1), Result.DRAIN_UNVERIFIED),
             (PressureObservation(1501, 0, 1), Result.DRAIN_UNVERIFIED),
             (PressureObservation(1400, False, 1), Result.DRAIN_UNVERIFIED),
+            (PressureObservation(1400, 0, True), Result.DRAIN_UNVERIFIED),
+            (PressureObservation(1400, 0, None), Result.DRAIN_UNVERIFIED),
             ((1400, 0, 1), Result.DRAIN_UNVERIFIED),
         ):
             with self.subTest(sample=sample):

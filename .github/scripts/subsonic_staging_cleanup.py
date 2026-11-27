@@ -105,6 +105,7 @@ def verify_cleanup(
             or not fresh(row)
             or type(row.measurement) is not int
             or row.measurement < 0
+            or type(row.ordinary_free) is not int
         ):
             return failure
         if row.measurement != 0:

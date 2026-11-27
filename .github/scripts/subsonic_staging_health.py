@@ -1,6 +1,7 @@
 """Read staging API liveness and build SHA, not Cloudflare deployment identity."""
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -45,7 +46,11 @@ def _validate(response, expected_sha):
         )
     except (ValueError, RecursionError):
         raise UnsafeHealth("cache-unverified") from None
-    if type(headers) is not dict or any(key != key.lower() for key in headers):
+    if type(headers) is not dict or any(
+        key != key.lower() or type(values) is not list or not values
+        or any(type(value) is not str for value in values)
+        for key, values in headers.items()
+    ):
         raise UnsafeHealth("cache-unverified")
     # Direct Worker responses have no CF cache status; a present one must agree.
     if (
@@ -68,7 +73,8 @@ def _access_headers(access):
     client_id = access.get("SUBSONIC_HEALTH_ACCESS_CLIENT_ID", "")
     secret = access.get("SUBSONIC_HEALTH_ACCESS_CLIENT_SECRET", "")
     # Visible ASCII only: reject control characters and config/header injection.
-    if any(not re.fullmatch(r"[!-~]{1,512}", value) for value in (client_id, secret)):
+    if any(not isinstance(value, str) or not re.fullmatch(r"[!-~]{1,512}", value)
+           for value in (client_id, secret)):
         raise UnsafeHealth("access-config")
     return f"CF-Access-Client-Id: {client_id}\nCF-Access-Client-Secret: {secret}\n".encode()
 
@@ -143,6 +149,8 @@ def sample_build_health(
     ]  # fmt: skip
     headers = _access_headers(os.environ if access is None else access)
     preflight_ms = monotonic() * 1000
+    if not math.isfinite(preflight_ms):
+        raise UnsafeHealth("deadline")
     cutoff_ms = min(deadline_ms, int(preflight_ms) + MAX_SAMPLE_AGE_MS)
     if not preflight_ms < cutoff_ms:
         raise UnsafeHealth("deadline")

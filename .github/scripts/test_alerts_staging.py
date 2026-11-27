@@ -3,6 +3,7 @@
 
 import copy
 import hashlib
+import http.client
 import io
 import json
 from pathlib import Path
@@ -16,6 +17,7 @@ import alerts_staging as guard
 
 ACCOUNT = "a" * 32
 LOGS = guard.logs_url(ACCOUNT)
+VERSION = "11111111-1111-1111-1111-111111111111"
 
 
 def fixtures():
@@ -31,7 +33,7 @@ def fixtures():
         ],
     }
     namespaces = [{"script": guard.WORKER, "class": "ErrorRateAlerts", "id": "namespace-id"}]
-    return settings, namespaces, {"enabled": False}, {"items": [{"id": "version-id"}]}
+    return settings, namespaces, {"enabled": False}, {"items": [{"id": VERSION}]}
 
 
 class VerificationTests(unittest.TestCase):
@@ -45,7 +47,7 @@ class VerificationTests(unittest.TestCase):
                 if secret:
                     data[0]["bindings"].append({"name": guard.WEBHOOK, "type": "secret_text"})
                 result = self.verify(data)
-                self.assertEqual(result["version_id"], "version-id")
+                self.assertEqual(result["version_id"], VERSION)
                 self.assertEqual(result["do_namespace_id"], "namespace-id")
                 self.assertEqual(guard.WEBHOOK in result["bindings"], secret)
                 self.assertNotIn(LOGS, json.dumps(result))
@@ -96,14 +98,15 @@ class VerificationTests(unittest.TestCase):
         # annotations and bindings on 2026-10-31: no "observability" key at all.
         data = fixtures()
         del data[0]["observability"]
-        self.assertEqual(self.verify(data)["version_id"], "version-id")
+        self.assertEqual(self.verify(data)["version_id"], VERSION)
 
     def test_compatibility_date_accepts_api_timestamp_and_rejects_drift(self):
         for value in ("2026-10-01", "2026-10-01T00:00:00Z"):
             data = fixtures()
             data[0]["compatibility_date"] = value
             self.verify(data)
-        for value in (None, "", "2026-10-02", "2026-10-02T00:00:00Z", 20261001):
+        for value in (None, "", "2026-10-02", "2026-10-02T00:00:00Z", 20261001,
+                      "2026-10-01T", "2026-10-01T99:00:00Z"):
             data = fixtures()
             data[0]["compatibility_date"] = value
             with self.subTest(value=value), self.assertRaisesRegex(guard.GuardError, "COMPATIBILITY_DATE"):
@@ -169,11 +172,13 @@ class VerificationTests(unittest.TestCase):
                 self.verify(data)
 
     def test_versions_shapes_and_missing_evidence(self):
-        for versions in ({"items": [{"id": "version-id"}]}, [{"id": "version-id"}]):
+        for versions in ({"items": [{"id": VERSION}]}, [{"id": VERSION}]):
             data = list(fixtures())
             data[3] = versions
             self.verify(data)
-        for versions in (None, {}, [], {"items": []}, {"items": [{}]}):
+        for versions in (None, {}, [], {"items": []}, {"items": [{}]}, [None],
+                         [{"id": {"unexpected": "provider-data"}}], [{"id": " "}],
+                         [{"id": "unexpected-version"}]):
             data = list(fixtures())
             data[3] = versions
             with self.subTest(versions=versions), self.assertRaisesRegex(guard.GuardError, "VERSION_EVIDENCE"):
@@ -327,7 +332,8 @@ class PaginationAndTransportTests(unittest.TestCase):
             response.read.assert_called_once_with(8 * 1024 * 1024 + 1)
 
     def test_transport_errors_and_invalid_json_are_redacted(self):
-        for error in (urllib.error.URLError("private-canary"), TimeoutError("private-canary")):
+        for error in (urllib.error.URLError("private-canary"), TimeoutError("private-canary"),
+                      http.client.IncompleteRead(b"private-canary")):
             with patch.object(guard.urllib.request, "build_opener") as opener:
                 opener.return_value.open.side_effect = error
                 with self.assertRaisesRegex(guard.GuardError, "API_GET_FAILED") as raised:
@@ -337,6 +343,16 @@ class PaginationAndTransportTests(unittest.TestCase):
             opener.return_value.open.return_value.__enter__.return_value.read.return_value = b"private-canary"
             with self.assertRaisesRegex(guard.GuardError, "API_JSON_INVALID"):
                 guard.api_get("unused", ACCOUNT, "test-token")
+
+    def test_transport_rejects_ambiguous_or_nonstandard_json(self):
+        for body in (b'{"success":false,"success":true,"result":{}}',
+                     b'{"success":true,"result":{"enabled":true,"enabled":false}}',
+                     b'{"success":true,"result":NaN}',
+                     b'{"success":true,"result":' + b"[" * 10_000 + b"0" + b"]" * 10_000 + b"}"):
+            with self.subTest(body=body[:64]), patch.object(guard.urllib.request, "build_opener") as opener:
+                opener.return_value.open.return_value.__enter__.return_value.read.return_value = body
+                with self.assertRaisesRegex(guard.GuardError, "^API_JSON_INVALID$"):
+                    guard.api_get("unused", ACCOUNT, "test-token")
 
 
 class ConfigAndFreezeTests(unittest.TestCase):
@@ -348,10 +364,11 @@ class ConfigAndFreezeTests(unittest.TestCase):
                     LOGS.replace("dash.cloudflare.com", "discord.com"),
                     LOGS.replace("/workers/services/view/", "/api/webhooks/"),
                     LOGS.replace("staging", "production"), LOGS + "?token=private-canary",
-                    LOGS + "#fragment", LOGS + "\n", "https://[invalid"):
-            with self.subTest(url=url), self.assertRaises(guard.GuardError) as raised:
-                guard.validate_logs_url(url)
-            self.assertNotIn("private-canary", str(raised.exception))
+                    LOGS + "#fragment", LOGS + "?", LOGS + "#", LOGS + "\n", "https://[invalid"):
+            with self.subTest(url=url):
+                with self.assertRaises(guard.GuardError) as raised:
+                    guard.validate_logs_url(url)
+                self.assertNotIn("private-canary", str(raised.exception))
         for account in ("", "not-an-account", ACCOUNT + '"\n', None):
             with self.assertRaisesRegex(guard.GuardError, "ACCOUNT_ID_SHAPE"):
                 guard.logs_url(account)
@@ -382,10 +399,44 @@ class ConfigAndFreezeTests(unittest.TestCase):
                      example.replace('name = "nntune-alerts-local"', 'name = "nntune-alerts"'),
                      example.replace('tag = "v1"', 'tag = "v2"'),
                      example.replace("workers_dev = false", "workers_dev = true"),
+                     example.replace("workers_dev = false", "workers_dev = 0"),
                      example + '\n[[routes]]\npattern = "example.invalid/*"\n',
                      example.replace('[vars]', '[vars]\nOPS_ALERT_WEBHOOK_URL = "private-canary"')):
             with self.subTest(drift=True), self.assertRaisesRegex(guard.GuardError, "CONFIG_DRIFT"):
                 guard.generate_config(ACCOUNT, text)
+
+    def test_config_cli_replaces_output_without_writing_through_symlink(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = guard.ROOT / "workers/observability/wrangler.toml.example"
+            example = root / source.relative_to(guard.ROOT)
+            example.parent.mkdir(parents=True)
+            example.write_bytes(source.read_bytes())
+            destination = example.with_name("wrangler.staging.toml")
+            unrelated = root / "unrelated"
+            unrelated.write_text("preserve this file")
+            destination.symlink_to(unrelated)
+            with patch.object(guard, "ROOT", root), patch.dict(guard.os.environ, {"CLOUDFLARE_ACCOUNT_ID": ACCOUNT}), \
+                    patch.object(guard.sys, "argv", ["alerts_staging.py", "config"]), patch("sys.stdout", io.StringIO()):
+                self.assertEqual(guard.main(), 0)
+            self.assertEqual(unrelated.read_text(), "preserve this file")
+            self.assertFalse(destination.is_symlink())
+            self.assertEqual(tomllib.loads(destination.read_text())["name"], guard.WORKER)
+
+    def test_config_rejects_symlinked_output_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            donor = Path(temp) / "donor"
+            (root / "workers").mkdir(parents=True)
+            donor.mkdir()
+            source = guard.ROOT / "workers/observability/wrangler.toml.example"
+            (donor / source.name).write_bytes(source.read_bytes())
+            (root / "workers/observability").symlink_to(donor, target_is_directory=True)
+            with patch.object(guard, "ROOT", root), patch.dict(guard.os.environ, {"CLOUDFLARE_ACCOUNT_ID": ACCOUNT}), \
+                    patch.object(guard.sys, "argv", ["alerts_staging.py", "config"]), patch("sys.stdout", io.StringIO()) as output:
+                self.assertEqual(guard.main(), 1)
+            self.assertEqual(json.loads(output.getvalue())["code"], "CONFIG_PATH")
+            self.assertFalse((donor / "wrangler.staging.toml").exists())
 
     def frozen_fixture(self):
         repo = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="alerts-freeze-fixture-")))

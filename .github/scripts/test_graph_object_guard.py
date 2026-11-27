@@ -18,6 +18,23 @@ SUPPORTED = subprocess.run(
 
 
 class GuardTests(unittest.TestCase):
+    def test_git_binds_repository_root_and_uses_literal_paths(self):
+        result = subprocess.CompletedProcess([], 0, b"true\n", b"")
+        root = Path.cwd()
+        with mock.patch.object(guard.subprocess, "run", return_value=result) as run:
+            with self.assertRaisesRegex(ValueError, "shallow"):
+                guard.guard(root, ["a" * 40], ["controls"])
+        args = run.call_args.args[0]
+        self.assertIn("--literal-pathspecs", args)
+        self.assertEqual(args[args.index("--git-dir") + 1], str(root / ".git"))
+
+    def test_rejects_nonlocal_paths_before_git(self):
+        with mock.patch.object(guard.subprocess, "run") as run:
+            for path in ("controls/../control", "/control", "control\0name"):
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, "trusted input paths"):
+                    guard.guard(".", ["a" * 40], [path])
+            run.assert_not_called()
+
     def test_unsupported_git_fails_closed(self):
         result = subprocess.CompletedProcess([], 129, b"", b"unsupported option")
         with mock.patch.object(guard.subprocess, "run", return_value=result):
@@ -135,6 +152,17 @@ class RealRepositoryTests(unittest.TestCase):
     def test_unmatched_trusted_path_is_refused(self):
         with self.assertRaisesRegex(ValueError, "no tracked files"):
             guard.guard(self.root, [self.commit], ["controls", "absent"])
+        with self.assertRaisesRegex(ValueError, "no tracked files"):
+            guard.guard(self.root, [self.commit], iter(["absent"]))
+
+    def test_paths_are_literal_and_root_cannot_inherit_parent_git_directory(self):
+        for path in ("controls/in*", ":(glob)controls/in*"):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "no tracked files"):
+                guard.guard(self.root, [self.commit], [path])
+        nested = self.root / "nested"
+        shutil.copytree(self.root / "controls", nested / "controls")
+        with self.assertRaises(ValueError):
+            guard.guard(nested, [self.commit], ["controls"])
 
     def test_clean_filter_cannot_hide_dirty_trusted_bytes(self):
         self.git("config", "filter.normalize.clean", "sed s/evil/good/g")

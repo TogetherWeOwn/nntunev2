@@ -77,6 +77,26 @@ class AccountingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 accounting.run_controls(("control",))
 
+    def test_rejects_empty_and_duplicate_control_lists_before_loading(self):
+        with mock.patch.object(accounting.unittest.defaultTestLoader, "loadTestsFromName") as load:
+            for names in ((), ("control", "control")):
+                with self.subTest(names=names), self.assertRaises(ValueError):
+                    accounting.run_controls(names)
+            load.assert_not_called()
+
+    def test_loader_output_does_not_escape_accounting(self):
+        def load(_):
+            print("loader stdout")
+            print("loader stderr", file=accounting.sys.stderr)
+            return unittest.TestSuite([Samples("success")])
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(accounting.unittest.defaultTestLoader, "loadTestsFromName", load), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual({"control": {"matched": 1, "executed": 1}},
+                             accounting.run_controls(("control",)))
+        self.assertEqual(("", ""), (stdout.getvalue(), stderr.getvalue()))
+
     def test_rejects_count_mismatch(self):
         suite = unittest.TestSuite([Samples("success")])
         with mock.patch.object(suite, "countTestCases", return_value=2), mock.patch.object(

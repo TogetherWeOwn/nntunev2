@@ -16,6 +16,13 @@ SUPPORTED = subprocess.run(["git", "--no-lazy-fetch", "--version"],
 
 
 class IdentityTests(unittest.TestCase):
+    def test_equal_parents_fail_before_integration_commands(self):
+        with mock.patch.object(identity, "_git") as git, mock.patch.object(identity, "guard") as guard:
+            with self.assertRaisesRegex(ValueError, "distinct"):
+                identity.construct(".", "a" * 40, "a" * 40, ["control"])
+            git.assert_not_called()
+            guard.assert_not_called()
+
     def test_bad_input_and_guard_failure_stop_construction(self):
         with self.assertRaises(ValueError):
             identity.construct(".", "main", "b" * 40, ["control"])
@@ -53,11 +60,12 @@ class IdentityTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     identity.verify(".", base, head, tree, merge)
 
-    def test_git_disables_configured_fsmonitor(self):
+    def test_git_binds_repository_root_and_disables_configured_fsmonitor(self):
         result = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
         with mock.patch.object(identity.subprocess, "run", return_value=result) as run:
             identity._git(".", "checkout", "--detach", "a" * 40)
         args = run.call_args.args[0]
+        self.assertEqual(args[args.index("--git-dir") + 1], str(Path.cwd() / ".git"))
         self.assertIn("core.fsmonitor=false", args)
         self.assertEqual(args[args.index("core.fsmonitor=false") - 1], "-c")
 

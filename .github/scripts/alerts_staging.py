@@ -2,16 +2,21 @@
 """Frozen staging alert deployment guards. Verification uses GET requests only."""
 
 import argparse
+from datetime import datetime
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from staging_api_identity import UUID, Unavailable, decode, valid
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULES = tuple(
@@ -64,7 +69,7 @@ def validate_logs_url(url):
         parts = urllib.parse.urlsplit(url)
         require(parts.scheme == "https", "LOGS_URL_SCHEME")
         require(parts.netloc == "dash.cloudflare.com", "LOGS_URL_HOST")
-        require(not parts.query and not parts.fragment, "LOGS_URL_SUFFIX")
+        require("?" not in url and "#" not in url, "LOGS_URL_SUFFIX")
         require(re.fullmatch(
             rf"/[0-9a-fA-F]{{32}}/workers/services/view/{PRODUCER}/observability/logs",
             parts.path,
@@ -100,8 +105,24 @@ def generate_config(account_id, example=None):
         "durable_objects": {"bindings": [{"name": "ALERT_WINDOWS", "class_name": "ErrorRateAlerts"}]},
         "migrations": [{"tag": "v1", "new_sqlite_classes": ["ErrorRateAlerts"]}],
     }
-    require(tomllib.loads(text) == expected, "CONFIG_DRIFT")
+    parsed = tomllib.loads(text)
+    # Python equality treats integer zero and false as equal.
+    require(parsed == expected and json.dumps(parsed, sort_keys=True) ==
+            json.dumps(expected, sort_keys=True), "CONFIG_DRIFT")
     return text
+
+
+def write_config(account_id):
+    path = ROOT / "workers/observability/wrangler.staging.toml"
+    require(path.parent.resolve(strict=True) == path.parent, "CONFIG_PATH")
+    text = generate_config(account_id)
+    temporary = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
+    try:
+        with temporary:
+            temporary.write(text)
+        os.replace(temporary.name, path)
+    finally:
+        Path(temporary.name).unlink(missing_ok=True)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -120,12 +141,12 @@ def api_get(path, account_id, token):
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=20) as response:
             raw = response.read(8 * 1024 * 1024 + 1)
         require(len(raw) <= 8 * 1024 * 1024, "API_RESPONSE_TOO_LARGE")
-        payload = json.loads(raw)
+        payload = decode(raw, "API_JSON_INVALID")
     except GuardError:
         raise
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except (OSError, http.client.HTTPException):
         raise GuardError("API_GET_FAILED") from None
-    except (ValueError, UnicodeError):
+    except (ValueError, Unavailable):
         raise GuardError("API_JSON_INVALID") from None
     require(isinstance(payload, dict) and payload.get("success") is True, "API_UNSUCCESSFUL")
     require("result" in payload, "API_RESULT_MISSING")
@@ -194,6 +215,10 @@ def verify(settings, namespaces, subdomain, versions, expected_logs):
     date = settings.get("compatibility_date")
     require(isinstance(date, str) and date.split("T", 1)[0] == COMPATIBILITY_DATE,
             "COMPATIBILITY_DATE_DRIFT")
+    try:
+        datetime.fromisoformat(date)
+    except ValueError:
+        raise GuardError("COMPATIBILITY_DATE_DRIFT") from None
     require(settings.get("tail_consumers") in (None, []), "UNEXPECTED_TAIL_CONSUMERS")
     bindings = settings.get("bindings", [])
     by_name = {binding["name"]: binding for binding in bindings}
@@ -214,9 +239,11 @@ def verify(settings, namespaces, subdomain, versions, expected_logs):
     require(mine[0].get("id") == binding["namespace_id"], "DO_NAMESPACE_ID")
     require(subdomain.get("enabled") is False, "WORKERS_DEV_NOT_OFF")
     items = versions.get("items") if isinstance(versions, dict) else versions
-    require(isinstance(items, list) and bool(items) and bool(items[0].get("id")),
+    require(isinstance(items, list) and bool(items) and isinstance(items[0], dict),
             "VERSION_EVIDENCE_MISSING")
-    return {"worker": WORKER, "version_id": items[0]["id"],
+    version_id = items[0].get("id")
+    require(valid(UUID, version_id), "VERSION_EVIDENCE_MISSING")
+    return {"worker": WORKER, "version_id": version_id,
             "do_namespace_id": mine[0]["id"], "bindings": sorted(by_name)}
 
 
@@ -229,8 +256,7 @@ def main():
             check_frozen()
             result = {"modules": len(MODULES)}
         elif args.command == "config":
-            text = generate_config(os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""))
-            (ROOT / "workers/observability/wrangler.staging.toml").write_text(text)
+            write_config(os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""))
             result = {"worker": WORKER, "config": "wrangler.staging.toml"}
         else:
             account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")

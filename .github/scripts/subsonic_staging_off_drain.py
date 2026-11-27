@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from staging_api_identity import SCRIPT, provider_result, valid
 from subsonic_staging_cleanup import CleanupResult, DeploymentPin, verify_cleanup
-from subsonic_staging_observer import require_preflight, sample_pressure
+from subsonic_staging_observer import UnsafeSample, connection_env, require_preflight, sample_pressure
 
 BUDGET_SECONDS = 30
 
@@ -31,8 +31,12 @@ def readback(env, *, require_headroom=False):
     if not (
         valid(re.compile(r"[0-9a-f]{32}"), account)
         and valid(re.compile(r"[\x21-\x7e]{1,512}"), token)
-        and env.get("PLANETSCALE_OBSERVER_URL_STAGING")
+        and type(require_headroom) is bool
     ):
+        return "readback-config-unavailable"
+    try:
+        connection_env(env)
+    except UnsafeSample:
         return "readback-config-unavailable"
 
     pin = DeploymentPin(

@@ -72,6 +72,11 @@ class ObserverTests(unittest.TestCase):
             URL + "&options=-csearch_path=other",
             URL + "&sslrootcert=",
             URL + "#fragment",
+            URL + "#",
+            " " + URL,
+            URL.replace("db.example.test", "db.example.\ntest"),
+            URL.replace("db.example.test", "db.example.test:"),
+            URL.replace("%21", "%zz"),
         ):
             with (
                 self.subTest(url=url),
@@ -91,6 +96,7 @@ class ObserverTests(unittest.TestCase):
                 if isinstance(result, Exception)
                 else Mock(return_value=result)
             )
+
             with (
                 self.subTest(category=category),
                 self.assertRaisesRegex(UnsafeSample, f"^{category}$"),
@@ -103,6 +109,14 @@ class ObserverTests(unittest.TestCase):
                 wall=lambda: 100,
                 monotonic=iter((0, 6)).__next__,
             )
+
+    def test_smoke_rejects_regressing_or_nonfinite_monotonic_clock(self):
+        for readings in ((1, 0), (1, float("nan")), (float("nan"), 1)):
+            run = Mock(return_value=subprocess.CompletedProcess([], 0, stdout=VALID))
+            with self.subTest(readings=readings), self.assertRaisesRegex(UnsafeSample, "^deadline$"):
+                sample(ENV, run=run, wall=lambda: 100, monotonic=iter(readings).__next__)
+            if readings[0] != 1:
+                run.assert_not_called()
 
     def test_pressure_rejects_invalid_deadlines_before_calling_client(self):
         for deadline in (None, "1500", True, -1):

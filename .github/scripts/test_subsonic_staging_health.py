@@ -73,6 +73,7 @@ class HealthTests(unittest.TestCase):
             {ID_ENV: "fixture-id"},
             {**ACCESS, SECRET_ENV: "x\r\ny"},
             {**ACCESS, ID_ENV: "x" * 513},
+            {**ACCESS, ID_ENV: None},
         ):
             self.refuses("access-config", popen, access=access)
         self.refuses("expected-build", popen, sha="unknown")
@@ -84,9 +85,12 @@ class HealthTests(unittest.TestCase):
             b',"cache-status":["edge; hit"]}',
             b',"cf-cache-status":["DYNAMIC","HIT"]}',
             b',"cf-cache-status":["HIT"]}',
+            b',"content-type":NaN}',
+            b',"content-type":[123]}',
             b"",
         ):
-            self.refuses("cache-unverified", curl(BODY + FOOTER[:-1] + extra)[0])
+            with self.subTest(extra=extra):
+                self.refuses("cache-unverified", curl(BODY + FOOTER[:-1] + extra)[0])
         for reply, reason in (
             (BODY + FOOTER.replace(b"200", b"302"), "status"),
             (BODY + FOOTER.replace(b"no-store", b"max-age=60"), "cache-unverified"),
@@ -99,6 +103,13 @@ class HealthTests(unittest.TestCase):
             ),
         ):
             self.refuses(reason, curl(reply)[0])
+
+    def test_nonfinite_preflight_clock_never_dispatches(self):
+        popen = Mock()
+        for reading in (float("nan"), float("inf")):
+            with self.subTest(reading=reading):
+                self.refuses("deadline", popen, monotonic=lambda: reading)
+        popen.assert_not_called()
 
     def test_launch_overrun_never_releases_credentials(self):
         popen, probe = curl()
