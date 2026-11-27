@@ -485,6 +485,8 @@ test('bad counts rationals fail closed', () => {
   ]) {
     assert.equal(render(breachVerdict({ counts }), contextFixture()), null, `${name} must not render`);
   }
+  const zero = { total: 4, failed: 0 };
+  assert.equal(render(breachVerdict({ counts: zero, rate: { ...zero, decimal: '0.0000' } }), contextFixture()), null);
 });
 
 test('bad rate rationals or decimals fail closed', () => {
@@ -512,6 +514,7 @@ test('breach without named rules fails closed', () => {
     ['numeric entry', { overall, breached_rules: ['overall', 42] }],
     ['empty-string entry', { overall, breached_rules: ['overall', ''] }],
     ['null entry', { overall, breached_rules: ['overall', null] }],
+    ['130 rules', { overall, breached_rules: Array(130).fill('overall') }],
   ]) {
     assert.equal(render(breachVerdict({ thresholds }), contextFixture()), null, `${name} must not render`);
   }
@@ -531,6 +534,7 @@ test('bad breakdowns fail closed', () => {
   cases.push(['null bucket entry', { ...good, by_error_class: { buckets: [null], overflow: emptyOverflow() } }]);
   cases.push(['bucket without key', { ...good, by_error_class: { buckets: [{ total: 1, failed: 1 }], overflow: emptyOverflow() } }]);
   cases.push(['numeric bucket key', { ...good, by_error_class: oneBucket(42) }]);
+  cases.push(['33 buckets', { ...good, by_route: { buckets: Array(33).fill({ key: 'GET /health' }) } }]);
   for (const [name, breakdowns] of cases) {
     assert.equal(render(breachVerdict({ breakdowns }), contextFixture()), null, `${name} must not render`);
   }

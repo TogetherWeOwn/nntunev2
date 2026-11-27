@@ -254,6 +254,7 @@ const invalidPolicies = [
   policyFixture({ environment: 'STAGING' }),
   policyFixture({ routes: '*' }), policyFixture({ error_classes: '*' }),
   policyFixture({ routes: [null] }), policyFixture({ error_classes: [42] }),
+  policyFixture({ routes: Object.setPrototypeOf(new Array(1), ['GET /healthz']) }),
   policyFixture({ routes: ['https://example.invalid/v1/library/search'] }),
   policyFixture({ routes: ['GET /v1/library/search?secret=synthetic'] }),
   policyFixture({ routes: ['GET /healthz\n'] }),

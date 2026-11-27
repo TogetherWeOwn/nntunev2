@@ -22,15 +22,13 @@
 // for rendering but rank by failures (valid non-negative integer failed
 // counts sort first, ties break by key), so the capped "Top" fields show
 // the highest-failure entries instead of alphabetical prefixes.
-// context: {logsUrl, windowLabel}. A configured log-view URL uses an absolute
-// HTTP(S) link and a literal path. The window label uses the runtime's
-// DO receive-time interval of canonical UTC timestamps.
+// context: {logsUrl, windowLabel}, an absolute HTTP(S) log-view URL with a
+// literal path and a DO receive-time interval of canonical UTC timestamps.
 //
 // Bounds: content <= 2000 chars, exactly one embed, payload total
 // <= 6000 chars, <= 25 fields per embed, field names 1..256 chars,
-// field values 1..1024 chars. Lists render a leading prefix with a
-// "+N more" marker; identical input always yields
-// byte-identical output.
+// field values 1..1024 chars. Capped lists end with a "+N more" marker.
+// Identical input always yields byte-identical output.
 // The source-only runtime imports this pure helper; it carries no webhook
 // URL or secret and performs no delivery or deployment itself.
 
@@ -115,7 +113,6 @@ function extractRules(thresholds) {
     const rules = thresholds.breached_rules;
     if (!Array.isArray(rules)) return null;
     const length = rules.length;
-    // One overall rule plus 64 rules for each of two keyed dimensions.
     if (!Number.isInteger(length) || length < 1 || length > 129) return null;
     const out = [];
     for (let i = 0; i < length; i += 1) {
