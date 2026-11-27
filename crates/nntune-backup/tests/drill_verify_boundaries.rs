@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use nntune_backup::{
-    drill::{self, MIN_FIXTURE_BYTES},
+    bundle::BundleError,
+    drill::{self, DrillError, MIN_FIXTURE_BYTES},
     verify::VerifyReport,
 };
 use nntune_core::original_source::MAX_CIPHERTEXT_BYTES;
@@ -33,9 +34,10 @@ fn restore_requires_fresh_separate_destination() {
     let existing = scratch.0.join("existing");
     fs::create_dir(&existing).unwrap();
     let nested = source.join("nested");
-    for target in [&existing, &nested, &source] {
-        assert!(drill::restore_and_decrypt(&source, target, &keyring, "test").is_err());
-    }
+    assert!(drill::restore_and_decrypt(&source, &existing, &keyring, "test").is_err());
+    let overlap = BundleError::Io("restore directory overlaps backup".into());
+    let result = drill::restore_and_decrypt(&source, &nested, &keyring, "test");
+    assert_eq!(result, Err(DrillError::Bundle(overlap)));
     assert!(!nested.exists());
     assert_eq!(fs::read_dir(existing).unwrap().count(), 0);
     let restored = scratch.0.join("fresh");

@@ -132,12 +132,8 @@ fn hex_bytes(s: &str, expect: usize) -> Option<Vec<u8>> {
 /// Authenticate every row in `rows_jsonl` against `keyring`. The
 /// per-row KEK copy and decrypted payload are zeroized immediately.
 pub fn verify_rows(rows_jsonl: &str, keyring: &Keyring, tool: &str) -> VerifyReport {
-    verify_lines(
-        rows_jsonl.lines().map(Ok::<_, core::convert::Infallible>),
-        keyring,
-        tool,
-    )
-    .unwrap()
+    let lines = rows_jsonl.lines().map(Ok::<_, core::convert::Infallible>);
+    verify_lines(lines, keyring, tool).unwrap()
 }
 
 // Hex ciphertext plus room for the other columns and the line terminator.
