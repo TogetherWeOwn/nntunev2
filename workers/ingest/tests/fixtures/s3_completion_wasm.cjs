@@ -1033,3 +1033,41 @@ for (const [name, code, prefix, marker] of [
     verifyCalls();
   });
 }
+
+test('recovers after an inventory continuation fails beyond a confirmed prefix', async (t) => {
+  const unavailable = new Error('ServiceUnavailable');
+  const readParts = [];
+  let interruptions = 0;
+  const { confirmed, readPage, verifyCalls } = mockResumeInventory(t, [
+    [null, (parts) => {
+      readParts.push(parts[0].number);
+      return firstPartPage(parts);
+    }],
+    [1, () => {
+      assert.deepEqual(readParts, [1]);
+      interruptions += 1;
+      throw unavailable;
+    }],
+    [null, (parts) => {
+      readParts.push(parts[0].number);
+      return firstPartPage(parts);
+    }],
+    [1, ([, second]) => {
+      readParts.push(second.number);
+      return terminalInventory([second]);
+    }],
+  ]);
+
+  const result = JSON.parse(await complete('multipart-resume-inventory-retry', readPage));
+  verifyCalls();
+  assert.equal(interruptions, 1);
+  assert.deepEqual(readParts, [1, 1, 2]);
+  assert.deepEqual(result, {
+    statuses: [
+      { status: 'resumable', upload_id: inventoryUploadId, parts: [] },
+      { status: 'unavailable', upload_id: inventoryUploadId, parts: confirmed },
+      { status: 'resumable', upload_id: inventoryUploadId, parts: confirmed },
+    ],
+    manifest: confirmed.map(({ number, etag, digest }) => [number, etag, Buffer.from(digest).toString('base64')]),
+  });
+});

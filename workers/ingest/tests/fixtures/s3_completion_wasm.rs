@@ -180,7 +180,10 @@ async fn run(
         (mode, None)
     };
     let readback = mode.starts_with("readback");
-    let multipart_resume = matches!(mode, "multipart-resume" | "multipart-resume-full");
+    let multipart_resume = matches!(
+        mode,
+        "multipart-resume" | "multipart-resume-full" | "multipart-resume-inventory-retry"
+    );
     let resume_bytes;
     let plaintext: &[u8] = if matches!(mode, "readback-publish" | "readback-playback") {
         TONE
@@ -214,9 +217,8 @@ async fn run(
         [1, 2, 0xab, 0xcd].map(|value| hex::encode(id(value)));
     let key = format!("media/{object}/{generation}");
     let budget = match mode {
-        "readback-publish" | "readback-playback" | "multipart-resume" | "multipart-resume-full" => {
-            5000
-        }
+        "readback-publish" | "readback-playback" => 5000,
+        _ if multipart_resume => 5000,
         "deadline" => 200,
         "expired" | "reconcile-expired" => 0,
         _ => 2000,
@@ -334,7 +336,7 @@ async fn run(
             &parts,
             until,
             staged_inventory,
-            mode == "multipart-resume",
+            mode,
             read_page,
             observe,
             conflicting_status,
@@ -493,7 +495,7 @@ async fn resume_multipart<'a>(
     parts: &[UploadPart<'a>],
     until: std::time::SystemTime,
     staged_inventory: Option<Function>,
-    interrupt_second: bool,
+    mode: &str,
     read_page: Option<Function>,
     observe: Option<&Function>,
     conflicting_status: bool,
@@ -508,7 +510,7 @@ async fn resume_multipart<'a>(
             binding,
             parts: &[],
         };
-        let (coherent, status) = read_inventory_status(&read_page, target, &empty)?;
+        let (coherent, status) = read_inventory_status(&read_page, target, &empty, false)?;
         if !coherent {
             return Err(JsValue::from_str(
                 "initial inventory disagrees with checkpoint",
@@ -539,8 +541,10 @@ async fn resume_multipart<'a>(
             context,
             [first, second],
             initial_status,
+            mode == "multipart-resume-inventory-retry",
         );
     }
+    let interrupt_second = mode == "multipart-resume";
     let mut receipts = vec![first];
     if let Some(observe) = observe {
         let report = |stage, part_count: usize| {
@@ -678,6 +682,7 @@ fn resume_from_inventory<'a>(
     context: &'a EnvelopeContext,
     receipts: [UploadedPart<'a>; 2],
     initial_status: serde_json::Value,
+    retry_continuation: bool,
 ) -> Result<String, JsValue> {
     let [first_etag, second_etag] = receipts.each_ref().map(|part| part.etag().to_owned());
     let saved = [
@@ -689,8 +694,13 @@ fn resume_from_inventory<'a>(
         parts: &saved,
     };
     let mut statuses = vec![initial_status];
-    for _ in 0..2 {
-        let (coherent, status) = read_inventory_status(read_page, target, &checkpoint)?;
+    for attempt in 0..2 {
+        let (coherent, status) = read_inventory_status(
+            read_page,
+            target,
+            &checkpoint,
+            retry_continuation && attempt == 0,
+        )?;
         statuses.push(status);
         if coherent {
             let completion =
@@ -709,22 +719,34 @@ fn read_inventory_status(
     read_page: &Function,
     target: UploadTarget<'_>,
     checkpoint: &ResumeCheckpoint<'_>,
+    retry_continuation: bool,
 ) -> Result<(bool, serde_json::Value), JsValue> {
     // The callback models one complete page or a read with one continuation.
     // A thrown provider error leaves the caller without an inventory verdict.
-    let page = |marker: JsValue| -> Result<InventoryPage, JsValue> {
-        let reply = read_page.call4(
+    let page = |marker: JsValue| {
+        read_page.call4(
             &JsValue::UNDEFINED,
             &JsValue::from_str(target.bucket),
             &JsValue::from_str(target.key),
             &JsValue::from_str(target.upload_id),
             &marker,
-        )?;
-        serde_wasm_bindgen::from_value(reply).map_err(|error| JsValue::from_str(&error.to_string()))
+        )
     };
-    let mut first = page(JsValue::NULL)?;
+    let decode = |reply| {
+        serde_wasm_bindgen::from_value::<InventoryPage>(reply)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    };
+    let mut first = decode(page(JsValue::NULL)?)?;
     if let Some(marker) = first.next_marker {
-        let last = page(JsValue::from(marker))?;
+        let last = match page(JsValue::from(marker)) {
+            Ok(last) => decode(last)?,
+            Err(_) if retry_continuation => {
+                // Discard this prefix. The retry starts at the first marker
+                // with the entire original checkpoint still available.
+                return Ok((false, inventory_status("unavailable", target, checkpoint)));
+            }
+            Err(error) => return Err(error),
+        };
         assert!(last.next_marker.is_none());
         first.parts.extend(last.parts);
     }
@@ -734,11 +756,12 @@ fn read_inventory_status(
         etag: &part.etag,
         digest: part.digest,
     }));
-    Ok((coherent, inventory_status(coherent, target, checkpoint)))
+    let status = if coherent { "resumable" } else { "pending" };
+    Ok((coherent, inventory_status(status, target, checkpoint)))
 }
 
 fn inventory_status(
-    coherent: bool,
+    status: &str,
     target: UploadTarget<'_>,
     checkpoint: &ResumeCheckpoint<'_>,
 ) -> serde_json::Value {
@@ -754,7 +777,6 @@ fn inventory_status(
             })
         })
         .collect();
-    let status = if coherent { "resumable" } else { "pending" };
     serde_json::json!({ "status": status, "upload_id": target.upload_id, "parts": saved })
 }
 
