@@ -13,6 +13,13 @@
 use std::future::Future;
 use std::task::Poll;
 
+/// Bound an override to the production budget and the Worker timer's signed
+/// millisecond range. Zero expires before starting a stub call.
+pub fn bounded_deadline_ms(requested_ms: u64, budget_ms: u64) -> Option<u64> {
+    let millis = requested_ms.min(budget_ms).min(i32::MAX as u64);
+    (millis != 0).then_some(millis)
+}
+
 /// Race `op` against `deadline`, polling the deadline first.
 ///
 /// Returns `Some(output)` when `op` completes before the deadline fires,

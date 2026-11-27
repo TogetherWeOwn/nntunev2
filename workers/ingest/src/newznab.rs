@@ -68,15 +68,11 @@ pub fn percent_encode(raw: &str) -> String {
     out
 }
 
-/// Reject non-https URLs, embedded credentials, and URLs that already carry
-/// a query or fragment.
+/// Validate an HTTPS origin and optional path for Newznab requests.
 ///
-/// A base URL pasted with its own `?apikey=…` would compose into a URL that
-/// already holds a key before [`inject_api_key`] runs (malforming `/api` into
-/// a query value and leaking the real key past [`redact_api_key`); a `#`
-/// would swallow the whole search query into the fragment so it is never
-/// sent. Bare origin + optional path only.
-fn check_base_url(base_url: &str) -> Result<String, &'static str> {
+/// Credentials, queries and fragments are refused so the endpoint can be
+/// composed before the service key is appended.
+fn check_base_url(base_url: &str) -> Result<&str, &'static str> {
     if !base_url.starts_with("https://") {
         return Err("indexer base url must be https");
     }
@@ -90,10 +86,14 @@ fn check_base_url(base_url: &str) -> Result<String, &'static str> {
     if rest.contains('?') || rest.contains('#') {
         return Err("indexer base url must not contain '?' or '#'");
     }
-    if rest.chars().any(|c| c.is_whitespace()) {
-        return Err("indexer base url must not contain whitespace");
+    if rest.contains('\\') || rest.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("indexer base url contains invalid characters");
     }
-    Ok(base_url.trim_end_matches('/').to_string())
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.contains('%') || worker::Url::parse(base_url).is_err() {
+        return Err("indexer base url has an invalid authority");
+    }
+    Ok(base_url.trim_end_matches('/'))
 }
 
 /// Endpoint for a validated base URL: a base whose final path segment is
@@ -145,7 +145,7 @@ pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static st
     if params.categories.len() > MAX_CATEGORIES {
         return Err("too many categories (max 16)");
     }
-    let endpoint = endpoint_for_base(&base);
+    let endpoint = endpoint_for_base(base);
     let mut url = format!(
         "{endpoint}?t={SEARCH_TYPE}&o=json&q={}&limit={}&offset={}",
         percent_encode(q),
@@ -167,16 +167,16 @@ pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static st
     Ok(url)
 }
 
-/// Append the service-held admin-ingest key at request time. Never log
-/// the result.
+/// Append the service-held admin-ingest key to a keyless HTTPS search URL.
 ///
-/// The only contract is length: a nonempty key of at most 1024 UTF-8
-/// bytes (`str::len` is byte length). The key comes from the
-/// admin-ingest secret path, never from user input or a user vault.
+/// The key must be 1 to 1024 UTF-8 bytes and come from the admin-ingest
+/// secret path, never from user input or a user vault. Never log the
+/// resulting URL.
 pub fn inject_api_key(url_without_key: &str, api_key: &str) -> Result<String, &'static str> {
     if api_key.is_empty() || api_key.len() > 1024 {
         return Err("api key must be 1..=1024 bytes");
     }
+    check_keyless_search_url(url_without_key)?;
     Ok(format!(
         "{url_without_key}&apikey={}",
         percent_encode(api_key)
@@ -212,6 +212,27 @@ pub fn redact_api_key(url_with_key: &str) -> String {
     }
     out.push_str(&url_with_key[last..]);
     out
+}
+
+fn check_keyless_search_url(raw: &str) -> Result<(), &'static str> {
+    let (base, query) = raw
+        .split_once('?')
+        .ok_or("indexer search url must include a query")?;
+    check_base_url(base)?;
+    if query.is_empty()
+        || query.contains('#')
+        || query.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("indexer search url has an invalid query");
+    }
+    let url = worker::Url::parse(raw).map_err(|_| "invalid indexer search url")?;
+    if url
+        .query_pairs()
+        .any(|(name, _)| name.eq_ignore_ascii_case("apikey"))
+    {
+        return Err("indexer search url already contains an api key");
+    }
+    Ok(())
 }
 
 /// Offset for `page` (0-based) with a row `limit`, saturating on overflow.

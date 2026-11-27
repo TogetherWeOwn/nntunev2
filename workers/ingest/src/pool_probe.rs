@@ -47,17 +47,17 @@ pub enum PoolProbeError {
 /// Check a pool answer against its request: the batch index echoes, and
 /// `present` + `missing` are exactly the requested ids (same multiset), so a
 /// short, padded or foreign answer can never move the tally.
+///
+/// Check the batch and count before allocating the lists used for sorting.
 pub fn check_outcome(req: &ProbeRequest, outcome: &ProbeOutcome) -> Result<(), PoolProbeError> {
-    if outcome.batch_index != req.batch_index {
+    check_request(req)?;
+    let answered = outcome.present.iter().chain(&outcome.missing);
+    if outcome.batch_index != req.batch_index || answered.clone().count() != req.segment_ids.len() {
         return Err(PoolProbeError::Rejected);
     }
-    let mut answered: Vec<&str> = outcome
-        .present
-        .iter()
-        .chain(&outcome.missing)
-        .map(String::as_str)
-        .collect();
-    let mut asked: Vec<&str> = req.segment_ids.iter().map(String::as_str).collect();
+
+    let mut answered: Vec<_> = answered.collect();
+    let mut asked: Vec<_> = req.segment_ids.iter().collect();
     answered.sort_unstable();
     asked.sort_unstable();
     if answered != asked {
@@ -73,6 +73,8 @@ pub fn classify_reply(
     retry_after: Option<&str>,
     body: &str,
 ) -> Result<ProbeOutcome, PoolProbeError> {
+    use crate::retry::pool_retry_after;
+
     match status {
         200 => {
             if body.len() > MAX_PROBE_REPLY_BYTES {
@@ -91,11 +93,23 @@ pub fn classify_reply(
         // deliberately unread here.
         401 | 403 => Err(PoolProbeError::Rejected),
         _ => Err(PoolProbeError::Retry {
-            after_secs: retry_after
-                .and_then(|v| v.trim().parse::<u32>().ok())
-                .map_or(DEFAULT_RETRY_SECS, |s| s.clamp(1, MAX_RETRY_SECS)),
+            after_secs: pool_retry_after(retry_after, DEFAULT_RETRY_SECS, MAX_RETRY_SECS),
         }),
     }
+}
+
+fn check_request(req: &ProbeRequest) -> Result<(), PoolProbeError> {
+    use crate::probe::{validate_message_id, MAX_PROBE_SEGMENTS, MAX_SEGMENT_BYTES};
+
+    let mut known_sizes = req.segment_bytes.iter().flatten();
+    if !(1..=MAX_PROBE_SEGMENTS).contains(&req.segment_ids.len())
+        || req.segment_bytes.len() != req.segment_ids.len()
+        || req.segment_ids.iter().any(|id| !validate_message_id(id))
+        || known_sizes.any(|bytes| !(1..=MAX_SEGMENT_BYTES).contains(bytes))
+    {
+        return Err(PoolProbeError::Rejected);
+    }
+    Ok(())
 }
 
 /// Longest one pool probe stub call may take, headers plus body sharing one
@@ -156,12 +170,17 @@ pub async fn call_pool_probe_with_deadline(
     req: &ProbeRequest,
     deadline_ms: u64,
 ) -> Result<ProbeOutcome, PoolProbeError> {
+    use crate::pool_body::{check_reply_length, declared_reply_length};
+    use crate::pool_deadline::bounded_deadline_ms;
+
     let unavailable = PoolProbeError::Retry {
         after_secs: DEFAULT_RETRY_SECS,
     };
     let expired = PoolProbeError::Retry {
         after_secs: DEFAULT_RETRY_SECS,
     };
+    let deadline_ms = bounded_deadline_ms(deadline_ms, POOL_PROBE_DEADLINE_MS).ok_or(expired)?;
+    check_request(req)?;
     let body = serde_json::to_string(req).map_err(|_| PoolProbeError::Rejected)?;
     let stub = env
         .durable_object(POOL_BINDING)
@@ -204,15 +223,22 @@ pub async fn call_pool_probe_with_deadline(
     if status != 200 {
         return classify_reply(req, status, retry_after.as_deref(), "");
     }
+    let declared = response
+        .headers()
+        .get("content-length")
+        .map_err(|_| PoolProbeError::Rejected)?;
+    let declared = declared_reply_length(declared.as_deref(), reply_cap)
+        .map_err(|_| PoolProbeError::Rejected)?;
     // Bounded 200 read under the same deadline: stream the body and fail
     // closed on the chunk that would cross the cap, so no more than the cap
-    // is ever retained. A body that is not streamable falls back to one
-    // buffered read with the same ceiling. The drain races the shared
+    // is ever retained. Check an already-buffered body before copying it.
+    // The drain races the shared
     // deadline (partial progress never re-arms it), so headers plus body
     // share one total budget and a stalled body expires instead of hanging.
     let body_read = async {
-        match response.stream() {
-            Ok(stream) => {
+        match response.body() {
+            worker::ResponseBody::Stream(_) => {
+                let stream = response.stream().map_err(|_| unavailable)?;
                 let mut stream = Box::pin(stream);
                 let mut buf = Vec::new();
                 while let Some(chunk) = stream.next().await {
@@ -224,13 +250,9 @@ pub async fn call_pool_probe_with_deadline(
                 }
                 Ok(buf)
             }
-            Err(_) => {
-                let buf = response.bytes().await.map_err(|_| unavailable)?;
-                if buf.len() > reply_cap {
-                    return Err(PoolProbeError::Rejected);
-                }
-                Ok(buf)
-            }
+            worker::ResponseBody::Body(buf) if buf.len() <= reply_cap => Ok(buf.clone()),
+            worker::ResponseBody::Body(_) => Err(PoolProbeError::Rejected),
+            worker::ResponseBody::Empty => Ok(Vec::new()),
         }
     };
     let body_read = Box::pin(body_read);
@@ -243,6 +265,7 @@ pub async fn call_pool_probe_with_deadline(
         Some(Err(_)) | None => return Err(expired),
     };
     drop(deadline);
+    check_reply_length(declared, bytes.len()).map_err(|_| PoolProbeError::Rejected)?;
     let text = String::from_utf8(bytes).map_err(|_| PoolProbeError::Rejected)?;
     classify_reply(req, status, retry_after.as_deref(), &text)
 }

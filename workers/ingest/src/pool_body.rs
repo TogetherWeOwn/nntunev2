@@ -86,6 +86,13 @@ pub fn classify_body_reply(
     retry_after: Option<&str>,
     body: &[u8],
 ) -> Result<BodyFetch, PoolBodyError> {
+    let retry = || PoolBodyError::Retry {
+        after_secs: crate::retry::pool_retry_after(retry_after, DEFAULT_RETRY_SECS, MAX_RETRY_SECS),
+    };
+    if status == 413 && body != br#"{"error":"too_large"}"# {
+        return Err(retry());
+    }
+
     match status {
         200 => {
             if body.len() > MAX_BODY_REPLY_BYTES {
@@ -109,13 +116,13 @@ pub fn classify_body_reply(
         // not burn all 5 job attempts plus DLQ. Any `Retry-After` is
         // deliberately unread here.
         401 | 403 => Err(PoolBodyError::Rejected),
-        _ => Err(PoolBodyError::Retry {
-            after_secs: retry_after
-                .and_then(|v| v.trim().parse::<u32>().ok())
-                .map_or(DEFAULT_RETRY_SECS, |s| s.clamp(1, MAX_RETRY_SECS)),
-        }),
+        _ => Err(retry()),
     }
 }
+
+// Matches the stream Worker's body-envelope cap. Its 413 uses the same
+// code as an oversized article, so refuse oversized requests here.
+const MAX_BODY_REQUEST_BYTES: usize = 64 * 1024;
 
 /// Longest one pool body stub call may take, headers plus body sharing one
 /// cancellable deadline. Overridable in tests via
@@ -174,13 +181,32 @@ fn push_reply_chunk(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<(), PoolBodyError
     Ok(())
 }
 
+pub(crate) fn declared_reply_length(header: Option<&str>, cap: usize) -> Result<Option<usize>, ()> {
+    let Some(digits) = header.map(|value| value.trim_matches([' ', '\t'])) else {
+        return Ok(None);
+    };
+    if !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+        return Err(());
+    }
+    let length = digits.parse::<usize>().map_err(|_| ())?;
+    if length > cap {
+        return Err(());
+    }
+    Ok(Some(length))
+}
+
+pub(crate) fn check_reply_length(declared: Option<usize>, received: usize) -> Result<(), ()> {
+    if declared.is_some_and(|length| length != received) {
+        return Err(());
+    }
+    Ok(())
+}
+
 /// Send one body request to the user's pool and classify the answer.
 ///
-/// The reply body is never buffered past `MAX_BODY_REPLY_BYTES`: a truthful
-/// declared length over the cap fails closed before any byte is read, and an
-/// undeclared or lying length is stopped on the chunk that would cross the
-/// cap. Oversize is `Rejected` because more bytes existed, never a truncated
-/// prefix handed to the classifier, and the excess is dropped unretained.
+/// The reply body is never buffered past `MAX_BODY_REPLY_BYTES`. A declared
+/// length must fit the cap and match the received byte count. Oversize replies
+/// are rejected without handing a truncated prefix to the classifier.
 pub async fn call_pool_body(env: &Env, req: &BodyRequest) -> Result<BodyFetch, PoolBodyError> {
     call_pool_body_with_deadline(env, req, POOL_BODY_DEADLINE_MS).await
 }
@@ -192,13 +218,22 @@ pub async fn call_pool_body_with_deadline(
     req: &BodyRequest,
     deadline_ms: u64,
 ) -> Result<BodyFetch, PoolBodyError> {
+    use crate::pool_deadline::bounded_deadline_ms;
+
     let unavailable = PoolBodyError::Retry {
         after_secs: DEFAULT_RETRY_SECS,
     };
     let expired = PoolBodyError::Retry {
         after_secs: DEFAULT_RETRY_SECS,
     };
+    let deadline_ms = bounded_deadline_ms(deadline_ms, POOL_BODY_DEADLINE_MS).ok_or(expired)?;
+    if !validate_message_id(&req.segment_id) {
+        return Err(PoolBodyError::Rejected);
+    }
     let body = serde_json::to_string(req).map_err(|_| PoolBodyError::Rejected)?;
+    if body.len() > MAX_BODY_REQUEST_BYTES {
+        return Err(PoolBodyError::Rejected);
+    }
     let stub = env
         .durable_object(POOL_BINDING)
         .and_then(|ns| ns.id_from_name(&req.user_id)?.get_stub())
@@ -230,13 +265,15 @@ pub async fn call_pool_body_with_deadline(
     };
     let status = response.status_code();
     let retry_after = response.headers().get("retry-after").ok().flatten();
-    if let Ok(Some(declared)) = response.headers().get("content-length") {
-        if let Ok(len) = declared.trim().parse::<usize>() {
-            if len > MAX_BODY_REPLY_BYTES {
-                return Err(PoolBodyError::Rejected);
-            }
-        }
+    if !matches!(status, 200 | 404 | 413) {
+        return classify_body_reply(status, retry_after.as_deref(), &[]);
     }
+    let declared = response
+        .headers()
+        .get("content-length")
+        .map_err(|_| PoolBodyError::Rejected)?;
+    let declared = declared_reply_length(declared.as_deref(), MAX_BODY_REPLY_BYTES)
+        .map_err(|_| PoolBodyError::Rejected)?;
     let is_empty = matches!(response.body(), worker::ResponseBody::Empty);
     let bytes = if is_empty {
         Vec::new()
@@ -277,6 +314,7 @@ pub async fn call_pool_body_with_deadline(
         }
     };
     drop(deadline);
+    check_reply_length(declared, bytes.len()).map_err(|_| PoolBodyError::Rejected)?;
     classify_body_reply(status, retry_after.as_deref(), &bytes)
 }
 
@@ -290,6 +328,19 @@ mod reply_chunk_tests {
     //! the cap must each fail here.
 
     use super::*;
+
+    #[test]
+    fn declared_length_is_optional_but_must_be_a_single_bounded_decimal() {
+        assert_eq!(declared_reply_length(None, 16), Ok(None));
+        assert_eq!(declared_reply_length(Some(" 16\t"), 16), Ok(Some(16)));
+        for invalid in ["", "+1", "1, 1", "17", "18446744073709551616"] {
+            assert_eq!(declared_reply_length(Some(invalid), 16), Err(()));
+        }
+        let declared = declared_reply_length(Some("3"), 16).unwrap();
+        assert_eq!(check_reply_length(declared, b"abc".len()), Ok(()));
+        assert_eq!(check_reply_length(declared, b"ab".len()), Err(()));
+        assert_eq!(check_reply_length(declared, b"abcd".len()), Err(()));
+    }
 
     fn chunk(n: usize) -> Vec<u8> {
         vec![0x41u8; n]
