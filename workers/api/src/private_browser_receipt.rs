@@ -17,6 +17,19 @@ pub(crate) fn is_browser_play(play: &str) -> bool {
     play.starts_with(PREFIX) && play.len() == PREFIX.len() + 22 && is_valid_key_field(play, 64)
 }
 
+fn valid_track(track: &str) -> bool {
+    crate::meter_sink::is_uuid_shaped(track) && !track.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+fn valid_path(path: &str) -> bool {
+    path.split_once('/').is_some_and(|(track, tail)| {
+        valid_track(track)
+            && tail
+                .split_once('/')
+                .is_some_and(|(tab, play)| is_valid_key_field(tab, 128) && is_browser_play(play))
+    })
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct BrowserScope<'a> {
     pub publication: PublicationScope<'a>,
@@ -80,15 +93,17 @@ async fn current(
         return Ok(None);
     };
     let raw: Option<&str> = row.try_get(0).map_err(|_| StoreError)?;
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let pins: ReceiptPins = serde_json::from_str(raw).map_err(|_| StoreError)?;
-    Ok((pins.play == lease.play_id
-        && pins.tab == lease.session_id
-        && pins.epoch == lease.epoch
-        && pins.expires_at == lease.expires_at)
-        .then_some((lease, pins)))
+    let pins: ReceiptPins = serde_json::from_str(raw.ok_or(StoreError)?).map_err(|_| StoreError)?;
+    if pins.play != lease.play_id
+        || pins.tab != lease.session_id
+        || pins.epoch != lease.epoch
+        || pins.expires_at != lease.expires_at
+    {
+        // A caller starting a play must not treat inconsistent custody as
+        // the absence of a receipt and fall through to lease acquisition.
+        return Err(StoreError);
+    }
+    Ok(Some((lease, pins)))
 }
 
 fn duration(row: &tokio_postgres::Row) -> Result<Option<NonZeroU64>, StoreError> {
@@ -182,6 +197,9 @@ impl PrivatePlayback<'_> {
         scope: BrowserScope<'_>,
         now: impl Fn() -> SystemTime,
     ) -> Result<Option<PrivateReceipt>, StoreError> {
+        if !valid_path(path) {
+            return Ok(None);
+        }
         let Some((lease, pins)) = current(db, &claims.user_id).await? else {
             return Ok(None);
         };
@@ -470,6 +488,17 @@ use crate::postgres::PgClient;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_media_path_requires_exact_route_fields() {
+        let track = "a1000000-0000-4000-8000-000000000001";
+        let play = format!("{PREFIX}{}", "A".repeat(22));
+        assert!(valid_path(&format!("{track}/tab_1/{play}")));
+        assert!(!valid_path(&format!("{}/tab/{play}", track.to_uppercase())));
+        assert!(!valid_path(&format!("{track}//{play}")));
+        assert!(!valid_path(&format!("{track}/tab/{play}/extra")));
+        assert!(!valid_path(&format!("{track}/tab/private_other")));
+    }
 
     #[test]
     fn stream_grant_requires_live_signed_browser_claims() {

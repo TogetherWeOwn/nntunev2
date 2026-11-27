@@ -79,9 +79,6 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let valid_range = |value: &str| {
-        value.len() <= 128 && value.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
-    };
     if req.method != "GET"
         || fetch_site != Some("same-origin")
         || !range.is_none_or(valid_range)
@@ -202,4 +199,62 @@ fn valid_grant(secret: Option<&[u8]>, grant: &BrowserGrant<'_>, now: u64, versio
         return false;
     };
     signed == expected && crate::private_playback::verify_grant_signature(secret, signed, signature)
+}
+
+// Stream treats malformed or multi-range values as full-body requests.
+fn valid_range(value: &str) -> bool {
+    if value.len() > 128 {
+        return false;
+    }
+    let Some((start, end)) = value
+        .trim_matches(' ')
+        .strip_prefix("bytes=")
+        .and_then(|spec| spec.split_once('-'))
+    else {
+        return false;
+    };
+    let number = |field: &str| {
+        if field.bytes().all(|b| b.is_ascii_digit()) {
+            field.parse::<u64>().ok()
+        } else {
+            None
+        }
+    };
+    match (number(start), number(end)) {
+        (Some(start), Some(end)) => start <= end,
+        (Some(_), None) => end.is_empty(),
+        (None, Some(_)) => start.is_empty(),
+        (None, None) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_range;
+
+    #[test]
+    fn relay_accepts_only_one_well_formed_byte_range() {
+        for range in [
+            "bytes=0-1",
+            "bytes=2-",
+            "bytes=-1",
+            " bytes=-0 ",
+            "bytes=02-2",
+        ] {
+            assert!(valid_range(range), "{range}");
+        }
+        for range in [
+            "",
+            "bytes=-",
+            "bytes=7-2",
+            "bytes=0-1,3-4",
+            "bytes=+1-",
+            "bytes=1- 2",
+            "bytes=18446744073709551616-",
+            "bytes=0-1\r\n",
+            "bytes=１-",
+        ] {
+            assert!(!valid_range(range), "{range}");
+        }
+    }
 }

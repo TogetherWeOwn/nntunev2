@@ -141,6 +141,43 @@ pub(super) async fn receipt_retries(
         .await
         .unwrap()
         .is_none());
+    let stored_receipt = async || {
+        writer
+            .query_one(
+                "SELECT browser_receipt::text FROM public.playback_leases WHERE user_id = $1",
+                &[&MEMBER],
+            )
+            .await
+            .unwrap()
+            .get::<_, Option<String>>(0)
+    };
+    let write_receipt = async |value: Option<&str>| {
+        assert_eq!(writer.execute(
+            "UPDATE public.playback_leases SET browser_receipt = $2::text::jsonb WHERE user_id = $1",
+            &[&MEMBER, &value],
+        ).await.unwrap(), 1);
+    };
+    let saved = stored_receipt().await.unwrap();
+    let mut mismatched: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    mismatched["epoch"] = serde_json::json!(original.lease.epoch + 1);
+    for value in [None, Some(mismatched.to_string())] {
+        write_receipt(value.as_deref()).await;
+        let before = stored_receipt().await;
+        assert!(service
+            .open_browser(reader, claims, &input, scope, SystemTime::now)
+            .await
+            .is_err());
+        assert!(service
+            .load_for_stream(reader, grant, scope, SystemTime::now)
+            .await
+            .is_err());
+        assert_eq!(
+            query_playback_lease_row(writer, MEMBER).await.unwrap(),
+            Some(original.lease.clone())
+        );
+        assert_eq!(stored_receipt().await, before);
+    }
+    write_receipt(Some(&saved)).await;
     let replay = open(reader, claims, &input, scope).await.unwrap();
     assert_eq!(replay.relay().lease, original.lease);
     assert!(replay.relay().grant.token == original.grant.token);

@@ -66,6 +66,29 @@ impl CommittedDigestRead {
     }
 }
 
+fn is_uuid_v4(id: [u8; 16]) -> bool {
+    id[6] >> 4 == 4 && id[8] >> 6 == 2
+}
+
+impl DigestReadTarget {
+    fn geometry(&self) -> Option<DigestGeometry> {
+        [
+            self.environment,
+            self.library,
+            self.object,
+            self.generation,
+            self.provider_configuration,
+            self.root_version,
+        ]
+        .into_iter()
+        .all(is_uuid_v4)
+        .then_some(())?;
+        let len = u64::try_from(self.plaintext_bytes).ok()?;
+        (len > 0).then_some(())?;
+        DigestGeometry::new(len)
+    }
+}
+
 /// `authorize` is the trusted caller's independent grant/reference check, not
 /// a winner lookup or an input supplied by a client. It returns the exact
 /// target's authorization cutoff, or `None`. Use a fresh clock on each call;
@@ -77,13 +100,12 @@ pub async fn protect_digest_read(
     authorize: impl AsyncFnOnce(&DigestReadTarget) -> Option<SystemTime>,
     now: impl Fn() -> SystemTime,
 ) -> Result<Option<CommittedDigestRead>, StoreError> {
-    let Some(geometry) = u64::try_from(target.plaintext_bytes)
-        .ok()
-        .filter(|&len| len > 0)
-        .and_then(DigestGeometry::new)
-    else {
+    let Some(geometry) = target.geometry() else {
         return Ok(None);
     };
+    if requested_until <= now() {
+        return Ok(None);
+    }
     let Some(cutoff) = authorize(&target).await else {
         return Ok(None);
     };
@@ -140,8 +162,7 @@ pub async fn protect_digest_read(
         page_versions: row.try_get("page_versions").map_err(|_| StoreError)?,
         usable_until: row.try_get("usable_until").map_err(|_| StoreError)?,
     };
-    if pins.map_id[6] >> 4 != 4
-        || pins.map_id[8] >> 6 != 2
+    if !is_uuid_v4(pins.map_id)
         || pins.page_versions.len() != geometry.pages() as usize
         || !valid_version(&pins.media_version)
         || !pins
@@ -158,7 +179,7 @@ pub async fn protect_digest_read(
     Ok((now() < pins.usable_until).then_some(CommittedDigestRead { target, pins }))
 }
 
-fn valid_version(version: &str) -> bool {
+pub(crate) fn valid_version(version: &str) -> bool {
     (1..=1024).contains(&version.len())
         && version != "null"
         && version.bytes().all(|b| b.is_ascii_graphic() && b != b',')
@@ -188,10 +209,107 @@ impl<'a> FromSql<'a> for ReadUuid {
 #[path = "storage_digest_read_postgres.rs"]
 mod postgres_tests;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "../tests/support/private_playback_offline_client.rs"]
+mod offline;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+use crate::postgres::PgClient;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn target() -> DigestReadTarget {
+        let id = 0x2100_0000_0000_4000_8000_0000_0000_00ffu128.to_be_bytes();
+        DigestReadTarget {
+            environment: id,
+            library: id,
+            reference: id,
+            object: id,
+            generation: id,
+            provider_configuration: id,
+            root_version: id,
+            plaintext_sha256: [42; 32],
+            plaintext_bytes: 1,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn protected_read_rejects_bad_targets_before_authorization() {
+        let mut db = offline::offline_client().await;
+        let now = UNIX_EPOCH;
+        let until = now + Duration::from_secs(1);
+        let mut invalid = target();
+        invalid.object = [0; 16];
+        for (target, deadline) in [(invalid, until), (target(), now)] {
+            let result = protect_digest_read(
+                &mut db,
+                target,
+                deadline,
+                async |_| panic!("invalid read reached authorization"),
+                || now,
+            )
+            .await;
+            assert!(matches!(result, Ok(None)));
+        }
+        assert!(
+            protect_digest_read(&mut db, target(), until, async |_| Some(until), || now)
+                .await
+                .is_err(),
+            "valid input reaches the disconnected store"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn custody_rejects_another_objects_locator_before_reading() {
+        use custody::{resolve_custody, PlaybackRoot};
+        use nntune_core::s3_locator::{S3Binding, S3Locator};
+
+        let mut db = offline::offline_client().await;
+        let now = UNIX_EPOCH;
+        let root = PlaybackRoot {
+            version: target().root_version,
+            secret: &[42; 32],
+        };
+        for (object, should_query) in [
+            (target().object, true),
+            (target().object.map(|b| b ^ 1), false),
+        ] {
+            let target = target();
+            let locator = S3Locator::new(
+                "fixture-bucket".into(),
+                format!(
+                    "media/{}/{}",
+                    uuid_text(object),
+                    uuid_text(target.generation)
+                ),
+                S3Binding::VersionId("media-version".into()),
+            )
+            .unwrap();
+            let read = CommittedDigestRead {
+                target,
+                pins: DigestReadPins {
+                    map_id: root.version,
+                    media_version: "media-version".into(),
+                    page_versions: vec!["page-version".into()],
+                    usable_until: now + Duration::from_secs(1),
+                },
+            };
+            let result = resolve_custody(&mut db, read, &locator, &root, || now).await;
+            if should_query {
+                assert!(
+                    result.is_err(),
+                    "canonical locator reaches the disconnected store"
+                );
+            } else {
+                assert!(matches!(result, Ok(None)));
+            }
+        }
+    }
 
     #[test]
     fn deadline_requires_future_inclusive_authorization_cutoff() {

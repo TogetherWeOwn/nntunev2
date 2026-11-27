@@ -42,9 +42,22 @@ pub async fn resolve_custody(
 ) -> Result<Option<ResolvedPlayback>, StoreError> {
     let operation = async {
         let pins = read.playback_snapshot()?;
+        let mut context = EnvelopeContext {
+            identities: [
+                root.version,
+                pins.environment_id,
+                pins.library_id,
+                pins.object_id,
+                pins.generation_id,
+                pins.provider_configuration,
+            ],
+            plaintext_len: pins.plaintext_len,
+            header: [0; 48],
+        };
         if now() >= pins.usable_until
             || root.version != pins.root_version_id
             || !matches!(locator.binding(), S3Binding::VersionId(version) if version == pins.media_version)
+            || !S3MediaMetadata::matches_target(locator.bucket(), locator.key(), &context)
         {
             return Ok(None);
         }
@@ -70,18 +83,7 @@ pub async fn resolve_custody(
             return Ok(None);
         };
         let bytes = |key| row.try_get::<_, &[u8]>(key).map_err(|_| StoreError);
-        let context = EnvelopeContext {
-            identities: [
-                root.version,
-                pins.environment_id,
-                pins.library_id,
-                pins.object_id,
-                pins.generation_id,
-                pins.provider_configuration,
-            ],
-            plaintext_len: pins.plaintext_len,
-            header: bytes("header_tag")?.try_into().map_err(|_| StoreError)?,
-        };
+        context.header = bytes("header_tag")?.try_into().map_err(|_| StoreError)?;
         let record = bytes("wrapped_record")?
             .try_into()
             .map_err(|_| StoreError)?;

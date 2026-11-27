@@ -55,6 +55,12 @@ impl Permit<'_> {
         {
             return Err(Unconfirmed);
         }
+        if !self
+            .confirms_reservation(writer, prepared.scope, prepared.intent.identities[2])
+            .await?
+        {
+            return Err(Refused);
+        }
         // The catalogue lookup reads the same inventory. Check its completeness
         // against the authenticated upload geometry before comparing the pins.
         let geometry = DigestGeometry::new(prepared.context.plaintext_len).ok_or(Unconfirmed)?;

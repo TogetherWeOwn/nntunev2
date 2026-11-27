@@ -11,7 +11,7 @@ use {
 };
 
 use super::{caller::FIXTURE_DIGEST, TrialError};
-use crate::storage_digest_read::uuid_text;
+use crate::storage_digest_read::{uuid_text, valid_version};
 
 #[cfg(all(target_arch = "wasm32", feature = "staging-body-wasm-test"))]
 #[path = "../../../tests/fixtures/private_trial_cleanup_wasm.rs"]
@@ -145,18 +145,16 @@ async fn retire(
     let generation = field("generation")?;
     let map = field("map")?;
     let root = field("root")?;
+    let media_version = field("media_version")?;
+    let page_version = field("page_version")?;
+    // Validate both pins before committing retirement or deleting either version.
+    if !valid_version(&media_version) || !valid_version(&page_version) {
+        return Err(TrialError::Unconfirmed);
+    }
     let media = S3Locator::new(
         fixture.bucket.into(),
         format!("media/{obj}/{generation}"),
-        S3Binding::VersionId(field("media_version")?),
-    )
-    .map_err(|_| TrialError::Unconfirmed)?;
-    let page_version = field("page_version")?;
-    // Apply the same opaque token validation as for a media version.
-    S3Locator::new(
-        fixture.bucket.into(),
-        media.key().into(),
-        S3Binding::VersionId(page_version.clone()),
+        S3Binding::VersionId(media_version),
     )
     .map_err(|_| TrialError::Unconfirmed)?;
     let retired = row

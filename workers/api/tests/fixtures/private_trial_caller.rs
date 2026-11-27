@@ -871,6 +871,10 @@ pub(crate) async fn verify_publication(
     assert_eq!((replay.status, &replay.body), (200, &first.body));
     assert_eq!(replay.extra_headers, first.extra_headers);
     assert_eq!(receipt_rows().await, receipt_before);
+    assert_eq!(set_job("other-trial-job").await, 1);
+    let refused = publish(&mut recovered_reader, upload_writer, Some("fixture-bucket")).await;
+    assert_eq!((refused.status, refused.body), (404, not_found().body));
+    assert_eq!(set_job(JOB).await, 1);
     // A different completed job can reference the same deduplicated object,
     // so both catalogue receipts have identical upload bytes, digest and pins.
     let unrelated_job = "synthetic-unrelated-replay-job";
@@ -1307,6 +1311,24 @@ pub(crate) async fn verify_cleanup(
     let other_references = reference_count().await;
     let generation = uuid_text(scope.seal);
     let map = uuid_text(prepared.intent.map_id);
+    let set_page_version = async |db: &mut Client, version: &str| {
+        let tx = db.transaction().await.unwrap();
+        tx.batch_execute("ALTER TABLE public.storage_digest_inventory_intents DISABLE TRIGGER storage_digest_inventory_intent_append_only").await.unwrap();
+        assert_eq!(tx.execute(
+            "UPDATE public.storage_digest_inventory_intents SET page_versions = ARRAY[$2::text] WHERE map_id = $1::text::uuid",
+            &[&map, &version],
+        ).await.unwrap(), 1);
+        tx.batch_execute("ALTER TABLE public.storage_digest_inventory_intents ENABLE TRIGGER storage_digest_inventory_intent_append_only").await.unwrap();
+        tx.commit().await.unwrap();
+    };
+    set_page_version(publication, "invalid,fixture-version").await;
+    assert_eq!(cleanup(publication, &fixture, unexpected).await, Err(TrialError::Unconfirmed));
+    assert!(observer.query_one(
+        "SELECT EXISTS (SELECT FROM public.private_library_admissions WHERE track_id = $1::text::uuid)
+            AND EXISTS (SELECT FROM public.storage_validated_digest_references WHERE reference_id = $1::text::uuid)",
+        &[&track],
+    ).await.unwrap().get::<_, bool>(0));
+    set_page_version(publication, "page-fixture-version").await;
     let media = format!("media/{object_id}/{generation}");
     let page = format!("media-digests/{object_id}/{generation}/{map}/00000000");
     let mut versions = std::collections::BTreeSet::from([

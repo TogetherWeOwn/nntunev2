@@ -141,6 +141,29 @@ pub struct MatchEvidence<'a> {
 }
 
 impl Permit<'_> {
+    async fn confirms_reservation(
+        &self,
+        writer: &Client,
+        scope: CompletionScope<'_>,
+        object: [u8; 16],
+    ) -> Result<bool, TrialError> {
+        Ok(writer
+            .query_typed_opt(
+                "SELECT 1 FROM public.ingest_session_reservations
+                 WHERE id = $1::text::uuid AND principal_id = $2 AND idempotency_key = $3
+                   AND terminal_reason = 'completed' AND multipart_object_id = $4::text::uuid",
+                &[
+                    (&scope.session, Type::TEXT),
+                    (&scope.principal, Type::TEXT),
+                    (&self.target.job_id, Type::TEXT),
+                    (&uuid_text(object), Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| Unconfirmed)?
+            .is_some())
+    }
+
     async fn recipient(&self, tx: &Transaction<'_>) -> Result<String, TrialError> {
         let authenticated = i64::try_from(self.actor.created_at).map_err(|_| Refused)?;
         let stepped_up_until = i64::try_from(
@@ -243,21 +266,9 @@ impl Permit<'_> {
         };
         let mut tx = begin(publication_writer).await.map_err(|_| Unconfirmed)?;
         let recipient = self.recipient(&tx).await?;
-        if upload_writer
-            .query_typed_opt(
-                "SELECT 1 FROM public.ingest_session_reservations
-             WHERE id = $1::text::uuid AND principal_id = $2 AND idempotency_key = $3
-               AND terminal_reason = 'completed' AND multipart_object_id = $4::text::uuid",
-                &[
-                    (&scope.session, Type::TEXT),
-                    (&scope.principal, Type::TEXT),
-                    (&self.target.job_id, Type::TEXT),
-                    (&uuid_text(prepared.intent.identities[2]), Type::TEXT),
-                ],
-            )
-            .await
-            .map_err(|_| Unconfirmed)?
-            .is_none()
+        if !self
+            .confirms_reservation(upload_writer, scope, prepared.intent.identities[2])
+            .await?
         {
             return Err(Refused);
         }
