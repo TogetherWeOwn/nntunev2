@@ -23,7 +23,8 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /** Exit code the Python fetcher uses for "skip: not configured here". */
@@ -55,16 +56,7 @@ function runFetcher(args: string[], env: NodeJS.ProcessEnv): Cc0Fixture {
     [join(repoRoot(), 'fixtures/cc0/fetch_fixture.py'), ...args],
     { encoding: 'utf-8', env },
   );
-  if (result.error) {
-    const code = (result.error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') {
-      return {
-        status: 'skipped',
-        reason: 'CC0 fixture fetch skipped: python3 not found on PATH',
-      };
-    }
-    throw result.error;
-  }
+  if (result.error) throw new Error('CC0 fixture fetch could not run python3.');
   const stdout = (result.stdout ?? '').trim();
   const stderr = (result.stderr ?? '').trim();
   if (result.status === 0) {
@@ -103,5 +95,10 @@ export function cc0File(
   file: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Cc0Fixture {
-  return runFetcher(['--manifest', manifest, file], env);
+  const root = realpathSync(repoRoot());
+  const path = resolve(root, manifest);
+  if (!path.startsWith(root + sep) || !realpathSync(path).startsWith(root + sep)) {
+    throw new Error('CC0 fixture manifest is outside the repository.');
+  }
+  return runFetcher(['--manifest', path, '--', file], env);
 }

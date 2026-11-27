@@ -53,7 +53,8 @@ export function qaAuthHeader(): Record<string, string> {
  */
 export function isStagingOrigin(requestUrl: string, baseURL: string): boolean {
   try {
-    return new URL(requestUrl).origin === new URL(baseURL).origin;
+    const request = new URL(requestUrl);
+    return ['http:', 'https:'].includes(request.protocol) && request.origin === new URL(baseURL).origin;
   } catch {
     return false;
   }
@@ -90,10 +91,8 @@ export function isAccessWall(probe: WallProbe): boolean {
   // an application response as an Access wall.
   const headerNames = Object.keys(probe.headers).join('\n');
   const location = probe.headers['location'] ?? probe.headers['Location'] ?? '';
-  const redirectToAccess =
-    probe.status === 302 && /cloudflareaccess\.com|\/cdn-cgi\/access/i.test(location);
-  const wallStatus =
-    probe.status === 401 || probe.status === 403 || probe.status === 302 || redirectToAccess;
+  const redirectToAccess = probe.status === 302 && isAccessRedirect(location, probe.url);
+  const wallStatus = probe.status === 401 || probe.status === 403 || probe.status === 302;
   // Access-specific response markers only. Generic edge-challenge
   // markers (`cf-mitigated`, `cf_clearance`) are deliberately excluded: a
   // bot-management/WAF challenge is not proof of Access enforcement, and
@@ -165,7 +164,7 @@ export async function readApiBody(
   url: string,
   context: string,
 ): Promise<string> {
-  const bodyText = await res.text().catch(() => '');
+  const bodyText = await readApiText(res, context);
   assertNoAccessWall({ status: res.status(), headers: res.headers(), bodyText, url }, context);
   return bodyText;
 }
@@ -176,7 +175,7 @@ export async function readApiBody(
  * - Throws when `required` and unconfigured: callers fail closed (post-deploy).
  */
 export function stagingBaseUrl(required: 'skip' | 'fail-closed', context: string): string | null {
-  const raw = (process.env.STAGING_BASE_URL || '').trim().replace(/\/+$/, '');
+  const raw = (process.env.STAGING_BASE_URL || '').trim();
   if (!raw) {
     if (required === 'fail-closed') {
       throw new Error(
@@ -186,14 +185,17 @@ export function stagingBaseUrl(required: 'skip' | 'fail-closed', context: string
     }
     return null;
   }
-  if (!/^https:\/\//i.test(raw)) {
+  let target: URL;
+  try {
+    if (!/^https:\/\/[^\s/\\@?#]+\/*$/i.test(raw)) throw new Error();
+    target = new URL(raw);
+  } catch {
     throw new Error(
-      `[${context}] STAGING_BASE_URL must be an https:// URL, got a non-https value. ` +
-        'Refusing to run against a non-TLS staging target.',
+      `[${context}] STAGING_BASE_URL must be an https:// origin without credentials, path, query or fragment.`,
     );
   }
   accessHeaders(); // Validate the pair before any caller can use the protected URL.
-  return raw;
+  return target.origin;
 }
 
 /** Real staging NNTP endpoint the BYOP wizard points at (a real provider despite the `SYNTHETIC_` names). */
@@ -240,4 +242,22 @@ export function syntheticNntpEndpoint(): NntpEndpoint & { hasPassword: boolean }
     throw new Error('[byop] SYNTHETIC_NNTP_TLS must be "on" (or unset). See e2e/README.md.');
   }
   return { host, port, user, tls: true, hasPassword: Boolean(process.env.SYNTHETIC_NNTP_PASS) };
+}
+
+export function isAccessRedirect(location: string, requestUrl = 'https://placeholder.invalid'): boolean {
+  if (!location || /[\s\\]/.test(location)) return false;
+  try {
+    const target = new URL(location, requestUrl);
+    return target.protocol === 'https:' &&
+      (target.hostname.endsWith('.cloudflareaccess.com') ||
+        /^\/cdn-cgi\/access(?:\/|$)/.test(target.pathname));
+  } catch {
+    return false;
+  }
+}
+
+export async function readApiText(res: ApiResponseLike, context: string): Promise<string> {
+  return res.text().catch(() => {
+    throw new Error(`[${context}] could not read API response body (HTTP ${res.status()}).`);
+  });
 }

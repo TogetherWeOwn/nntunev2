@@ -600,15 +600,15 @@ test.describe('anonymousGet (no credentials, no follow)', () => {
 });
 
 test.describe('readApiBody', () => {
-  test('body-read errors are discarded without exposing their message or cause', async () => {
+  test('offline boundaries surface body-read errors without exposing their message or cause', async () => {
     const sentinel = 'synthetic-body-read-secret';
     const raw = Object.assign(new Error(sentinel), { cause: new Error(sentinel) });
-    const body = await readApiBody({
+    await expect(readApiBody({
       status: () => 200,
       headers: () => ({}),
       text: async () => { throw raw; },
-    }, 'https://fixture.invalid/probe', 'body-read');
-    expect(body).toBe('');
+    }, 'https://fixture.invalid/probe', 'body-read')).rejects.toThrow(
+      /^\[body-read\] could not read API response body \(HTTP 200\)\.$/);
   });
 
   test('returns the body text for a clean response', async () => {
@@ -1542,7 +1542,7 @@ test.describe('plan-limit refusal verdict (offline pins)', () => {
     expect(leak).toMatch(/account email/);
     expect(leak).not.toContain('capped+sentinel@example.test');
     const keyed = secretLeak(JSON.stringify({ token: 'abc' }), [], 'plan-limit-stream');
-    expect(keyed).toMatch(/credential-shaped key 'token'/);
+    expect(keyed).toMatch(/credential-shaped key \(name redacted\)/);
     expect(secretLeak(clean402.bodyText, secrets, 'plan-limit-stream')).toBeNull();
   });
 
@@ -1855,6 +1855,20 @@ test.describe('prepare-real-nzb script (offline pins)', () => {
 
   const countSegments = (doc: string): number => (doc.match(/<segment\b/g) ?? []).length;
 
+  test('offline boundaries refuse PAR2-only input and never echo unknown arguments', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'nzb-boundary-'));
+    try {
+      const input = join(dir, 'input.nzb');
+      const output = join(dir, 'output.nzb');
+      writeFileSync(input, singleFileNzb(['synthetic']).replace('pin.dat', 'pin.par2'));
+      expect.soft(runPrepare(['--input', input, '--output', output]).status).toBe(1);
+      expect.soft(runPrepare(['ARGUMENT-SENTINEL']).stderr).not.toContain('ARGUMENT-SENTINEL');
+      withEnv({ TEST_NZB_PATH: dir }, () => expect.soft(realNzbActive()).toBe(false));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
   test('generated single-file NZB round-trips with counts-only stdout', () => {
     const dir = mkdtempSync(join(tmpdir(), 'prepare-nzb-pin-'));
     try {
@@ -1951,4 +1965,55 @@ test.describe('prepare-real-nzb script (offline pins)', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+test('offline boundaries reject malformed staging origins and Access lookalikes', () => {
+  for (const target of ['https://', 'https://staging.example/app', 'https://staging.example?next=', 'https://user@staging.example']) {
+    withEnv({ STAGING_BASE_URL: target, ...dummyAccessPair }, () => {
+      expect.soft(() => stagingBaseUrl('skip', 'offline')).toThrow(/STAGING_BASE_URL/);
+    });
+  }
+  expect.soft(isStagingOrigin('data:,request', 'file:///tmp')).toBe(false);
+  expect.soft(isAccessWall({
+    status: 302, url: 'https://staging.example/', bodyText: '',
+    headers: { location: 'https://other.example/?next=cloudflareaccess.com' },
+  })).toBe(false);
+});
+
+test('offline boundaries reject invalid counters and escaped credential values', () => {
+  for (const value of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    expect.soft(() => extractUsageBytes({ used_bytes: value })).toThrow(/byte counter/);
+    expect.soft(() => extractPlanMeta({ limit: 100, used: value, tier: 'fixture' })).toThrow(/plan metadata/);
+  }
+  expect(secretLeak('{"note":"fixture\\u002dvalue"}', [{ name: 'FIXTURE', value: 'fixture-value' }], 'offline'))
+    .toContain('FIXTURE');
+});
+
+test('offline boundaries reconcile JUnit counts and bind skips to their spec', () => {
+  const script = fileURLToPath(new URL('../scripts/enforce-journey-evidence.mjs', import.meta.url));
+  const dir = mkdtempSync(join(tmpdir(), 'journey-boundary-'));
+  const report = join(dir, 'junit.xml');
+  const wrap = (inner: string, tests: number, skips = 0) =>
+    `<testsuites><testsuite tests="${tests}" skipped="${skips}">${inner}</testsuite></testsuites>`;
+  const pass = '<testcase classname="health.spec.ts" name="health"/>';
+  const skip = '<testcase classname="other-ingest-play-meter.spec.ts" name="ingested track carries recording_mbids"><skipped/></testcase>';
+  try {
+    for (const [xml, status] of [
+      [wrap(pass, 1), 0],
+      [wrap('', 1), 1],
+      [wrap(pass, 2), 1],
+      [wrap(pass + '<testcase name="failed"><failure/></testcase>', 2), 1],
+      [wrap(pass + skip, 2, 1), 1],
+      [wrap(pass.replace('/>', '><system-out><![CDATA[<skipped/>]]></system-out></testcase>'), 1), 0],
+      [wrap(pass, 1).replace('</testsuites>', ''), 1],
+    ] as const) {
+      writeFileSync(report, xml);
+      const result = spawnSync(process.execPath, [script], {
+        env: { PATH: process.env.PATH, JUNIT_PATH: report }, encoding: 'utf8',
+      });
+      expect.soft(result.status, result.stdout + result.stderr).toBe(status);
+    }
+  } finally {
+    rmSync(dir, { recursive: true });
+  }
 });

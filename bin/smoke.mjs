@@ -174,7 +174,11 @@ async function getText(url, headers, timeoutMs, byteLimit) {
       }
     }
     finished = true;
-    return new TextDecoder().decode(bytes.subarray(0, length));
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length));
+    } catch {
+      throw new ProbeError("invalid UTF-8");
+    }
   };
   try {
     // One race for the whole request, not one retained deadline handler per chunk.

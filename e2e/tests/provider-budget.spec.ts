@@ -47,7 +47,7 @@ test.describe('provider connection budget (offline pins)', () => {
   });
 
   test('non-numeric, blank, zero and negative values fall back to the default', () => {
-    for (const raw of ['', '   ', 'many', '2.5', '0', '-3']) {
+    for (const raw of ['', '   ', 'many', '2.5', '0', '-3', '0x3', '3e0']) {
       const budget = readProviderBudget({ [PROVIDER_BUDGET_ENV]: raw });
       expect(budget.maxConnections, `raw ${JSON.stringify(raw)}`).toBe(2);
       expect(budget.clamped, `raw ${JSON.stringify(raw)}`).toBe(true);

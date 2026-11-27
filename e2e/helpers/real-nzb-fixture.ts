@@ -26,7 +26,7 @@
  * at all (it uses a random, never-posted message-ID).
  */
 
-import { existsSync } from 'node:fs';
+import { statSync } from 'node:fs';
 
 /** Environment variable carrying the runtime real-NZB path (CI `RUNNER_TEMP` only). */
 export const REAL_NZB_PATH_ENV = 'TEST_NZB_PATH';
@@ -65,9 +65,13 @@ export function resolveRealNzbFixture(
   return exists(trimmed) ? trimmed : null;
 }
 
+function isFixtureFile(path: string): boolean {
+  return statSync(path, { throwIfNoEntry: false })?.isFile() === true;
+}
+
 /** True when a runtime real-NZB fixture is staged for this run. */
 export function realNzbActive(): boolean {
-  return resolveRealNzbFixture(process.env[REAL_NZB_PATH_ENV], existsSync) !== null;
+  return resolveRealNzbFixture(process.env[REAL_NZB_PATH_ENV], isFixtureFile) !== null;
 }
 
 /**
@@ -77,7 +81,7 @@ export function realNzbActive(): boolean {
  * pre-deploy skip, so a throw here is a red staging run, not a silent pass.
  */
 export function requireRealNzbFixture(): string {
-  const staged = resolveRealNzbFixture(process.env[REAL_NZB_PATH_ENV], existsSync);
+  const staged = resolveRealNzbFixture(process.env[REAL_NZB_PATH_ENV], isFixtureFile);
   if (staged === null) {
     throw new Error(
       `[real-nzb] no staged real-NZB fixture (${REAL_NZB_PATH_ENV} unset, blank or missing): ` +

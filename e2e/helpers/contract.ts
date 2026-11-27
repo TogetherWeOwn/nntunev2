@@ -299,30 +299,31 @@ export function secretLeak(
   secrets: NamedSecret[],
   context: string,
 ): string | null {
-  for (const secret of secrets) {
-    if (secret.value && bodyText.includes(secret.value)) {
-      return `[${context}] plan-limit body leaks the ${secret.name} (value redacted): refusing to pass with credential material in a limit refusal.`;
-    }
-  }
+  const leaked = (value: string) => secrets.find((secret) => secret.value && value.includes(secret.value));
+  const redacted = (secret: NamedSecret) =>
+    `[${context}] plan-limit body leaks the ${secret.name} (value redacted): refusing to pass with credential material in a limit refusal.`;
+  const rawLeak = leaked(bodyText);
+  if (rawLeak) return redacted(rawLeak);
   let parsed: unknown;
   try {
     parsed = JSON.parse(bodyText) as unknown;
   } catch {
     return null;
   }
-  const visit = (value: unknown, depth: number): string | null => {
-    if (depth > 4 || typeof value !== 'object' || value === null) return null;
+  const pending = [parsed];
+  while (pending.length) {
+    const value = pending.pop();
+    const stringLeak = typeof value === 'string' ? leaked(value) : undefined;
+    if (stringLeak) return redacted(stringLeak);
+    if (typeof value !== 'object' || value === null) continue;
     for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      if (SECRET_KEY_RE.test(key)) return key;
-      const hit = visit(entry, depth + 1);
-      if (hit) return hit;
+      const decodedLeak = leaked(key);
+      if (decodedLeak) return redacted(decodedLeak);
+      if (SECRET_KEY_RE.test(key)) return `[${context}] plan-limit body carries a credential-shaped key (name redacted).`;
+      pending.push(entry);
     }
-    return null;
-  };
-  const key = visit(parsed, 0);
-  return key
-    ? `[${context}] plan-limit body carries a credential-shaped key '${key}': limit refusals must be names-only (docs/api-errors.md).`
-    : null;
+  }
+  return null;
 }
 
 /**
@@ -408,6 +409,10 @@ export function uniqueTestEmail(prefix = 'e2e'): string {
  * drift by checking the known keys. Throws listing the actual keys so a
  * contract change shows up as an explicit diff, not a silent zero.
  */
+function isByteCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
 export function extractUsageBytes(body: unknown): number {
   if (typeof body !== 'object' || body === null) {
     throw new Error(`[usage] expected a JSON object, got ${typeof body}.`);
@@ -416,7 +421,7 @@ export function extractUsageBytes(body: unknown): number {
   const candidates = ['bytes_streamed', 'streamed_bytes', 'usage_bytes', 'used_bytes'];
   for (const key of candidates) {
     const value = record[key];
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (isByteCount(value)) return value;
   }
   // One level of common nesting ({ usage: {...} } / { data: {...} }).
   for (const nest of ['usage', 'data']) {
@@ -457,7 +462,7 @@ export function extractPlanMeta(body: unknown): { limit: number; used: number; t
   const limit = pick(['limit_bytes', 'plan_limit_bytes', 'limit']);
   const used = pick(['used_bytes', 'usage_bytes', 'used']);
   const tier = pick(['plan', 'plan_tier', 'tier']);
-  if (typeof limit !== 'number' || typeof used !== 'number' || typeof tier !== 'string') {
+  if (!isByteCount(limit) || !isByteCount(used) || typeof tier !== 'string' || !tier.trim()) {
     throw new Error(
       '[usage] plan metadata incomplete: expected numeric limit/used + string tier, ' +
         `got keys: ${Object.keys(record).join(', ') || '(empty)'}.`,

@@ -511,6 +511,7 @@ test.describe('corpus loader (offline, no staging)', () => {
       const result: Check<unknown[]> = decodeCorpusFile(raw, 'probe.json');
       if (result.ok) failures.push(`${name}: loader accepted, want reject`);
     };
+    rejects('empty corpus', { version: BOT_CONTRACT.corpusVersion, vectors: [] });
     rejects('wrong version', { version: 999, vectors: [] });
     rejects('missing version', { vectors: [] });
     rejects('vectors not an array', { version: 1, vectors: {} });

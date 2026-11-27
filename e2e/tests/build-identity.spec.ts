@@ -149,6 +149,11 @@ test.describe('build identity assertion (offline fixtures)', () => {
 });
 
 test.describe('API build identity assertion (offline fixtures)', () => {
+  test('offline boundaries reject malformed SHA and outages even when API deploy was skipped', () => {
+    expect.soft(() => resolveApiIdentity(200, '{"ok":true,"build_sha":"RESPONSE-SENTINEL"}', HEAD, 'skipped', 'api'))
+      .toThrow(/API build identity is malformed/);
+    expect(() => resolveApiIdentity(503, '', HEAD, 'skipped', 'api')).toThrow(/HTTP 503/);
+  });
   const HEAD = 'a'.repeat(40);
   const OLD = 'b'.repeat(40);
 

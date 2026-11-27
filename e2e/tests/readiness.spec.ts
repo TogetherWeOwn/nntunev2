@@ -56,6 +56,11 @@ function failureMessage(p: ReturnType<typeof probe>): string {
 }
 
 test.describe('assertPromotionReady (promotion readiness, offline fixtures)', () => {
+  test('offline boundaries omit untrusted content-type from JSON diagnostics', () => {
+    expect(failureMessage(probe({
+      status: 200, bodyText: '<html>', headers: { 'content-type': 'HEADER-SENTINEL' },
+    }))).not.toContain('HEADER-SENTINEL');
+  });
   test('valid 200 JSON {ok:true} succeeds', () => {
     expect(() =>
       assertPromotionReady(probe({ status: 200, bodyText: '{"ok":true}' }), 'ready'),

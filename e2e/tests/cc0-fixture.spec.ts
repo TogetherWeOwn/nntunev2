@@ -10,7 +10,7 @@ import { test, expect } from '@playwright/test';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cc0Track, FIXTURE_CONFIG_ENV } from '../helpers/cc0-fixture.js';
+import { cc0File, cc0Track, FIXTURE_CONFIG_ENV } from '../helpers/cc0-fixture.js';
 
 function unconfiguredEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
@@ -29,4 +29,10 @@ test('unconfigured environment skips with a reason, never fails', () => {
 
 test('unknown track position is an error, not a skip', () => {
   expect(() => cc0Track(99, unconfiguredEnv())).toThrow(/position 99/);
+});
+
+test('offline boundaries reject external manifests and treat a missing fetcher as failure', () => {
+  const env = unconfiguredEnv();
+  expect.soft(() => cc0File('../outside.json', 'track.flac', env)).toThrow(/outside the repository/);
+  expect(() => cc0Track(1, { ...env, PATH: env.NNTUNE_FIXTURE_CACHE_DIR })).toThrow(/could not run/);
 });

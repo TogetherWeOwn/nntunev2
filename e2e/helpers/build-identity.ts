@@ -216,6 +216,9 @@ export function assertApiBuildMatchesPromotion(
 ): { sameBuild: boolean; note: string } {
   const shown = apiSha ?? '(absent)';
   if (API_NOT_REDEPLOYED.has(outcome)) {
+    if (apiSha !== null && apiSha !== 'unknown' && !SHA40.test(apiSha)) {
+      throw new Error(`[${context}] API build identity is malformed. See e2e/README.md.`);
+    }
     // Never same-run evidence, even when an earlier API deploy happens to
     // report the same SHA (for example a same-SHA rerun).
     return {
@@ -270,7 +273,7 @@ export function assertApiBuildMatchesPromotion(
 /**
  * Turn one `GET /healthz` response into the API identity verdict.
  *
- * When `staging-api` did not redeploy (skipped/unconfigured), a non-200
+ * When `staging-api` did not redeploy (skipped/unconfigured), a 404
  * answer (no API Worker route, so the web catch-all answers) records "no
  * API identity" without claiming web=API=head. Every other outcome needs
  * HTTP 200 with the exact `{ ok, build_sha }` shape, judged by
@@ -283,7 +286,7 @@ export function resolveApiIdentity(
   outcome: string,
   context: string,
 ): { apiSha: string | null; sameBuild: boolean; note: string } {
-  if (status !== 200 && API_NOT_REDEPLOYED.has(outcome)) {
+  if (status === 404 && API_NOT_REDEPLOYED.has(outcome)) {
     return {
       apiSha: null,
       sameBuild: false,

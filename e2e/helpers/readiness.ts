@@ -40,9 +40,7 @@ export function assertPromotionReady(probe: WallProbe, context: string): void {
   try {
     parsed = JSON.parse(probe.bodyText);
   } catch {
-    const contentType =
-      probe.headers['content-type'] ?? probe.headers['Content-Type'] ?? 'unknown';
-    throw fail(`body is not valid JSON (content-type: ${contentType}).`);
+    throw fail('body is not valid JSON.');
   }
 
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {

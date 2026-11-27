@@ -1,6 +1,6 @@
 import { test, type APIRequestContext } from '@playwright/test';
 import { API } from './contract.js';
-import { accessHeaders, assertNoAccessWall } from './access.js';
+import { accessHeaders, assertNoAccessWall, readApiText } from './access.js';
 import { apiGet } from './accounts.js';
 import {
   apiDeployOutcome,
@@ -40,7 +40,7 @@ export async function assertServingBuildMatchesPromotion(
   // apiGet fetches with maxRedirects: 0 so a staging 302 never carries the
   // Access pair to another origin (see helpers/accounts.ts).
   const res = await apiGet(request, `${baseURL}${API.build}`, accessHeaders(), context);
-  const bodyText = await res.text().catch(() => '');
+  const bodyText = await readApiText(res, context);
   assertNoAccessWall(
     { status: res.status(), headers: res.headers(), bodyText, url: `${baseURL}${API.build}` },
     context,
@@ -57,7 +57,7 @@ export async function assertServingBuildMatchesPromotion(
 
   const apiUrl = `${baseURL}${API.healthz}`;
   const apiRes = await apiGet(request, apiUrl, accessHeaders(), context);
-  const apiBody = await apiRes.text().catch(() => '');
+  const apiBody = await readApiText(apiRes, context);
   assertNoAccessWall(
     { status: apiRes.status(), headers: apiRes.headers(), bodyText: apiBody, url: apiUrl },
     context,

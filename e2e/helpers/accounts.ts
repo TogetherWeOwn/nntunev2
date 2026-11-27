@@ -9,6 +9,7 @@ import {
 import { API, TESTIDS, uniqueTestEmail } from './contract.js';
 import {
   accessHeaders,
+  isAccessRedirect,
   assertNoAccessWall,
   isAuthStartRequest,
   isStagingOrigin,
@@ -196,7 +197,7 @@ function throwOnRedirect(status: number, headers: Record<string, string>, contex
   if (status < 300 || status >= 400) return;
   const location = headers['location'] ?? headers['Location'];
   const note = locationNote(location);
-  if (location !== undefined && /cloudflareaccess\.com|\/cdn-cgi\/access/i.test(location)) {
+  if (location && isAccessRedirect(location)) {
     throw new Error(
       `[${context}] hit the Cloudflare Access wall (HTTP ${status}, ${note}). ` +
         'Set CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET for a QA service ' +

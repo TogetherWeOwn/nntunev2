@@ -117,6 +117,17 @@ function runCli(args) {
 }
 
 describe("bounded response reads", () => {
+  it("rejects malformed UTF-8 in otherwise valid health JSON", async () => {
+    await withFixture({
+      "/api/health": (_req, res) => res.end(Buffer.concat([
+        Buffer.from('{"ok":true,"version":"'), Buffer.from([0xff]), Buffer.from('"}'),
+      ])),
+    }, async ({ base }) => {
+      const { log, lines } = captureLog();
+      assert.equal(await smoke(base, { log }), 1);
+      assert.match(lines.join("\n"), /\/api\/health: invalid UTF-8/);
+    });
+  });
   it("accepts a JSON body of exactly the byte ceiling", async () => {
     const core = JSON.stringify({ ok: true, version: "1" });
     const body = core + " ".repeat(JSON_CAP - core.length);

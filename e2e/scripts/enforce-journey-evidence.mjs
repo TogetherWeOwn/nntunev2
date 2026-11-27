@@ -77,6 +77,7 @@
  * the summary — never failure messages, which can carry filled secrets.
  */
 
+import { spawnSync } from 'node:child_process';
 import { appendFileSync, readFileSync } from 'node:fs';
 
 const JUNIT_PATH = process.env.JUNIT_PATH ?? 'test-results/junit.xml';
@@ -264,74 +265,68 @@ function fail(message) {
   process.exit(1);
 }
 
-function attr(tag, name) {
-  // Anchor on whitespace: a bare `name=` pattern would also match the tail of
-  // `classname="..."`. Attributes in junit tags are space-separated.
-  const match = tag.match(new RegExp(`(?:\\s)${name}\\s*=\\s*"([^"]*)"`));
-  return match ? match[1] : null;
+// The workflow already uses Python's standard library to parse its JUnit receipt.
+function parseEvidence(xml) {
+  const parsed = spawnSync('python3', ['-I', '-c', String.raw`
+import json, re, sys
+from xml.etree import ElementTree as ET
+
+class Report(ET.TreeBuilder):
+    def doctype(self, *args):
+        raise ValueError("DTD is unsupported")
+
+root = ET.fromstring(sys.stdin.buffer.read(), parser=ET.XMLParser(target=Report()))
+suites = [root] if root.tag == "testsuite" else list(root)
+if root.tag not in ("testsuite", "testsuites") or not suites:
+    raise ValueError("invalid JUnit root")
+fields = ("tests", "failures", "errors", "skipped")
+def counts(element):
+    values = [element.get(field, "0" if field != "tests" else "") for field in fields]
+    if any(not re.fullmatch(r"[0-9]{1,9}", value) for value in values):
+        raise ValueError("invalid JUnit count")
+    return list(map(int, values))
+
+cases, totals, consistent = [], [0, 0, 0, 0], True
+for suite in suites:
+    if suite.tag != "testsuite":
+        raise ValueError("invalid JUnit suite")
+    actual = [0, 0, 0, 0]
+    for case in suite.findall("testcase"):
+        outcomes = [child.tag for child in case if child.tag in ("failure", "error", "skipped")]
+        if len(outcomes) > 1:
+            raise ValueError("conflicting JUnit outcomes")
+        actual[0] += 1
+        if outcomes:
+            actual[("failure", "error", "skipped").index(outcomes[0]) + 1] += 1
+        cases.append([case.get("classname", ""), case.get("name", ""), next(iter(outcomes), "")])
+    declared = counts(suite)
+    consistent = consistent and declared == actual
+    totals = [a + b for a, b in zip(totals, declared)]
+if root.tag == "testsuites" and any(field in root.attrib for field in fields):
+    consistent = consistent and counts(root) == totals
+print(json.dumps([totals, cases, consistent]))
+`], { input: xml, encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 * 1024 });
+  return parsed.status === 0 ? JSON.parse(parsed.stdout) : null;
 }
 
-function parseCounts(xml) {
-  const suites = [...xml.matchAll(/<testsuite\b[^>]*>/g)].map((m) => m[0]);
-  if (suites.length === 0) return null;
-  let tests = 0;
-  let failures = 0;
-  let errors = 0;
-  let skipped = 0;
-  for (const suite of suites) {
-    const num = (name) => {
-      const raw = attr(suite, name);
-      if (raw === null) return 0;
-      const parsed = Number(raw);
-      return Number.isInteger(parsed) && parsed >= 0 ? parsed : NaN;
-    };
-    const t = num('tests');
-    const f = num('failures');
-    const e = num('errors');
-    const s = num('skipped');
-    if ([t, f, e, s].some((n) => Number.isNaN(n))) return null;
-    tests += t;
-    failures += f;
-    errors += e;
-    skipped += s;
-  }
-  return { tests, failures, errors, skipped };
+function matchesCase([classname, name], entry) {
+  const file = classname.split(/[\\/]/).pop();
+  return file === entry.file && (name === entry.match || name.endsWith(` › ${entry.match}`));
 }
 
-function parseSkippedNames(xml) {
-  const names = [];
-  // Match each testcase element on its own: self-closing tags first (they
-  // cannot carry a <skipped> child), then paired tags with their own body. A
-  // single lazy match from one <testcase> to the next </testcase> would span
-  // several elements and attribute the skip to the wrong test.
-  const element = /<testcase\b[^>]*\/>|<testcase\b[^>]*>[\s\S]*?<\/testcase>/g;
-  for (const m of xml.matchAll(element)) {
-    const text = m[0];
-    if (!/<skipped[\s>/]/.test(text)) continue;
-    const openTag = text.slice(0, text.indexOf('>') + 1);
-    const classname = attr(openTag, 'classname');
-    const name = attr(openTag, 'name') ?? '(unnamed test)';
-    names.push(classname ? `${classname} ${name}` : name);
-  }
-  return names;
+function skipTitle([file, name]) {
+  const title = `${file} ${name}`.trim();
+  return /^[\p{L}\p{N} ._:/›+()-]{1,240}$/u.test(title) ? title : '(title withheld)';
 }
 
-function namedJourneyEvidence(xml) {
-  const cases = [...xml.matchAll(/<testcase\b[^>]*\/>|<testcase\b[^>]*>[\s\S]*?<\/testcase>/g)];
+function namedJourneyEvidence(cases) {
   return NAMED_JOURNEYS.map((entry) => {
-    const matches = cases.filter(([text]) => {
-      const openTag = text.slice(0, text.indexOf('>') + 1);
-      const file = (attr(openTag, 'classname') ?? '').split(/[\\/]/).pop();
-      const name = attr(openTag, 'name') ?? '';
-      return file === entry.file && (name === entry.match || name.endsWith(` ${entry.match}`));
-    });
+    const matches = cases.filter((testCase) => matchesCase(testCase, entry));
     let outcome = 'missing';
     if (matches.length > 1) outcome = 'duplicate';
     else if (matches.length === 1) {
-      const text = matches[0][0];
-      outcome = /<(?:failure|error)[\s>/]/.test(text)
-        ? 'failed'
-        : /<skipped[\s>/]/.test(text) ? 'skipped' : 'passed';
+      const status = matches[0][2];
+      outcome = status === 'skipped' ? 'skipped' : status ? 'failed' : 'passed';
     }
     return { ...entry, outcome };
   });
@@ -388,8 +383,8 @@ try {
   );
 }
 
-const counts = parseCounts(xml);
-if (!counts) {
+const evidence = parseEvidence(xml);
+if (!evidence) {
   summaryLines = [
     `- junit evidence: unparseable (${JUNIT_PATH})`,
     '',
@@ -408,24 +403,24 @@ if (!counts) {
   );
 }
 
-const { tests, failures, errors } = counts;
-const { skipped } = counts;
+const [[tests, failures, errors, skipped], cases, consistent] = evidence;
 const failed = failures + errors;
 const ran = tests - skipped;
-const skippedNames = parseSkippedNames(xml);
-const namedJourneys = namedJourneyEvidence(xml);
+const skippedCases = cases.filter(([, , outcome]) => outcome === 'skipped');
+const skippedNames = skippedCases.map(skipTitle);
+const namedJourneys = namedJourneyEvidence(cases);
 // Each allow-list entry binds to its owning spec file and is consumed at
 // most once: a same-titled skip from another file cannot take its slot,
 // and one entry cannot cover two skips.
 const consumedAllowances = new Set();
-const unknownSkips = skippedNames.filter((title) => {
+const unknownSkips = skippedCases.filter((testCase) => {
   const idx = ACTIVE_ALLOWED_SKIPS.findIndex(
-    (entry, i) => !consumedAllowances.has(i) && title.includes(entry.file) && title.includes(entry.match),
+    (entry, i) => !consumedAllowances.has(i) && matchesCase(testCase, entry),
   );
   if (idx === -1) return true;
   consumedAllowances.add(idx);
   return false;
-});
+}).map(skipTitle);
 
 summaryLines = [
   '| total | ran | skipped | failed |',
@@ -482,6 +477,7 @@ if (skippedNames.length < skipped) {
       'junit evidence — refusing to pass on unattributed skips.',
   );
 }
+if (!consistent) fail('JUnit counts do not match the reported test cases and outcomes.');
 if (failed > 0) fail(`${failed} failing test(s) — the journey is red.`);
 if (REQUIRE_QA_AUTH_TOKEN) {
   const invalid = namedJourneys.filter((entry) =>

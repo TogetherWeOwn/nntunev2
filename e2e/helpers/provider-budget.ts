@@ -50,8 +50,9 @@ export function readProviderBudget(
   if (raw === undefined) {
     return { maxConnections: PROVIDER_BUDGET_DEFAULT, requested: null, clamped: false };
   }
-  const parsed = Number(raw.trim());
-  if (!Number.isInteger(parsed) || parsed <= 0) {
+  const value = raw.trim();
+  const parsed = Number(value);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed <= 0) {
     return { maxConnections: PROVIDER_BUDGET_DEFAULT, requested: null, clamped: true };
   }
   if (parsed > PROVIDER_BUDGET_HARD_MAX) {

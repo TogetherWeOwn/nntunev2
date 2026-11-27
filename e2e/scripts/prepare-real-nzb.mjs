@@ -45,7 +45,7 @@ function parseArgs(argv) {
       process.stdout.write(`${usage()}\n`);
       process.exit(0);
     } else {
-      process.stderr.write(`unknown argument: ${argv[i]}\n${usage()}\n`);
+      process.stderr.write(`unknown argument\n${usage()}\n`);
       process.exit(2);
     }
   }
@@ -107,7 +107,11 @@ function main() {
     );
     process.exit(1);
   }
-  const dataFile = files.find((block) => !isPar2File(block)) ?? files[0];
+  const dataFile = files.find((block) => !isPar2File(block));
+  if (!dataFile) {
+    process.stderr.write('no non-PAR2 file block found.\n');
+    process.exit(1);
+  }
   const segments = dataFile.match(/<segment\b[^>]*>[\s\S]*?<\/segment>/g) ?? [];
   if (segments.length === 0) {
     process.stderr.write('chosen file block carries no segments; refusing an empty fixture.\n');
