@@ -179,8 +179,12 @@ upload inputs are original
 The self-test hashes two clips and checks their sizes against the manifest.
 The [ingest readback test](../workers/ingest/tests/multipart_readback_inventory.rs)
 already verifies the clips' whole-frame range handoff against pinned media
-metadata and digest. Each clip is about 93 ms and has one frame. Publication,
-Library, transport and refusal observations here are synthetic. The
+metadata and digest. Each admin-upload clip is about 93 ms and has one frame.
+Publication, Library, transport, delivered-byte union and refusal observations
+here are synthetic. The metering assertion uses the checked-in 14-second
+private-staging tone, folds an initial range and overlapping backward seek into
+one bounded play window, and derives stream seconds from its file size and
+duration. The
 [signup browser test](../apps/web/tests/passkey-dismissal.spec.ts) exercises
 the rendered signup and Library surfaces with intercepted HTTP and passkeys.
 

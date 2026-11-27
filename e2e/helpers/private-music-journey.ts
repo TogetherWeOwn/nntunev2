@@ -136,6 +136,77 @@ export function assertPrivateTransport(selectionOrder: string[], observed: {
   }
 }
 
+export type PrivateMeteredPlay = {
+  userId: string;
+  trackId: string;
+  playId: string;
+  fileBytes: number;
+  durationMs: number;
+  delivered: readonly { start: number; end: number }[];
+  unionBytes: number;
+  streamSeconds: number;
+};
+
+const MAX_METER_RANGES = 32;
+const MAX_METER_FILE_BYTES = 4_147_200_000;
+const MAX_METER_DURATION_MS = 86_400_000;
+
+/**
+ * Check the bounded play-window shape consumed by the private staging journey.
+ * Delivered ranges are folded as a half-open union, so an overlapping seek
+ * cannot bill the same bytes twice.
+ */
+export function assertPrivateMeteredPlay(
+  expected: Pick<PrivateMeteredPlay, 'userId' | 'trackId' | 'playId' | 'fileBytes' | 'durationMs'>,
+  observed: PrivateMeteredPlay,
+): void {
+  if (
+    observed.userId !== expected.userId || observed.trackId !== expected.trackId ||
+    observed.playId !== expected.playId || observed.fileBytes !== expected.fileBytes ||
+    observed.durationMs !== expected.durationMs
+  ) {
+    throw new Error('Metered play must remain bound to the published track and browser play');
+  }
+  if (
+    !Number.isSafeInteger(observed.fileBytes) || observed.fileBytes <= 0 ||
+    observed.fileBytes > MAX_METER_FILE_BYTES ||
+    !Number.isSafeInteger(observed.durationMs) || observed.durationMs <= 0 ||
+    observed.durationMs > MAX_METER_DURATION_MS ||
+    !Array.isArray(observed.delivered) || observed.delivered.length === 0 ||
+    observed.delivered.length > MAX_METER_RANGES
+  ) {
+    throw new Error('Metered play fixture must stay within the bounded media limits');
+  }
+
+  const ranges = observed.delivered
+    .map(({ start, end }) => {
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start ||
+        end > observed.fileBytes) {
+        throw new Error('Metered play delivered ranges must be non-empty file spans');
+      }
+      return [start, end] as const;
+    })
+    .sort(([left], [right]) => left - right);
+  const merged: [number, number][] = [];
+  for (const [start, end] of ranges) {
+    const previous = merged.at(-1);
+    if (previous && start <= previous[1]) previous[1] = Math.max(previous[1], end);
+    else merged.push([start, end]);
+  }
+  const unionBytes = merged.reduce((total, [start, end]) => total + end - start, 0);
+  if (!Number.isSafeInteger(observed.unionBytes) || observed.unionBytes !== unionBytes || unionBytes <= 0) {
+    throw new Error('Metered play must report the delivered-byte union exactly once');
+  }
+
+  const numerator = BigInt(unionBytes) * BigInt(observed.durationMs);
+  const denominator = BigInt(observed.fileBytes) * 1_000n;
+  const proportionalSeconds = Number((numerator + denominator - 1n) / denominator);
+  const cappedSeconds = Math.min(proportionalSeconds, Math.ceil(observed.durationMs / 1_000) + 2, 86_400);
+  if (!Number.isSafeInteger(observed.streamSeconds) || observed.streamSeconds !== cappedSeconds || cappedSeconds <= 0) {
+    throw new Error('Metered play seconds must derive from the delivered-byte union');
+  }
+}
+
 const REFUSALS = {
   missingInviteSignup: 401,
   anonymousLibrary: 401,
