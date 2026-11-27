@@ -417,6 +417,7 @@ mod tests {
         fields.remove("transcode_inputs");
         let mut cp: JobCheckpoint = serde_json::from_value(legacy).unwrap();
         assert!(validate_checkpoint(&cp, &msg.job_id).is_ok());
+        assert!(validate_checkpoint(&cp, "other_job").is_err());
         cp.transcode_inputs.push(TranscodeInput {
             file_index: 0,
             key: VerifyProgress::file_key(&msg.job_id, 1, 0, "track.flac"),
@@ -492,7 +493,7 @@ mod tests {
         progress.spool.insert(MAX_VERIFY_FILES, Vec::new());
         assert!(validate_verify_progress(&progress).is_err());
         progress.spool.clear();
-        progress.round = u32::MAX;
+        progress.round = MAX_REPAIR_ROUNDS + 2;
         assert!(resume(&progress).unwrap().is_none());
         assert!(resume_verify(decode_json(Some("malformed".into()))).is_err());
         assert!(resume_verify(Err(worker::Error::RustError(
@@ -503,19 +504,18 @@ mod tests {
 
     #[test]
     fn bounds_storage_entry_points_call_the_progress_guards() {
-        // Native tests exercise the validators without a Workers KV binding.
         let source = include_str!("checkpoint.rs");
-        for (name, guard) in [
-            ("get", "validate_checkpoint(cp, job_id)?"),
-            ("put", "validate_checkpoint("),
-            ("get_verify", "resume_verify(get_json(env, &key).await)"),
-            ("put_verify", "validate_verify_progress(progress)?"),
-        ] {
-            let (_, signature_and_body) =
-                source.split_once(&format!("pub async fn {name}(")).unwrap();
-            let (function, _) = signature_and_body.split_once("\n}\n").unwrap();
-            assert!(function.contains(guard), "{name} must call {guard}");
-        }
+        let body = |signature: &str| {
+            let (_, tail) = source.split_once(&format!("fn {signature}")).unwrap();
+            tail.split_once("\n}\n").unwrap().0
+        };
+        assert!(body("get(").contains("get_json(env, &key).await?"));
+        assert!(body("get(").contains("validate_checkpoint(cp, job_id)?"));
+        assert!(body("get_json<").contains(".text()"));
+        assert!(body("get_json<").contains("decode_json(text)"));
+        assert!(body("put(").contains("validate_checkpoint(checkpoint, &checkpoint.job_id)?"));
+        assert!(body("get_verify(").contains("resume_verify(get_json(env, &key).await)"));
+        assert!(body("put_verify(").contains("validate_verify_progress(progress)?"));
     }
 
     #[test]
