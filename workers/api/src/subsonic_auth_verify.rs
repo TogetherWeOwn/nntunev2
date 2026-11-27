@@ -12,7 +12,7 @@ use crate::{
     rotation::KekSource,
 };
 
-use super::{AuthError, CredentialRecord};
+use super::{valid_version, AuthError, CredentialRecord};
 
 pub(super) fn token_context<'a>(user_id: &'a str, credential_id: &'a str) -> Context<'a> {
     Context {
@@ -52,6 +52,8 @@ pub(super) fn verify_token(
     let stored = selected.token.as_ref().ok_or(AuthError::InvalidToken)?;
     if stored.envelope_version != 2
         || stored.payload_format != 1
+        || !valid_version(stored.kek_version)
+        || stored.envelope.dek_wrapped.len() != 32 + 16
         || stored.envelope.ciphertext.len() < 32 + 16
         || stored.envelope.ciphertext.len() > 512 + 16
     {

@@ -92,8 +92,9 @@ pub fn admit_metadata(
             .and_then(|n| n.checked_add(4))
             .filter(|&n| n <= HEADER_BYTES)
             .ok_or(TOO_LARGE)?;
-        if is_ascii_literal(&name, "content-type") {
-            form = method == "POST" && value.index_of(FORM, 0) >= 0;
+        if method == "POST" && is_ascii_literal(&name, "content-type") {
+            // Fetch's normalized header values are ByteStrings.
+            form = is_form_content_type((0..value.length()).map(|i| value.char_code_at(i) as u8))?;
         } else if is_ascii_literal(&name, "content-length") {
             declared = Some(value);
         }
@@ -114,6 +115,46 @@ pub fn admit_metadata(
         query,
         body,
     })
+}
+
+pub(crate) fn is_form_content_type(
+    bytes: impl Iterator<Item = u8> + Clone,
+) -> Result<bool, InputError> {
+    let is_ows = |byte: &u8| matches!(byte, b' ' | b'\t');
+    let mut essence = bytes.clone().skip_while(is_ows).take_while(|&b| b != b';');
+    let form = FORM.bytes().all(|expected| {
+        essence
+            .next()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected))
+    }) && essence.all(|byte| is_ows(&byte));
+
+    // Fetch combines duplicate headers with a comma. A quoted parameter
+    // may contain a comma, but a list of media types is ambiguous.
+    let (mut parameters, mut value_start, mut quoted, mut escaped) = (false, false, false, false);
+    for byte in bytes {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if quoted => escaped = true,
+            b'"' if quoted => quoted = false,
+            _ if quoted => {}
+            b'"' if value_start => {
+                quoted = true;
+                value_start = false;
+            }
+            b',' | b'"' => return Err(InputError::Unreadable),
+            b';' => {
+                parameters = true;
+                value_start = false;
+            }
+            b'=' if parameters => value_start = true,
+            b' ' | b'\t' => {}
+            _ => value_start = false,
+        }
+    }
+    if quoted {
+        return Err(InputError::Unreadable);
+    }
+    Ok(form)
 }
 
 pub(crate) fn request_url(request: &web_sys::Request) -> Result<JsValue, InputError> {

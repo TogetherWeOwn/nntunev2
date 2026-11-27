@@ -24,14 +24,13 @@ use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use crate::native_rest::Pepper;
-use crate::subsonic_auth::{AuthError, IndexKeyring};
+use crate::subsonic_auth::{same_index_pepper, valid_version, AuthError, IndexKeyring};
 
 /// Upper bound on the raw secret string (two 64-byte keys encode to well
 /// under 300 bytes; this leaves room for whitespace without allowing
 /// unbounded parse work).
 pub const MAX_CONFIG_BYTES: usize = 1024;
-/// Minimum key length: the 256-bit generation target, matching
-/// `IndexKeyring::new`.
+/// Minimum decoded key length, matching the 256-bit generation target.
 pub const MIN_KEY_BYTES: usize = 32;
 /// Maximum decoded key length.
 pub const MAX_KEY_BYTES: usize = 64;
@@ -136,14 +135,14 @@ fn parse_version_key(s: &str) -> Result<u32, ConfigError> {
         return Err(ConfigError::BadVersion);
     }
     match s.parse::<u32>() {
-        Ok(n) if n != 0 && n <= i32::MAX as u32 => Ok(n),
+        Ok(n) if valid_version(n) => Ok(n),
         _ => Err(ConfigError::BadVersion),
     }
 }
 
 fn version_value(v: u64) -> Result<u32, ConfigError> {
     match u32::try_from(v) {
-        Ok(n) if n != 0 && n <= i32::MAX as u32 => Ok(n),
+        Ok(n) if valid_version(n) => Ok(n),
         _ => Err(ConfigError::BadVersion),
     }
 }
@@ -165,6 +164,10 @@ impl SubsonicIndexConfig {
     pub fn parse(secret: &str) -> Result<Self, ConfigError> {
         if secret.len() > MAX_CONFIG_BYTES {
             return Err(ConfigError::TooLarge);
+        }
+        // Serde also accepts positional sequences for structs by default.
+        if !secret.trim_start().starts_with('{') {
+            return Err(ConfigError::Malformed);
         }
         let raw: Raw = serde_json::from_str(secret).map_err(|_| ConfigError::Malformed)?;
 
@@ -201,7 +204,7 @@ impl SubsonicIndexConfig {
             None => None,
         };
         if let Some((_, pk)) = &previous {
-            if **pk == *current_key {
+            if same_index_pepper(pk, &current_key) {
                 return Err(ConfigError::DuplicateVersion);
             }
         }

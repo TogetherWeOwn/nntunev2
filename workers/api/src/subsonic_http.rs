@@ -13,8 +13,8 @@
 //!   last-wins would let a smuggled copy disagree with what the core
 //!   authenticator checks. An array-style key (`u[]`, `apiKey[x]`) whose
 //!   base name is a credential key is rejected for the same reason.
-//! - A malformed percent escape or non-UTF-8 decoded text in any key, or in
-//!   the value of a credential key, is an error (never lossily repaired).
+//! - Malformed percent escapes and non-UTF-8 decoded text are errors in
+//!   keys and credential values. Parameter names also reject controls.
 //!   Values of non-credential parameters are not decoded here.
 //! - Presence is preserved: `p` and `p=` both yield `Some("")`, which the
 //!   production core refuses as `Unsupported`, even alongside another mode.
@@ -195,6 +195,9 @@ fn scan(
             return Err(CredentialParseError::KeyTooLong);
         }
         let key = decode(raw_key, budget.as_deref_mut())?;
+        if key.chars().any(char::is_control) {
+            return Err(CredentialParseError::MalformedEncoding);
+        }
         // Array-style names (`u[]`) are judged by their base name.
         let base = key.split('[').next().unwrap_or("");
         let Some(slot) = Slot::from_key(base) else {
