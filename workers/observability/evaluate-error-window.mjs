@@ -40,7 +40,7 @@ const UNKNOWN = 'unknown';
 const SHA40_RE = /^[0-9a-f]{40}$/;
 const ERROR_CLASS_RE = /^[a-z][a-z0-9_]{0,63}$/;
 const METHOD_RE = /^[A-Z]+$/;
-const PATH_RE = /^[A-Za-z0-9\-._~!$&'()*+,;=:@%/{}]+$/;
+const PATH_RE = /^[A-Za-z0-9._~/{}-]+$/;
 
 function compareKeys(a, b) {
   if (a < b) return -1;
@@ -52,35 +52,26 @@ function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function isValidRational(value) {
-  try {
-    if (!isRecord(value)) return false;
-    const failed = value.failed;
-    const total = value.total;
-    if (typeof failed !== 'number' || !Number.isInteger(failed) || failed < 0) return false;
-    if (typeof total !== 'number' || !Number.isInteger(total) || total < 1 || total > RATIONAL_TOTAL_MAX) {
-      return false;
-    }
-    if (failed > total) return false;
-    return true;
-  } catch {
-    return false;
-  }
+function readRational(value) {
+  if (!isRecord(value)) return null;
+  const { failed, total } = value;
+  if (!Number.isInteger(failed) || failed < 0 || !Number.isInteger(total)
+    || total < 1 || total > RATIONAL_TOTAL_MAX || failed > total) return null;
+  return { failed, total };
 }
 
-function isValidRuleMap(value, isValidKey) {
-  try {
-    if (!isRecord(value)) return false;
-    const keys = Object.keys(value);
-    if (keys.length > MAX_RULES) return false;
-    for (let i = 0; i < keys.length; i += 1) {
-      if (!isValidKey(keys[i])) return false;
-      if (!isValidRational(value[keys[i]])) return false;
-    }
-    return true;
-  } catch {
-    return false;
+function readRuleMap(value, isValidKey) {
+  if (!isRecord(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length > MAX_RULES) return null;
+  const rules = Object.create(null);
+  for (const key of keys) {
+    if (!isValidKey(key)) return null;
+    const rational = readRational(value[key]);
+    if (rational === null) return null;
+    rules[key] = rational;
   }
+  return rules;
 }
 
 function isValidErrorClassKey(key) {
@@ -91,27 +82,17 @@ function isValidReleaseKey(key) {
   return key === UNKNOWN || SHA40_RE.test(key);
 }
 
-function isValidPolicy(policy) {
-  try {
-    if (!isRecord(policy)) return false;
-    if (policy.service !== EXPECTED_SERVICE) return false;
-    if (policy.environment !== EXPECTED_ENVIRONMENT) return false;
-    const minInvocations = policy.min_invocations;
-    if (
-      typeof minInvocations !== 'number'
-      || !Number.isInteger(minInvocations)
-      || minInvocations < MIN_INVOCATIONS_MIN
-      || minInvocations > MIN_INVOCATIONS_MAX
-    ) {
-      return false;
-    }
-    if (!isValidRational(policy.max_error_rate)) return false;
-    if (!isValidRuleMap(policy.per_error_class, isValidErrorClassKey)) return false;
-    if (!isValidRuleMap(policy.per_release, isValidReleaseKey)) return false;
-    return true;
-  } catch {
-    return false;
-  }
+function readPolicy(policy) {
+  if (!isRecord(policy) || policy.service !== EXPECTED_SERVICE
+    || policy.environment !== EXPECTED_ENVIRONMENT) return null;
+  const minInvocations = policy.min_invocations;
+  if (!Number.isInteger(minInvocations)
+    || minInvocations < MIN_INVOCATIONS_MIN || minInvocations > MIN_INVOCATIONS_MAX) return null;
+  const maxErrorRate = readRational(policy.max_error_rate);
+  const perErrorClass = readRuleMap(policy.per_error_class, isValidErrorClassKey);
+  const perRelease = readRuleMap(policy.per_release, isValidReleaseKey);
+  if (maxErrorRate === null || perErrorClass === null || perRelease === null) return null;
+  return { minInvocations, maxErrorRate, perErrorClass, perRelease };
 }
 
 function isValidRoute(value) {
@@ -253,14 +234,12 @@ function buildBreakdown(buckets) {
 
 export function evaluateErrorWindow(observations, policy) {
   try {
-    if (!isValidPolicy(policy)) return null;
+    const config = readPolicy(policy);
+    if (config === null) return null;
     if (!Array.isArray(observations)) return null;
-    const service = policy.service;
-    const environment = policy.environment;
-    const minInvocations = policy.min_invocations;
-    const maxErrorRate = policy.max_error_rate;
-    const perErrorClass = policy.per_error_class;
-    const perRelease = policy.per_release;
+    const length = observations.length;
+    if (!Number.isInteger(length) || length < 0 || length > 0xffffffff) return null;
+    const { minInvocations, maxErrorRate, perErrorClass, perRelease } = config;
 
     let total = 0;
     let failed = 0;
@@ -274,8 +253,8 @@ export function evaluateErrorWindow(observations, policy) {
     const byRelease = new Map();
     const byRoute = new Map();
 
-    for (let i = 0; i < observations.length; i += 1) {
-      const result = classifyEntry(observations[i], service, environment);
+    for (let i = 0; i < length; i += 1) {
+      const result = classifyEntry(observations[i], EXPECTED_SERVICE, EXPECTED_ENVIRONMENT);
       if (result.kind === 'malformed') {
         malformed += 1;
         continue;
@@ -309,8 +288,8 @@ export function evaluateErrorWindow(observations, policy) {
 
     return {
       schema_version: SCHEMA_VERSION,
-      service,
-      environment,
+      service: EXPECTED_SERVICE,
+      environment: EXPECTED_ENVIRONMENT,
       verdict: !evaluated ? 'unknown' : (inBreach ? 'breach' : 'pass'),
       reason: !evaluated ? 'insufficient_data' : (inBreach ? 'breach' : 'ok'),
       counts: {

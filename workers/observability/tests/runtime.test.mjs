@@ -160,7 +160,8 @@ test('fixture controls exercise the actual projector, reducer and renderer', () 
   assert.equal(verdict.rate.decimal, '0.1000');
   assert.equal(evaluateErrorWindow(batch(1), POLICY).verdict, 'pass');
   assert.equal(evaluateErrorWindow(batch(19, 19), POLICY).verdict, 'unknown');
-  const rendered = renderVerdictAlert(verdict, { logsUrl: LOGS, windowLabel: 'receive-time local window' });
+  const rendered = renderVerdictAlert(verdict, { logsUrl: LOGS,
+    windowLabel: 'DO receive-time [2026-10-22T12:00:00.000Z, 2026-10-22T12:01:00.000Z)' });
   assert.match(rendered.content, /2\/20/);
   assert.ok(strings(rendered).some((value) => value === SHA));
   noCanaries(rendered);
@@ -353,6 +354,15 @@ test('RPC rebuilds a whitelist and drops unexpected properties at every retained
       assert.deepEqual(Object.keys(row.failure_flags).sort(), ['exceeded_cpu', 'exceeded_memory', 'exception', 'http_5xx']);
     }
   }
+});
+
+test('RPC keeps non-allowlisted grouping out of both storage and alerts', async () => {
+  const h = await harness();
+  await ingestBreach(h, { route: 'GET /fixture-private', error_class: 'fixture_private' });
+  assert.doesNotMatch(serialized(h.storage.snapshot()), /fixture[-_]private/);
+  await h.close();
+  assertPost(h);
+  assert.doesNotMatch(h.calls.fetch[0].body, /fixture[-_]private/);
 });
 
 const invalidRecords = [

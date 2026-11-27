@@ -19,10 +19,10 @@ MODULES = tuple(
     for name in ("runtime", "project-tail-event", "evaluate-error-window", "render-verdict-alert")
 )
 FROZEN_MODULE_SHA256 = {
-    "workers/observability/runtime.mjs": "cc1f2f8060658bee685d132bc570e1c164e688ae7a4e06867b05549428fb250c",
-    "workers/observability/project-tail-event.mjs": "ecb40e1758cdd9f4bdd4098ad296e0874cf695709b246042def1cf46bdc3ab82",
-    "workers/observability/evaluate-error-window.mjs": "ee9254ea085f58da15ef0e12d162a5c3d2c78f6e3db475998295be8d43179d3c",
-    "workers/observability/render-verdict-alert.mjs": "63c9880886adc1bfdcea4e8796e54555eb3810bb2f2b7676162d7e9cdd25b023",
+    "workers/observability/runtime.mjs": "2f1f33e518c5ca6b23a6262b0e695d0e0b9906706ac07708d17cfa5713350837",
+    "workers/observability/project-tail-event.mjs": "8f9361d7398f686bebf881e58ec241cb25cd0e77b7df31e4c837715bbdb4de8e",
+    "workers/observability/evaluate-error-window.mjs": "b23968f59efea9f78508e8380b603ad0887da5dd071ff1cd6bd2f2f0fe4d4a2e",
+    "workers/observability/render-verdict-alert.mjs": "b15ef420bfc471223ae61c0e825d7443d98b4691a22cbfca4c7a0bdc3854ee62",
 }
 WORKER = "nntune-alerts-staging"
 PRODUCER = "nntune-api-staging"

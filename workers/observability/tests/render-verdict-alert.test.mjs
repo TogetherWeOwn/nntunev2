@@ -27,9 +27,8 @@
 // breached_rules list, or missing bucket arrays fail closed to null.
 // Other counts/rate/bucket fields are not validated by this contract.
 //
-// Frozen context input: {logsUrl, windowLabel}, both non-empty strings with no
-// trimming; logsUrl must match /^https?:\/\/\S+$/ with a non-empty host (http
-// and https both render; anything else fails closed to null). Extra fields on
+// Context uses a literal HTTP(S) log link and a canonical DO receive-time
+// interval. Extra fields on
 // the verdict or the context are ignored, never echoed, never fatal.
 //
 // Output: exactly {content, embeds} (no other top-level keys) ONLY for a
@@ -61,7 +60,7 @@ const MODULE_URL = new URL('../render-verdict-alert.mjs', import.meta.url);
 const SHA_A = '0123456789abcdef0123456789abcdef01234567';
 const SHA_B = 'fedcba9876543210fedcba9876543210fedcba98';
 const LOGS_URL = 'https://logs.example.invalid/staging/api/window/2026-10-22-1200';
-const WINDOW_LABEL = 'staging api error-rate window 12:00-12:05 UTC';
+const WINDOW_LABEL = 'DO receive-time [2026-10-22T12:00:00.000Z, 2026-10-22T12:01:00.000Z)';
 const LONG = 'x'.repeat(5000);
 // All canaries are deliberately synthetic, never credentials or real user data.
 const CANARIES = [
@@ -78,13 +77,20 @@ const deny = (name) => (..._args) => {
 };
 const math = Object.create(Math);
 math.random = deny('Math.random');
+class CalendarDate extends Date {
+  static now = deny('Date.now');
+  constructor(value) {
+    if (value === undefined) deny('Date')();
+    super(value);
+  }
+}
 const context = vm.createContext({
   console: Object.fromEntries(['log', 'info', 'warn', 'error', 'debug', 'trace', 'dir', 'assert']
     .map((name) => [name, deny(`console.${name}`)])),
   fetch: deny('fetch'),
   WebSocket: deny('WebSocket'),
   XMLHttpRequest: deny('XMLHttpRequest'),
-  Date: deny('Date'),
+  Date: CalendarDate,
   JSON,
   URL,
   URLSearchParams,
@@ -479,6 +485,8 @@ test('bad counts rationals fail closed', () => {
   ]) {
     assert.equal(render(breachVerdict({ counts }), contextFixture()), null, `${name} must not render`);
   }
+  const zero = { total: 4, failed: 0 };
+  assert.equal(render(breachVerdict({ counts: zero, rate: { ...zero, decimal: '0.0000' } }), contextFixture()), null);
 });
 
 test('bad rate rationals or decimals fail closed', () => {
@@ -506,6 +514,8 @@ test('breach without named rules fails closed', () => {
     ['numeric entry', { overall, breached_rules: ['overall', 42] }],
     ['empty-string entry', { overall, breached_rules: ['overall', ''] }],
     ['null entry', { overall, breached_rules: ['overall', null] }],
+    ['free-form rule', { overall, breached_rules: ['overall', 'unregistered_rule'] }],
+    ['130 rules', { overall, breached_rules: Array(130).fill('overall') }],
   ]) {
     assert.equal(render(breachVerdict({ thresholds }), contextFixture()), null, `${name} must not render`);
   }
@@ -525,6 +535,7 @@ test('bad breakdowns fail closed', () => {
   cases.push(['null bucket entry', { ...good, by_error_class: { buckets: [null], overflow: emptyOverflow() } }]);
   cases.push(['bucket without key', { ...good, by_error_class: { buckets: [{ total: 1, failed: 1 }], overflow: emptyOverflow() } }]);
   cases.push(['numeric bucket key', { ...good, by_error_class: oneBucket(42) }]);
+  cases.push(['33 buckets', { ...good, by_route: { buckets: Array(33).fill({ key: 'GET /health' }) } }]);
   for (const [name, breakdowns] of cases) {
     assert.equal(render(breachVerdict({ breakdowns }), contextFixture()), null, `${name} must not render`);
   }
@@ -555,7 +566,7 @@ test('non-http(s) logs URLs fail closed', () => {
 
 // Break caught: unbounded output for adversarial strings, dropped short fields
 // when truncating, or nondeterministic truncation across identical calls.
-test('adversarial long rule names, breakdown keys, and SHAs stay within bounds', () => {
+test('adversarial long rule names, breakdown keys, and SHAs fail closed', () => {
   const verdict = breachVerdict({
     thresholds: {
       overall: { failed: 1, total: 4, breached: true },
@@ -576,48 +587,31 @@ test('adversarial long rule names, breakdown keys, and SHAs stay within bounds',
       },
     },
   });
-  const first = render(verdict, contextFixture());
-  assert.notEqual(first, null, 'oversized strings must truncate, not fail closed');
-  assert.deepEqual(Object.keys(first), ['content', 'embeds']);
-  assertDiscordBounds(first);
-  const text = JSON.stringify(first);
-  assert.equal(text.includes('…'), true, 'oversized strings must truncate with an ellipsis marker');
-  assert.equal(text.includes('3/4'), true, 'rational must survive truncation');
-  assert.equal(text.includes('0.7500'), true, 'decimal must survive truncation');
-  assert.equal(text.includes('overall'), true, 'short rules must survive truncation');
-  assertCarriesLogsUrl(first, LOGS_URL, 'logs URL must survive truncation');
-  assert.equal(text.includes(WINDOW_LABEL), true, 'window label must survive truncation');
-  const second = render(verdict, contextFixture());
-  assert.equal(JSON.stringify(second), text, 'adversarial render must be deterministic');
+  assert.equal(render(verdict, contextFixture()), null);
 });
 
-test('adversarial long window label stays within bounds without losing the logs URL', () => {
-  const contextArg = contextFixture({ windowLabel: `window ${LONG}` });
-  const first = render(breachVerdict(), contextArg);
-  assert.notEqual(first, null, 'oversized label must truncate, not fail closed');
-  assertDiscordBounds(first);
-  const text = JSON.stringify(first);
-  assert.equal(text.includes('…'), true, 'oversized label must truncate with an ellipsis marker');
-  assertCarriesLogsUrl(first, LOGS_URL, 'logs URL must survive label truncation');
-  assert.equal(text.includes('3/4'), true, 'rational must survive label truncation');
-  assert.equal(JSON.stringify(render(breachVerdict(), contextFixture({ windowLabel: `window ${LONG}` }))), text,
-    'label truncation must be deterministic');
+test('invalid window labels fail closed', () => {
+  for (const windowLabel of [`window ${LONG}`, CANARIES[1], 'receive-time local window',
+    WINDOW_LABEL.replace('2026-10-22', '2026-02-30'),
+    WINDOW_LABEL.replace('12:01:00', '12:00:00')]) {
+    assert.equal(render(breachVerdict(), contextFixture({ windowLabel })), null);
+  }
 });
 
 test('adversarial breakdown and rule cardinality stays within bounds', () => {
-  const buckets = (prefix) => Array.from({ length: 100 }, (_, i) => ({
-    key: `${prefix}${String(i).padStart(3, '0')}`, total: 1, failed: 1, decimal: '1.0000',
+  const buckets = (key) => Array.from({ length: 32 }, (_, i) => ({
+    key: key(i), total: 1, failed: 1, decimal: '1.0000',
   }));
   const verdict = breachVerdict({
     thresholds: {
       overall: { failed: 1, total: 4, breached: true },
       breached_rules: ['overall',
-        ...Array.from({ length: 99 }, (_, i) => `error_class:rule_${String(i).padStart(3, '0')}`)],
+        ...Array.from({ length: 64 }, (_, i) => `error_class:rule_${i}`)],
     },
     breakdowns: {
-      by_error_class: { buckets: buckets('error_'), overflow: emptyOverflow() },
-      by_release: { buckets: buckets('release_'), overflow: emptyOverflow() },
-      by_route: { buckets: buckets('GET /route_'), overflow: emptyOverflow() },
+      by_error_class: { buckets: buckets((i) => `error_${i}`), overflow: emptyOverflow() },
+      by_release: { buckets: buckets((i) => i.toString(16).padStart(40, '0')), overflow: emptyOverflow() },
+      by_route: { buckets: buckets((i) => `GET /route_${i}`), overflow: emptyOverflow() },
     },
   });
   const first = render(verdict, contextFixture());
@@ -799,44 +793,35 @@ test('producer-shaped breach surfaces breaching release despite caps', () => {
   assertNoWebhookHost(text, 'payload must not contain a webhook URL');
 });
 
-// Break caught: unpinned cap schedule. Combined worst case (long label,
-// long logs URL, 100 long rules, 100 long buckets in all three dimensions)
-// must stay within 6000 chars via the schedule. The no-schedule mutant
-// renders 6546 chars on this input; head renders 5334.
-test('combined worst case stays within bounds via cap schedule', () => {
-  const longRules = Array.from({ length: 100 }, (_, i) => `rule_${i}_${'R'.repeat(300)}`);
-  const longBuckets = (prefix) => Array.from({ length: 100 }, (_, i) => ({
-    key: `${prefix}_${i}_${'K'.repeat(300)}`, total: 1, failed: 1, decimal: '1.0000',
+test('maximum-length canonical inputs stay within alert bounds', () => {
+  const longRules = Array.from({ length: 64 }, (_, i) => `error_class:${`rule_${i}`.padEnd(64, 'x')}`);
+  const longBuckets = (key) => Array.from({ length: 32 }, (_, i) => ({
+    key: key(i), total: 1, failed: 1, decimal: '1.0000',
   }));
   const verdict = breachVerdict({
     thresholds: { breached_rules: longRules },
     breakdowns: {
-      by_error_class: { buckets: longBuckets('error'), overflow: emptyOverflow() },
-      by_release: { buckets: longBuckets('release'), overflow: emptyOverflow() },
-      by_route: { buckets: longBuckets('route'), overflow: emptyOverflow() },
+      by_error_class: { buckets: longBuckets((i) => `error_${i}`.padEnd(64, 'x')), overflow: emptyOverflow() },
+      by_release: { buckets: longBuckets((i) => i.toString(16).padStart(40, '0')), overflow: emptyOverflow() },
+      by_route: { buckets: longBuckets((i) => `GET /route_${i}`.padEnd(128, 'x')), overflow: emptyOverflow() },
     },
   });
   const contextArg = contextFixture({
-    logsUrl: `https://logs.example.invalid/${'L'.repeat(2000)}`,
-    windowLabel: `window ${'W'.repeat(5000)}`,
+    logsUrl: LOGS_URL.padEnd(1024, 'x'),
   });
   const first = render(verdict, contextArg);
   assert.notEqual(first, null, 'combined worst case must render within bounds, not fail closed');
   assertDiscordBounds(first);
+  assertNoLoneSurrogates(first, 'canonical payload contains only supported text');
   const text = JSON.stringify(first);
   assert.equal(text.includes('3/4'), true, 'rational must survive schedule capping');
   assert.equal(text.includes('0.7500'), true, 'decimal must survive schedule capping');
   assertLogsHostSurvives(first, 'logs.example.invalid', 'logs host must survive schedule capping');
-  const second = render(verdict, contextFixture({
-    logsUrl: `https://logs.example.invalid/${'L'.repeat(2000)}`,
-    windowLabel: `window ${'W'.repeat(5000)}`,
-  }));
+  const second = render(verdict, contextArg);
   assert.equal(JSON.stringify(second), text, 'scheduled render must be deterministic');
 });
 
-// Break caught: truncation splitting non-BMP pairs. Emoji straddling every
-// cap (label, logs URL, rule, key) must not emit lone surrogates.
-test('emoji straddling truncation caps emits no lone surrogates', () => {
+test('free-form verdict labels and non-canonical log links fail closed', () => {
   const bell = '🔔';
   const longRule = `error_class:${bell.repeat(150)}`;
   const emojiKey = (prefix) => `${prefix}:${bell.repeat(150)}`;
@@ -861,13 +846,19 @@ test('emoji straddling truncation caps emits no lone surrogates', () => {
     logsUrl: `https://logs.example.invalid/${bell.repeat(600)}`,
     windowLabel: bell.repeat(600),
   });
-  const payload = render(verdict, contextArg);
-  assert.notEqual(payload, null, 'emoji input must truncate, not fail closed');
-  assertDiscordBounds(payload);
-  assertNoLoneSurrogates(payload, 'payload must carry no lone surrogates');
-  const text = JSON.stringify(payload);
-  assert.equal(text.includes('3/4'), true, 'rational must survive emoji truncation');
-  assertLogsHostSurvives(payload, 'logs.example.invalid', 'logs host must survive emoji truncation');
+  assert.equal(render(verdict, contextFixture()), null);
+  assert.equal(render(breachVerdict(), contextArg), null);
+  for (const [dimension, key] of [['by_route', 'GET /rest/ping.view%3Ft%3Dsynthetic'],
+    ['by_error_class', CANARIES[1]], ['by_release', CANARIES[0]]]) {
+    const hostile = breachVerdict();
+    hostile.breakdowns[dimension].buckets[0].key = key;
+    assert.equal(render(hostile, contextFixture()), null);
+  }
+  for (const logsUrl of [`${LOGS_URL}?t=synthetic`, `${LOGS_URL}#synthetic`,
+    `${LOGS_URL}%40example.invalid`, 'https://fixture:synthetic@logs.example.invalid/',
+    'https://logs.example.invalid/api/v9/webhooks/123/synthetic']) {
+    assert.equal(render(breachVerdict(), contextFixture({ logsUrl })), null);
+  }
 });
 
 test('host-less logs URLs fail closed', () => {

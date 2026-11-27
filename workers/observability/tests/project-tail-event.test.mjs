@@ -254,6 +254,7 @@ const invalidPolicies = [
   policyFixture({ environment: 'STAGING' }),
   policyFixture({ routes: '*' }), policyFixture({ error_classes: '*' }),
   policyFixture({ routes: [null] }), policyFixture({ error_classes: [42] }),
+  policyFixture({ routes: Object.setPrototypeOf(new Array(1), ['GET /healthz']) }),
   policyFixture({ routes: ['https://example.invalid/v1/library/search'] }),
   policyFixture({ routes: ['GET /v1/library/search?secret=synthetic'] }),
   policyFixture({ routes: ['GET /healthz\n'] }),
@@ -272,6 +273,14 @@ for (const [index, policy] of invalidPolicies.entries()) {
 test('empty allowlists retain the observation but discard grouping', () => {
   assert.deepEqual(project(invocation(), policyFixture({ routes: [], error_classes: [] })),
     expected({ route: 'unknown' }));
+});
+test('grouping uses validated allowlist entries only', () => {
+  const routes = Object.assign(['GET /healthz'], { indexOf: () => 0 });
+  assert.deepEqual(project(withMessages([served({ route: CANARIES[1] })]), policyFixture({ routes })),
+    expected({ route: 'unknown' }));
+  for (const route of ['GET /rest/ping.view%3Ft%3Dsynthetic', `GET /users/${CANARIES[1]}`]) {
+    assert.equal(project(withMessages([served({ route })]), policyFixture({ routes: [route] })), null);
+  }
 });
 test('allowlists at the exact finite cap remain valid', () => {
   const policy = policyFixture({
@@ -563,6 +572,10 @@ test('the string cap is UTF-8 bytes, not UTF-16 character count', () => {
 });
 test('oversized scanning after a valid identity still invalidates metadata', () => {
   assertUnknownMetadata(project(withMessages([served(), sizedServed(16385)])));
+});
+test('non-finite JSON numbers in a served envelope invalidate its metadata', () => {
+  const malformed = served().replace('"duration_ms":4', '"duration_ms":1e400');
+  assertUnknownMetadata(project(withMessages([served(), malformed])));
 });
 test('malformed JSON and non-string messages do not crash or erase a fully scanned valid record', () => {
   assert.deepEqual(project(withMessages(['{malformed', null, { not: 'a string' }, served()])), expected());

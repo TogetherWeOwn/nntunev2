@@ -505,6 +505,15 @@ test('policy is read on each call, not cached from an earlier window', () => {
     policyFixture({ environment: 'production' })), null);
 });
 
+test('the verdict uses only the policy labels and thresholds validated at entry', () => {
+  let labelReads = 0;
+  let totalReads = 0;
+  const policy = policyFixture();
+  Object.defineProperty(policy.max_error_rate, 'total', { get: () => totalReads++ === 0 ? 4 : CANARIES[0] });
+  Object.defineProperty(policy, 'service', { get: () => labelReads++ === 0 ? 'api' : CANARIES[0] });
+  assert.deepEqual(evaluate([obs(), obs(), obs(), failedObs()], policy), expectedVerdict());
+});
+
 test('extra policy fields are ignored without changing the verdict', () => {
   const got = evaluate([obs(), obs(), obs(), failedObs()],
     { ...policyFixture(), build_sha: SHA_B, release: SHA_B, script_name: 'other-producer' });
@@ -591,7 +600,7 @@ test('unknown release still counts and breaches under its own per-release rule',
 test('invalid breakdown keys fold into unknown without losing totals', () => {
   const observations = [
     obs({ release: 'NOTHEX', error_class: 'Bad!', route: 'not a route' }),
-    obs({ release: 42, error_class: null, route: 'GET /search?q=synthetic' }),
+    obs({ release: 42, error_class: null, route: 'GET /rest/ping.view%3Ft%3Dsynthetic' }),
     obs(),
     failedObs(),
   ];
