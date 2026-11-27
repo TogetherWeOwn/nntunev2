@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -779,39 +780,34 @@ class DraftPrivateContractTests(Base):
 class PrivateEvidenceMapTests(unittest.TestCase):
     def test_offline_map_covers_requested_areas_and_keeps_live_gaps_explicit(self):
         text = (HERE.parent / "docs/ops/private-staging-evidence-map.md").read_text(encoding="utf-8")
-        table = text.split("## Synthetic map\n", 1)[1].split("\n\nThe `invite-acceptance`", 1)[0]
-        rows = {}
-        for line in table.splitlines():
-            if not line.startswith("| ") or line.startswith("| ---"):
-                continue
-            fields = [field.strip() for field in line.strip("|").split("|")]
-            if len(fields) == 5 and fields[0] != "Evidence area":
-                rows[fields[0]] = fields
-        expected = {
-            "Encrypted upload": ({"private-publication"}, {"upload-to-library"}),
-            "Library visibility": ({"private-library"}, {"upload-to-library"}),
-            "Playback": ({"private-play"}, {"play", "seek", "queue"}),
-            "Access refusals": (
-                {"private-anonymous-refusal", "private-unlisted-refusal", "private-cutoff-refusal"},
-                {"anonymous-refused", "unlisted-refused", "revoked-or-expired-refused"},
-            ),
-        }
-        self.assertEqual(set(rows), set(expected))
-        for area, (proofs, criteria) in expected.items():
-            source, mapping = rows[area][1:3]
-            self.assertTrue(all(f"`{proof}`" in source for proof in proofs), area)
-            self.assertEqual({part.strip(" `") for part in mapping.split(",")}, criteria, area)
-        for proof, criterion in sa.PRIVATE_TRACK_PROOFS.items():
-            self.assertIn(f"`{proof}`", rows[
-                "Encrypted upload" if proof == "private-publication" else
-                "Library visibility" if proof == "private-library" else
-                "Playback" if proof == "private-play" else "Access refusals"
-            ][1])
-            self.assertIn(f"`{criterion}`", text)
+        table = text.split("## Synthetic map\n", 1)[1].split("## Build identity boundary\n", 1)[0]
+        rows = [line.strip("|").split("|") for line in table.splitlines() if line.startswith("|")]
+        areas = [
+            ("Encrypted upload", ["private-publication"], []),
+            ("Library visibility", ["private-library"], []),
+            ("Playback", ["private-play"], ["seek", "queue"]),
+            ("Access refusals", ["private-anonymous-refusal", "private-unlisted-refusal",
+                                 sa.PRIVATE_CUTOFF_PROOF], []),
+        ]
+        cases = set()
+        proofs = set()
+        for row, (area, track_properties, extra_cases) in zip(rows[2:], areas, strict=True):
+            with self.subTest(area=area):
+                label, properties, mapping, _, _ = row
+                self.assertEqual(label.strip(), area)
+                self.assertEqual(re.findall(r"`([^`]+)`", properties), track_properties)
+                mapped_cases = [sa.PRIVATE_TRACK_PROOFS[proof] for proof in track_properties] + extra_cases
+                self.assertEqual(re.findall(r"`([^`]+)`", mapping), mapped_cases)
+                cases.update(mapped_cases)
+                proofs.update(track_properties)
+        self.assertEqual(proofs, sa.PRIVATE_TRACK_PROOFS.keys())
+        self.assertEqual(cases, sa.PRIVATE_CRITERIA - {"video-off"})
+        for criterion in ("invite-acceptance", "video-off", "paid-signup"):
+            self.assertIn(f"`{criterion}`", table)
+        self.assertIn(f"`{sa.PRIVATE_TRACK_FILE}`", table)
         for phase in sa.IDENTITY_PHASES:
             self.assertIn(f"`{phase}`", text)
-        self.assertIn("does not prove ciphertext at rest", text)
-        self.assertIn("must supply the protected encrypted-storage and upload evidence", text)
+        self.assertIn("Rank 77c must supply protected proof of encrypted upload", rows[2][4])
         self.assertIn("synthetic test data only", text)
         self.assertIn("`jq`", text)
 
