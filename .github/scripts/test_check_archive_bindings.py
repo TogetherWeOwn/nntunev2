@@ -521,8 +521,13 @@ def test_tracked_manifest_cannot_disappear_from_scan():
 
 
 def test_archive_binding_requires_bucket_name():
-    repo = _repo_with({"workers/stream/wrangler.toml": '[[r2_buckets]]\nbinding = "R2"\nbucket_name = 7\n'})
-    _assert_rejected(repo, "invalid bucket_name")
+    for field, error in (
+        ("bucket_name = 7", "invalid bucket_name"),
+        ('preview_bucket_name = " "', "invalid preview_bucket_name"),
+        ("", "R2 binding has no bucket name"),
+    ):
+        repo = _repo_with({"workers/stream/wrangler.toml": f'[[r2_buckets]]\nbinding = "R2"\n{field}\n'})
+        _assert_rejected(repo, error)
 
 
 def test_invalid_utf8_manifest_fails_read_closed():

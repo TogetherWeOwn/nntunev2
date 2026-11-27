@@ -244,13 +244,16 @@ def _bucket_names(manifest: Path) -> list[str] | None:
             raise ManifestError(f"invalid env entry in {manifest}")
         r2_bindings.extend(bindings_from(env))
 
+    bucket_keys = ("bucket_name", "preview_bucket_name")
     for binding in r2_bindings:
         if not isinstance(binding, dict):
             raise ManifestError(f"invalid r2_buckets entry in {manifest}")
-        for key in ("bucket_name", "preview_bucket_name"):
-            if key == "preview_bucket_name" and key not in binding:
+        if not any(key in binding for key in bucket_keys):
+            raise ManifestError(f"R2 binding has no bucket name in {manifest}")
+        for key in bucket_keys:
+            if key not in binding:
                 continue
-            value = binding.get(key)
+            value = binding[key]
             if not isinstance(value, str) or not value.strip():
                 raise ManifestError(f"invalid {key} in {manifest}")
             found.append(value)
