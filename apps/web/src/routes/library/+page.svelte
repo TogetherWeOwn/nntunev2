@@ -233,8 +233,13 @@
 			visibleItems.map((track) => track.id)
 		)
 	);
-	// The last append outcome stays until the next append or a boundary purge.
-	let appendFeedback: string | null = $state(null);
+	// A retry notice belongs to the refused selection. Completed outcomes stay
+	// visible until the next append or a boundary purge.
+	let appendOutcome = $state.raw<{ text: string; forSelection?: readonly string[] } | null>(null);
+	const appendFeedback = $derived(
+		appendOutcome && (appendOutcome.forSelection === undefined || appendOutcome.forSelection === selectedIds)
+			? appendOutcome.text : null
+	);
 	/**
 	 * Range anchor: the most recently activated selection checkbox, or null
 	 * after Clear selection, a boundary purge or a prune that dropped it.
@@ -439,7 +444,7 @@
 			// Purge on an auth boundary; reconcile against fresh membership only.
 			if (authoritative) {
 				if ((state.loadError && state.items.length === 0) || state.libraryUnavailable) {
-					if (selectedIds.length > 0 || appendFeedback !== null || rangeAnchorId !== null) {
+					if (selectedIds.length > 0 || appendOutcome !== null || rangeAnchorId !== null) {
 						purgeSelection();
 					}
 				} else if (!state.loadError) {
@@ -1256,7 +1261,9 @@
 	}
 
 	function selectDisplayedIds(): void {
-		selectedIds = selectAllDisplayed(selectedIds, renderedItems.map((track) => track.id));
+		const next = selectAllDisplayed(selectedIds, renderedItems.map((track) => track.id));
+		if (next.length === selectedIds.length && next.every((id, index) => id === selectedIds[index])) return;
+		selectedIds = next;
 	}
 
 	function clearSelectedIds(): void {
@@ -1275,10 +1282,17 @@
 	}
 
 	function appendSelectedIds(): void {
+		if (loading) {
+			appendOutcome = {
+				text: 'Could not add selected tracks while the Library is refreshing. Try again when it finishes.',
+				forSelection: selectedIds
+			};
+			return;
+		}
 		const queue = queueController.snapshot;
 		const result = appendSelection(queue, selectedIds.filter(queueController.hasLibraryTrack), items);
 		if (!replaceQueue(result.queue)) return;
-		appendFeedback = appendResultLabel(result.added, result.skipped);
+		appendOutcome = { text: appendResultLabel(result.added, result.skipped) };
 	}
 
 
@@ -1518,7 +1532,7 @@
 		endTrackDrag();
 		selectedIds = createSelection();
 		rangeAnchorId = null;
-		appendFeedback = null;
+		appendOutcome = null;
 	}
 
 	function refresh(): Promise<void> {
@@ -2073,9 +2087,9 @@
 					Append selected
 				</button>
 				<SelectionExport {items} {selectedIds} />
-				{#if appendFeedback}
-					<p data-testid="append-result" role="status">{appendFeedback}</p>
-				{/if}
+				<p aria-live="polite" aria-atomic="true" role={appendFeedback ? 'status' : undefined}
+					data-testid={appendFeedback ? 'append-result' : undefined}
+					class:nt-visually-hidden={!appendFeedback}>{appendFeedback}</p>
 				{#if hiddenSelectionCount > 0}
 					<p data-testid="selection-hidden-count">
 						{hiddenSelectionCount} selected {hiddenSelectionCount === 1 ? 'track is' : 'tracks are'} hidden by this {view === 'all' ? 'find' : 'view'}.

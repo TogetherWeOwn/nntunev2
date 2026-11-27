@@ -323,6 +323,24 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(ir.report(api, run["id"], dry_run=True), ["opened: " + name])
         self.assertEqual(api.writes, [])
 
+    def test_combined_post_deploy_job_preserves_smoke_and_journey_incidents(self):
+        run = make_run(workflow="deploy.yml", event="push")
+        smoke_name = "post-deploy-e2e / " + SMOKE
+        journey_name = "post-deploy-e2e / full journey (signup → library → meter → limits)"
+        marker = "<!-- incident-key: deploy.yml:post-deploy-e2e-synthetic-smoke-health -->"
+        for smoke_outcome, journey, expected in (
+            ("failure", "skipped", [f"commented #7: {smoke_name}"]),
+            ("skipped", "skipped", [f"commented #7: {smoke_name}"]),
+            ("success", "failure", [f"recovered #7: {smoke_name}", f"opened: {journey_name}"]),
+            ("success", "success", [f"recovered #7: {smoke_name}"]),
+        ):
+            job = smoke("success" if journey == "success" else "failure", step=smoke_outcome)
+            job.update(name=journey_name)
+            job["steps"] += [{"number": 4, "name": "Run full journey", "conclusion": journey},
+                             {"number": 5, "name": ir.GATES["deploy.yml"][journey_name], "conclusion": journey}]
+            api = FakeAPI(run=run, jobs=[job], issues=[issue(7, body=marker)])
+            self.assertEqual(ir.report(api, 10), expected, (smoke_outcome, journey))
+
     def test_configuration_gate_recovers_only_after_actual_web_deploy(self):
         run = make_run(workflow="deploy.yml", event="push")
         key = "<!-- incident-key: deploy.yml:gate -->"

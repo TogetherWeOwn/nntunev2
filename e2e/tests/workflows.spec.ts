@@ -44,12 +44,14 @@ const dummyPair = {
   CF_ACCESS_CLIENT_SECRET: 'dummy-client-secret',
 };
 
-test('both staging jobs have tested preflights', () => {
-  expect(preflights).toHaveLength(2);
+test('ordinary staging shares one configuration preflight', () => {
+  expect(preflights).toHaveLength(1);
+  expect(preflights[0]![1]).toContain("POST_DEPLOY: ${{ inputs.post_deploy && 'true' || 'false' }}");
 });
 
-for (const [index, preflight] of preflights.entries()) {
-  const script = preflight[2]!.replace(/^ {10}/gm, '');
+for (const [index, postDeploy] of ['false', 'true'].entries()) {
+  const preflight = preflights[0]!;
+  const script = `export POST_DEPLOY=${postDeploy}\n${preflight[2]!.replace(/^ {10}/gm, '')}`;
   test.describe(index === 0 ? 'synthetic preflight' : 'journey preflight', () => {
     test('binds both Access secrets into the preflight environment', () => {
       expect(preflight[1]).toContain('CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}');
@@ -534,9 +536,8 @@ function fileContainsMarker(file: string, marker: string): boolean {
 }
 
 test.describe('failure-artifact sanitization', () => {
-  test('both jobs sanitize before uploading', () => {
-    expect(sanitizeSections).toHaveLength(2);
-    expect(sanitizeBlocks).toHaveLength(2);
+  test('shared staging job sanitizes before uploading', () => {
+    expect(sanitizeSections).toHaveLength(1);
     for (const section of sanitizeSections) {
       // The scrub needs the secret VALUES, so each sanitize step must bind
       // them (names only in source; values come from GitHub secrets).
@@ -572,11 +573,11 @@ test.describe('failure-artifact sanitization', () => {
   });
 
   test('uploads are junit-only (no playwright-report)', () => {
-    // Both jobs upload test-results/ only. The html report (index.html with
+    // The failure artifact uploads test-results/ only. The html report (index.html with
     // its embedded base64 zip of step fill values) must never be an upload
     // path — the sanitize step may still NAME playwright-report/ to delete it.
     const uploadPaths = [...stagingWorkflow.matchAll(/path: \|\n((?:            [^\n]*\n)+)/g)];
-    expect(uploadPaths).toHaveLength(2);
+    expect(uploadPaths).toHaveLength(1);
     for (const upload of uploadPaths) {
       expect(upload[1]).toContain('e2e/test-results/');
       expect(upload[1]).not.toContain('playwright-report');
@@ -739,9 +740,9 @@ function makeProbe(): string {
 const GATE_MARKER = 'SENTINEL-SECRET-VALUE-GATE';
 
 test.describe('fail-closed artifact publication gate', () => {
-  test('both uploads require a successful sanitizer outcome (evaluated)', () => {
-    expect(uploadSections).toHaveLength(2);
-    expect(sanitizeSections).toHaveLength(2);
+  test('the failure upload requires a successful sanitizer outcome (evaluated)', () => {
+    expect(uploadSections).toHaveLength(1);
+    expect(sanitizeSections).toHaveLength(1);
     for (const [index, upload] of uploadSections.entries()) {
       const condition = upload[1]!;
       const sanitizeId = sanitizeSections[index]![1]!.match(/^\s+id:\s*(\S+)/m)?.[1];
@@ -767,7 +768,7 @@ test.describe('fail-closed artifact publication gate', () => {
   });
 
   test('uploads keep junit-only path and 7-day retention', () => {
-    expect(uploadSections).toHaveLength(2);
+    expect(uploadSections).toHaveLength(1);
     for (const upload of uploadSections) {
       expect(upload[2]).toContain('e2e/test-results/');
       expect(upload[2]).not.toContain('playwright-report');
@@ -777,9 +778,9 @@ test.describe('fail-closed artifact publication gate', () => {
     }
   });
 
-  for (const [index, block] of sanitizeBlocks.entries()) {
+  for (const block of sanitizeBlocks) {
     const script = block.replace(/^ {10}/gm, '');
-    const job = index === 0 ? 'synthetic' : 'journey';
+    const job = 'staging';
 
     test(`${job} sanitizer: positive control publishes only scrubbed junit`, () => {
       const probe = makeProbe();
@@ -900,6 +901,12 @@ function jobIf(workflow: string, job: string): string | undefined {
   return jobSection(workflow, job).match(/^    if: (.+)$/m)?.[1];
 }
 
+function stagingStep(name: string): string {
+  const step = stagingWorkflow.split(`\n      - name: ${name}\n`)[1];
+  expect(step, `staging step ${name} not found`).toBeDefined();
+  return step!.split(/\n      - /, 1)[0]!;
+}
+
 const stagingOnBlock = stagingWorkflow
   .split('\non:\n')[1]!
   .split('\npermissions:\n')[0]!;
@@ -922,20 +929,21 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
   });
 
   test('full journey runs only for the post-deploy call (evaluated)', () => {
-    const condition = jobIf(stagingWorkflow, 'e2e');
-    expect(condition, 'e2e job must carry a job-level if').toBeDefined();
+    const condition = stagingStep('Run full journey').match(/^        if: (.+)$/m)?.[1];
+    expect(condition, 'full journey needs a step-level gate').toBeDefined();
     expect(condition).not.toContain('always()');
     expect(condition).not.toContain('!cancelled()');
-    expect(jobSection(stagingWorkflow, 'e2e')).toContain('needs: [synthetic]');
+    expect(condition).toContain("steps.smoke.outcome == 'success'");
 
-    const evaluate = (postDeploy: boolean | ''): boolean => {
+    const evaluate = (postDeploy: boolean | '', smokePassed = true): boolean => {
       const inner = condition!
         .replace(/^\$\{\{\s*/, '')
         .replace(/\s*\}\}$/, '');
       const expr = inner.replace(
         /inputs\.post_deploy/g,
         postDeploy === '' ? 'false' : String(postDeploy),
-      );
+      ).replace(/success\(\)/g, 'true')
+        .replace(/steps\.smoke\.outcome == 'success'/g, String(smokePassed));
       expect(expr, `unmodelled journey-gate syntax in: ${condition}`).toMatch(
         /^[\s()!&|truefals]+$/,
       );
@@ -943,16 +951,49 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     };
     // workflow_call from deploy.yml passes post_deploy: true.
     expect(evaluate(true)).toBe(true);
+    expect(evaluate(true, false)).toBe(false);
     // workflow_dispatch/schedule leave the input unset: monitoring only.
     expect(evaluate('')).toBe(false);
     expect(evaluate(false)).toBe(false);
   });
 
-  test('synthetic smoke stays ungated monitoring on every trigger', () => {
-    // No job-level if: scheduled and manual runs execute the smoke (and
-    // step-level skip while staging is unconfigured), distinct from the
-    // gated full journey above.
-    expect(jobIf(stagingWorkflow, 'synthetic')).toBeUndefined();
+  test('post-deploy smoke and journey share one runner and block qualification on failure', () => {
+    const jobs = stagingWorkflow.split('\njobs:\n')[1]!;
+    expect([...jobs.matchAll(/^  ([\w-]+):/gm)].map((m) => m[1])).toEqual(['e2e']);
+    const job = jobSection(stagingWorkflow, 'e2e');
+    expect(job).toContain("name: ${{ inputs.post_deploy && 'full journey (signup → library → meter → limits)' || 'synthetic smoke (health)' }}");
+    expect(job).not.toMatch(/^    (if|needs):/m);
+    expect(job).not.toContain('continue-on-error');
+
+    expect(job.split('\n      - name: Run synthetic smoke\n')[0]!.match(/^        timeout-minutes: 10$/gm)).toHaveLength(4);
+    expect(job).toMatch(/Run synthetic smoke[\s\S]*Run full journey[\s\S]*Enforce journey evidence gate[\s\S]*Record candidate admission receipt[\s\S]*Upload candidate admission receipt/);
+    expect(stagingStep('Run synthetic smoke')).toContain("\n        if: success() && steps.staging.outputs.configured == 'true'\n");
+    expect(stagingStep('Record candidate admission receipt')).toContain("\n        if: ${{ !cancelled() && (steps.journey-gate.outcome == 'success' || steps.journey-gate.outcome == 'failure') }}\n");
+    expect(stagingStep('Upload candidate admission receipt')).toContain("        if: ${{ success() && steps.journey-gate.outcome == 'success' && steps.receipt.outcome == 'success' }}\n");
+  });
+
+  test('post-deploy smoke only discards JUnit after a successful smoke', () => {
+    const step = stagingStep('Run synthetic smoke');
+    expect(step).toContain("POST_DEPLOY: ${{ inputs.post_deploy && 'true' || 'false' }}");
+    const script = 'npm() { test "$*" = "run e2e:smoke"; return "$SMOKE_EXIT"; }\n'
+      + step.split('        run: |\n')[1]!.replace(/^ {10}/gm, '');
+    const probe = makeProbe();
+    try {
+      mkdirSync(join(probe, 'test-results'));
+      const junit = join(probe, 'test-results', 'junit.xml');
+      for (const [postDeploy, exitCode, keepJunit] of [
+        ['true', 3, true],
+        ['false', 0, true],
+        ['true', 0, false],
+      ] as const) {
+        writeFileSync(junit, '<testsuite/>');
+        const result = runShell(script, { POST_DEPLOY: postDeploy, SMOKE_EXIT: String(exitCode) }, probe);
+        expect(result.status).toBe(exitCode);
+        expect(existsSync(junit)).toBe(keepJunit);
+      }
+    } finally {
+      rmSync(probe, { recursive: true, force: true });
+    }
   });
 
   test('ordinary staging E2E installs only the default Chromium headless shell', () => {
@@ -964,11 +1005,8 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     expect(use.headless).not.toBe(false);
     expect(use.launchOptions?.executablePath).toBeUndefined();
 
-    for (const job of ['synthetic', 'e2e']) {
-      expect(jobSection(stagingWorkflow, job)).toContain(
-        'run: npx playwright install --with-deps --only-shell chromium\n',
-      );
-    }
+    expect(stagingWorkflow.match(/run: npm ci\n/g)).toHaveLength(1);
+    expect(stagingWorkflow.match(/run: npx playwright install --with-deps --only-shell chromium\n/g)).toHaveLength(1);
   });
 
   test('deploy calls e2e-staging only after successful push staging-web and staging-api (evaluated)', () => {
@@ -3021,7 +3059,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.status).not.toBe(0);
     expect(result.summary).toContain('ingested track carries recording_mbids | missing |');
   });
-  test('journey job carries an always-run evidence gate on configured runs', () => {
+  test('journey job runs the evidence gate after a passing or failing journey', () => {
     const section = jobSection(stagingWorkflow, 'e2e');
     const gateAt = section.indexOf('Enforce journey evidence gate');
     expect(gateAt, 'e2e job must carry the evidence gate step').toBeGreaterThan(-1);
@@ -3030,10 +3068,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(gateAt, 'gate must run after the full journey').toBeGreaterThan(runAt);
     const nextStep = section.indexOf('\n      - name:', gateAt + 1);
     const stepBlock = section.slice(gateAt, nextStep === -1 ? undefined : nextStep);
-    // Runs even when the journey failed (to publish counts) but never
-    // pre-deploy (unconfigured staging produces no evidence by design).
-    expect(stepBlock).toContain('if: always()');
-    expect(stepBlock).toContain(`steps.staging.outputs.configured == 'true'`);
+    expect(stepBlock).toContain("\n        if: ${{ !cancelled() && (steps.journey.outcome == 'success' || steps.journey.outcome == 'failure') }}\n");
     expect(stepBlock).toContain('node scripts/enforce-journey-evidence.mjs');
     expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '12'`);
     expect(stepBlock).toContain(`REQUIRE_QA_AUTH_TOKEN: 'true'`);

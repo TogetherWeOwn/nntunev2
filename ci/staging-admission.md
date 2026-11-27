@@ -237,6 +237,13 @@ The object has `schema: 1`, the candidate `sha`, decimal string `run_id` and
 no private pins. The line is staging evidence only. Match it against the
 [pinned candidate template](../docs/first-private-music-launch.md#pinned-candidate-template).
 
+If the final Web or API read returns a different build after the selected
+private receipt and its Web/API/Stream pins pass verification, admission is
+Pending. The refusal identifies the selected SHA, run and attempt. Retain
+those references and compare the current Web, API and Stream build, version
+and deployment IDs with that attempt through the authorized read-only
+deployment records. Return to candidate qualification if staging moved.
+
 ### Synthetic handoff when Actions evidence is unavailable
 
 For candidate `<sha>`, the private journey and receipt upload in run
@@ -337,6 +344,24 @@ build identity case. It also checks that paid signup stays excluded and that
 a report containing an unexpected paid-signup case emits no summary. This CI
 comparison prepares QA for the live review, which still requires evidence
 from the exact protected run.
+
+### Accepted automatic push awaiting work
+
+Run `python3 -I ci/staging_admission.py diagnose-pending-push <pinned-sha> <
+evidence.json` with saved Actions responses for a first-attempt main push.
+Provide the run object as `run` and its complete attempt-specific jobs page
+(`total_count` and `jobs`, up to 100 rows) as `jobs`. Capture the two
+responses for the same attempt.
+
+An unresolved run with zero job rows points to the attempt's jobs endpoint.
+A queued full-journey job with runner ID `0`, an empty runner name and no steps
+points to that job's endpoint. Actions can populate `started_at` on a queued job
+before runner assignment. The diagnostic prints the observed IDs and the next
+read on stderr, exits 1 and emits no receipt or admission pins. Use the normal
+receipt verifier for a completed success. A rejected push or a failed journey
+does not receive a pending-work diagnosis.
+
+### Receipt verification fixtures
 
 `python3 -I ci/test_staging_admission.py` uses synthetic policy and authenticated
 API-shaped fixtures without a network, deploy or operational acceptance claim.

@@ -110,6 +110,7 @@ pub(super) struct Source {
     clock: Cell<SystemTime>,
     pub(super) expected_media_end: Cell<u64>,
     pub(super) corrupt_final_frame_once: Cell<bool>,
+    pub(super) pause_last_byte: Cell<Option<Rc<FrameGate>>>,
 }
 
 impl Source {
@@ -176,6 +177,7 @@ impl Source {
             clock: Cell::new(start),
             expected_media_end: Cell::new(sealed_len),
             corrupt_final_frame_once: Cell::new(false),
+            pause_last_byte: Cell::new(None),
         }
     }
 
@@ -208,11 +210,13 @@ pub(super) struct BodyBytes {
 
 impl ReadbackBody for BodyBytes {
     async fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-        if let Some((_, gate)) = self
-            .gate
-            .as_ref()
-            .filter(|(offset, _)| self.cursor.position() == *offset)
-        {
+        let position = self.cursor.position();
+        if let Some((offset, _)) = self.gate.as_ref().filter(|(offset, _)| position < *offset) {
+            // Stop at the gate so a large read cannot skip past the held byte.
+            let available = dst.len().min((*offset - position) as usize);
+            return io::Read::read(&mut self.cursor, &mut dst[..available]);
+        }
+        if let Some((_, gate)) = self.gate.as_ref().filter(|(offset, _)| position == *offset) {
             gate.waiting.set(true);
             // The test invokes each poll and controls when the frame is readable.
             poll_fn(|_| {
@@ -308,11 +312,16 @@ impl PrivateSource for Source {
             has_content_encoding: false,
             body: BodyBytes {
                 cursor: io::Cursor::new(bytes),
-                gate: self.pause_final_frame.take().map(|gate| {
-                    assert!(!self.fixture.last.is_empty());
-                    let offset = end - start - self.fixture.last.len() as u64;
-                    (offset, gate)
-                }),
+                gate: match (self.pause_final_frame.take(), self.pause_last_byte.take()) {
+                    (Some(gate), None) => {
+                        assert!(!self.fixture.last.is_empty());
+                        Some((end - start - self.fixture.last.len() as u64, gate))
+                    }
+                    // Hold inside the final frame after all but one ciphertext byte.
+                    (None, Some(gate)) => Some((end - start - 1, gate)),
+                    (None, None) => None,
+                    (Some(_), Some(_)) => panic!("one media gate per read"),
+                },
             },
         })
     }
@@ -357,6 +366,7 @@ pub(super) struct Writer<'a> {
     pub(super) output: &'a RefCell<Vec<u8>>,
     pub(super) fault: Fault,
     pub(super) aborted: &'a Cell<bool>,
+    pub(super) closed: Option<&'a Cell<bool>>,
     pub(super) revoke_on_write: Option<&'a Cell<bool>>,
 }
 impl OriginalWriter for Writer<'_> {
@@ -378,6 +388,9 @@ impl OriginalWriter for Writer<'_> {
         Poll::Ready(Ok(1))
     }
     fn poll_close(&mut self, _: &mut Context<'_>) -> Poll<Result<(), SourceError>> {
+        if let Some(closed) = self.closed {
+            closed.set(true);
+        }
         Poll::Ready(Ok(()))
     }
     fn abort(&mut self) {

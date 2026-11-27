@@ -491,7 +491,7 @@ How the suite uses them:
   (pre-deploy); the post-deploy full journey fails in preflight, because a
   skipped journey after a real `staging-web` deploy would otherwise pass
   green and be accepted as promotion evidence.
-  Both jobs require the Access pair in preflight before activating tests;
+  The shared preflight requires the Access pair before activating tests;
   configured staging never skips for missing credentials. The full journey
   additionally runs the evidence gate
   (`e2e/scripts/enforce-journey-evidence.mjs`): a configured run with no
@@ -514,7 +514,7 @@ How the suite uses them:
   helper/workflow self-tests, `playwright test --list`, and the
   traceability-matrix check (`docs/m1-exit-traceability.md` must cite every
   listed spec). Runs on every PR
-  with no staging needed. Offline tests execute both checked-in preflights
+  with no staging needed. Offline tests execute both modes of the staging preflight
   and the aggregate gate with dummy inputs; failures, cancellations and skips
   of required jobs make `ci-ok` red.
 - **Prod promotion gate (required integration):** the deployment lane must
@@ -569,10 +569,10 @@ specs) — never a scheduled/manual synthetic run, which
 is monitoring only; NEEDS WORK cites the failing spec + step. Every spec that branches on the test-account seam records a
 bounded `signup-path` test annotation — exactly `public-ui-signup` or
 `api-minted-account`, with no email, account id, token or provider data.
-Both staging jobs publish those labels to the run's step summary on every
+The staging job publishes those labels to the run's step summary on every
 configured run (pass or fail), because green runs upload no artifacts and
 the list reporter does not print annotations; the sanitized junit upload
 stays failure-only (7 days). The full journey's evidence gate publishes the
-ran / skipped / failed counts beside those labels on every configured run,
+ran / skipped / failed counts after smoke passes and the journey runs,
 so a PASS always names how many journeys actually ran. A seam-backed (`api-minted-account`) run
 never counts as proof of the public UI signup.

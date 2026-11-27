@@ -471,6 +471,82 @@ pub(crate) async fn verify_publication(
         }))
         .await
     };
+
+    // Fail the catalogue transaction at COMMIT after all publication writes
+    // have been staged. The upload's authenticated completion is already durable.
+    observer
+        .batch_execute(
+            "CREATE FUNCTION public.fixture_fail_catalogue_commit() RETURNS trigger
+             LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+             BEGIN
+                 PERFORM pg_advisory_xact_lock(1753);
+                 RAISE EXCEPTION 'synthetic catalogue commit failure';
+             END $$;
+             CREATE CONSTRAINT TRIGGER fixture_fail_catalogue_commit
+             AFTER INSERT ON public.catalogue_s3_sources DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW EXECUTE FUNCTION public.fixture_fail_catalogue_commit();",
+        )
+        .await
+        .unwrap();
+    let failed = {
+        let mut gate = connection().await;
+        let gate = gate.transaction().await.unwrap();
+        let gate_pid = gate
+            .query_one("SELECT pg_backend_pid(), pg_advisory_xact_lock(1753)", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let publication_pid = publication
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let mut pending = std::pin::pin!(publish(&mut publication, upload_writer, None));
+        blocker_observer::observe_blocked(observer, gate_pid, publication_pid, pending.as_mut())
+            .await
+            .unwrap();
+        let command: String = observer
+            .query_one(
+                "SELECT query FROM pg_stat_activity WHERE pid = $1",
+                &[&publication_pid],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(command, "COMMIT");
+        gate.commit().await.unwrap();
+        pending.await
+    };
+    assert_eq!((failed.status, failed.body), (503, unavailable().body));
+
+    let pins = committed.outcome();
+    let rolled_back = observer.query_one(
+        "SELECT NOT EXISTS (SELECT FROM public.tracks WHERE release_id = $1::text::uuid)
+           AND NOT EXISTS (SELECT FROM public.catalogue_s3_sources WHERE object_id = $2::text::uuid)
+           AND NOT EXISTS (SELECT FROM public.storage_s3_locator_intents WHERE object_id = $2::text::uuid)
+           AND NOT EXISTS (SELECT FROM public.private_library_admissions WHERE object_id = $2::text::uuid)
+           AND NOT EXISTS (SELECT FROM public.storage_validated_digest_references WHERE object_id = $2::text::uuid)
+           AND EXISTS (SELECT FROM public.ingest_session_reservations r
+               JOIN public.storage_digest_inventory_intents i ON i.map_id = r.completed_map_id
+               JOIN public.storage_validated_digest_winners w ON w.object_id = r.multipart_object_id
+               WHERE r.id = $3::text::uuid AND w.object_id = $2::text::uuid
+                 AND r.terminal_reason = 'completed' AND i.map_id = $4::text::uuid
+                 AND i.media_version = $5 AND i.page_versions = $6)",
+        &[&RELEASE, &pins.object, &prepared.scope.session, &pins.map,
+          &pins.media_version, &pins.page_versions],
+    ).await.unwrap().get::<_, bool>(0);
+    assert!(
+        rolled_back,
+        "failed catalogue commit must preserve only the completed upload"
+    );
+    observer
+        .batch_execute(
+            "DROP TRIGGER fixture_fail_catalogue_commit ON public.catalogue_s3_sources;
+             DROP FUNCTION public.fixture_fail_catalogue_commit();",
+        )
+        .await
+        .unwrap();
+
     let set_job = async |job: &str| {
         observer.execute(
             "UPDATE public.ingest_session_reservations SET idempotency_key = $1 WHERE id = $2::text::uuid",

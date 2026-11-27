@@ -1,6 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import { test as base, expect, type Page, type Route } from '@playwright/test';
-import { preview } from 'vite';
+import { preview, type Connect } from 'vite';
 import { PRIVATE_MUSIC } from '../../../../e2e/helpers/private-music-journey.js';
 
 // Loopback HTTP uses a fixture-only cookie. The staged runner sends the real cookie over HTTPS.
@@ -24,14 +24,29 @@ export function serveRangedAudio(route: Route, body: Buffer, contentType: 'audio
 	});
 }
 
-export const test = base.extend<{ origin: string }>({
+export function flacRange(rangeHeader: string | undefined, body: Buffer) {
+	const range = /^bytes=(\d+)-(\d*)$/.exec(rangeHeader ?? '');
+	const start = range ? Number(range[1]) : 0;
+	const end = range?.[2] ? Math.min(Number(range[2]), body.length - 1) : body.length - 1;
+	if (start > end) return { status: 416, start, bytes: body.subarray(0, 0), headers: { 'content-range': `bytes */${body.length}` } };
+	const headers: Record<string, string> = { 'accept-ranges': 'bytes' };
+	if (range) headers['content-range'] = `bytes ${start}-${end}/${body.length}`;
+	return { status: range ? 206 : 200, start, bytes: body.subarray(start, end + 1), headers };
+}
+
+export const test = base.extend<{ origin: string; privateMediaMiddleware?: Connect.NextHandleFunction }>({
 	serviceWorkers: 'block',
-	origin: async ({}, use) => {
+	privateMediaMiddleware: undefined,
+	origin: async ({ privateMediaMiddleware }, use) => {
 		// Serve the existing browser-fixtures build with the runtime arm set only here.
 		const previous = process.env['PUBLIC_BROWSER_PLAYBACK'];
 		process.env['PUBLIC_BROWSER_PLAYBACK'] = '1';
 		const server = await preview({
 			root: fileURLToPath(new URL('../../', import.meta.url)), mode: 'browser-fixtures',
+			plugins: privateMediaMiddleware ? [{
+				name: 'private-media-fixture',
+				configurePreviewServer(server) { server.middlewares.use(privateMediaMiddleware); }
+			}] : [],
 			preview: { host: '127.0.0.1', port: 0 }
 		}).finally(() => {
 			if (previous === undefined) delete process.env['PUBLIC_BROWSER_PLAYBACK'];

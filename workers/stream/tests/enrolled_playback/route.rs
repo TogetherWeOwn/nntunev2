@@ -76,6 +76,7 @@ async fn interrupting_one_track_preserves_the_other_tracks_cursor_and_receipt() 
                     output,
                     fault: Fault::None,
                     aborted,
+                    closed: None,
                     revoke_on_write: None,
                 }))
             },
@@ -189,6 +190,7 @@ async fn private_route_authenticates_flac_and_accounts_for_writer_prefixes() {
                     output: &output,
                     fault: case.fault,
                     aborted: &aborted,
+                    closed: None,
                     revoke_on_write: None,
                 }))
             },
@@ -243,6 +245,7 @@ async fn open_ended_range_delivers_plaintext_through_eof() {
                 output: &output,
                 fault: Fault::None,
                 aborted: &aborted,
+                closed: None,
                 revoke_on_write: None,
             }))
         },
@@ -290,6 +293,7 @@ async fn empty_media_read_does_not_credit_or_advance_seek() {
                     output: &output,
                     fault: Fault::None,
                     aborted: &aborted,
+                    closed: None,
                     revoke_on_write: None,
                 }))
             },
@@ -354,6 +358,7 @@ async fn short_media_read_reports_only_written_bytes_and_retry_is_contiguous() {
                     output: &output,
                     fault: Fault::None,
                     aborted: &aborted,
+                    closed: None,
                     revoke_on_write: None,
                 }))
             },
@@ -429,6 +434,7 @@ async fn final_frame_verification_failure_preserves_acknowledged_delivery() {
                     output: &output,
                     fault: Fault::None,
                     aborted: &aborted,
+                    closed: None,
                     revoke_on_write: None,
                 }))
             },
@@ -515,6 +521,7 @@ async fn browser_stream_aborts_at_the_next_chunk_after_lease_revocation() {
                 output: &output,
                 fault: Fault::None,
                 aborted: &aborted,
+                closed: None,
                 revoke_on_write: Some(&source.revoked),
             }))
         },
@@ -578,6 +585,7 @@ async fn successful_seek_reports_all_written_bytes_and_meters_only_new_bytes() {
                         output: &output,
                         fault: Fault::None,
                         aborted: &aborted,
+                        closed: None,
                         revoke_on_write: None,
                     }))
                 },
@@ -618,4 +626,106 @@ async fn successful_seek_reports_all_written_bytes_and_meters_only_new_bytes() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn dropping_a_partial_encrypted_read_leaves_the_other_caller_live() {
+    let source = Source::browser();
+    let request = |start| PlayRouteRequest {
+        track_id: "track".into(),
+        token: Some(BROWSER_TOKEN.into()),
+        range: Some(format!("bytes={start}-65536")),
+        trace_id: None,
+    };
+    let cancelled = request(65_534);
+    let live = request(65_535);
+    let cancelled_output = RefCell::new(Vec::new());
+    let live_output = RefCell::new(Vec::new());
+    let cancelled_closed = Cell::new(false);
+    let live_closed = Cell::new(false);
+    let cancelled_aborted = Cell::new(false);
+    let live_aborted = Cell::new(false);
+    let reports = RefCell::new(Vec::new());
+    let read = |request, output, closed, aborted, range: &'static str, len| {
+        serve(
+            request,
+            b"test only, not a deployed secret",
+            Some(&source),
+            || source.time(),
+            move |head| {
+                assert_eq!(head.status, 206);
+                assert_eq!(head.content_range.as_deref(), Some(range));
+                assert_eq!(head.len, len);
+                Ok(Some(Writer {
+                    output,
+                    fault: Fault::None,
+                    aborted,
+                    closed: Some(closed),
+                    revoke_on_write: None,
+                }))
+            },
+            |interval| reports.borrow_mut().push(interval),
+        )
+    };
+    let receipt = |start, end| DeliveredInterval {
+        user_id: "member".into(),
+        play_id: "private_browser_AAAAAAAAAAAAAAAAAAAAAA".into(),
+        track_id: "track".into(),
+        start,
+        end,
+        file_bytes: Some(LEN),
+    };
+
+    let cancelled_tail = Rc::<FrameGate>::default();
+    source.pause_last_byte.set(Some(cancelled_tail.clone()));
+    let mut cancelled = Box::pin(read(
+        &cancelled,
+        &cancelled_output,
+        &cancelled_closed,
+        &cancelled_aborted,
+        "bytes 65534-65536/65537",
+        3,
+    ));
+    assert!(futures_util::poll!(&mut cancelled).is_pending());
+    assert!(cancelled_tail.waiting.get());
+    assert_eq!(*cancelled_output.borrow(), b"AY");
+
+    let live_tail = Rc::<FrameGate>::default();
+    source.pause_last_byte.set(Some(live_tail.clone()));
+    let mut live = Box::pin(read(
+        &live,
+        &live_output,
+        &live_closed,
+        &live_aborted,
+        "bytes 65535-65536/65537",
+        2,
+    ));
+    assert!(futures_util::poll!(&mut live).is_pending());
+    assert!(live_tail.waiting.get());
+    assert_eq!(*live_output.borrow(), b"Y");
+    assert!(reports.borrow().is_empty());
+
+    drop(cancelled);
+    assert!(cancelled_tail.dropped.get());
+    assert!(!live_tail.dropped.get());
+    assert!(!cancelled_closed.get());
+    assert!(!live_closed.get());
+    assert!(!live_aborted.get());
+    assert_eq!(*cancelled_output.borrow(), b"AY");
+    assert_eq!(*live_output.borrow(), b"Y");
+    assert_eq!(*reports.borrow(), [receipt(65_534, 65_536)]);
+
+    live_tail.released.set(true);
+    assert!(matches!(
+        futures_util::poll!(&mut live),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(live_tail.dropped.get());
+    assert!(live_closed.get());
+    assert!(!live_aborted.get());
+    assert_eq!(*live_output.borrow(), b"YZ");
+    assert_eq!(
+        *reports.borrow(),
+        [receipt(65_534, 65_536), receipt(65_535, LEN)]
+    );
 }

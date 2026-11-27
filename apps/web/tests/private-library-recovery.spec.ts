@@ -346,3 +346,49 @@ test('Refresh adds the first available track to an empty invited Library', async
 		repeatRefresh.resolve([updated]);
 	}
 });
+
+test('Title Z–A survives a failed invited Library refresh and successful Retry', async ({ page, origin }) => {
+	const initial = [first, selected, added];
+	const renamed = { ...first, title: 'Zulu catalogue track' };
+	const newcomer = { id: '00000000-0000-4000-8000-000000000004', title: 'Amber catalogue track' };
+	const refreshed = [renamed, newcomer, selected];
+	let listing: Listing = initial;
+	const fixture = await mockCatalogue(page, origin, () => listing);
+	await fixture.signIn();
+
+	const main = page.getByRole('main');
+	const order = main.getByRole('combobox', { name: 'Order tracks', exact: true });
+	const selectedOrder = order.locator('option:checked');
+	const titles = main.getByTestId('library-list').getByTestId(library.item).locator(library.select);
+	const stale = main.getByTestId('library-stale-badge');
+	const refresh = main.getByRole('button', { name: library.refresh, exact: true });
+	const retry = main.getByRole('button', { name: 'Retry', exact: true });
+	const listingUrl = origin + library.api;
+	const mode = 'Title Z–A';
+	const initialSorted = [selected.title, added.title, first.title];
+
+	await page.goto(origin + library.path);
+	await expect(selectedOrder).toHaveText('Original order');
+	await expect(titles).toHaveText(initial.map(({ title }) => title));
+	await order.selectOption({ label: mode });
+	await expect(selectedOrder).toHaveText(mode);
+	await expect(titles).toHaveText(initialSorted);
+	expect(fixture.listingAccounts).toEqual([listener.account]);
+
+	listing = 503;
+	const [failed] = await Promise.all([page.waitForResponse(listingUrl), refresh.click()]);
+	expect(failed.status()).toBe(503);
+	await expect(stale).toBeVisible();
+	await expect(selectedOrder).toHaveText(mode);
+	await expect(titles).toHaveText(initialSorted);
+	expect(fixture.listingAccounts).toEqual([listener.account, listener.account]);
+
+	listing = refreshed;
+	const [retried] = await Promise.all([page.waitForResponse(listingUrl), retry.click()]);
+	expect(retried.status()).toBe(200);
+	await expect(stale).toBeHidden();
+	await expect(refresh).toBeVisible();
+	await expect(selectedOrder).toHaveText(mode);
+	await expect(titles).toHaveText([renamed.title, selected.title, newcomer.title]);
+	expect(fixture.listingAccounts).toEqual([listener.account, listener.account, listener.account]);
+});

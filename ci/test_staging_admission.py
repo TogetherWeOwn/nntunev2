@@ -47,6 +47,16 @@ CONTRACT = {
     ],
 }
 CONTRACT_BYTES = json.dumps(CONTRACT).encode()
+ORDINARY_IDENTITY_CASES = {
+    "build-identity": (
+        "build-identity.spec.ts",
+        "deployed build matches the promotion SHA (exact-head staging evidence)",
+    ),
+    "build-identity-final": (
+        "zz-build-identity-final.spec.ts",
+        "deployed build still matches the promotion SHA at journey end (superseded-deploy guard)",
+    ),
+}
 PRIVATE_CASES = ("upload-to-library", "play", "seek", "queue", "anonymous-refused",
                  "unlisted-refused", "revoked-or-expired-refused", "video-off")
 PRIVATE_CONTRACT = dict(CONTRACT, journey="private-music", criteria=[
@@ -78,7 +88,8 @@ def make_junit(skip=False, fail=False, omit=False, final_sha=None):
         if fail:
             ET.SubElement(case, "failure")
     for phase, minutes, web in (("build-identity", -3, SHA), ("build-identity-final", -2, final_sha)):
-        case = ET.SubElement(suite, "testcase", classname="identity", name=phase)
+        classname, name = ORDINARY_IDENTITY_CASES[phase]
+        case = ET.SubElement(suite, "testcase", classname=classname, name=name)
         props = ET.SubElement(case, "properties")
         value = {"phase": phase, "web": web, "api": SHA, "expected": SHA, "observed_at": iso(minutes)}
         ET.SubElement(props, "property", name="candidate-identity", value=json.dumps(value))
@@ -769,6 +780,23 @@ class ProduceTests(Base):
         self.assertEqual((receipt["result"], receipt["reasons"]), ("satisfied", []))
         self.assertEqual(receipt["coverage"], [{"id": "signup", "outcome": "passed"}])
 
+    def test_identity_properties_must_come_from_the_designated_ordinary_cases(self):
+        xml = make_junit()
+        control = World(xml=xml).receipt
+        self.assertEqual((control["result"], control["reasons"]), ("satisfied", []))
+        self.assertEqual(control["coverage"], [{"id": "signup", "outcome": "passed"}])
+
+        for phase, (classname, _) in ORDINARY_IDENTITY_CASES.items():
+            with self.subTest(phase=phase):
+                suite = ET.fromstring(xml)
+                source = suite.find(f"testcase[@classname='{classname}']")
+                properties = source.find("properties")
+                source.remove(properties)
+                suite.find("testcase[@name='signup']").append(properties)
+                receipt = World(xml=ET.tostring(suite)).receipt
+                self.assertEqual((receipt["result"], receipt["reasons"]),
+                                 ("incomplete", ["unexpected ordinary identity case"]))
+
     def test_incomplete_criteria_are_never_satisfied(self):
         for kind in ({"skip": True}, {"fail": True}, {"omit": True}):
             receipt = World(xml=make_junit(**kind)).receipt
@@ -910,6 +938,66 @@ class VerifyTests(Base):
                     self.assertEqual(w.verify_with_actions(actions), w.receipt)
                 self.assertNotIn(selected_jobs, actions.calls)
                 self.assertEqual(other_jobs in actions.calls, api_conclusion is not None)
+
+    def test_offline_pending_push_distinguishes_job_creation_from_runner_assignment(self):
+        # Shapes from Actions run and attempt-jobs captures. All IDs, SHAs,
+        # runner names and times are synthetic.
+        world = World()
+        repository = {"id": REPO_ID, "full_name": "TogetherWeOwn/nntunev2"}
+        run = dict(world.run, repository=repository, head_repository=repository)
+        uncreated = {"run": dict(run, status="pending", conclusion=None), "jobs": page("jobs", [])}
+        for job_id, job in enumerate(world.jobs, start=200):
+            job.update(id=job_id, runner_id=300, runner_name="synthetic-runner")
+        assigned = world.jobs[-1]
+        unassigned = dict(assigned, status="queued", conclusion=None, completed_at=None,
+                          runner_id=0, runner_name="", steps=[])
+        queued_run = dict(run, status="queued", conclusion=None)
+        queued_jobs = [*world.jobs[:-1], unassigned]
+        queued = {"run": queued_run, "jobs": page("jobs", queued_jobs)}
+        success = {"run": run, "jobs": page("jobs", world.jobs)}
+        receipt = world.verify()
+        self.assertEqual((receipt["sha"], receipt["run_id"], receipt["run_attempt"], receipt["result"]),
+                         (SHA, str(RUN_ID), "1", "satisfied"))
+        rejected = {
+            "run": dict(run, conclusion="failure"), "jobs": page("jobs", []),
+            "annotations": [{"annotation_level": "failure",
+                             "message": "Queue is full for concurrency group 'deploy-staging-main'"}],
+        }
+        failed_journey = dict(assigned, conclusion="failure", steps=[world.step("Run full journey", 1, "failure")])
+        failed = {"run": dict(run, conclusion="failure"), "jobs": page("jobs", [*world.jobs[:-1], failed_journey])}
+        generic = "::error::Candidate admission refused: missing, unapproved, stale or incoherent evidence\n"
+        target = f"Staging run {RUN_ID}, attempt 1"
+        api = "/repos/TogetherWeOwn/nntunev2/actions"
+        cases = [
+            ("no jobs", uncreated, f"{target} was accepted and has no jobs yet. "
+             f"Next read: GET {api}/runs/{RUN_ID}/attempts/1/jobs?per_page=100&page=1\n"),
+            ("unassigned journey", queued, f"{target} has a queued full-journey job {assigned['id']} "
+             f"with no runner assigned. Next read: GET {api}/jobs/{assigned['id']}\n"),
+            ("completed success", success, generic),
+            ("rejected admission", rejected, generic),
+            ("failed journey", failed, generic),
+            ("incomplete page", dict(queued, jobs=page("jobs", queued_jobs, total=len(queued_jobs) + 1)), generic),
+            ("missing journey", dict(queued, jobs=page("jobs", world.jobs[:-1])), generic),
+            ("ambiguous journey", dict(queued, jobs=page("jobs", [*queued_jobs, dict(unassigned, id=203)])), generic),
+            ("different run source", dict(uncreated, run=dict(uncreated["run"], head_sha=OTHER_SHA)), generic),
+            ("foreign repository", dict(uncreated, run=dict(uncreated["run"], head_repository=world.run["repository"])),
+             generic),
+        ]
+        for field, value in (("run_attempt", 2), ("run_id", RUN_ID + 1), ("head_sha", OTHER_SHA),
+                             ("runner_id", 300), ("runner_id", False), ("runner_name", "synthetic-runner"),
+                             ("steps", [{"status": "in_progress"}]), ("status", "in_progress"),
+                             ("completed_at", iso(0)), ("id", "private\ntext")):
+            changed = [*world.jobs[:-1], dict(unassigned, **{field: value})]
+            cases.append((field, dict(queued, jobs=page("jobs", changed)), generic))
+        for case, evidence, expected in cases:
+            with self.subTest(case=case):
+                result = subprocess.run(
+                    [sys.executable, "-I", str(HERE / "staging_admission.py"), "diagnose-pending-push", SHA],
+                    input=json.dumps(evidence), capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, expected)
+                self.assertEqual(result.returncode, 1)
 
     def test_hash_source_and_manifest_mismatch(self):
         w = World()
@@ -1162,13 +1250,37 @@ class VerifyTests(Base):
         w.others[101][0]["completed_at"] = iso(-30)
         self.assertWorldRefused(w, "intervening staging deployment")
 
-    def test_prior_rerun_mutation_is_not_hidden_by_latest_predeploy_failure(self):
+    def test_older_run_retry_requires_complete_deployment_history(self):
         w = World()
-        w.add_other("failure")
-        w.others[101][0]["steps"] = [w.step("Prerequisite", 1, "failure"),
-                                    w.step("Deploy api to staging", 2, "skipped")]
-        w.others[101].append(dict(w.others[101][0], conclusion="success", steps=[]))
-        self.assertWorldRefused(w, "intervening staging deployment")
+        older_id = RUN_ID - 1
+        w.runs.append(dict(w.run, id=older_id, head_sha=OTHER_SHA, run_attempt=2,
+                           created_at=iso(-60), updated_at=iso(12), conclusion="failure"))
+        # The older push left the queue after the candidate journey finished.
+        # Only Web was retried. The API job remains in attempt 1's history.
+        older_job = {"run_id": older_id, "head_sha": OTHER_SHA, "conclusion": "failure"}
+        api = dict(w.job("staging-api", 7, started=6, steps=[
+            w.step("Verify actual staging migration schema (read-only)", 8, "failure"),
+            w.step("Deploy api to staging", 9, "skipped"),
+        ]), **older_job, id=201)
+        web = dict(w.job("staging-web", 9, started=8, steps=[
+            w.step("Build staging web", 7, "failure"),
+            w.step("Deploy to staging", 8, "skipped"),
+        ]), **older_job, id=202)
+        retry = dict(web, id=203, run_attempt=2, started_at=iso(10), completed_at=iso(11))
+        route = f"runs/{older_id}/jobs?filter=all&per_page=100&page=1"
+        routes = w.routes()
+        routes[route] = page("jobs", [retry, web, api])
+        self.assertEqual(w.verify(routes), w.receipt)
+
+        # A failed job can still have finished writing before its cleanup failed.
+        late_writer = dict(web, steps=[w.step("Build staging web", 7),
+                                       w.step("Deploy to staging", 8),
+                                       w.step("Post job cleanup", 20, "failure")])
+        routes[route] = page("jobs", [retry, late_writer, api])
+        self.assertWorldRefused(w, "intervening staging deployment", routes=routes)
+
+        routes[route] = page("jobs", [retry, api], total=3)
+        self.assertWorldRefused(w, "incomplete or exhausted jobs listing", routes=routes)
 
     def test_pending_rerun_cannot_reuse_historical_lanes(self):
         for status in ("queued", "waiting", "in_progress"):
@@ -1312,6 +1424,14 @@ class VerifyTests(Base):
         w.artifact["digest"] = "sha256:" + "0" * 64
         self.assertWorldRefused(w, "content digest mismatch")
 
+    def test_artifact_archive_size_mismatch(self):
+        w = World()
+        self.assertEqual(w.verify()["result"], "satisfied")
+        for difference in (-1, 1):
+            with self.subTest(difference=difference):
+                w.artifact["size_in_bytes"] = len(w.archive) + difference
+                self.assertWorldRefused(w, "artifact archive size mismatch")
+
     def test_incomplete_listings(self):
         w = World()
         self.assertWorldRefused(w, "incomplete or exhausted jobs",
@@ -1444,7 +1564,9 @@ class SourceBindingTests(Base):
                                   b'classname="journey"', b'classname="signup.spec.ts"'))
             actions = FakeActions(world.routes(), hook=actions_hook)
         env = make_env(GITHUB_SHA=trusted, DEPLOY_SHA=candidate, GITHUB_EVENT_NAME="workflow_dispatch",
-                       GITHUB_REPOSITORY_ID=str(REPO_ID), GITHUB_TOKEN="synthetic-token", DEPLOY_MODE=mode)
+                       GITHUB_REPOSITORY_ID=str(REPO_ID), GITHUB_TOKEN="synthetic-token", DEPLOY_MODE=mode,
+                       STAGING_BASE_URL="https://staging.example.invalid", CF_ACCESS_CLIENT_ID="synthetic-id",
+                       CF_ACCESS_CLIENT_SECRET="synthetic-secret")
         with patch.object(sa, "ROOT", self.root), patch.dict(sa.os.environ, env, clear=True), \
                 patch.object(sa.sys, "argv", ["staging_admission.py", "verify"]), \
                 patch.object(sa, "Actions", return_value=actions), \
@@ -1462,7 +1584,7 @@ class SourceBindingTests(Base):
             with patch.object(sa, "git", wraps=sa.git) as source_git:
                 try:
                     sa.main()
-                except sa.Refused:
+                except (sa.Refused, SystemExit):
                     self.assertEqual(output.getvalue(), "")
                     raise
             live.assert_called_once_with(sa.os.environ, candidate)
@@ -1577,8 +1699,9 @@ class SourceBindingTests(Base):
 
         def different_download():
             world = PrivateWorld()
-            # Keep the published artifact metadata and repackage the same receipt.
+            # Keep the published digest while matching the repackaged ZIP length so the digest check runs.
             world.archive = make_zip([("staging-admission.json", json.dumps(world.receipt, indent=2))])
+            world.artifact["size_in_bytes"] = len(world.archive)
             return world
 
         self.refused("^artifact content digest mismatch$", self.run_main, private=True, mode="promote",
@@ -1640,6 +1763,48 @@ class SourceBindingTests(Base):
 
                 self.run_main(private=True, mode="promote", world_factory=pending, cli_refusal=generic,
                               actions_hook=change_run)
+
+    def test_private_main_reports_late_build_drift_for_the_selected_attempt(self):
+        self.install_private_contract()
+        current_identity = sa.current_identity
+        origin = "https://staging.example.invalid"
+        paths = ("/api/build", "/healthz")
+
+        for drift in (None, "Web", "API"):
+            with self.subTest(drift=drift), patch("sys.stderr", new=io.StringIO()) as errors, \
+                    patch.object(sa.urllib.request, "build_opener") as opener:
+                selected = []
+
+                def readback(env, sha):
+                    selected.append(sha)
+                    responses = ({"sha": OTHER_SHA if drift == "Web" else sha},
+                                 {"ok": True, "build_sha": OTHER_SHA if drift == "API" else sha})
+                    bodies = [io.BytesIO(json.dumps(response).encode()) for response in responses]
+                    for body in bodies:
+                        body.status = 200
+                    opener.return_value.open.side_effect = bodies
+                    current_identity(env, sha)
+
+                if drift is None:
+                    world, lines = self.run_main(private=True, mode="promote", live_error=readback)
+                    pins = json.loads(lines[0])["verified_private_music_staging"]
+                    self.assertEqual((pins["sha"], pins["run_id"], pins["run_attempt"]),
+                                     (selected[0], str(RUN_ID), "1"))
+                    self.assertEqual(pins["deployments"], world.receipt["deployments"])
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    with self.assertRaises(SystemExit) as refused:
+                        self.run_main(private=True, mode="promote", live_error=readback)
+                    self.assertEqual(refused.exception.code, 1)
+                    message = errors.getvalue()
+                    self.assertIn(f"Candidate admission pending for {selected[0]}, "
+                                  f"staging run {RUN_ID}, attempt 1.", message)
+                    self.assertIn(f"The live {drift} build differs from the selected build.", message)
+                    self.assertIn("authorized read-only deployment records to compare the current "
+                                  "Web, API and Stream build, version and deployment IDs", message)
+                    self.assertNotIn(OTHER_SHA, message)
+                self.assertEqual([call.args[0].full_url for call in opener.return_value.open.call_args_list],
+                                 [origin + path for path in (paths[:1] if drift == "Web" else paths)])
 
     def test_private_producer_cli_binds_candidate_audio(self):
         fixture = self.install_private_contract()
@@ -1923,11 +2088,22 @@ class TransportTests(Base):
             def read(self, limit):
                 return json.dumps(self.data).encode()
         with patch.object(sa.urllib.request, "build_opener") as opener:
-            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"build_sha": SHA})]
+            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"ok": True, "build_sha": SHA})]
             sa.current_identity(env, SHA)
             self.assertEqual(opener.return_value.open.call_count, 2)
-            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"build_sha": OTHER_SHA})]
+            opener.return_value.open.side_effect = [
+                Response({"sha": SHA}), Response({"ok": True, "build_sha": OTHER_SHA})]
             self.refused("current staging identity drift", sa.current_identity, env, SHA)
+            opener.return_value.open.side_effect = [
+                Response({"sha": SHA}), Response({"ok": True, "build_sha": "unknown"})]
+            self.refused("invalid staging build identity", sa.current_identity, env, SHA)
+            for bad_api in ({"build_sha": OTHER_SHA}, {"ok": False, "build_sha": OTHER_SHA},
+                            {"ok": 1, "build_sha": OTHER_SHA}, {"ok": True, "build_sha": OTHER_SHA, "extra": True}):
+                with self.subTest(api=bad_api):
+                    opener.return_value.open.side_effect = [Response({"sha": SHA}), Response(bad_api)]
+                    self.refused("invalid API identity shape", sa.current_identity, env, SHA)
+            opener.return_value.open.side_effect = [Response({"sha": OTHER_SHA, "extra": True})]
+            self.refused("invalid web identity shape", sa.current_identity, env, SHA)
         for origin in ("http://staging.example.invalid", "https://user:pass@staging.example.invalid",
                        "https://staging.example.invalid/?token=x", ""):
             self.refused("invalid staging identity origin", sa.current_identity,
