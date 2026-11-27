@@ -752,6 +752,10 @@ pub fn handle_endpoint<S: Library>(
         }
         "getCoverArt" => {
             let id = ok_or_return!(req(params, "id"));
+            // Launch cover art needs its own membership and entitlement gate.
+            if !legacy_media {
+                return not_found_with("Cover art not found.");
+            }
             match store.cover(id) {
                 Some(bytes) => EndpointResult::Binary {
                     content_type: "image/png".to_string(),

@@ -50,6 +50,7 @@ impl<'a> MemberBrowse<'a> {
         )
     }
 
+    /// The resolver uses raw occurrence provenance to select a row from `self.songs`.
     pub fn document(
         &self,
         budget: &mut ConstructionBudget,
@@ -76,7 +77,9 @@ impl<'a> MemberBrowse<'a> {
                 let album = || self.albums.iter().find(|album| album.id == id);
                 let artist = || self.artists.iter().find(|artist| artist.id == id);
                 match name {
-                    "getSong" => match resolve_song(id) {
+                    "getSong" => match resolve_song(id).filter(|&song| {
+                        song.id == id && self.songs.iter().any(|row| std::ptr::eq(row, song))
+                    }) {
                         Some(song) => {
                             let item = song_item(budget, song)?;
                             charged_ok_document(budget, [("song", item)])?
@@ -421,4 +424,57 @@ pub fn member_browse_boundaries() {
     assert_eq!(declined.unwrap(), Some(not_found));
     assert_eq!(index_key("The ßeta"), [b'S', b'S', 0]);
     assert_eq!(index_key("Les Æthers"), [b'#', 0, 0]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envelope::{error_document, render_json};
+    use crate::library::{Library, MemStore};
+
+    #[test]
+    fn member_browse_cannot_render_a_foreign_song_occurrence() {
+        let fixture = MemStore::seeded();
+        let alice_songs = fixture.all_songs();
+        let mut bob_songs = [alice_songs[0].clone()];
+        // Two different member occurrences can share a recording ID.
+        bob_songs[0].title = "Bob-only title".into();
+        bob_songs[0].album_id = "bob-release".into();
+        bob_songs[0].cover_art = "coverart:bob-release".into();
+
+        for (own, foreign) in [
+            (&alice_songs[..], &bob_songs[..]),
+            (&bob_songs, &alice_songs),
+        ] {
+            let view = MemberBrowse {
+                artists: &[],
+                albums: &[],
+                songs: own,
+                now_millis: 0,
+            };
+            let mut budget = ConstructionBudget::new(64 * 1024);
+            let params = Params::parse("id=so-1");
+            let expected = Some(error_document(code::NOT_FOUND, "Song not found."));
+            assert_eq!(
+                view.document(&mut budget, "getSong", &params, |_| Some(&foreign[0])),
+                Ok(expected.clone())
+            );
+            let unknown = Params::parse("id=unknown");
+            assert_eq!(
+                view.document(&mut budget, "getSong", &unknown, |_| Some(&own[0])),
+                Ok(expected)
+            );
+
+            for (name, params) in [("getSong", params), ("search3", Params::parse("query="))] {
+                let doc = view
+                    .document(&mut budget, name, &params, |_| Some(&own[0]))
+                    .unwrap()
+                    .unwrap();
+                let body = String::from_utf8(render_json(&doc)).unwrap();
+                assert!(body.contains(&own[0].title), "{body}");
+                assert!(!body.contains(&foreign[0].title), "{body}");
+                assert!(!body.contains(&foreign[0].cover_art), "{body}");
+            }
+        }
+    }
 }
