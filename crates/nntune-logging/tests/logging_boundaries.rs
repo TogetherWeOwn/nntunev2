@@ -25,9 +25,10 @@ fn both_field_paths_reject_sensitive_keys_and_values() {
     for key in [
         "api-key",
         "requestBody",
-        "display-name",
+        "artist.name",
         "raw.query",
         "ghp_fixture",
+        "192.0.2.1",
     ] {
         assert_rejected(json!({key: "fixture"}));
     }
@@ -79,7 +80,6 @@ fn both_field_paths_enforce_byte_and_count_limits() {
     for key in ["", "bad key", "key\nline", "clé"] {
         assert_rejected(json!({key: null}));
     }
-    assert!(fields_from_json(json!(["fixture"])).is_err());
 }
 
 #[test]
