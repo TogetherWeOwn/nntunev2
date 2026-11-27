@@ -22,6 +22,7 @@ const TRACK: &str = "00000000-0000-0000-0000-000000000001";
 const NOW: u64 = 1000;
 const EXPIRY: u64 = NOW + 60;
 const SECRET: &[u8] = b"fixture signing material";
+const RUNTIME: &str = include_str!("../src/runtime.rs");
 
 fn request() -> PlayRouteRequest {
     PlayRouteRequest {
@@ -86,6 +87,8 @@ fn original_control_failure_and_grant_expiry_keep_distinct_statuses() {
 
 #[test]
 fn metered_body_rejects_overrun_and_short_eof() {
+    assert!(RUNTIME.contains(".from_stream(MeteredStream(metered))"));
+    assert!(RUNTIME.contains("self.0.poll_chunk("));
     for (chunks, accepted, terminal, reported) in [
         (&[5][..], 0, Some(Err("length")), None),
         (&[2, 3, 1][..], 1, Some(Err("length")), Some(2)),
@@ -111,6 +114,8 @@ fn metered_body_rejects_overrun_and_short_eof() {
 
 #[test]
 fn handshake_deadline_stops_a_pending_dial() {
+    let bounded = "dial_with_deadline(NntpClient::connect(transport, &config))";
+    assert_eq!(RUNTIME.matches(bounded).count(), 2);
     let refused = dial_before_deadline(ready(()), pending::<nntune_core::Result<()>>());
     assert!(matches!(
         refused.now_or_never(),

@@ -188,9 +188,7 @@ async fn serve_blob(
 ) -> Result<Response> {
     let blob_len = blob.size;
 
-    let Ok(range_header) = req.headers().get("range") else {
-        return api_error_response(&ApiError::invalid_request(), None);
-    };
+    let range_header = req.headers().get("range").ok().flatten();
     let (start, expected, status, content_range) =
         match range::parse(range_header.as_deref(), blob_len) {
             RangeOutcome::Full => (0, blob_len, 200, None),
@@ -698,8 +696,6 @@ impl NntpPool {
     }
 }
 
-/// Bound the whole greeting/auth exchange even when each socket I/O succeeds
-/// within its own per-operation timeout.
 async fn dial_with_deadline<T>(
     dial: impl std::future::Future<Output = nntune_core::Result<T>>,
 ) -> nntune_core::Result<T> {
