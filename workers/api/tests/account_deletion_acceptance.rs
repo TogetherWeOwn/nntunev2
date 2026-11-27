@@ -141,33 +141,33 @@ fn migration_evolves_users_and_defines_restrictive_delete_operations() {
 }
 
 #[test]
-fn schedule_sql_sets_fence_and_idempotently_returns_existing_operation() {
+fn schedule_sql_locks_before_starting_grace_and_preserves_retries() {
     let sql = normalize(SCHEDULE_ACCOUNT_DELETION_SQL);
-    assert!(sql.contains("updateusers"), "{sql}");
-    assert!(sql.contains("setdeleting_at"), "{sql}");
+    assert_eq!(sql.matches("clock_timestamp()").count(), 1, "{sql}");
     assert!(
-        sql.contains("setdeleting_at=coalesce(deleting_at,now())"),
-        "fence must preserve an existing deleting_at instead of overwriting it: {sql}"
+        sql.contains("locked_userasmaterialized(selectidfromuserswhereid=$1fornokeyupdate)"),
+        "the account lock must precede the grace clock: {sql}"
     );
     assert!(
-        sql.contains("withfenced_useras(updateusers"),
-        "fenced_user CTE must wrap the user fence update: {sql}"
+        sql.contains(
+            "request_timeasmaterialized(selectid,clock_timestamp()asrequested_atfromlocked_user)"
+        ),
+        "clock must be sampled once after locking: {sql}"
     );
     assert!(
-        sql.contains("whereid=$1returningid"),
-        "fence must be owner-scoped to a single user row: {sql}"
+        sql.contains(concat!(
+            "fenced_useras(updateuserssetdeleting_at=coalesce(users.deleting_at,request_time.requested_at)",
+            "fromrequest_timewhereusers.id=request_time.idreturningusers.id,request_time.requested_at)"
+        )),
+        "the fence must preserve an existing marker on the locked account: {sql}"
     );
-    assert!(sql.contains("insertintodelete_operations"), "{sql}");
-    assert!(sql.contains("'account'"), "{sql}");
-    assert!(sql.contains("'scheduled'"), "{sql}");
-    assert!(sql.contains("now()+interval'24hours'"), "{sql}");
     assert!(
         sql.contains("state,erase_after,started_at"),
         "operation columns must stay aligned as state, erase_after, started_at: {sql}"
     );
     assert!(
-        sql.contains("'scheduled',now()+interval'24hours',now()"),
-        "scheduled values must align as state, 24h deadline, start time: {sql}"
+        sql.contains("selectid,'account',null,'{}'::jsonb,'scheduled',requested_at+interval'24hours',requested_atfromfenced_user"),
+        "the fence and the deadline must use the same clock sample: {sql}"
     );
     assert!(
         sql.contains(
@@ -205,6 +205,10 @@ fn erasure_start_sql_is_deadline_guarded_compare_and_set() {
     assert!(
         sql.contains("whereid=$1andscope='account'andstate='scheduled'anderase_after<=now()"),
         "only a scheduled account operation past its deadline can start: {sql}"
+    );
+    assert!(
+        sql.contains("andexists(select1fromuserswhereusers.id=delete_operations.user_idanddeleting_atisnotnull)"),
+        "the operation must belong to a fenced account: {sql}"
     );
     assert!(sql.contains("setstate='running'"), "{sql}");
 }

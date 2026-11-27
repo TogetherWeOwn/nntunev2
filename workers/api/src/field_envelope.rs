@@ -3,11 +3,14 @@
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Nonce,
+    Aes256Gcm, Nonce, A_MAX, P_MAX,
 };
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::vault::VaultError;
+
+const DEK_LEN: usize = 32;
+const TAG_LEN: usize = 16;
 
 /// Stored bytes only; never a plaintext DEK. Deliberately no Debug.
 #[derive(Clone)]
@@ -19,7 +22,7 @@ pub struct FieldEnvelope {
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
-struct Dek([u8; 32]);
+struct Dek([u8; DEK_LEN]);
 
 /// Expected identity comes from the selected row, not ciphertext claims.
 pub(crate) struct Context<'a> {
@@ -48,14 +51,16 @@ impl Context<'_> {
         self.aad_parts(purpose)
             .into_iter()
             .try_fold(trailer, |size, part| {
+                u32::try_from(part.len()).ok()?;
                 size.checked_add(4)?.checked_add(part.len())
             })
+            .filter(|size| *size <= isize::MAX as usize && *size as u64 <= A_MAX)
     }
 
-    pub(crate) fn aad(&self, purpose: &str, kek_version: Option<u32>) -> Vec<u8> {
+    fn checked_aad(&self, purpose: &str, kek_version: Option<u32>) -> Result<Vec<u8>, VaultError> {
         let capacity = self
             .aad_capacity(purpose, kek_version.is_some())
-            .expect("field AAD capacity overflow");
+            .ok_or(VaultError::Invalid)?;
         let mut out = Vec::with_capacity(capacity);
         for s in self.aad_parts(purpose) {
             out.extend_from_slice(&(s.len() as u32).to_be_bytes());
@@ -66,7 +71,12 @@ impl Context<'_> {
         if let Some(v) = kek_version {
             out.extend_from_slice(&v.to_be_bytes());
         }
-        out
+        Ok(out)
+    }
+
+    #[cfg(any(test, all(target_arch = "wasm32", feature = "ledger-wasm-test")))]
+    pub(crate) fn aad(&self, purpose: &str, kek_version: Option<u32>) -> Vec<u8> {
+        self.checked_aad(purpose, kek_version).unwrap()
     }
 }
 
@@ -76,7 +86,10 @@ pub(crate) fn seal(
     context: &Context<'_>,
     plaintext: &[u8],
 ) -> Result<FieldEnvelope, VaultError> {
-    let mut bytes = crate::random::secure_random_bytes::<32>()?;
+    if plaintext.len() as u64 > P_MAX {
+        return Err(VaultError::Invalid);
+    }
+    let mut bytes = crate::random::secure_random_bytes::<DEK_LEN>()?;
     let dek = Dek(bytes);
     bytes.zeroize();
     let wrap_nonce = crate::random::secure_random_bytes::<12>()?;
@@ -87,7 +100,7 @@ pub(crate) fn seal(
             &Nonce::from(wrap_nonce),
             Payload {
                 msg: &dek.0,
-                aad: &context.aad("dek", Some(kek_version)),
+                aad: &context.checked_aad("dek", Some(kek_version))?,
             },
         )
         .map_err(|_| VaultError::Crypto)?;
@@ -97,7 +110,7 @@ pub(crate) fn seal(
             &Nonce::from(payload_nonce),
             Payload {
                 msg: plaintext,
-                aad: &context.aad("payload", None),
+                aad: &context.checked_aad("payload", None)?,
             },
         )
         .map_err(|_| VaultError::Crypto)?;
@@ -130,7 +143,9 @@ pub(crate) fn open(
     context: &Context<'_>,
     envelope: &FieldEnvelope,
 ) -> Result<Vec<u8>, VaultError> {
-    if envelope.dek_wrapped.len() != 48 {
+    if envelope.dek_wrapped.len() != DEK_LEN + TAG_LEN
+        || !(TAG_LEN as u64..=P_MAX + TAG_LEN as u64).contains(&(envelope.ciphertext.len() as u64))
+    {
         return Err(VaultError::CorruptStoredData);
     }
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
@@ -140,12 +155,12 @@ pub(crate) fn open(
                 &Nonce::from(envelope.dek_wrapped_nonce),
                 Payload {
                     msg: &envelope.dek_wrapped,
-                    aad: &context.aad("dek", Some(kek_version)),
+                    aad: &context.checked_aad("dek", Some(kek_version))?,
                 },
             )
             .map_err(|_| VaultError::Crypto)?,
     );
-    if bytes.len() != 32 {
+    if bytes.len() != DEK_LEN {
         return Err(VaultError::Crypto);
     }
     let dek_cipher = Aes256Gcm::new_from_slice(&bytes).map_err(|_| VaultError::Crypto)?;
@@ -154,8 +169,117 @@ pub(crate) fn open(
             &Nonce::from(envelope.payload_nonce),
             Payload {
                 msg: &envelope.ciphertext,
-                aad: &context.aad("payload", None),
+                aad: &context.checked_aad("payload", None)?,
             },
         )
         .map_err(|_| VaultError::Crypto)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: [u8; 32] = [19; 32];
+    const KEK_VERSION: u32 = 7;
+    const CONTEXT: Context<'static> = Context {
+        table: "table",
+        field: "field",
+        scope: "owner",
+        row: "row",
+        version: 2,
+        format: 1,
+    };
+
+    #[test]
+    fn envelope_rejects_wrong_identity_and_key() {
+        let envelope = seal(&KEY, KEK_VERSION, &CONTEXT, b"fixture").unwrap();
+        assert_eq!(
+            open(&KEY, KEK_VERSION, &CONTEXT, &envelope).unwrap(),
+            b"fixture"
+        );
+        for other in [
+            Context {
+                table: "elsewhere",
+                ..CONTEXT
+            },
+            Context {
+                field: "other",
+                ..CONTEXT
+            },
+            Context {
+                scope: "different owner",
+                ..CONTEXT
+            },
+            Context {
+                row: "different row",
+                ..CONTEXT
+            },
+            Context {
+                version: 3,
+                ..CONTEXT
+            },
+            Context {
+                format: 2,
+                ..CONTEXT
+            },
+        ] {
+            assert!(matches!(
+                open(&KEY, KEK_VERSION, &other, &envelope),
+                Err(VaultError::Crypto)
+            ));
+        }
+        assert!(matches!(
+            open(&[9; 32], KEK_VERSION, &CONTEXT, &envelope),
+            Err(VaultError::Crypto)
+        ));
+        assert!(matches!(
+            open(&KEY, KEK_VERSION + 1, &CONTEXT, &envelope),
+            Err(VaultError::Crypto)
+        ));
+    }
+
+    #[test]
+    fn envelope_rejects_nonce_tag_and_ciphertext_changes() {
+        let envelope = seal(&KEY, KEK_VERSION, &CONTEXT, b"fixture").unwrap();
+        let mutations: [fn(&mut FieldEnvelope); 6] = [
+            |value| value.dek_wrapped_nonce[0] ^= 1,
+            |value| value.payload_nonce[0] ^= 1,
+            |value| value.dek_wrapped[0] ^= 1,
+            |value| value.dek_wrapped[DEK_LEN] ^= 1,
+            |value| value.ciphertext[0] ^= 1,
+            |value| {
+                let index = value.ciphertext.len() - 1;
+                value.ciphertext[index] ^= 1;
+            },
+        ];
+        for mutate in mutations {
+            let mut tampered = envelope.clone();
+            mutate(&mut tampered);
+            assert!(matches!(
+                open(&KEY, KEK_VERSION, &CONTEXT, &tampered),
+                Err(VaultError::Crypto)
+            ));
+        }
+    }
+
+    #[test]
+    fn envelope_requires_full_tags_and_accepts_authenticated_empty_payload() {
+        let envelope = seal(&KEY, KEK_VERSION, &CONTEXT, b"").unwrap();
+        assert_eq!(envelope.ciphertext.len(), TAG_LEN);
+        assert!(open(&KEY, KEK_VERSION, &CONTEXT, &envelope)
+            .unwrap()
+            .is_empty());
+        let mut truncated = envelope.clone();
+        truncated.dek_wrapped.pop();
+        assert!(matches!(
+            open(&KEY, KEK_VERSION, &CONTEXT, &truncated),
+            Err(VaultError::CorruptStoredData)
+        ));
+        let mut truncated = envelope;
+        truncated.ciphertext.pop();
+        assert!(matches!(
+            open(&KEY, KEK_VERSION, &CONTEXT, &truncated),
+            Err(VaultError::CorruptStoredData)
+        ));
+    }
 }
