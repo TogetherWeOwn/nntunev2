@@ -168,3 +168,63 @@ async fn bad_metadata_page_and_sealed_bytes_release_no_plaintext() {
         ));
     }
 }
+
+#[test]
+fn missing_partial_or_mismatched_encryption_metadata_refuses_start() {
+    fn env_err<'a>(f: &'a Fixture, edit: impl FnOnce(&mut EnrolledMedia<'a>)) {
+        let mut m = f.media_input();
+        edit(&mut m);
+        assert!(matches!(
+            EnrolledPlayback::start(Some("bytes=0-0"), f.pins(), m, now()),
+            Err(PlaybackError::Frame(RangeError::Envelope(_)))
+        ));
+    }
+    fn bind_err<'a>(
+        f: &'a Fixture,
+        edit: impl FnOnce(&mut DigestReadSnapshot<'a>, &mut EnrolledMedia<'a>),
+    ) {
+        let (mut p, mut m) = (f.pins(), f.media_input());
+        edit(&mut p, &mut m);
+        assert!(matches!(
+            EnrolledPlayback::start(Some("bytes=0-0"), p, m, now()),
+            Err(PlaybackError::Binding)
+        ));
+    }
+
+    let f = Fixture::new();
+    let (wrong_root, mut corrupt) = ([8; 32], f.envelope);
+    corrupt[229] ^= 1;
+    env_err(&f, |m| m.root = &wrong_root);
+    env_err(&f, |m| {
+        m.expected_record = &corrupt;
+        m.retained_record = &corrupt;
+    });
+    env_err(&f, |m| m.retained_record = &[]);
+    env_err(&f, |m| m.retained_record = &f.envelope[..229]);
+    env_err(&f, |m| m.retained_record = &corrupt);
+
+    let mut header = f.context.header;
+    header[0] ^= 1;
+    let altered = EnvelopeContext {
+        identities: f.context.identities,
+        plaintext_len: f.context.plaintext_len,
+        header,
+    };
+    let loc = f.media.locator();
+    let etag_loc = S3Locator::new(
+        loc.bucket().into(),
+        loc.key().into(),
+        S3Binding::Etag("\"etag\"".into()),
+    )
+    .unwrap();
+    let etag_media = S3MediaMetadata::from_trusted_context(etag_loc, &f.context).unwrap();
+    bind_err(&f, |_, m| m.context = &altered);
+    bind_err(&f, |_, m| m.media = &etag_media);
+    bind_err(&f, |p, _| p.root_version_id = id(8));
+    bind_err(&f, |p, _| p.object_id = id(8));
+    bind_err(&f, |p, _| p.provider_configuration = id(8));
+    assert!(matches!(
+        EnrolledPlayback::start(Some("bytes=0-0"), f.pins(), f.media_input(), now()),
+        Ok((RangeOutcome::Partial(_), Some(_)))
+    ));
+}

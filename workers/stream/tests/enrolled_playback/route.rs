@@ -729,3 +729,182 @@ async fn dropping_a_partial_encrypted_read_leaves_the_other_caller_live() {
         [receipt(65_534, 65_536), receipt(65_535, LEN)]
     );
 }
+
+#[tokio::test]
+async fn operator_source_stays_closed_until_verified_encryption_outputs_and_reopens() {
+    use nntune_core::digest_readback::ReadbackPin;
+    use nntune_stream::enrolled_playback::{
+        route::{CatalogueMedia, PrivateSource},
+        S3Get, S3GetReply,
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Stage {
+        Closed,
+        WrongDigest,
+        WrongRoot,
+        CorruptEnvelope,
+        TruncatedRetained,
+        EtagLocator,
+        EmptyPages,
+        MismatchedMediaVersion,
+        NullPageVersion,
+        Verified,
+    }
+    struct ReopenSource {
+        inner: Source,
+        wrong_root: [u8; 32],
+        corrupt: [u8; 230],
+        etag_media: S3MediaMetadata,
+        null_pages: [String; 1],
+        stage: Cell<Stage>,
+        media_reads: Cell<usize>,
+    }
+    impl PrivateSource for ReopenSource {
+        type Body = fixture::BodyBytes;
+        async fn resolve(&self, g: &nntune_stream::grant::Grant) -> Option<CatalogueMedia<'_>> {
+            (self.stage.get() != Stage::Closed).then_some(())?;
+            let mut m = self.inner.resolve(g).await?;
+            match self.stage.get() {
+                Stage::WrongDigest => m.pins.plaintext_sha256[0] ^= 1,
+                Stage::WrongRoot => m.media.root = &self.wrong_root,
+                Stage::CorruptEnvelope => {
+                    m.media.expected_record = &self.corrupt;
+                    m.media.retained_record = &self.corrupt;
+                }
+                Stage::TruncatedRetained => m.media.retained_record = &self.corrupt[..229],
+                Stage::EtagLocator => m.media.media = &self.etag_media,
+                Stage::EmptyPages => m.pins.page_versions = &[],
+                Stage::MismatchedMediaVersion => m.pins.media_version = "stale-version",
+                Stage::NullPageVersion => m.pins.page_versions = &self.null_pages,
+                Stage::Closed | Stage::Verified => {}
+            }
+            Some(m)
+        }
+        async fn lease_live(&self, g: &nntune_stream::grant::Grant) -> bool {
+            self.inner.lease_live(g).await
+        }
+        async fn media(&self, g: S3Get<'_>) -> std::io::Result<S3GetReply<Self::Body>> {
+            self.media_reads.set(self.media_reads.get() + 1);
+            self.inner.media(g).await
+        }
+        async fn page(
+            &self,
+            b: &str,
+            p: ReadbackPin<'_>,
+            l: u32,
+            u: SystemTime,
+        ) -> std::io::Result<(String, Vec<u8>)> {
+            self.inner.page(b, p, l, u).await
+        }
+    }
+
+    let s = Fixture::from_plaintext(FLAC);
+    let mut corrupt = s.envelope;
+    corrupt[229] ^= 1;
+    let loc = s.media.locator();
+    let etag = S3Locator::new(
+        loc.bucket().into(),
+        loc.key().into(),
+        S3Binding::Etag("\"e\"".into()),
+    )
+    .unwrap();
+    let source = ReopenSource {
+        inner: Source::new(Fault::None),
+        wrong_root: [8; 32],
+        corrupt,
+        etag_media: S3MediaMetadata::from_trusted_context(etag, &s.context).unwrap(),
+        null_pages: ["null".into()],
+        stage: Cell::new(Stage::Closed),
+        media_reads: Cell::new(0),
+    };
+    let key = b"test only, not a deployed secret";
+    let req = |range: Option<&str>| PlayRouteRequest {
+        track_id: "track".into(),
+        token: Some(TOKEN.into()),
+        range: range.map(str::to_owned),
+        trace_id: None,
+    };
+
+    assert_eq!(
+        serve::<ReopenSource, Writer<'_>>(&req(None), key, None, now, |_| panic!(), |_| panic!())
+            .await
+            .unwrap_err()
+            .status,
+        404
+    );
+    for (stage, status, expect_media) in [
+        (Stage::Closed, 404, false),
+        (Stage::WrongDigest, 404, false),
+        (Stage::WrongRoot, 502, false),
+        (Stage::CorruptEnvelope, 502, false),
+        (Stage::TruncatedRetained, 502, false),
+        (Stage::EtagLocator, 502, false),
+        (Stage::EmptyPages, 502, false),
+        (Stage::MismatchedMediaVersion, 502, false),
+        (Stage::NullPageVersion, 502, true),
+    ] {
+        source.stage.set(stage);
+        let reads = source.media_reads.get();
+        let err = serve::<_, Writer<'_>>(
+            &req(None),
+            key,
+            Some(&source),
+            now,
+            |_| panic!("{stage:?}"),
+            |_| panic!("{stage:?}"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (
+                err.status,
+                source.media_reads.get(),
+                source.inner.page_reads.get()
+            ),
+            (status, reads + usize::from(expect_media), 0),
+            "{stage:?}"
+        );
+    }
+
+    source.stage.set(Stage::Verified);
+    for (range, want_status, want_range, slice) in [
+        (None, 200, None, 0..FLAC.len()),
+        (
+            Some("bytes=-2"),
+            206,
+            Some("bytes 51-52/53"),
+            FLAC.len() - 2..FLAC.len(),
+        ),
+    ] {
+        let (output, aborted, mut report) = (RefCell::new(Vec::new()), Cell::new(false), None);
+        serve(
+            &req(range),
+            key,
+            Some(&source),
+            now,
+            |head| {
+                assert_eq!(
+                    (head.status, head.content_range.as_deref(), head.len),
+                    (want_status, want_range, slice.len() as u64)
+                );
+                Ok(Some(Writer {
+                    output: &output,
+                    fault: Fault::None,
+                    aborted: &aborted,
+                    closed: None,
+                    revoke_on_write: None,
+                }))
+            },
+            |i| report = Some(i),
+        )
+        .await
+        .unwrap();
+        assert!(!aborted.get());
+        assert_eq!(output.into_inner(), FLAC[slice.clone()]);
+        assert_eq!(
+            report.map(|r| r.start as usize..r.end as usize),
+            Some(slice)
+        );
+    }
+}
