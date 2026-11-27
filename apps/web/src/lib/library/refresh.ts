@@ -151,6 +151,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		}
 
 		async function readJsonBody(resp: Response): Promise<unknown> {
+			const decoder = new TextDecoder('utf-8', { fatal: true });
 			const body = resp.body;
 			if (!body) {
 				// No readable stream to bound; fall back to a length-checked
@@ -162,7 +163,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 					if (buffer.byteLength > LIBRARY_BODY_MAX_BYTES) {
 						throw new Error('library request timed out');
 					}
-					return JSON.parse(new TextDecoder().decode(new Uint8Array(buffer)));
+					return JSON.parse(decoder.decode(buffer));
 				}
 				// Runtimes (and injected test fetches) without `arrayBuffer`
 				// cannot be measured before parsing; enforce the cap on the
@@ -204,7 +205,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 					combined.set(chunk, offset);
 					offset += chunk.length;
 				}
-				return JSON.parse(new TextDecoder().decode(combined));
+				return JSON.parse(decoder.decode(combined));
 			} finally {
 				if (activeReader === reader) activeReader = null;
 				try {
@@ -372,7 +373,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const committed = await runBeforeDeadline(fence, () => {
 				if (!matches) return refuse(true);
 				const deviceScope = establishVerifiedLibraryScope(storage, label);
-				storageScope = scopeLibraryStorage(storage, fence);
+				storageScope = deviceScope ? scopeLibraryStorage(storage, fence) : null;
 				verified = { binding: label, fence, storage: storageScope };
 				commit();
 				publish(label, deviceScope);

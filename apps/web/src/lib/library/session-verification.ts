@@ -5,6 +5,7 @@ import { validSessionBinding as validBinding, type AccountSession } from '../aut
 export { validBinding };
 
 export async function verifyLibrarySession(binding: string, signal: AbortSignal, owner: AccountSession): Promise<boolean> {
+	if (!validBinding(binding)) return false;
 	try {
 		const result = await new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal, session: { owner } })
 			.get<{ session_binding?: unknown }>('/v1/me/likes/session');

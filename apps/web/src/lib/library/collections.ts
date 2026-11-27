@@ -39,6 +39,7 @@ function parseCollections(value: unknown, kind: Collection['kind']): Collection[
 }
 
 export async function loadCollections(client: { get(path: string): Promise<unknown> }, filter: CollectionFilter): Promise<Collection[]> {
+	if (filter !== 'all' && filter !== 'albums' && filter !== 'artists') throw new Error('Invalid collection filter');
 	const [albums, artists] = await Promise.all([
 		filter === 'artists' ? [] : client.get('/v1/releases').then((rows) => parseCollections(rows, 'Album')),
 		filter === 'albums' ? [] : client.get('/v1/artists').then((rows) => parseCollections(rows, 'Artist'))
@@ -49,7 +50,7 @@ export async function loadCollections(client: { get(path: string): Promise<unkno
 export function displayCollections(rows: readonly Collection[], query: string, sort: CollectionSort, reverse: boolean): Collection[] {
 	const { canonical } = findNeedle(query);
 	const visible = rows.filter(({ title, creator }) => [title, creator].some((text) => canonicalMetadata(text).includes(canonical)));
-	if (sort !== 'catalogue') {
+	if (sort === 'title' || sort === 'creator') {
 		const key = (row: Collection) => sort === 'creator' ? row.creator || row.title : row.title;
 		visible.sort((a, b) => key(a).localeCompare(key(b)) || a.title.localeCompare(b.title) || a.id.localeCompare(b.id));
 	}

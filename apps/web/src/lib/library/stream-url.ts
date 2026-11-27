@@ -1,14 +1,15 @@
-/**
- * Resolve the playable stream URL for the queue's current track.
- *
- * Returns the trimmed `streamUrl`, or `''` when there is no track or no
- * usable URL (missing, non-string, empty or whitespace-only). The library
- * route renders `<audio>` only for a non-empty result, so a whitespace-only
- * URL must not slip through: `src="   "` resolves to the page URL as media,
- * the same failure an empty `src` caused.
- */
+const MEDIA_BASE = 'https://nntune.invalid';
+
+/** Return the trimmed application-relative media path, or an empty string. */
 export function resolveStreamUrl(track: { streamUrl?: unknown } | null | undefined): string {
 	const raw = track?.streamUrl;
 	if (typeof raw !== 'string') return '';
-	return raw.trim();
+	const path = raw.trim();
+	if (!path.startsWith('/') || path.startsWith('//') || path.includes('\\') ||
+		Array.from(path).some((char) => char.charCodeAt(0) <= 0x1f)) return '';
+	try {
+		return new URL(path, MEDIA_BASE).origin === MEDIA_BASE ? path : '';
+	} catch {
+		return '';
+	}
 }

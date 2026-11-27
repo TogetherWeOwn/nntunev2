@@ -18,8 +18,12 @@ const REJECTION_ID_LIMIT = 64;
 const TRACK_ID = /^[A-Za-z0-9_-]{1,512}$/;
 const RELEASE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-function isTrackId(value: unknown): value is string {
+export function isTrackId(value: unknown): value is string {
 	return typeof value === 'string' && TRACK_ID.test(value);
+}
+
+export function isReleaseId(value: unknown): value is string {
+	return typeof value === 'string' && RELEASE_ID.test(value);
 }
 
 function isCount(value: unknown): value is number {
@@ -47,7 +51,7 @@ export async function loadLikes(client: Pick<LikesClient, 'get'>) {
 	const likes = items.map((item: unknown): LibraryLike => {
 		const { kind, target_id, created_at } = record(item);
 		if ((kind !== 'track' && kind !== 'release') || !isTrackId(target_id) ||
-			(kind === 'release' && !RELEASE_ID.test(target_id)) || !isCount(created_at)) {
+			(kind === 'release' && !isReleaseId(target_id)) || !isCount(created_at)) {
 			throw new Error('Invalid likes list');
 		}
 		const key = `${kind}:${target_id}`;
@@ -65,6 +69,7 @@ export async function setTrackLike(
 	liked: boolean
 ): Promise<string> {
 	if (!isTrackId(id)) throw new Error('Invalid track ID');
+	if (typeof liked !== 'boolean') throw new Error('Invalid like intent');
 	// The server checks exact member job IDs before resolving recording MBIDs.
 	const path = `${LIKES_PATH}/track/${id}`;
 	const receipt = record(liked ? await client.put<unknown>(path, {}) : await client.delete<unknown>(path));
@@ -119,6 +124,7 @@ export async function importDeviceLikes(
 		retireConfirmed: (ids: readonly string[]) => Promise<boolean>;
 	}
 ): Promise<'none-confirmed' | 'partial' | 'complete' | 'cleanup-failed' | null> {
+	if (!validBinding(scope.binding)) return null;
 	const targets = [...new Set(ids.filter(isTrackId))];
 	let count = 0;
 	for (let start = 0; start < targets.length; start += IMPORT_BATCH_SIZE) {

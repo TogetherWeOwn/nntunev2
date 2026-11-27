@@ -30,7 +30,7 @@ export function displayArtist(track: Pick<LibraryItem, 'id' | 'artist'>): string
  */
 export function orderLibraryItems(items: readonly LibraryItem[], order: LibraryOrder): LibraryItem[] {
 	const ordered = [...items];
-	if (order === 'original') return ordered;
+	if (order !== 'title' && order !== 'title-desc' && order !== 'artist' && order !== 'artist-desc') return ordered;
 	const descending = order === 'title-desc' || order === 'artist-desc';
 	const field = order === 'title' || order === 'title-desc' ? 'title' : 'artist';
 	const key = (track: LibraryItem): string | null =>

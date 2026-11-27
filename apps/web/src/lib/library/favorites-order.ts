@@ -8,6 +8,8 @@
  * the library lists them again. Pure: no storage or network use.
  */
 
+import { isLibraryId } from './cache.js';
+
 /** Move direction for a visible favorite within the stored order. */
 export type FavoriteMoveDirection = 'up' | 'down';
 
@@ -36,7 +38,7 @@ export function restoreFavoriteId(
 	id: string,
 	anchor: FavoriteRestoreAnchor
 ): readonly string[] {
-	if (stored.includes(id)) return stored;
+	if (!isLibraryId(id) || stored.includes(id)) return stored;
 	const next = [...stored];
 	if (anchor.successor !== null) {
 		const at = next.indexOf(anchor.successor);
@@ -52,6 +54,7 @@ export function restoreFavoriteId(
 			return next;
 		}
 	}
+	if (!Number.isSafeInteger(anchor.previousIndex)) return stored;
 	next.splice(Math.min(Math.max(anchor.previousIndex, 0), next.length), 0, id);
 	return next;
 }
@@ -70,9 +73,10 @@ export function moveFavoriteId(
 	id: string,
 	direction: FavoriteMoveDirection
 ): readonly string[] {
+	if (!isLibraryId(id) || (direction !== 'up' && direction !== 'down')) return stored;
 	const at = visibleIds.indexOf(id);
 	const neighbor = direction === 'up' ? visibleIds[at - 1] : visibleIds[at + 1];
-	if (at < 0 || neighbor === undefined) return stored;
+	if (at < 0 || !isLibraryId(neighbor) || neighbor === id) return stored;
 	const from = stored.indexOf(id);
 	const to = stored.indexOf(neighbor);
 	if (from < 0 || to < 0) return stored;

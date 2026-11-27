@@ -15,7 +15,7 @@
  */
 
 import { clearUsageWarnings } from '../billing/usageWarnings.js';
-import type { AccountSession } from '../auth-fence.js';
+import { validSessionBinding, type AccountSession } from '../auth-fence.js';
 
 export interface LibraryItem {
 	id: string;
@@ -81,7 +81,7 @@ function provenance(session: SnapshotStorage | null): [string, string] | null {
 		const context = session?.getItem(LIBRARY_AUTH_CONTEXT_KEY);
 		const proof: unknown = JSON.parse(session?.getItem(LIBRARY_SESSION_BINDING_KEY) ?? 'null');
 		return context && Array.isArray(proof) && proof.length === 2 && proof[0] === context &&
-			typeof proof[1] === 'string' && proof[1] ? [context, proof[1]] : null;
+			validSessionBinding(proof[1]) ? [context, proof[1]] : null;
 	} catch { return null; }
 }
 
@@ -95,6 +95,7 @@ export function verifiedFavoritesKey(session: SnapshotStorage | null, binding: s
 
 /** After verification, bind only a newly minted, unused scope. */
 export function establishVerifiedLibraryScope(session: SnapshotStorage | null, binding: string): string | undefined {
+	if (!validSessionBinding(binding)) return;
 	try {
 		if (!session || session.getItem(LIBRARY_AUTH_CONTEXT_KEY)) return verifiedFavoritesKey(session, binding) ?? undefined;
 		const context = crypto.randomUUID(), key = `${LIBRARY_FAVORITES_KEY}.${context}`;
@@ -150,10 +151,13 @@ export function browserStorage(kind: StorageKind): SnapshotStorage | null {
 	}
 }
 
+export function isLibraryId(id: unknown): id is string {
+	return typeof id === 'string' && id.trim().length > 0;
+}
+
 export function isLibraryItem(value: unknown): value is LibraryItem {
-	if (typeof value !== 'object' || value === null) return false;
-	const id = (value as Record<string, unknown>).id;
-	return typeof id === 'string' && id.length > 0;
+	return typeof value === 'object' && value !== null && !Array.isArray(value) &&
+		isLibraryId((value as Record<string, unknown>).id);
 }
 
 /** Occurrence identity is separate from the legacy playback id. */
@@ -236,7 +240,7 @@ export function decodeSnapshot(raw: string | null): LibrarySnapshot | null {
 	if (!raw) return null;
 	try {
 		const parsed = JSON.parse(raw) as Partial<LibrarySnapshot>;
-		if (typeof parsed.savedAt !== 'string' || Number.isNaN(Date.parse(parsed.savedAt))) {
+		if (typeof parsed.savedAt !== 'string' || new Date(parsed.savedAt).toISOString() !== parsed.savedAt) {
 			return null;
 		}
 		if (!Array.isArray(parsed.items)) return null;
@@ -287,16 +291,11 @@ export function clearLibraryQueue(storage: SnapshotStorage | null): void {
 
 export function clearSnapshot(storage: SnapshotStorage | null): void {
 	if (!storage) return;
-	clearLibraryQueue(storage);
-	try {
-		const key = snapshotKey(storage);
-		// Revoke access to the snapshot before attempting to remove its bytes.
-		storage.removeItem(LIBRARY_AUTH_CONTEXT_KEY);
-		storage.removeItem(LIBRARY_SESSION_BINDING_KEY);
-		if (key) storage.removeItem(key);
-		storage.removeItem(LIBRARY_SNAPSHOT_KEY);
-	} catch {
-		// Best effort; a stale key is never read without its auth context.
+	const snapshot = snapshotKey(storage);
+	const queue = libraryContextKey(storage, LIBRARY_QUEUE_KEY);
+	// Capture the scoped keys first, then try each removal independently.
+	for (const key of [LIBRARY_AUTH_CONTEXT_KEY, LIBRARY_SESSION_BINDING_KEY, snapshot, queue, LIBRARY_SNAPSHOT_KEY]) {
+		try { if (key) storage.removeItem(key); } catch { /* Storage may be unavailable. */ }
 	}
 }
 

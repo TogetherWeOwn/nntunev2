@@ -8,6 +8,7 @@ export interface RecentPlay {
 
 const MAX_PLAYS = 50;
 const PLAY_ID = /^[A-Za-z0-9_-]{1,512}$/;
+const CATALOGUE_OCCURRENCE = /^([A-Za-z0-9_-]{1,512}):[1-9][0-9]*$/;
 const MAX_UNIX_SECONDS = 253_402_300_799; // Last second with a four-digit ISO year.
 
 function isId(value: unknown): value is string {
@@ -44,7 +45,7 @@ export function recentPlayTitles(payload: unknown): Map<string, string> {
 		// The full job membership is present even when other occurrences fall off the page.
 		const recordings = row.recording_mbids;
 		const jobId = Array.isArray(recordings) && recordings.length === 1 && recordings[0] === row.id
-			&& typeof row.occurrence_key === 'string' ? row.occurrence_key.split(':')[0] : '';
+			&& typeof row.occurrence_key === 'string' ? CATALOGUE_OCCURRENCE.exec(row.occurrence_key)?.[1] : undefined;
 		for (const id of [row.id, jobId]) {
 			if (!id || ambiguous.has(id)) continue;
 			if (titles.has(id) && titles.get(id) !== title) {

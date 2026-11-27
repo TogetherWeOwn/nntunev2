@@ -1,4 +1,6 @@
 import type { ApiClient } from '../api/client.js';
+import { isReleaseId, isTrackId } from './likes.js';
+import { validBinding } from './session-verification.js';
 
 export type TasteSignal = 'dislike' | 'hide' | 'ban' | 'snooze';
 export type TrackTaste = { signal: TasteSignal | 'love'; until: number | null };
@@ -23,25 +25,34 @@ function preference({ signal, until }: Record<string, unknown>): TrackTaste {
 }
 
 export async function loadTrackTaste(client: Pick<ApiClient, 'get'>, binding: string) {
+	if (!validBinding(binding)) throw new Error('Invalid taste binding');
 	const result = record(await client.get<unknown>(PATH));
 	if (result.session_binding !== binding || !Array.isArray(result.items) || result.items.length > MAX_TASTE_ROWS) {
 		throw new Error('Invalid taste list');
 	}
 	const tracks = new Map<string, TrackTaste>();
+	const releases = new Set<string>();
 	for (const row of result.items) {
 		const item = record(row);
-		if (item.kind === 'release') continue;
 		const id = item.target_id;
-		if (item.kind !== 'track' || typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,512}$/.test(id) || tracks.has(id)) {
+		if (item.kind === 'release' && isReleaseId(id) && !releases.has(id)) {
+			preference(item);
+			releases.add(id);
+		} else if (item.kind === 'track' && isTrackId(id) && !tracks.has(id)) {
+			tracks.set(id, preference(item));
+		} else {
 			throw new Error('Invalid track taste list');
 		}
-		tracks.set(id, preference(item));
 	}
 	return { tracks, complete: result.items.length < MAX_TASTE_ROWS };
 }
 
 /** Only exact, session-bound receipts can update the Library's confirmed state. */
 export async function saveTrackTaste(client: Pick<ApiClient, 'put' | 'delete'>, binding: string, id: string, signal: TasteSignal | null) {
+	if (!validBinding(binding) || !isTrackId(id) ||
+		(signal !== null && signal !== 'hide' && signal !== 'ban' && signal !== 'dislike' && signal !== 'snooze')) {
+		throw new Error('Invalid taste intent');
+	}
 	const target = { kind: 'track', target_id: id };
 	const result = record(signal === null
 		? await client.delete<unknown>(PATH, undefined, target)

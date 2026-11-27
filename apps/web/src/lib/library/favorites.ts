@@ -13,6 +13,7 @@
  */
 
 import {
+	isLibraryId,
 	LIBRARY_FAVORITES_KEY,
 	libraryContextKey,
 	purgeFavorites,
@@ -25,14 +26,11 @@ export function favoritesKey(session: SnapshotStorage | null): string | null {
 	return libraryContextKey(session, LIBRARY_FAVORITES_KEY);
 }
 
-function isStoredId(value: unknown): value is string {
-	return typeof value === 'string' && value.length > 0;
-}
-
 /**
  * Load the current context's favorites. Missing or corrupt stored values
  * yield an empty list. Unavailable storage/context also defaults to empty;
- * a caller may supply in-memory state to use when storage cannot be read.
+ * a caller with a current context may supply in-memory state when local
+ * storage cannot be read.
  */
 export function loadFavorites(
 	session: SnapshotStorage | null,
@@ -40,7 +38,8 @@ export function loadFavorites(
 	fallback: readonly string[] = []
 ): string[] {
 	const key = favoritesKey(session);
-	if (!local || !key) return [...fallback];
+	if (!key) return [];
+	if (!local) return [...fallback];
 	let raw: string | null;
 	try {
 		raw = local.getItem(key);
@@ -51,7 +50,7 @@ export function loadFavorites(
 		if (!raw) return [];
 		const parsed: unknown = JSON.parse(raw);
 		if (!Array.isArray(parsed)) return [];
-		return [...new Set(parsed.filter(isStoredId))];
+		return [...new Set(parsed.filter(isLibraryId))];
 	} catch {
 		return [];
 	}
@@ -75,10 +74,10 @@ export async function updateStoredFavorites(
 		if (favoritesKey(session) !== key) return null;
 		const raw = local.getItem(key);
 		const parsed: unknown = raw === null ? [] : JSON.parse(raw);
-		if (!Array.isArray(parsed) || !parsed.every(isStoredId)) return null;
+		if (!Array.isArray(parsed) || !parsed.every(isLibraryId)) return null;
 		const latest = [...new Set<string>(parsed)];
 		const committed = [...new Set(update(latest.slice()))];
-		if (!committed.every(isStoredId) || favoritesKey(session) !== key) return null;
+		if (!committed.every(isLibraryId) || favoritesKey(session) !== key) return null;
 		const encoded = JSON.stringify(committed);
 		if (encoded !== JSON.stringify(latest)) local.setItem(key, encoded);
 		return committed;
@@ -98,7 +97,7 @@ export function saveFavorites(
 	const key = favoritesKey(session);
 	if (!local || !key) return false;
 	try {
-		local.setItem(key, JSON.stringify(ids.filter(isStoredId)));
+		local.setItem(key, JSON.stringify([...new Set(ids.filter(isLibraryId))]));
 		return true;
 	} catch {
 		// Quota or privacy mode: memory remains authoritative this visit.

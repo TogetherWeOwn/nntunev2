@@ -81,7 +81,8 @@ export function saveRecentFinds(
 	const key = recentFindsKey(session);
 	if (!local || !key) return;
 	try {
-		local.setItem(key, JSON.stringify(queries.filter(isStoredQuery).slice(0, MAX_RECENT_FINDS)));
+		const distinct = [...new Set(queries.filter(isStoredQuery))];
+		local.setItem(key, JSON.stringify(distinct.slice(0, MAX_RECENT_FINDS)));
 	} catch {
 		// Quota or privacy mode: memory remains authoritative this visit.
 	}
