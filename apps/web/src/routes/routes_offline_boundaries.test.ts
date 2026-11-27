@@ -48,6 +48,8 @@ describe('API base URL environment schema', () => {
 		'https://api.example.test\\other',
 		'https://api.example.test/path?',
 		'https://api.example.test/path#',
+		'https://api.example.test/path%2',
+		'https://api.example.test/path%xy',
 		'https://user@api.example.test',
 		'https://@api.example.test',
 		'https://api.example.test\t',
@@ -57,7 +59,7 @@ describe('API base URL environment schema', () => {
 		expect(await validate(value)).toEqual({ issues: [{ message: expect.any(String) }] });
 	});
 
-	it.each([undefined, '', 'https://api.example.test:8443/prefix/', 'http://[::1]:8787'])(
+	it.each([undefined, '', 'https://api.example.test:8443/prefix/', 'https://api.example.test/a%20b', 'http://[::1]:8787'])(
 		'preserves supported API bases %j',
 		async (value) => expect(await validate(value)).toEqual({ value: value ?? '' })
 	);

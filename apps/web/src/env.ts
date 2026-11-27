@@ -7,7 +7,9 @@ function parseApiBaseUrl(value = ''): string {
 	// Reject syntax the URL parser could silently repair or discard before
 	// clients append their endpoint paths. Keep supported path prefixes.
 	const authority = /^https?:\/\/([^/]+)/i.exec(value)?.[1];
-	if (!authority || authority.includes('@') || /[\\?#\s\p{Cc}]/u.test(value)) throw invalid();
+	if (!authority || authority.includes('@') || /[\\?#\s\p{Cc}]|%(?![0-9a-f]{2})/iu.test(value)) {
+		throw invalid();
+	}
 	try {
 		cspSources(value, { allowHttpLoopback: import.meta.env.DEV });
 	} catch {
