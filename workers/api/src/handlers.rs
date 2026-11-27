@@ -13832,7 +13832,6 @@ pub(crate) mod tests {
         assert_eq!(initial.status, 200);
         let lease: Value = serde_json::from_str(&initial.body).unwrap();
         assert_eq!(lease["expires_at"], expires_at);
-
         let co_evt = checkout_completed_body("evt_disabled_co", "cs_test_1", false);
         let in_obj =
             json!({"id": "in_test_1", "customer": "cus_test_1", "subscription": "sub_test_1"});
@@ -13895,8 +13894,7 @@ pub(crate) mod tests {
             assert_eq!(sub["state"], "no_subscription");
             assert!(sub.get("canChangePlan").is_none());
         }
-
-        // Without private listening, portal stays closed unless all paid gates and config hold.
+        // Without private listening, checkout, portal and webhook stay closed unless all gates hold.
         h.config.private_listening = None;
         for (paid, invites, portal, expected) in [
             (false, true, Some("bpc_fixture"), 404),
@@ -13906,8 +13904,16 @@ pub(crate) mod tests {
             h.config.paid_invite_billing = paid;
             h.config.invites_required = invites;
             h.config.stripe_portal_configuration = portal.map(str::to_string);
-            assert_eq!(post(&h, paid_invite_billing::PORTAL, "{}"), expected);
+            let co = post(&h, paid_invite_billing::CHECKOUT, r#"{"planId":"plus"}"#);
+            assert_eq!(
+                (co, post(&h, paid_invite_billing::PORTAL, "{}")),
+                (expected, expected)
+            );
+            if expected == 404 {
+                assert_eq!((wh(&h, &co_evt), wh(&h, &in_evt)), (404, 404));
+            }
             assert!(h.stripe.portal_reply.borrow().is_some());
+            assert_eq!(*h.stripe.sessions_created.borrow(), 0);
         }
     }
 
@@ -14000,7 +14006,6 @@ pub(crate) mod tests {
         assert_eq!(*h.store.webhook_events.borrow(), claims_before);
         assert_eq!(h.store.paid_reconcile_attempts.get(), attempts_before);
         unchanged(&h);
-
         // 2. Cross-account and unknown-account invoice.paid webhooks reconcile nothing.
         for (id, c, s) in [
             ("evt_x1", c2, s1),
@@ -14011,7 +14016,6 @@ pub(crate) mod tests {
         }
         assert_eq!(h.store.paid_reconcile_attempts.get(), attempts_before);
         unchanged(&h);
-
         // 3. Retrieved subscription reporting another account's customer or livemode=true fails closed.
         let u1_sub = h.stripe.subscriptions.borrow()[s1].clone();
         let u1_evt = inv_evt("evt_u1_guard", "in_ren", c1, s1);
@@ -14036,7 +14040,6 @@ pub(crate) mod tests {
             .borrow_mut()
             .insert(s1.into(), u1_sub);
         h.stripe.forbid_invoice_reads = false;
-
         // 4. Renewal invoice listing carrying another account's customer never advances u1.
         let scope = crate::stripe::ListInvoices {
             customer_id: Some(c1.into()),
@@ -14052,7 +14055,6 @@ pub(crate) mod tests {
         webhook_ok(&deliver(&h, &u1_evt));
         assert!(h.stripe.scripted_invoice_list.borrow().is_none());
         unchanged(&h);
-
         // 5. Renewal invoice listing carrying livemode=true fails closed on webhook and hourly sweep.
         let mut live_inv = inv("in_live_ren", c1, s1, first_end, ren_end);
         live_inv.livemode = true;
