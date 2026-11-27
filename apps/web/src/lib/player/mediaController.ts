@@ -14,7 +14,7 @@ import type { SystemSeekGuard } from './systemSeek.js';
 import { bindSystemTransport } from './systemTransport.js';
 import { applyMediaSession, clearMediaSession } from './mediaSession.js';
 import type { BrowserPlaybackSource } from './browserPlaybackGrant.js';
-import type { ShareTarget } from './shareTimestamp.js';
+import { isShareTimestamp, type ShareTarget } from './shareTimestamp.js';
 
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean | { end: number; seekDuration: number; played: TimeRanges; settled?: number; progressed?: boolean; tailProgress?: boolean } };
 export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' | 'blocked' | 'error' | 'retrying';
@@ -370,12 +370,18 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const revision = queue.revision, intent = playIntent, position = positionIntent, version = attachmentVersion;
 		const current = () => !destroyed && pendingGrant === request && queue.isCurrent(revision) && isEligible() &&
 			intent === playIntent && position === positionIntent && version === attachmentVersion;
+		let published = false;
 		let playback: Promise<void> | undefined;
 		try {
-			const accepted = await selection.prepare(trackId, current, (grant) => { playback = publish(grant); }, {
+			const accepted = await selection.prepare(trackId, current, (grant) => {
+				if (current() && grant.trackId === trackId && resolveStreamUrl(grant) && grant.isCurrent() && current() && !published) {
+					published = true;
+					playback = publish(grant);
+				}
+			}, {
 				retry, retireSuperseded: retireSuperseded ? () => pendingGrant === request : undefined
 			});
-			if (!accepted && current()) selection.announce(failureMessage, true);
+			if ((!accepted || !published) && current()) selection.announce(failureMessage, true);
 			await playback;
 		} finally { if (pendingGrant === request) pendingGrant = undefined; }
 	}
@@ -383,11 +389,12 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	async function playSelected(
 		base: QueueState, index: number, source: QueuedPlaySource, suffix = '', grant?: BrowserPlaybackSource
 	): Promise<void> {
-		if (!selection || queue.purging) return;
+		if (!selection || queue.purging || !Number.isSafeInteger(index) || index < 0 || index >= base.tracks.length) return;
 		const target = base.tracks[index];
 		if (!target || destroyed || !source.isCurrent()) return;
+		if (grant && (source !== grant || grant.trackId !== target.id || !resolveStreamUrl(grant))) return;
 		if (selection.prepare && !grant) return preparePlay(target.id, source.isCurrent, (issued) => playSelected(base, index, issued, suffix, issued));
-		const { streamUrl } = source;
+		const streamUrl = resolveStreamUrl(source);
 		const tracks = [...base.tracks];
 		if (!grant) tracks[index] = { ...target, streamUrl };
 		if (!selection.commit(selectTrack({ ...base, tracks }, index), grant) || !source.isCurrent() || destroyed) return;
@@ -428,20 +435,25 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				return;
 			}
 			if (!ownsPlay()) return;
+			const matches = () => !!audio && matchesSource(audio, streamUrl, ownsPlay);
 			try {
-				if (audio?.isConnected && audio.getAttribute('src') === streamUrl && ownsPlay()) {
+				if (audio && matches()) {
 					const play = audio.play;
-					if (!ownsPlay()) return;
+					if (!matches()) return;
 					await play.call(audio);
-					lead = `Playing ${title}.`;
+					if (!matches()) return;
+					lead = !audio.paused && !audio.ended ? `Playing ${title}.` : '';
 				}
 			} catch {
 				// No retry and no pause or selection change on a retired receipt.
-				if (ownsPlay() && attachment) attachment.playing = false;
+				if (!matches()) return;
+				if (attachment) attachment.playing = false;
 			}
-			if (ownsPlay() && audio?.error) lead = `Selected ${title}; audio unavailable.`;
+			if (audio && matches() && audio.error) lead = `Selected ${title}; audio unavailable.`;
+			if (audio && !matches()) return;
 		}
-		if (ownsPlay()) selection.announce(suffix ? `${lead} ${suffix}` : lead, true);
+		const message = [lead, suffix].filter(Boolean).join(' ');
+		if (message && ownsPlay()) selection.announce(message, true);
 	}
 
 	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
@@ -450,7 +462,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			// with a DOM snapshot that does not call back into those accessors.
 			return isCurrent() && audio.isConnected && isCurrent() &&
 				audio.getAttribute('src') === source && isCurrent() && audio.isConnected && isCurrent() &&
-				matchesNative(audio, source);
+				matchesNative(audio, source) && isCurrent();
 		} catch {
 			return false;
 		}
@@ -494,7 +506,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function captureShareSeek(intent: number, { trackId, seconds }: ShareTarget, routeIsCurrent: () => boolean) {
-		if (!routeIsCurrent() || destroyed || intent !== positionIntent) return;
+		if (!isShareTimestamp(seconds) || !routeIsCurrent() || destroyed || queue.purging || intent !== positionIntent) return;
 		const track = currentTrack(queue.snapshot);
 		if (track?.id !== trackId) return;
 		const streamUrl = streamFor(track);
@@ -524,7 +536,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function jump(direction: JumpDirection, seconds = RELATIVE_JUMP_SECONDS, system?: SystemSeekGuard): void {
-		if (destroyed || queue.purging || system?.active() === false) return;
+		if ((direction !== 'back' && direction !== 'forward') || !Number.isFinite(seconds) || seconds <= 0 ||
+			destroyed || queue.purging || system?.active() === false) return;
 		const track = currentTrack(queue.snapshot);
 		const source = streamFor(track);
 		const attachment = current;
@@ -879,6 +892,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					switch (event.type) {
 						case 'play':
 							if (event.type === 'play' && pendingReconnect?.audio === audio) invalidatePlay();
+						// Falls through to observe native playback.
 						case 'playing':
 							if (!audio.paused && !audio.ended && matches()) {
 								receipt.playing = true;

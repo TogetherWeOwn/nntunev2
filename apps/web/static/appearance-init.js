@@ -1,2 +1,9 @@
-/* Pre-paint appearance init (render-blocking same-origin script; strict CSP unchanged). Applies a saved light/dark override before first paint; reads only the validated enum, never writes. */
-(function(){try{var v=localStorage.getItem('nntune:appearance:v1');if(v==='light'||v==='dark')document.documentElement.setAttribute('data-appearance',v);}catch{}})();
+// Read the saved override before first paint. Blocked storage leaves the CSS default.
+(() => {
+	try {
+		const appearance = localStorage.getItem('nntune:appearance:v1');
+		if (appearance === 'light' || appearance === 'dark') {
+			document.documentElement.setAttribute('data-appearance', appearance);
+		}
+	} catch { /* Appearance storage is optional. */ }
+})();

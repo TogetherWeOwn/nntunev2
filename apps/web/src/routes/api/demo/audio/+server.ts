@@ -1,53 +1,51 @@
 import type { RequestHandler } from './$types';
 import { audioCacheHeaders } from '#lib/player/cacheHeaders.js';
-import { syntheticBody } from '#lib/player/demoMedia.js';
+import { MEDIA_BYTES, syntheticBody } from '#lib/player/demoMedia.js';
 
 /**
  * Deterministic WAV media for player smoke tests. No provider, no R2, no auth.
  * `?track=<id>` selects distinct samples; byte ranges preserve WAV playback.
  */
 
-type ParsedRange = { start: number; end: number } | { unsatisfiable: true };
-
-function parseRange(header: string | null, len: number): ParsedRange | null {
-	if (header === null) return null;
-	const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
-	if (!match) return null;
+function parseRange(header: string, len: number): { start: number; end: number } | undefined {
+	const match = /^bytes=([0-9]{0,16})-([0-9]{0,16})$/i.exec(header);
+	if (!match) return;
 	const [, startText, endText] = match;
-	if (startText === '' && endText === '') return null;
+	const last = endText === '' ? len - 1 : Number(endText);
+	if (!Number.isSafeInteger(last)) return;
 	if (startText === '') {
-		const suffix = Number(endText);
-		if (!Number.isFinite(suffix)) return null;
-		if (suffix <= 0) return { unsatisfiable: true };
-		const n = Math.min(suffix, len);
-		return { start: len - n, end: len - 1 };
+		if (endText === '' || last === 0) return;
+		return { start: Math.max(0, len - last), end: len - 1 };
 	}
 	const start = Number(startText);
-	if (!Number.isFinite(start)) return null;
-	if (start >= len) return { unsatisfiable: true };
-	const end = endText === '' ? len - 1 : Math.min(Number(endText), len - 1);
-	if (!Number.isFinite(end)) return null;
-	if (end < start) return { unsatisfiable: true };
+	const end = Math.min(last, len - 1);
+	if (!Number.isSafeInteger(start) || end < start) return;
 	return { start, end };
 }
 
 export const GET: RequestHandler = ({ request, url }) => {
-	const body = syntheticBody(url.searchParams.get('track'));
+	const rangeHeader = request.headers.get('range');
+	const range = rangeHeader === null ? undefined : parseRange(rangeHeader, MEDIA_BYTES);
+	if (rangeHeader !== null && !range) {
+		return new Response(null, { status: 416, headers: {
+			'accept-ranges': 'bytes', 'cache-control': 'no-store',
+			'content-range': `bytes */${MEDIA_BYTES}`, 'content-length': '0'
+		} });
+	}
+	const tracks = url.searchParams.getAll('track');
+	if (tracks.length > 1) return new Response(null, { status: 400, headers: { 'cache-control': 'no-store' } });
+	const body = syntheticBody(tracks[0]);
 	const headers = new Headers({
 		...audioCacheHeaders(),
 		'content-type': 'audio/wav',
+		'x-content-type-options': 'nosniff',
 		'accept-ranges': 'bytes',
 		'content-length': String(body.length)
 	});
 
-	const range = parseRange(request.headers.get('range'), body.length);
-	if (range === null) {
+	// No validator is advertised, so an If-Range condition cannot match.
+	if (!range || request.headers.has('if-range')) {
 		return new Response(body.buffer as ArrayBuffer, { status: 200, headers });
-	}
-	if ('unsatisfiable' in range) {
-		headers.set('content-range', `bytes */${body.length}`);
-		headers.set('content-length', '0');
-		return new Response(null, { status: 416, headers });
 	}
 	const slice = body.slice(range.start, range.end + 1);
 	headers.set('content-range', `bytes ${range.start}-${range.end}/${body.length}`);

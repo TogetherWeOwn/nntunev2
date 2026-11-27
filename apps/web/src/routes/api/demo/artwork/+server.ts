@@ -12,6 +12,8 @@ export const GET: RequestHandler = () =>
 		status: 200,
 		headers: {
 			...artworkCacheHeaders(),
-			'content-type': 'image/svg+xml'
+			'content-type': 'image/svg+xml',
+			'x-content-type-options': 'nosniff',
+			'content-security-policy': "default-src 'none'; sandbox"
 		}
 	});

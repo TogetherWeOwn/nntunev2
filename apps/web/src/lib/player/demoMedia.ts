@@ -6,15 +6,11 @@ export const MEDIA_BYTES = 256 * 1024;
 const WAV_HEADER_BYTES = 44;
 const SAMPLE_RATE = 8_000;
 
-/** Allowlisted track ids -> sample salt. Unknown ids serve the default stream. */
-const TRACK_SALT: Readonly<Record<string, number>> = {
-	'second-signal': 41,
-	'third-light': 97
-};
-
 export function trackSalt(track: string | null): number {
-	if (track === null || !Object.hasOwn(TRACK_SALT, track)) return 0;
-	return TRACK_SALT[track] ?? 0;
+	// Unknown ids serve the default stream. Only literal strings select variants.
+	if (track === 'second-signal') return 41;
+	if (track === 'third-light') return 97;
+	return 0;
 }
 
 export function syntheticBody(track: string | null = null): Uint8Array {

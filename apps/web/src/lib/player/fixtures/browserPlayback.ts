@@ -5,15 +5,22 @@ import { createQueue, currentTrack } from '../queue.js';
 
 export const binding = 'A'.repeat(43);
 export const initial = createQueue(['first', 'second'].map((id) => ({ id, title: id, artist: '', streamUrl: `/fixture/${id}` })));
+const sessionId = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export const receipt = (tab: string, track: string, play: string) => ({ sessionBinding: binding,
 	playbackSessionId: tab, trackId: track, playId: play, durationMs: 120_000 });
 
-export function grantReply(mode: string, tab: string) {
-	if (mode === 'refused') return new Response(null, { status: 409 });
-	if (mode === 'legacy reply') return Response.json({ play_id: 'late', grant: 'synthetic' });
-	const current = receipt(tab, 'second', 'late');
-	return Response.json(mode === 'extra field' ? { ...current, grant: 'synthetic' } : current);
+type GrantCase = 'refused' | 'legacy reply' | 'extra field' | 'superseded' | 'account retirement' | 'newer play';
+export function grantReply(mode: GrantCase, tab: string) {
+	switch (mode) {
+		case 'refused': return new Response(null, { status: 409 });
+		case 'legacy reply': return Response.json({ play_id: 'late', grant: 'synthetic' });
+		case 'extra field': return Response.json({ ...receipt(tab, 'second', 'late'), grant: 'synthetic' });
+		case 'superseded':
+		case 'account retirement':
+		case 'newer play': return Response.json(receipt(tab, 'second', 'late'));
+		default: throw new Error('Unknown grant fixture case');
+	}
 }
 
 export function setup(privateTtlSeconds = 60) {
@@ -23,17 +30,35 @@ export function setup(privateTtlSeconds = 60) {
 	let marked = false;
 	const starts: boolean[] = [];
 	const respond: typeof fetch = async (path, init) => {
-		const { session_id, enabled, track_id, play_id } = JSON.parse(String(init?.body));
-		expect(new Headers(init?.headers).get(SESSION_BINDING_HEADER)).toBe(binding);
+		const headers = new Headers(init?.headers);
+		expect(headers.get(SESSION_BINDING_HEADER)).toBe(binding);
+		expect(headers.get('content-type')).toBe('application/json');
 		expect(init).toMatchObject({ credentials: 'include', cache: 'no-store', redirect: 'error' });
+		if (typeof init?.body !== 'string') throw new Error('Expected a JSON request body');
+		const body: unknown = JSON.parse(init.body);
+		if (!body || typeof body !== 'object' || !('session_id' in body) ||
+			typeof body.session_id !== 'string' || body.session_id.length !== 36 || !sessionId.test(body.session_id)) {
+			throw new Error('Expected a playback session ID');
+		}
+		const { session_id } = body;
 		if (path === '/v1/me/private-session') {
-			expect(init?.method).toBe('PUT');
-			marked = enabled;
+			expect([init.method, headers.get('x-nntune-browser-playback')]).toEqual(['PUT', null]);
+			if (!('enabled' in body) || typeof body.enabled !== 'boolean') throw new Error('Expected a boolean privacy toggle');
+			expect(Object.keys(body).sort()).toEqual(['enabled', 'session_id']);
+			marked = body.enabled;
 			return Response.json({ session_id, private_until: marked ? Math.floor(Date.now() / 1000) + privateTtlSeconds : null });
 		}
-		expect([path, init?.method]).toEqual(['/v1/plays', 'POST']);
-		expect(new Headers(init?.headers).get('x-nntune-browser-playback')).toBe('1');
-		if (play_id) return Response.json(receipt(session_id, track_id, play_id));
+		expect([path, init.method, headers.get('x-nntune-browser-playback')]).toEqual(['/v1/plays', 'POST', '1']);
+		const track_id = 'track_id' in body ? body.track_id : undefined;
+		if (typeof track_id !== 'string' || !initial.tracks.some(({ id }) => id === track_id)) throw new Error('Unknown fixture track');
+		if ('play_id' in body) {
+			if (typeof body.play_id !== 'string' || body.play_id.length < 1 || body.play_id.length > 512 || /[^A-Za-z0-9_-]/.test(body.play_id)) {
+				throw new Error('Invalid fixture play ID');
+			}
+			expect(Object.keys(body).sort()).toEqual(['play_id', 'session_id', 'track_id']);
+			return Response.json(receipt(session_id, track_id, body.play_id));
+		}
+		expect(Object.keys(body).sort()).toEqual(['session_id', 'track_id']);
 		starts.push(marked);
 		return Response.json(receipt(session_id, track_id, `play-${starts.length}`));
 	};
@@ -106,15 +131,21 @@ export const refusedContinuations = (tab: string) => [
 	new Response(null, { status: 409 }), Response.json(receipt(tab, 'first', 'other-play'))
 ];
 
-function invalidToggleReply(reason: string) {
-	if (reason === 'server error') return new Response(null, { status: 503 });
-	if (reason === 'wrong tab') return Response.json({ session_id: 'another-tab', private_until: Math.floor(Date.now() / 1000) + 60 });
+type ToggleCase = 'server error' | 'wrong tab' | 'short expiry' | 'TTL expiry';
+function invalidToggleReply(reason: ToggleCase) {
+	switch (reason) {
+		case 'server error': return new Response(null, { status: 503 });
+		case 'wrong tab': return Response.json({ session_id: 'another-tab', private_until: Math.floor(Date.now() / 1000) + 60 });
+		case 'short expiry':
+		case 'TTL expiry': return undefined;
+		default: throw new Error('Unknown privacy fixture case');
+	}
 }
 
-export async function setupToggleCase(reason: string) {
+export async function setupToggleCase(reason: ToggleCase) {
+	const reply = invalidToggleReply(reason);
 	const fixture = setup(reason === 'TTL expiry' ? 7 * 60 * 60 : 60);
 	await fixture.play(0);
-	const reply = invalidToggleReply(reason);
 	if (reply) fixture.fetchFn.mockResolvedValueOnce(reply);
 	return fixture;
 }

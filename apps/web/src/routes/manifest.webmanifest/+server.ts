@@ -10,6 +10,7 @@ const MANIFEST = {
 	short_name: 'NNTune',
 	description:
 		'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up to choose an account plan.',
+	id: '/',
 	start_url: '/',
 	scope: '/',
 	display: 'standalone',
@@ -33,6 +34,7 @@ export const GET: RequestHandler = () =>
 	new Response(JSON.stringify(MANIFEST), {
 		headers: {
 			'content-type': 'application/manifest+json',
+			'x-content-type-options': 'nosniff',
 			'cache-control': 'public, max-age=3600'
 		}
 	});
