@@ -152,3 +152,18 @@ fn predictive_limits_accept_extrema_at_every_split_and_preserve_the_next_frame()
         }
     }
 }
+
+#[test]
+fn rejects_unsupported_inherited_width_before_taking_scratch() {
+    // The preamble refuses three-bit streams; a direct caller must still keep its scratch.
+    let info = StreamInfo {
+        bits_per_sample: 3,
+        ..INFO
+    };
+    let wire = frame(0, &[0, 0]);
+    let mut input = wire.as_slice();
+    let mut scratch = Some(vec![42]);
+    assert!(FrameReader::start_with_pcm(&mut input, &info, &mut scratch).is_err());
+    assert_eq!(input, wire);
+    assert_eq!(scratch, Some(vec![42]));
+}
