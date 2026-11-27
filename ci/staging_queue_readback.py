@@ -113,6 +113,7 @@ def select(evidence, pinned_runs, pinned_shas):
             and isinstance(jobs, dict), "missing unresolved run or job inventory")
 
     runs, numbers, eligible, kept = {}, set(), {}, {}
+    repository_id = None
     for state in RUN_STATES:
         for rid, run in pages(inventory[state], "workflow_runs").items():
             number, sha = run.get("run_number"), run.get("head_sha")
@@ -125,6 +126,8 @@ def select(evidence, pinned_runs, pinned_shas):
                     and isinstance(sha, str) and SHA.fullmatch(sha)
                     and isinstance(run.get("event"), str) and isinstance(run.get("head_branch"), str),
                     "duplicate or out-of-scope workflow run")
+            require(repository_id in (None, repo["id"]), "inconsistent staging repository identity")
+            repository_id = repo["id"]
             runs[rid] = (run["run_attempt"], sha)
             numbers.add(number)
             head_repo = run.get("head_repository")

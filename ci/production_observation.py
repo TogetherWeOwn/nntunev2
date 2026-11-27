@@ -15,6 +15,7 @@ MINIMUM = timedelta(minutes=30)
 UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 NULL_SHA = "0" * 40
+NULL_UUID = "00000000-0000-0000-0000-000000000000"
 PRIVATE_LINK = re.compile(r"#evidence-[a-z0-9][a-z0-9-]{0,63}")
 JOB_URL = re.compile(r"https://github\.com/TogetherWeOwn/nntunev2/actions/runs/([1-9][0-9]{0,15})/job/[1-9][0-9]{0,15}")
 PROMOTION = {"sha", "promoted_version_id", "deployment_id", "run_id", "run_attempt"}
@@ -55,7 +56,8 @@ def validate_observation(pins, watch):
             "unsupported observation schema")
     candidate = fields(pins["candidate"], PROMOTION | {"api_sha"}, "incomplete candidate identity")
     require(all(matches(SHA, candidate[key]) and candidate[key] != NULL_SHA for key in ("sha", "api_sha"))
-            and all(matches(UUID, candidate[key]) for key in ("promoted_version_id", "deployment_id")),
+            and all(matches(UUID, candidate[key]) and candidate[key] != NULL_UUID
+                    for key in ("promoted_version_id", "deployment_id")),
             "invalid candidate identity")
     for key in ("run_id", "run_attempt"):
         require(candidate[key] == decimal(candidate[key]) == watch[key], "watch run or attempt mismatch")

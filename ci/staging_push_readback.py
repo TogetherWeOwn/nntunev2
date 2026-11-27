@@ -32,7 +32,10 @@ def contains_squash(comparisons, squash, head):
             and behind >= 0 and ahead == total >= 0
             and isinstance(commits, list) and len(commits) == min(ahead, 250),
             "incomplete comparison")
-    require((commits[-1]["sha"] if commits else merge_base) == head,
+    commit_shas = [row["sha"] for row in commits]
+    require(all(isinstance(sha, str) and SHA.fullmatch(sha) and sha != merge_base for sha in commit_shas)
+            and len(set(commit_shas)) == len(commit_shas), "invalid comparison commit inventory")
+    require((commit_shas[-1] if commit_shas else merge_base) == head,
             "comparison belongs to a different head")
     # REST status describes HEAD relative to BASE.
     status = {(False, False): "identical", (True, False): "ahead",
@@ -100,11 +103,15 @@ def nominate(evidence, *, squash, repo, repository_id):
             required_jobs[name] = job
         if any(job["conclusion"] != "success" for job in required_jobs.values()):
             continue
+        require(all(timestamp(job["started_at"]) <= timestamp(job["completed_at"])
+                    for job in required_jobs.values()), "job completed before it started")
         # The ordinary journey follows both deploy jobs in the shared writer
         # group. Queued runs can complete in a different order from creation.
-        completed = timestamp(required_jobs[JOURNEY]["completed_at"])
-        require(all(timestamp(required_jobs[name]["completed_at"]) <= completed for name in DEPLOY_STEPS),
-                "journey completed before deployment")
+        journey = required_jobs[JOURNEY]
+        started = timestamp(journey["started_at"])
+        require(all(timestamp(required_jobs[name]["completed_at"]) <= started for name in DEPLOY_STEPS),
+                "journey started before deployment finished")
+        completed = timestamp(journey["completed_at"])
         candidates.append((completed, head, str(run_id), attempt))
 
     require(candidates, "no eligible staging attempt")

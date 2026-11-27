@@ -62,6 +62,16 @@ class GuardFixtures(unittest.TestCase):
         with self.assertRaisesRegex(yaml.YAMLError, "merge keys"):
             list(findings("on: {pull_request: {<<: {types: [edited]}}}"))
 
+    def test_malformed_filters_fail_closed(self):
+        for trigger in (
+            "[]", "[push, push]", '{"": {}, push: {paths: [src/**]}}',
+            "{push: {paths: src/**}}", "{push: {paths: [[], src/**]}}",
+            "{push: {branches: [main], branches-ignore: [main], paths: [src/**]}}",
+            "{pull_request: {types: {opened: yes}, paths: [src/**]}}",
+        ):
+            with self.subTest(trigger=trigger), self.assertRaises(ValueError):
+                list(findings(f"# guards: paths\non: {trigger}"))
+
 
 class TrustedPRRunnerTests(unittest.TestCase):
     def test_runner_selection_stays_scoped_to_trusted_prs(self):

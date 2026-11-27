@@ -12,7 +12,9 @@ import sys
 import zipfile
 import zlib
 
-from staging_admission import ROOT, SHA, Refused, decimal, digest, require, require_steps, timestamp
+from staging_admission import (
+    ROOT, SHA, TERMINAL_CONCLUSIONS, Refused, decimal, digest, require, require_steps, timestamp,
+)
 
 REPOSITORY = "TogetherWeOwn/nntunev2"
 CI_WORKFLOW = ".github/workflows/ci.yml"
@@ -99,10 +101,14 @@ def verified_candidate(actions, *, repository_id, sha, private_trial_upload):
 
     def check_run():
         run = actions.api(f"runs/{run_id}")
+        status, conclusion = run.get("status"), run.get("conclusion")
         require(decimal(run.get("id")) == run_id and decimal(run.get("workflow_id")) == workflow_id
                 and run.get("path") == CI_WORKFLOW and run.get("event") == "push"
                 and run.get("head_branch") == "main" and run.get("head_sha") == sha
-                and decimal(run.get("run_attempt")) == "1", "wrong or superseded CI attempt")
+                and decimal(run.get("run_attempt")) == "1"
+                and ((status == "in_progress" and "conclusion" in run and conclusion is None)
+                     or (status == "completed" and conclusion in TERMINAL_CONCLUSIONS)),
+                "wrong or superseded CI attempt")
         for field in ("repository", "head_repository"):
             repo = run.get(field)
             require(isinstance(repo, dict) and repo.get("full_name") == REPOSITORY

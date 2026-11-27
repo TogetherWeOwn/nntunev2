@@ -46,7 +46,8 @@ def require_reviewed_submission(
         raise ValueError("unapproved staging Worker target")
     if not re.fullmatch(r"[0-9a-f]{32}", approved_account) or account != approved_account:
         raise ValueError("unapproved Cloudflare account")
-    if not re.fullmatch(r"[0-9a-f]{40}", approved_source_sha) or source_sha != approved_source_sha:
+    if (not isinstance(approved_source_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", approved_source_sha)
+            or approved_source_sha == "0" * 40 or source_sha != approved_source_sha):
         raise ValueError("unapproved source revision")
     if operation not in ("deploy", "rollback") or operation != approved_operation:
         raise ValueError("unapproved deployment operation")

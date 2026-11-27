@@ -129,6 +129,8 @@ class ApiCandidateTests(unittest.TestCase):
             ("0", lambda a: a.run.update(head_sha="b" * 40), "wrong or superseded CI attempt"),
             ("0", lambda a: a.run.update(event="pull_request"), "wrong or superseded CI attempt"),
             ("0", lambda a: a.run.update(run_attempt=2), "wrong or superseded CI attempt"),
+            ("0", lambda a: a.run.update(status="queued"), "wrong or superseded CI attempt"),
+            ("0", lambda a: a.run.update(conclusion="failure"), "wrong or superseded CI attempt"),
             ("0", lambda a: a.jobs[0].update(conclusion="failure"), "Worker release build did not pass"),
             ("0", lambda a: a.jobs[0]["steps"][1].update(conclusion="skipped"), "required candidate build steps"),
             ("0", lambda a: a.jobs[0]["steps"].append(None), "invalid candidate CI step metadata"),

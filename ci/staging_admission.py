@@ -11,9 +11,11 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -22,6 +24,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from datetime import datetime, timedelta, timezone
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -74,6 +77,10 @@ SHA = re.compile(r"[0-9a-f]{40}")
 HASH = re.compile(r"[0-9a-f]{64}")
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 LABEL = re.compile(r"[A-Za-z0-9_.:/@ -]{1,200}")
+EVIDENCE_TIME = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?"
+    r"(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
 MAX_JSON = 256 * 1024
 MAX_ARCHIVE = 512 * 1024
 MAX_XML = 2 * 1024 * 1024
@@ -116,44 +123,52 @@ def decimal(value):
 
 
 def timestamp(value):
-    require(isinstance(value, str), "missing evidence time")
+    require(isinstance(value, str) and EVIDENCE_TIME.fullmatch(value), "missing or invalid evidence time")
     try:
-        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        require(result.tzinfo is not None, "evidence time lacks timezone")
-        return result
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         raise Refused("invalid evidence time") from None
 
 
 def parse_json(data, limit=MAX_JSON):
     require(len(data) <= limit, "oversized JSON")
+
     def unique(pairs):
         result = {}
         for key, value in pairs:
             require(key not in result, "duplicate JSON field")
             result[key] = value
         return result
+
+    def finite(token):
+        value = float(token)
+        require(math.isfinite(value), "malformed JSON")
+        return value
+
     try:
-        result = json.loads(data, object_pairs_hook=unique)
+        result = json.loads(data, object_pairs_hook=unique, parse_constant=finite, parse_float=finite)
         require(isinstance(result, dict), "invalid JSON object")
         return result
-    except (ValueError, UnicodeError):
+    except (ValueError, RecursionError):
         raise Refused("malformed JSON") from None
 
 
 def approved_contract(policy, contract_bytes):
-    require(policy.get("schema") == 1 and policy.get("evaluator") == "junit-map-v1",
+    require(isinstance(policy, dict) and type(policy.get("schema")) is int
+            and policy["schema"] == 1 and policy.get("evaluator") == "junit-map-v1",
             "unsupported trusted policy")
     approvals = policy.get("approvals")
     require(isinstance(approvals, list) and len(approvals) == 1,
             "approved product contract unavailable or ambiguous")
     approval = approvals[0]
-    require(approval.get("sha256") == digest(contract_bytes), "unapproved product contract hash")
+    require(isinstance(approval, dict) and approval.get("sha256") == digest(contract_bytes),
+            "unapproved product contract hash")
     for key in ("spec_revision", "product_approval", "qa_approval"):
         require(isinstance(approval.get(key), str) and LABEL.fullmatch(approval[key]),
                 "missing authenticated approval/spec reference in trusted policy")
     contract = parse_json(contract_bytes)
-    require(contract.get("schema") == 1 and contract.get("evaluator") == policy["evaluator"]
+    require(type(contract.get("schema")) is int and contract["schema"] == 1
+            and contract.get("evaluator") == policy["evaluator"]
             and contract.get("spec_revision") == approval["spec_revision"], "contract policy mismatch")
     require("journey" not in contract or contract["journey"] == PRIVATE, "unsupported contract journey")
     criteria = contract.get("criteria")
@@ -162,6 +177,7 @@ def approved_contract(policy, contract_bytes):
     selectors = set()
     applicable = set()
     for criterion in criteria:
+        require(isinstance(criterion, dict), "invalid criterion record")
         key = criterion.get("id")
         require(isinstance(key, str) and LABEL.fullmatch(key) and key not in seen,
                 "invalid or duplicate criterion")
@@ -176,7 +192,8 @@ def approved_contract(policy, contract_bytes):
         require(isinstance(evidence, list) and 0 < len(evidence) <= 100,
                 "applicable criterion has no executable evidence")
         for item in evidence:
-            require(set(item) == {"classname", "name", "outcome"} and item["outcome"] == "passed"
+            require(isinstance(item, dict) and item.keys() == {"classname", "name", "outcome"}
+                    and item["outcome"] == "passed"
                     and all(isinstance(item[k], str) and 0 < len(item[k]) <= 500
                             for k in ("classname", "name")), "unsupported evidence mapping")
             selector = (item["classname"], item["name"])
@@ -286,20 +303,23 @@ def private_track_evidence(track_proofs):
 def validate_receipt(receipt, *, repo, sha, run_id, attempt, workflow_sha,
                      manifest_hash, policy, contract_bytes, private_track_sha256=None):
     contract = approved_contract(policy, contract_bytes)
-    require(receipt.get("schema") == 1 and receipt.get("repository") == repo
+    require(isinstance(receipt, dict) and type(receipt.get("schema")) is int and receipt["schema"] == 1
+            and receipt.get("repository") == repo
             and receipt.get("environment") == "staging" and receipt.get("workflow") == WORKFLOW
             and receipt.get("event") == "push" and receipt.get("ref") == "refs/heads/main"
             and receipt.get("sha") == sha and receipt.get("workflow_sha") == workflow_sha
             and receipt.get("run_id") == run_id and receipt.get("run_attempt") == attempt,
             "receipt source, producer or attempt mismatch")
-    require(receipt.get("migration_manifest_sha256") == manifest_hash,
+    require(isinstance(manifest_hash, str) and HASH.fullmatch(manifest_hash)
+            and receipt.get("migration_manifest_sha256") == manifest_hash,
             "candidate migration manifest mismatch")
     require(receipt.get("contract_sha256") == digest(contract_bytes)
             and receipt.get("policy_sha256") == digest(json.dumps(policy, sort_keys=True).encode())
             and receipt.get("evaluator") == policy["evaluator"], "receipt approval/evaluator mismatch")
     require(receipt.get("journey") == contract.get("journey"), "receipt journey mismatch")
-    require(receipt.get("api") == {"job": "staging-api", "deployed": True,
-                                  "outcome": "deployed", "source_sha": sha},
+    api = receipt.get("api")
+    require(isinstance(api, dict) and api.get("deployed") is True
+            and api == {"job": "staging-api", "deployed": True, "outcome": "deployed", "source_sha": sha},
             "candidate API not actually deployed from the same source")
     private = contract.get("journey") == PRIVATE
     if private:
@@ -322,10 +342,12 @@ def validate_receipt(receipt, *, repo, sha, run_id, attempt, workflow_sha,
     require(isinstance(receipt.get("junit_sha256"), str) and HASH.fullmatch(receipt["junit_sha256"]),
             "missing evidence content digest")
     identities = receipt.get("identities", {})
+    require(isinstance(identities, dict), "invalid live identity records")
     times = []
     for phase in IDENTITY_PHASES:
         item = identities.get(phase, {})
-        require(item.get("phase") == phase and item.get("web") == sha and item.get("api") == sha
+        require(isinstance(item, dict) and item.get("phase") == phase
+                and item.get("web") == sha and item.get("api") == sha
                 and item.get("expected") == sha, "opening/closing live identities disagree")
         if private:
             require(item.get("deployments") == pins, "private journey observed different deployment identities")
@@ -343,6 +365,7 @@ def git(*args):
 
 
 def git_file(sha, name):
+    require(isinstance(sha, str) and SHA.fullmatch(sha), "invalid source commit")
     return git("show", f"{sha}:{name}")
 
 
@@ -422,11 +445,18 @@ def read_archive(archive):
     try:
         with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
             infos = bundle.infolist()
-            require(len(infos) == 1 and infos[0].filename == "staging-admission.json"
-                    and 0 < infos[0].file_size <= MAX_JSON and not infos[0].is_dir()
-                    and not infos[0].flag_bits & 1, "invalid receipt archive member")
-            return parse_json(bundle.read(infos[0]))
-    except (zipfile.BadZipFile, RuntimeError, OSError):
+            require(len(infos) == 1, "invalid receipt archive member")
+            entry = infos[0]
+            require(entry.filename == entry.orig_filename == "staging-admission.json"
+                    and stat.S_IFMT(entry.external_attr >> 16) in (0, stat.S_IFREG)
+                    and 0 < entry.file_size <= MAX_JSON and 0 < entry.compress_size <= MAX_ARCHIVE
+                    and entry.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                    and not entry.flag_bits & 1, "invalid receipt archive member")
+            with bundle.open(entry) as member:
+                data = member.read(MAX_JSON + 1)
+            require(len(data) == entry.file_size, "receipt length mismatch")
+            return parse_json(data)
+    except (zipfile.BadZipFile, RuntimeError, OSError, EOFError, zlib.error):
         raise Refused("unreadable receipt archive") from None
 
 
@@ -721,6 +751,7 @@ def diagnose_pending_push(sha, evidence):
 
 def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifest_hash,
            producer_source_ok, private_track_sha256=None):
+    require(isinstance(sha, str) and SHA.fullmatch(sha), "invalid selected candidate")
     # Approval absence is a refusal even when every legacy job is green.
     contract_journey = approved_contract(policy, contract_bytes).get("journey")
     private = contract_journey == PRIVATE
