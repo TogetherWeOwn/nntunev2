@@ -147,7 +147,19 @@ impl PlayError {
     /// failures use their shared-envelope statuses; provider failures and
     /// the endpoint-policy port refusal are `502`.
     pub fn http_status(&self) -> u16 {
-        self.api_error().status
+        match self {
+            PlayError::Unauthorized(_) | PlayError::ProviderAuthExpired => 401,
+            PlayError::WrongTrack => 403,
+            PlayError::RangeUnsatisfiable => 416,
+            PlayError::PoolExhausted => 429,
+            PlayError::PoolQuarantined { .. } => 503,
+            PlayError::ArticleMissing(_) => 404,
+            PlayError::InvalidSegment(_) => 400,
+            PlayError::Upstream(_)
+            | PlayError::ArticleTooLarge(_)
+            | PlayError::TransportPortNotAllowed(_)
+            | PlayError::Decode(_) => 502,
+        }
     }
 
     /// Value for the HTTP `Retry-After` response header (whole seconds,

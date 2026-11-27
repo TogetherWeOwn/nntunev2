@@ -384,6 +384,14 @@ impl DurableObject for NntpPool {
     }
 }
 
+/// Bound the complete NNTP greeting and authentication exchange.
+/// A timeout follows the existing provider failure and lease-release path.
+async fn dial_with_deadline<T>(
+    dial: impl std::future::Future<Output = nntune_core::Result<T>>,
+) -> nntune_core::Result<T> {
+    routes::dial_before_deadline(Delay::from(Duration::from_secs(20)), dial).await
+}
+
 impl NntpPool {
     /// Reads, validates and runs one probe envelope against this object's pool.
     async fn probe(&self, req: &mut Request) -> ProbeReply {
@@ -694,12 +702,6 @@ impl NntpPool {
     async fn provider(&self, _user_id: &str) -> core::result::Result<PoolProvider, ProbeError> {
         Err(ProbeError::ProviderUnavailable)
     }
-}
-
-async fn dial_with_deadline<T>(
-    dial: impl std::future::Future<Output = nntune_core::Result<T>>,
-) -> nntune_core::Result<T> {
-    routes::dial_before_deadline(Delay::from(Duration::from_secs(20)), dial).await
 }
 
 /// Convert the portable routing decision into the reply rendered by the adapter.
