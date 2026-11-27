@@ -5,7 +5,7 @@
 //! unknown or unsafe selector uses the default. JSONP is deliberately JSON,
 //! never executable script containing a request-supplied callback.
 
-use crate::envelope::{JSON_CONTENT_TYPE, XML_CONTENT_TYPE};
+use crate::envelope::{code, API_VERSION, JSON_CONTENT_TYPE, XML_CONTENT_TYPE};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectionFormat {
@@ -39,19 +39,38 @@ pub struct FixedRejectionResponse {
     pub retry_after: Option<&'static str>,
 }
 
-const TOO_LARGE_JSON: &[u8] = br#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Request or document too large."}}}"#;
-const TOO_LARGE_XML: &[u8] = br#"<subsonic-response status="failed" version="1.16.1"><error code="0" message="Request or document too large."/></subsonic-response>"#;
-const UNAVAILABLE_JSON: &[u8] = br#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Service unavailable."}}}"#;
-const UNAVAILABLE_XML: &[u8] = br#"<subsonic-response status="failed" version="1.16.1"><error code="0" message="Service unavailable."/></subsonic-response>"#;
+macro_rules! fixed_bodies {
+    ($version:literal, $error:literal; $($name:ident => $message:literal),+ $(,)?) => {
+        const _: () = {
+            const VERSION: &[u8] = $version.as_bytes();
+            assert!(matches!(API_VERSION.as_bytes(), VERSION));
+            assert!(code::GENERIC == $error);
+        };
+        $(
+            const $name: (&[u8], &[u8]) = (
+                concat!(r#"{"subsonic-response":{"status":"failed","version":""#, $version,
+                    r#"","error":{"code":"#, $error, r#","message":""#, $message, r#""}}}"#).as_bytes(),
+                concat!(r#"<subsonic-response status="failed" version=""#, $version,
+                    r#""><error code=""#, $error, r#"" message=""#, $message, r#""/></subsonic-response>"#).as_bytes(),
+            );
+            const _: () = assert!($name.0.len() <= 1024 && $name.1.len() <= 1024);
+        )+
+    };
+}
+
+fixed_bodies!("1.16.1", 0;
+    TOO_LARGE => "Request or document too large.",
+    UNAVAILABLE => "Service unavailable.",
+);
 
 pub fn fixed_staging_rejection(
     rejection: StagingRejection,
     format: RejectionFormat,
 ) -> FixedRejectionResponse {
-    let (status, retry_after, json, xml) = match rejection {
-        StagingRejection::RequestOrDocumentTooLarge => (413, None, TOO_LARGE_JSON, TOO_LARGE_XML),
-        StagingRejection::BusyOrCapacity => (503, Some("1"), UNAVAILABLE_JSON, UNAVAILABLE_XML),
-        StagingRejection::Unavailable => (503, None, UNAVAILABLE_JSON, UNAVAILABLE_XML),
+    let (status, retry_after, (json, xml)) = match rejection {
+        StagingRejection::RequestOrDocumentTooLarge => (413, None, TOO_LARGE),
+        StagingRejection::BusyOrCapacity => (503, Some("1"), UNAVAILABLE),
+        StagingRejection::Unavailable => (503, None, UNAVAILABLE),
     };
     let (content_type, body) = match format {
         RejectionFormat::Json => (JSON_CONTENT_TYPE, json),
