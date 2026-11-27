@@ -48,6 +48,7 @@ async fn connect_fixture(db: &str) -> Client {
 async fn publishes_and_admits_only_the_fresh_canonical_track() {
     let mut writer = connect().await;
     let fixture = publication_fixture::PublicationFixture::load(&writer, JOB).await;
+    let libraries = playlist_membership::create_empty_libraries(&writer).await;
     let source = fixture.source();
     let mut h = harness();
     h.config.private_listening = Some(fixture.policy(ISSUER));
@@ -145,16 +146,19 @@ async fn publishes_and_admits_only_the_fresh_canonical_track() {
     }
     assert!(ids(handle(&ctx, &request).await).is_empty());
     tx.commit().await.unwrap();
+    playlist_membership::assert_no_memberships(&writer).await;
 
     let mut tx = writer.transaction().await.unwrap();
     assert_eq!(stage(&mut tx, &occurrence, &source).await.unwrap(), track);
     assert!(stage_admission(&tx, Some(policy), admission).await.unwrap());
     tx.commit().await.unwrap();
+    playlist_membership::assert_no_memberships(&writer).await;
     assert_eq!(ids(handle(&ctx, &request).await), [track.clone()]);
     assert_ne!(track, MBID);
     assert!(ids(handle(&ctx, &unrelated).await).is_empty());
     let playlist =
-        playlist_membership::exercise(&mut writer, &ctx, &request, &unrelated, &track).await;
+        playlist_membership::exercise(&mut writer, &ctx, &request, &unrelated, &track, libraries)
+            .await;
     writer
         .execute(
             "INSERT INTO public.library (job_id, user_id, idempotency_key)

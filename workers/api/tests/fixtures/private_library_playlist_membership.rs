@@ -71,16 +71,40 @@ async fn remove_membership(db: &mut Client, owner: &str, library: &str, track: &
     removed
 }
 
+pub(super) async fn create_empty_libraries(db: &Client) -> [String; 2] {
+    db.batch_execute(include_str!("private_playlist_tables.sql"))
+        .await
+        .unwrap();
+    let ids: Vec<String> = db
+        .query_one_scalar(
+            "WITH seeded AS (
+                INSERT INTO public.libraries (user_id, name)
+                VALUES ($1, 'Active'), ($1, 'Alternate') RETURNING id, name
+             )
+             SELECT array_agg(id::text ORDER BY name) FROM seeded",
+            &[&RECIPIENT],
+        )
+        .await
+        .unwrap();
+    ids.try_into().unwrap()
+}
+
+pub(super) async fn assert_no_memberships(db: &Client) {
+    let count: i64 = db
+        .query_one_scalar("SELECT count(*) FROM public.library_tracks", &[])
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "browser admission must leave Libraries empty");
+}
+
 pub(super) async fn exercise(
     db: &mut Client,
     ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
     request: &Request,
     unrelated: &Request,
     track: &str,
+    [active, alternate]: [String; 2],
 ) -> String {
-    db.batch_execute(include_str!("private_playlist_tables.sql"))
-        .await
-        .unwrap();
     let owner = Request {
         origin: Some(ORIGIN.into()),
         ..request.clone()
@@ -93,14 +117,7 @@ pub(super) async fn exercise(
     let playlist = created["id"].as_str().unwrap();
     let attempt = || Append(playlist, track.to_owned());
 
-    // The browser already returns this exact track. The owned Library starts empty.
-    let active: String = db
-        .query_one_scalar(
-            "INSERT INTO public.libraries (user_id, name) VALUES ($1, 'Active') RETURNING id::text",
-            &[&RECIPIENT],
-        )
-        .await
-        .unwrap();
+    // The browser already returns this exact track, and both Libraries are empty.
     assert_denied(route(ctx, &owner, db, attempt()).await);
 
     // Model independent normalized memberships, including a foreign and a fenced Library.
@@ -143,13 +160,6 @@ pub(super) async fn exercise(
         detail
     );
 
-    let alternate: String = db
-        .query_one_scalar(
-            "INSERT INTO public.libraries (user_id, name) VALUES ($1, 'Alternate') RETURNING id::text",
-            &[&RECIPIENT],
-        )
-        .await
-        .unwrap();
     seed_membership(db, &alternate, track).await;
     let account_fence = db.transaction().await.unwrap();
     assert_eq!(
