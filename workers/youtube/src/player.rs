@@ -6,10 +6,12 @@
 //! from Worker egress. This module parses that record out of the raw
 //! `/player` JSON. It never fetches; the Worker entry does the I/O.
 
+use crate::client::is_url_token;
+
 /// Playability classes the gate cares about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Playability {
-    /// `status == "OK"`: stream URLs are present.
+    /// `status == "OK"`: the response may carry stream URLs.
     Ok,
     /// `status == "LOGIN_REQUIRED"`: the extraction IP is bot-walled (or
     /// the video needs auth); retry through the proxy for `/player`.
@@ -57,6 +59,19 @@ pub struct StreamFormat {
     pub ip: Option<String>,
 }
 
+impl StreamFormat {
+    pub(crate) fn has_plain_url(&self) -> bool {
+        !self.has_signature_cipher
+            && !self.has_n_param
+            && !self.has_sabr
+            && self.url.as_deref().is_some_and(|url| {
+                stream_path(url) == Some("videoplayback")
+                    && !query_pairs(url)
+                        .any(|(key, _)| !is_url_token(key) || matches!(key, "n" | "sabr"))
+            })
+    }
+}
+
 /// The parsed per-video extraction record.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayerOutcome {
@@ -82,17 +97,25 @@ pub fn parse_player_response(body: &serde_json::Value) -> PlayerOutcome {
         .and_then(|s| s.get("reason"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let playability = Playability::from_status(status);
     let mut formats = Vec::new();
-    if let Some(streaming) = body.get("streamingData") {
+    if let Some(streaming) = body
+        .get("streamingData")
+        .filter(|_| playability == Playability::Ok)
+    {
         for key in ["formats", "adaptiveFormats"] {
             if let Some(list) = streaming.get(key).and_then(serde_json::Value::as_array) {
-                formats.extend(list.iter().map(parse_format));
+                formats.extend(
+                    list.iter()
+                        .filter(|format| format.is_object())
+                        .map(parse_format),
+                );
             }
         }
     }
     PlayerOutcome {
         status: status.to_string(),
-        playability: Playability::from_status(status),
+        playability,
         reason,
         formats,
     }
@@ -102,6 +125,7 @@ fn parse_format(format: &serde_json::Value) -> StreamFormat {
     let url = format
         .get("url")
         .and_then(serde_json::Value::as_str)
+        .filter(|url| stream_path(url).is_some())
         .map(str::to_string);
     StreamFormat {
         itag: format
@@ -113,28 +137,59 @@ fn parse_format(format: &serde_json::Value) -> StreamFormat {
             .get("mimeType")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
-        has_signature_cipher: format
-            .get("signatureCipher")
-            .and_then(serde_json::Value::as_str)
-            .is_some(),
+        has_signature_cipher: ["signatureCipher", "cipher"]
+            .iter()
+            .any(|key| format.get(key).is_some_and(|value| !value.is_null())),
         has_n_param: url
             .as_deref()
-            .is_some_and(|u| query_param(u, "n").is_some()),
+            .is_some_and(|u| query_pairs(u).any(|(name, _)| name == "n")),
         has_sabr: url.as_deref().is_some_and(is_sabr_url),
-        ip: url.as_deref().and_then(|u| query_param(u, "ip")),
+        ip: url.as_deref().and_then(stream_ip),
         url,
     }
 }
 
-/// First value of query parameter `key` in `url` (no decoding: `ip`, `n`
-/// and `sabr` values are plain ASCII). Returns `None` without a query.
+fn stream_path(url: &str) -> Option<&str> {
+    if url.contains(|ch: char| !ch.is_ascii_graphic() || matches!(ch, '\\' | '#')) {
+        return None;
+    }
+    let (host, target) = url.strip_prefix("https://")?.split_once('/')?;
+    let prefix = host.strip_suffix(".googlevideo.com")?;
+    // Restrict the authority before using any part of the response URL.
+    if host.len() > 253
+        || !prefix.split('.').all(|label| {
+            label.len() <= 63
+                && !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return None;
+    }
+    target.split('?').next()
+}
+
+fn query_pairs(url: &str) -> impl Iterator<Item = (&str, &str)> {
+    let target = url.split_once('#').map_or(url, |(target, _)| target);
+    target
+        .split_once('?')
+        .into_iter()
+        .flat_map(|(_, query)| query.split('&'))
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+}
+
+fn stream_ip(url: &str) -> Option<String> {
+    let mut ips = query_pairs(url).filter_map(|(name, value)| (name == "ip").then_some(value));
+    let ip = ips.next()?.parse::<std::net::IpAddr>().ok()?;
+    ips.next().is_none().then(|| ip.to_string())
+}
+
+/// First raw value of query parameter `key`, with a bare key treated as empty.
 pub fn query_param(url: &str, key: &str) -> Option<String> {
-    let query = url.split_once('?')?.1.split('#').next()?;
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(k, _)| *k == key)
-        .map(|(_, v)| v.to_string())
+    query_pairs(url)
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| value.to_string())
 }
 
 /// SABR heuristic: `/sabr/` in the path or a `sabr=1` query parameter.
@@ -145,7 +200,7 @@ pub fn is_sabr_url(url: &str) -> bool {
     if path.contains("/sabr/") {
         return true;
     }
-    query_param(url, "sabr").as_deref() == Some("1")
+    query_pairs(url).any(|(name, value)| name == "sabr" && value == "1")
 }
 
 #[cfg(test)]

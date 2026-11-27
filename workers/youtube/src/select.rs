@@ -22,7 +22,7 @@
 //! - Caching: MBID→selection about 30 days, videoId→metadata about 7
 //!   days. Revalidate on MusicBrainz edits or dead IDs.
 
-use crate::player::StreamFormat;
+use crate::{client::is_video_id, player::StreamFormat};
 
 /// Duration match tolerance: ±5 s against the canonical recording
 /// duration. Anything further out is a different recording (or edit).
@@ -76,7 +76,7 @@ pub fn parse_music_video_type(config: &serde_json::Value) -> MusicVideoType {
 pub struct SearchCandidate {
     /// `watchEndpoint.videoId` (falling back to `playlistItemData`).
     pub video_id: String,
-    /// First `UC*` browse ID in the subtitle runs, when present.
+    /// Unique `UC*` browse ID in the subtitle runs, when present.
     pub channel_id: Option<String>,
     /// OMV/ATV/other from `watchEndpointMusicConfig`.
     pub music_video_type: MusicVideoType,
@@ -90,7 +90,7 @@ pub struct SearchCandidate {
 
 /// Parse one YTM search result (a bare renderer or one wrapped in
 /// `musicResponsiveListItemRenderer` / `musicTwoRowItemRenderer`).
-/// Returns `None` when no video ID survives; every other field degrades
+/// Returns `None` for missing, malformed or conflicting video IDs. Other fields degrade
 /// to unknown and fails closed in [`gate_candidate`].
 pub fn parse_search_candidate(item: &serde_json::Value) -> Option<SearchCandidate> {
     let renderer = item
@@ -98,15 +98,14 @@ pub fn parse_search_candidate(item: &serde_json::Value) -> Option<SearchCandidat
         .or_else(|| item.get("musicTwoRowItemRenderer"))
         .unwrap_or(item);
     let watch = renderer.get("navigationEndpoint")?.get("watchEndpoint")?;
-    let video_id = watch
-        .get("videoId")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            renderer
-                .get("playlistItemData")
-                .and_then(|data| data.get("videoId"))
-                .and_then(serde_json::Value::as_str)
-        })?;
+    let endpoint_id = watch.get("videoId");
+    let playlist_id = renderer
+        .get("playlistItemData")
+        .and_then(|data| data.get("videoId"));
+    let video_id = endpoint_id.or(playlist_id)?.as_str()?;
+    if !is_video_id(video_id) || playlist_id.is_some_and(|id| id.as_str() != Some(video_id)) {
+        return None;
+    }
     let music_video_type = watch
         .get("watchEndpointMusicConfig")
         .map(parse_music_video_type)
@@ -122,9 +121,9 @@ pub fn parse_search_candidate(item: &serde_json::Value) -> Option<SearchCandidat
     })
 }
 
-/// First `UC*` channel browse ID in the flex-column subtitle runs.
+/// A single distinct channel in the flex columns can prove ownership.
 fn channel_from_runs(renderer: &serde_json::Value) -> Option<String> {
-    renderer
+    let mut channels = renderer
         .get("flexColumns")?
         .as_array()?
         .iter()
@@ -142,8 +141,9 @@ fn channel_from_runs(renderer: &serde_json::Value) -> Option<String> {
                 .get("browseId")?
                 .as_str()
         })
-        .find(|id| id.starts_with("UC"))
-        .map(str::to_string)
+        .filter(|id| id.starts_with("UC"));
+    let first = channels.next()?;
+    channels.all(|id| id == first).then(|| first.to_string())
 }
 
 /// Badge icon types from `badges`, `subtitleBadges` (inline music
@@ -206,9 +206,8 @@ fn column_texts<'a>(
 
 /// Shelf duration: the last duration-shaped run in the fixed columns,
 /// falling back to the flex columns only when the fixed columns yield
-/// nothing. Fixed-first matters because flex subtitle runs carry bare
-/// numbers (years, album metadata) that parse as durations and would
-/// otherwise shadow the real shelf duration.
+/// nothing. In flex columns require a clock value so bare years and
+/// other numeric metadata cannot prove duration.
 fn duration_from_renderer(renderer: &serde_json::Value) -> Option<u64> {
     let fixed = column_texts(
         renderer,
@@ -225,7 +224,7 @@ fn duration_from_renderer(renderer: &serde_json::Value) -> Option<u64> {
         "flexColumns",
         "musicResponsiveListItemFlexColumnRenderer",
     );
-    for text in flex.iter().rev() {
+    for text in flex.iter().rev().filter(|text| text.contains(':')) {
         if let Some(duration) = parse_duration(text) {
             return Some(duration);
         }
@@ -236,16 +235,15 @@ fn duration_from_renderer(renderer: &serde_json::Value) -> Option<u64> {
 /// Parse a shelf duration (`m:ss`, `h:mm:ss` or bare seconds).
 pub fn parse_duration(text: &str) -> Option<u64> {
     let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let parts: Vec<&str> = text.split(':').collect();
-    if parts.len() > 3 {
-        return None;
-    }
     let mut total = 0u64;
-    for part in &parts {
+    for (index, part) in text.split(':').enumerate() {
+        if index > 2 || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
         let unit: u64 = part.parse().ok()?;
+        if index > 0 && (part.len() != 2 || unit >= 60) {
+            return None;
+        }
         total = total.checked_mul(60)?.checked_add(unit)?;
     }
     Some(total)
@@ -271,6 +269,8 @@ pub enum Rejection {
     /// Not OMV/ATV. Title/author substrings ("VEVO", "- Topic") never
     /// count; only `musicVideoType` admits a candidate.
     WrongType,
+    /// Missing or malformed video ID.
+    InvalidVideoId,
     /// Channel missing or outside the allowlist.
     ChannelNotAllowed,
     /// Neither the official-artist nor a verified badge.
@@ -293,6 +293,9 @@ pub fn gate_candidate(
         MusicVideoType::Omv | MusicVideoType::Atv
     ) {
         return Err(Rejection::WrongType);
+    }
+    if !is_video_id(&candidate.video_id) {
+        return Err(Rejection::InvalidVideoId);
     }
     if policy
         .denylisted_videos
@@ -377,8 +380,8 @@ pub enum AudioSource {
 
 /// Pick the audio format: the best available Opus from the ATV
 /// (itag 251 first, else the highest-bitrate Opus format; a missing
-/// bitrate sorts as 0 and ties keep shelf order). Cipher-only formats
-/// (no plain URL) are skipped: they cannot be fetched. Returns `None`
+/// bitrate sorts as 0 and ties keep shelf order). Requires plain URLs
+/// and an explicit Opus audio codec. Returns `None`
 /// for an OMV source or when no fetchable Opus format exists.
 pub fn select_audio_format(formats: &[StreamFormat], source: AudioSource) -> Option<&StreamFormat> {
     if !matches!(source, AudioSource::Atv) {
@@ -387,11 +390,8 @@ pub fn select_audio_format(formats: &[StreamFormat], source: AudioSource) -> Opt
     let mut best: Option<&StreamFormat> = None;
     let mut best_bitrate = 0u64;
     for format in formats {
-        let opus = format
-            .mime
-            .as_deref()
-            .is_some_and(|mime| mime.contains("opus"));
-        if !opus || format.url.is_none() {
+        let opus = format.mime.as_deref().and_then(opus_audio).unwrap_or(false);
+        if !opus || !format.has_plain_url() {
             continue;
         }
         if format.itag == PREFERRED_AUDIO_ITAG {
@@ -404,6 +404,18 @@ pub fn select_audio_format(formats: &[StreamFormat], source: AudioSource) -> Opt
         }
     }
     best
+}
+
+fn opus_audio(mime: &str) -> Option<bool> {
+    let (media_type, parameters) = mime.split_once(';')?;
+    let (kind, subtype) = media_type.trim().split_once('/')?;
+    let (name, value) = parameters.split_once('=')?;
+    Some(
+        kind.eq_ignore_ascii_case("audio")
+            && crate::client::is_url_token(subtype)
+            && name.trim().eq_ignore_ascii_case("codecs")
+            && matches!(value.trim(), "opus" | "\"opus\""),
+    )
 }
 
 /// MBID→selection cache key (TTL [`SELECTION_TTL_SECS`]).
@@ -702,7 +714,9 @@ mod tests {
             itag,
             bitrate,
             mime: Some("audio/webm; codecs=\"opus\"".to_string()),
-            url: Some("https://host.test/videoplayback?ip=203.0.113.7".to_string()),
+            url: Some(
+                "https://rr1---sn-abc123.googlevideo.com/videoplayback?ip=203.0.113.7".to_string(),
+            ),
             has_signature_cipher: false,
             has_n_param: false,
             has_sabr: false,

@@ -13,10 +13,28 @@ pub fn head_range() -> String {
     format!("bytes=0-{}", HEAD_BYTES - 1)
 }
 
-/// `Range` header for a 256 KiB window centered in a `total_bytes` file.
-/// `None` when the file fits in one head window, or when the centered
-/// window would start at byte 0 (mid == head then).
-pub fn mid_range(total_bytes: u64) -> Option<String> {
+/// Center a second 256 KiB range only after a complete head probe proves
+/// the total length. Skip it when it would duplicate the head window.
+pub fn mid_range_from_head(
+    status: u16,
+    content_range: &str,
+    received_bytes: u64,
+) -> Option<String> {
+    if status != 206 || received_bytes != HEAD_BYTES {
+        return None;
+    }
+    let (unit, range) = content_range.split_once(' ')?;
+    let (span, total) = range.split_once('/')?;
+    if !unit.eq_ignore_ascii_case("bytes")
+        || span != format!("0-{}", HEAD_BYTES - 1)
+        || !total.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    mid_range(total.parse().ok()?)
+}
+
+fn mid_range(total_bytes: u64) -> Option<String> {
     if total_bytes <= HEAD_BYTES {
         return None;
     }

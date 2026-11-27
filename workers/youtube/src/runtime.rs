@@ -41,7 +41,13 @@ impl DurableObject for YtExtract {
 
     /// Serves `POST /extract`; any other method or path is a 404.
     async fn fetch(&self, req: Request) -> Result<Response> {
-        let decision = routes::decide_extract(req.method().as_ref(), &req.path());
+        let decision = req.url().ok().map_or(ExtractDecision::NotFound, |url| {
+            routes::decide_extract(
+                req.method().as_ref(),
+                url.path(),
+                url.query().or(url.fragment()),
+            )
+        });
         match decision {
             ExtractDecision::NotFound => Response::error(
                 ExtractDecision::NotFound.body(),

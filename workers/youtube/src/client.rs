@@ -59,17 +59,35 @@ pub const CLIENT_ORDER: &[ClientProfile] = &[VISIONOS];
 /// Default Innertube host for `/player` requests.
 pub const INNERTUBE_HOST: &str = "www.youtube.com";
 
-/// `/player` endpoint URL for a bare `host` (no scheme). The caller
-/// supplies `api_key` from runtime config (never a committed literal).
-pub fn player_url(host: &str, api_key: &str) -> String {
-    format!("https://{host}/youtubei/v1/player?key={api_key}&prettyPrint=false")
+/// `/player` endpoint URL for the pinned host and a valid runtime key.
+pub fn player_url(host: &str, api_key: &str) -> Option<String> {
+    if !host.eq_ignore_ascii_case(INNERTUBE_HOST) || !is_url_token(api_key) {
+        return None;
+    }
+    Some(format!(
+        "https://{INNERTUBE_HOST}/youtubei/v1/player?key={api_key}&prettyPrint=false"
+    ))
+}
+
+pub(crate) fn is_url_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+pub(crate) fn is_video_id(value: &str) -> bool {
+    value.len() == 11 && is_url_token(value)
 }
 
 /// `/player` POST body for `profile` and `video_id`.
 ///
 /// Optional device fields the profile does not set are omitted (never
 /// sent as explicit nulls).
-pub fn player_body(profile: &ClientProfile, video_id: &str) -> serde_json::Value {
+pub fn player_body(profile: &ClientProfile, video_id: &str) -> Option<serde_json::Value> {
+    if !is_video_id(video_id) {
+        return None;
+    }
     let mut client = serde_json::Map::from_iter([
         ("clientName".to_string(), profile.name.into()),
         ("clientVersion".to_string(), profile.version.into()),
@@ -88,12 +106,12 @@ pub fn player_body(profile: &ClientProfile, video_id: &str) -> serde_json::Value
             client.insert(key.to_string(), value.into());
         }
     }
-    serde_json::json!({
+    Some(serde_json::json!({
         "context": {"client": client},
         "videoId": video_id,
         "contentCheckOk": true,
         "racyCheckOk": true,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -115,14 +133,14 @@ mod tests {
     #[test]
     fn player_url_shape() {
         assert_eq!(
-            player_url("www.youtube.com", "KEY"),
-            "https://www.youtube.com/youtubei/v1/player?key=KEY&prettyPrint=false"
+            player_url("www.youtube.com", "KEY").as_deref(),
+            Some("https://www.youtube.com/youtubei/v1/player?key=KEY&prettyPrint=false")
         );
     }
 
     #[test]
     fn player_body_carries_client_and_video() {
-        let body = player_body(&VISIONOS, "dQw4w9WgXcQ");
+        let body = player_body(&VISIONOS, "dQw4w9WgXcQ").expect("valid video ID");
         assert_eq!(body["context"]["client"]["clientName"], "VISIONOS");
         assert_eq!(body["context"]["client"]["clientVersion"], "1.02");
         assert_eq!(
