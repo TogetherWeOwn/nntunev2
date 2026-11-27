@@ -81,9 +81,11 @@ def require_already_cleared(evidence, sha, run_id, number, scope_sha256):
             "prior retirement dispatch is unverified")
     retired = job(jobs, RETIREMENT, "success")
     require_steps(retired, (CONTAINMENT, RETIRE), "protected retirement steps did not pass")
+    starts = {step["name"]: timestamp(step.get("started_at"))
+              for step in retired["steps"] if step["name"] in (CONTAINMENT, RETIRE)}
     require(decimal(retired.get("id")) == decimal(receipt.get("job_id"))
             and receipt.get("verdict") == CONFIRMED
-            and timestamp(retired.get("completed_at")) <= min(deploy_starts),
+            and starts[CONTAINMENT] <= starts[RETIRE] <= timestamp(retired.get("completed_at")) <= min(deploy_starts),
             "prior confirmation is missing, mismatched or too late")
 
 

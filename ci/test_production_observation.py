@@ -41,6 +41,15 @@ def fixture(*, start_hour=12, run_attempt="2", smoke_job_id="456"):
 
 
 class ProductionObservationTests(unittest.TestCase):
+    def test_missing_provider_identity_sentinel_cannot_be_pinned(self):
+        for field in ("promoted_version_id", "deployment_id"):
+            with self.subTest(field=field):
+                pins, watch = fixture()
+                for row in (pins["candidate"], pins["final_smoke"], *watch["samples"]):
+                    row[field] = "00000000-0000-0000-0000-000000000000"
+                with self.assertRaisesRegex(Refused, "^invalid candidate identity$"):
+                    validate_observation(pins, watch)
+
     def test_missing_build_sentinel_cannot_be_pinned(self):
         for pin, deployed in (("sha", "web_sha"), ("api_sha", "api_sha")):
             with self.subTest(pin=pin):

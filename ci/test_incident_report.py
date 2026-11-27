@@ -49,6 +49,21 @@ def job_page(rows, window):
 
 
 class StagingTimingTests(unittest.TestCase):
+    def test_staging_timing_refuses_duplicate_json_fields(self):
+        payload = json.dumps({"run": self.candidate(), "jobs": {"total_count": 0, "jobs": []}})
+        result = subprocess.run(
+            [sys.executable, "-I", os.path.join(CI_DIR, "incident_report.py"), "--staging-timing"],
+            input='{"run": null,' + payload[1:], capture_output=True, text=True, env={}, check=False,
+        )
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (1, "", "incident reporting failed: Invalid staging timing JSON\n"))
+
+    def test_delivery_refuses_duplicate_json_fields(self):
+        body = ('<!-- incident-delivery: {"run_id":9,"attempt":1,"kind":"recovery",'
+                '"delivered":false,"delivered":true,"cursor":null} -->')
+        with self.assertRaisesRegex(ir.ReportError, "delivery state malformed"):
+            ir.delivery({"body": body})
+
     @staticmethod
     def run_summary(run, jobs, **listing_fields):
         return subprocess.run(

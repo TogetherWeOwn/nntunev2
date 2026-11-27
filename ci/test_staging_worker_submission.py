@@ -55,6 +55,8 @@ class StagingWorkerSubmissionTests(unittest.TestCase):
             ({"source_sha": "d" * 40}, "source revision"),
             ({"approved_source_sha": "c" * 7, "source_sha": "c" * 7}, "source revision"),
             ({"approved_source_sha": "Ｃ" * 40, "source_sha": "Ｃ" * 40}, "source revision"),
+            ({"approved_source_sha": "0" * 40, "source_sha": "0" * 40}, "source revision"),
+            ({"approved_source_sha": None, "source_sha": None}, "source revision"),
             ({"operation": "rollback"}, "deployment operation"),
             ({"approved_operation": "delete", "operation": "delete"}, "deployment operation"),
             ({"version": "01234567-abcd-4321-9876-0123456789ab"}, "unexpected version"),

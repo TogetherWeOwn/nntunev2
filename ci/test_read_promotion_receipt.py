@@ -79,6 +79,11 @@ class TestReadReceipt(unittest.TestCase):
         with self.assertRaises(ValueError):
             read_receipt(make_archive([("promotion.json", b"\xff\xfe\x00bad")]))
 
+    def test_refuses_malformed_or_ambiguous_json_members(self):
+        for receipt in (b"{", b"[]", b'{"sha":"a","sha":"b"}', b'{"schema":NaN}'):
+            with self.subTest(receipt=receipt), self.assertRaises(ValueError):
+                read_receipt(make_archive([("promotion.json", receipt)]))
+
     def test_cli_refuses_empty_stdin(self):
         proc = subprocess.run(
             [sys.executable, HELPER],

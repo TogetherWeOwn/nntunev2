@@ -18,6 +18,7 @@ PR_EVENTS = {"pull_request", "pull_request_target"}
 PATH_EVENTS = PR_EVENTS | {"push"}
 WATCHED_EVENTS = PATH_EVENTS | {"workflow_run"}
 GUARD = re.compile(r"(paths|(?:required|release):[^\s|][^|]*)")
+FILTERS = ("branches", "paths", "tags")
 
 
 class WorkflowLoader(yaml.BaseLoader):
@@ -32,6 +33,10 @@ class WorkflowLoader(yaml.BaseLoader):
         return mapping
 
 
+def string_list(value):
+    return isinstance(value, list) and value and all(isinstance(item, str) and item.strip() for item in value)
+
+
 def workflows(text):
     doc = yaml.load(text, Loader=WorkflowLoader)
     if not isinstance(doc, dict) or "on" not in doc:
@@ -39,10 +44,11 @@ def workflows(text):
     events = doc["on"]
     if isinstance(events, str) and events:
         return {events: {}}
-    if isinstance(events, list) and all(isinstance(event, str) for event in events):
+    if string_list(events) and len(set(events)) == len(events):
         return dict.fromkeys(events, {})
-    if isinstance(events, dict) and all(settings == "" or isinstance(settings, dict)
-                                        for event, settings in events.items() if event in WATCHED_EVENTS):
+    if (isinstance(events, dict) and events and all(event.strip() for event in events)
+            and all(settings == "" or isinstance(settings, dict)
+                    for event, settings in events.items() if event in WATCHED_EVENTS)):
         return {event: settings or {} for event, settings in events.items()}
     raise ValueError("invalid on trigger")
 
@@ -78,9 +84,18 @@ def findings(text):
 
     for event in sorted(watched):
         settings = events[event]
+        for name in FILTERS:
+            exclude = f"{name}-ignore"
+            if name in settings and exclude in settings:
+                raise ValueError(f"{event} cannot combine {name} and {exclude}")
+            for key in (name, exclude):
+                if key in settings and not string_list(settings[key]):
+                    raise ValueError(f"{event} {key} must be a non-empty string list")
         types = settings.get("types", [])
         if isinstance(types, str):
             types = [types]
+        if "types" in settings and not string_list(types):
+            raise ValueError(f"{event} types must specify activities")
         if event in PR_EVENTS and "edited" in types:
             yield f"{event} types include 'edited'"
         if event == "workflow_run" and types != ["completed"]:

@@ -243,7 +243,7 @@ def print_staging_timing():
     if len(raw) > MAX_STAGING_TIMING_INPUT:
         raise ReportError("Staging timing metadata exceeded bound")
     try:
-        evidence = json.loads(raw)
+        evidence = json.loads(raw, object_pairs_hook=unique_json_fields)
     except (ValueError, RecursionError):
         raise ReportError("Invalid staging timing JSON") from None
     print(json.dumps(staging_timing(evidence)))
@@ -334,12 +334,19 @@ def source(issue):
 DELIVERY = re.compile(r"\n?<!-- incident-delivery: (\{[^\n]*\}) -->")
 
 
+def unique_json_fields(pairs):
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ValueError("duplicate evidence field")
+    return fields
+
+
 def delivery(issue):
     match = DELIVERY.search(issue.get("body") or "")
     if match is None:
         return None
     try:
-        state = json.loads(match[1])
+        state = json.loads(match[1], object_pairs_hook=unique_json_fields)
         if (type(state["run_id"]) is not int or state["run_id"] <= 0
                 or type(state["attempt"]) is not int or state["attempt"] <= 0
                 or state["kind"] not in {"failure", "recovery"}
@@ -350,7 +357,7 @@ def delivery(issue):
                     (not isinstance(state["cursor"], str) or not state["cursor"]
                      or len(state["cursor"]) > 2048))):
             raise ValueError
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, RecursionError):
         raise ReportError("Incident delivery state malformed") from None
     return state
 

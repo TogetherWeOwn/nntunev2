@@ -228,6 +228,8 @@ class StagingRetirementReadbackTests(unittest.TestCase):
         wrong_ref["actions"][current]["path"] = f"{sa.WORKFLOW}@other"
         late = copy.deepcopy(clean)
         late["actions"][f"{prior}/jobs"]["jobs"][0]["completed_at"] = iso(-9)
+        impossible = copy.deepcopy(clean)
+        impossible["actions"][f"{prior}/jobs"]["jobs"][0]["completed_at"] = iso(-16)
         truncated = copy.deepcopy(clean)
         truncated["actions"][f"{prior}/jobs"]["total_count"] += 1
 
@@ -244,6 +246,7 @@ class StagingRetirementReadbackTests(unittest.TestCase):
             ("another attempt's deploy job", wrong_attempt, 1),
             ("foreign workflow ref", wrong_ref, 1),
             ("cleanup completed after deployment started", late, 1),
+            ("cleanup completed before its protected steps started", impossible, 1),
             ("incomplete prior jobs page", truncated, 1),
             ("missing prior receipt", {"actions": clean["actions"]}, 1),
             ("different scope bytes", receipt_changed(scope_sha256="c" * 64), 1),
@@ -2436,6 +2439,40 @@ class WiringTests(Base):
 
 
 class ArchiveTests(Base):
+    def test_refuses_ambiguous_member(self):
+        archive = make_zip([("staging-admission.json~extra", "{}")])
+        self.refused("invalid receipt archive member", sa.read_archive, archive.replace(b"~extra", b"\0extra"))
+
+    def test_refuses_nonfinite_json(self):
+        for token in ("NaN", "Infinity", "-Infinity", "1e999"):
+            with self.subTest(token=token):
+                self.refused("malformed JSON", sa.parse_json, ('{"count":' + token + '}').encode())
+
+    def test_receipt_requires_typed_schema_and_independent_manifest_digest(self):
+        receipt = World().receipt
+        pins = dict(repo=REPO, sha=SHA, run_id=str(RUN_ID), attempt="1", workflow_sha=SHA,
+                    manifest_hash=sa.digest(MANIFEST), policy=make_policy(), contract_bytes=CONTRACT_BYTES)
+        for fields in ({"schema": True}, {"schema": 1.0}, {"api": receipt["api"] | {"deployed": 1}}):
+            with self.subTest(fields=fields), self.assertRaises(sa.Refused):
+                sa.validate_receipt(receipt | fields, **pins)
+        del receipt["migration_manifest_sha256"]
+        with self.assertRaises(sa.Refused):
+            sa.validate_receipt(receipt, **(pins | {"manifest_hash": None}))
+
+    def test_policy_requires_integer_schema_and_object_records(self):
+        for fields in ({"schema": True}, {"approvals": [None]}):
+            with self.subTest(fields=fields), self.assertRaises(sa.Refused):
+                sa.approved_contract(make_policy() | fields, CONTRACT_BYTES)
+
+    def test_invalid_timestamp_offset_cannot_be_normalized_into_evidence(self):
+        with self.assertRaises(sa.Refused):
+            sa.timestamp("2026-01-01T12:00:00+00:99")
+
+    def test_git_file_refuses_options_before_calling_git(self):
+        with patch.object(sa, "git") as git, self.assertRaises(sa.Refused):
+            sa.git_file("--format=raw", "migrations/manifest.toml")
+        git.assert_not_called()
+
     def test_valid(self):
         self.assertEqual(sa.read_archive(make_zip([("staging-admission.json", "{}")])), {})
 
@@ -2585,6 +2622,10 @@ class StagingPushReadbackTests(unittest.TestCase):
             ("wrong base", self.comparison(SHA) | {"base_commit": {"sha": OTHER_SHA}}),
             ("wrong merge base", self.comparison(SHA, merge_base=OTHER_SHA)),
             ("partial comparison", self.comparison(SHA, ahead=2)),
+            ("malformed intermediate commit", self.comparison(SHA) | {
+                "ahead_by": 2, "total_commits": 2, "commits": [None, {"sha": SHA}]}),
+            ("duplicate commit", self.comparison(SHA) | {
+                "ahead_by": 2, "total_commits": 2, "commits": [{"sha": SHA}, {"sha": SHA}]}),
         ):
             with self.subTest(outcome=outcome):
                 snapshot = self.snapshot()
@@ -2603,6 +2644,12 @@ class StagingPushReadbackTests(unittest.TestCase):
         result = self.readback(snapshot)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["sha"], self.SQUASH)
+
+    def test_successful_job_cannot_complete_before_it_starts(self):
+        snapshot = self.snapshot()
+        job = snapshot["jobs"][f"runs/{RUN_ID}/attempts/1/jobs"]["jobs"][-1]
+        job["started_at"] = iso(6)
+        self.assert_pending(snapshot)
 
     def test_incomplete_or_changed_attempt_evidence_stays_pending(self):
         jobs_route = f"runs/{RUN_ID}/attempts/1/jobs"

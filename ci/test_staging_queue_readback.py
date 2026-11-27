@@ -85,6 +85,11 @@ class QueueReadbackTests(unittest.TestCase):
                 self.assertEqual(report["runs"][0]["disposition"], "superseded")
                 self.assertEqual(report["runs"][1]["disposition"], "keep_existing_jobs")
 
+    def test_conflicting_repository_ids_cannot_define_the_newest_push(self):
+        other = REPO | {"id": 72}
+        evidence = snapshot(run(1), run(2, repository=other, head_repository=other), jobs={1: [], 2: []})
+        self.assert_indeterminate(evidence)
+
     def test_github_ref_qualified_paths_and_optional_job_attempt(self):
         queued_job = job(1)
         del queued_job["run_attempt"]
