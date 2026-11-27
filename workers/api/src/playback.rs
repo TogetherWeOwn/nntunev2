@@ -150,7 +150,9 @@ impl LeaseRow {
     /// expiry instant it is already free for other sessions, matching
     /// the acquire statement's `expires_at <= now`).
     pub fn is_live(&self, now: u64) -> bool {
-        self.expires_at > now && self.continuation_deadline > now
+        crate::play_grant::valid_lease_epoch(self.epoch)
+            && self.expires_at > now
+            && self.continuation_deadline > now
     }
 
     /// True while the same client session holds a live lease for this
@@ -171,9 +173,11 @@ impl LeaseRow {
     /// Seconds until another session may acquire without a takeover
     /// (`0` once expired): the `429`'s `Retry-After`.
     pub fn retry_after_secs(&self, now: u64) -> u64 {
-        self.expires_at
-            .min(self.continuation_deadline)
-            .saturating_sub(now)
+        if self.is_live(now) {
+            self.expires_at.min(self.continuation_deadline) - now
+        } else {
+            0
+        }
     }
 }
 

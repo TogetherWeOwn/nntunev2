@@ -32,6 +32,8 @@
 //! whole request so the DO keeps the windows pending and retries on
 //! its alarm.
 
+use std::collections::HashSet;
+
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -56,6 +58,8 @@ pub const MAX_TIMESTAMP_SKEW_SECS: u64 = 300;
 /// Windows per batch. The stream DO caps its batches identically; a
 /// larger batch is a broken caller, not a retry candidate.
 pub const MAX_BATCH_WINDOWS: usize = 64;
+/// Serialized body cap used by the stream Worker's batch packer.
+pub const MAX_BATCH_BODY_BYTES: usize = 16 * 1024;
 
 /// Why a sink request failed authentication or parsing. Every variant
 /// renders the same generic wire answer (401, or 422 for a signed but
@@ -200,13 +204,15 @@ pub fn verify(
     let Some(credentials) = credentials.strip_prefix(' ') else {
         return Err(SinkError::Unauthorized);
     };
-    let Some((timestamp, signature)) = credentials.split_once('.') else {
+    let Some((timestamp_text, signature)) = credentials.split_once('.') else {
         return Err(SinkError::Unauthorized);
     };
-    let Ok(timestamp) = timestamp.parse::<u64>() else {
+    let Ok(timestamp) = timestamp_text.parse::<u64>() else {
         return Err(SinkError::Unauthorized);
     };
-    if now_unix.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
+    if timestamp_text != timestamp.to_string()
+        || now_unix.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS
+    {
         return Err(SinkError::Unauthorized);
     }
     let expected = signature_hex(secret, timestamp, body);
@@ -222,9 +228,20 @@ pub fn verify(
 /// whole: partially applying a broken batch would make the ack lie
 /// about which windows landed.
 pub fn parse_batch(body: &[u8]) -> Result<Vec<WindowReport>, SinkError> {
+    if body.len() > MAX_BATCH_BODY_BYTES {
+        return Err(SinkError::Malformed);
+    }
     let batch: FlushBatch = serde_json::from_slice(body).map_err(|_| SinkError::Malformed)?;
     if batch.windows.len() > MAX_BATCH_WINDOWS {
         return Err(SinkError::Malformed);
+    }
+    // The ack identifies windows only by play ID. A repeated ID would
+    // make the dispositions ambiguous, even across different users.
+    let mut play_ids = HashSet::with_capacity(batch.windows.len());
+    for window in &batch.windows {
+        if !play_ids.insert(window.play_id.as_str()) {
+            return Err(SinkError::Malformed);
+        }
     }
     Ok(batch.windows)
 }

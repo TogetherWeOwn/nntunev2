@@ -329,13 +329,11 @@ pub fn check_stream_hours_with_caps(caps: &PlanCaps, stream_seconds_month: u64) 
 }
 
 /// Build [`PlanCaps`] from a `plans` row (`stream_hours_month` hours,
-/// `max_concurrent_streams` count): hours convert to seconds
-/// saturating, so a corrupt huge row caps at `u64::MAX` seconds rather
-/// than wrapping into a small allowance — and never below the raw
-/// value's own scale.
+/// `max_concurrent_streams` count). An unrepresentable hours value
+/// grants zero playback seconds.
 pub fn caps_from_plan_row(stream_hours_month: u64, max_concurrent_streams: u32) -> PlanCaps {
     PlanCaps {
-        stream_seconds_month: stream_hours_month.saturating_mul(3600),
+        stream_seconds_month: stream_hours_month.checked_mul(3600).unwrap_or(0),
         max_concurrent_streams,
     }
 }
@@ -525,11 +523,7 @@ mod tests {
             .denial()
             .expect("at-cap denies");
         assert_eq!(denial.limit_value, 2, "wire names the row's hours");
-        // Row values saturate instead of wrapping.
-        assert_eq!(
-            caps_from_plan_row(u64::MAX, 1).stream_seconds_month,
-            u64::MAX
-        );
+        assert_eq!(caps_from_plan_row(u64::MAX, 1).stream_seconds_month, 0);
         assert_eq!(
             plan_caps_select_statement(),
             "SELECT stream_hours_month, max_concurrent_streams FROM plans WHERE id = $1"
