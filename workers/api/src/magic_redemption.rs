@@ -14,7 +14,7 @@
 use crate::auth::MagicLinkRecord;
 use crate::handlers::StoreError;
 use crate::postgres::{PgQuery, PgTransaction};
-use crate::session::SessionRecord;
+use crate::session::{SessionRecord, MAX_SESSION_SECS};
 use crate::vault::AuditEvent;
 use tokio_postgres::types::Type;
 
@@ -184,7 +184,17 @@ pub(crate) async fn redeem(
     session: &SessionRecord,
     audit: Option<&AuditEvent>,
 ) -> Result<bool, StoreError> {
-    if session.user_id != magic.user_id {
+    // The insert writes an active row, so reject malformed input before
+    // claiming the link or attributing a success audit to another user.
+    if session.user_id != magic.user_id
+        || session.user_id.is_empty()
+        || session.id.is_empty()
+        || session.revoked
+        || session.rotation_counter != 0
+        || session.expires_at <= session.created_at
+        || session.expires_at - session.created_at > MAX_SESSION_SECS
+        || audit.is_some_and(|event| event.user_id != session.user_id || !event.ok)
+    {
         transaction.rollback().await?;
         return Err(StoreError);
     }
@@ -660,5 +670,39 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(*events.borrow(), ["rollback"]);
         assert_eq!(persisted(&db), (false, 0, 0));
+    }
+
+    #[test]
+    fn invalid_session_or_success_audit_never_claims() {
+        let (mut db, magic, session) = fixture();
+        let events = RefCell::new(Vec::new());
+        type Corrupt = fn(&mut SessionRecord, &mut AuditEvent);
+        let corruptions: [Corrupt; 7] = [
+            |session, _| session.revoked = true,
+            |session, _| session.rotation_counter = 1,
+            |session, _| session.expires_at = session.created_at,
+            |session, _| session.expires_at = session.created_at + MAX_SESSION_SECS + 1,
+            |session, _| session.id.clear(),
+            |_, audit| audit.user_id = "other".into(),
+            |_, audit| audit.ok = false,
+        ];
+        for corrupt in corruptions {
+            let mut session = session.clone();
+            let mut audit = success_audit(&magic);
+            corrupt(&mut session, &mut audit);
+            let result = ready(redeem(
+                SqliteTransaction {
+                    transaction: db.transaction().unwrap(),
+                    events: &events,
+                },
+                &magic,
+                &session,
+                Some(&audit),
+            ));
+            assert!(result.is_err());
+            assert_eq!(*events.borrow(), ["rollback"]);
+            assert_eq!(persisted(&db), (false, 0, 0));
+            events.borrow_mut().clear();
+        }
     }
 }
