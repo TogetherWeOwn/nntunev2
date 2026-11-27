@@ -262,7 +262,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 - Upload bodies are untrusted: capped, shape-checked, never logged.
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
-  `src/indexer_fetch.rs:1-52`, exported as `pub mod indexer_fetch` in
+  `src/indexer_fetch.rs:1-48`, exported as `pub mod indexer_fetch` in
   `src/lib.rs:53`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
@@ -344,7 +344,7 @@ routes are unchanged.
   `indexer_fetch_embedded_credentials`, `indexer_fetch_port_not_allowed`,
   `indexer_fetch_forbidden_address`, `indexer_fetch_unresolvable_host`,
   `indexer_fetch_too_many_redirects`, `indexer_fetch_dial_timeout`,
-  `indexer_fetch_timeout`, `indexer_fetch_upstream_status`. Full URLs
+  `indexer_fetch_timeout`, `indexer_fetch_too_large`, `indexer_fetch_upstream_status`. Full URLs
   must go through `newznab::redact_api_key` (`src/newznab.rs:191`) before any future log line;
   no such log is emitted today.
 
