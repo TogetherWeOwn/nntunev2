@@ -370,6 +370,29 @@ it('keeps one listen across seeks and clears sampled end when seeking back befor
 	]);
 });
 
+it.each(['during a seek', 'after a source reset'] as const)('skips abandonment %s without crediting an in-flight end', async (boundary) => {
+	const fetchFn = vi.fn<typeof fetch>(async (path) => path === contextPath ? Response.json({ context }) : ack());
+	const { sender, currentPlayId, open } = listenTransport(fetchFn);
+	const audio = listenMedia();
+	const observer = observeListenEvents(audio, { trackId, sender, grantPlayId: currentPlayId, startedPlaybacks: new Set() });
+	onTestFinished(() => observer.dispose());
+	const events = () => fetchFn.mock.calls.filter(([path]) => path === eventsPath)
+		.map(([, init]) => JSON.parse(String(init?.body)).event);
+	await sender.ready;
+	expect(await open('A'.repeat(22))).toBe(true);
+	fire(audio, 'playing');
+	await vi.advanceTimersByTimeAsync(0);
+
+	Object.assign(audio, { seeking: true, ended: true });
+	fire(audio, 'seeking', 'timeupdate', 'pause', 'ended');
+	await vi.advanceTimersByTimeAsync(0);
+	expect(events()).toEqual(['start']);
+	if (boundary === 'after a source reset') Object.assign(audio, { seeking: false, ended: false });
+	fire(audio, 'emptied');
+	await vi.advanceTimersByTimeAsync(0);
+	expect(events()).toEqual(['start', 'skip']);
+});
+
 it.each([200, 409] as const)('prevents leaks across rapid skips over an unstarted track (first start %s)', async (firstStatus) => {
 	const pendingFirst = Promise.withResolvers<Response>();
 	const f = await transitionFixture((body) =>
