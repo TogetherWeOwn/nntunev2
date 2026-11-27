@@ -48,7 +48,8 @@ impl S3Locator {
             return Err(S3LocatorError::Key);
         }
         let valid_binding = match &binding {
-            S3Binding::VersionId(id) => id != "null" && opaque_token(id),
+            // A comma can separate combined x-amz-version-id header values.
+            S3Binding::VersionId(id) => id != "null" && opaque_token(id) && !id.contains(','),
             S3Binding::Etag(tag) => tag
                 .strip_prefix('"')
                 .and_then(|tag| tag.strip_suffix('"'))

@@ -9,8 +9,9 @@
 //! The predicate rejects every non-public destination: v4 loopback,
 //! link-local (incl. the cloud metadata endpoint), private, carrier-grade
 //! NAT, multicast, broadcast, documentation, `0.0.0.0/8`, IETF protocol
-//! assignments, benchmarking and reserved space; v6 anything outside
-//! native global unicast plus transition/special-use space inside it
+//! assignments, deprecated 6to4 relay, benchmarking and reserved space.
+//! For v6 it rejects anything outside native global unicast and transition or
+//! special-use space inside it
 //! (mapped, translated, compatible, NAT64, 6to4, Teredo/ORCHID,
 //! site-local, discard, documentation). Resolve-ALL callers reject when
 //! ANY answer is forbidden; IP literals are checked directly with no DNS.
@@ -29,6 +30,7 @@ pub fn v4_is_forbidden(o: &[u8; 4]) -> bool {
         || o[0] == 0 // 0.0.0.0/8 ("this network")
         || (o[0] == 100 && (o[1] & 0xC0) == 64) // 100.64/10 carrier-grade NAT
         || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 (IETF protocol assignments)
+        || o[..3] == [192, 88, 99] // 192.88.99.0/24 (deprecated 6to4 relay)
         || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmarking
         || o[0] >= 240 // 240.0.0.0/4 reserved + 255.255.255.255 broadcast
 }
