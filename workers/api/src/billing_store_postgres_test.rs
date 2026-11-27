@@ -1208,12 +1208,12 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
         true
     );
     assert_eq!(after_cancel.1, committed.1);
-
     let locks_available = async || {
         let row = observer
             .query_one(
                 "SELECT pg_try_advisory_xact_lock(hashtext($1)), NOT EXISTS (
                     SELECT FROM pg_locks WHERE relation = 'public.subscriptions'::regclass
+                      AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
                       AND mode = 'ShareRowExclusiveLock' AND granted)",
                 &[&USER],
             )
