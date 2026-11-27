@@ -270,7 +270,10 @@ def write_rows(path: Path, rows, keys: tuple[str, ...], budget: list[int]) -> di
 
 
 def extract(args) -> None:
-    with open(args.input, "rb", opener=lambda path, flags: os.open(path, flags | os.O_NONBLOCK)) as source:
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not nonblock and not stat.S_ISREG(args.input.stat().st_mode):
+        raise Refused("input must be a local regular file")
+    with open(args.input, "rb", opener=lambda path, flags: os.open(path, flags | nonblock)) as source:
         if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
             raise Refused("input must be a local regular file")
         with decoded_stream(source, args.input.suffix) as stream:

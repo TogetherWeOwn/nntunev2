@@ -36,16 +36,31 @@ def _invalid_constant(_):
     raise ValueError("non-finite JSON")
 
 
+def _plain(info, file_type):
+    attributes = getattr(info, "st_file_attributes", 0)
+    return file_type(info.st_mode) and not (attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 def _read(directory, name, limit):
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    expected = None
     try:
-        fd = os.open(name, flags, dir_fd=directory)
+        if isinstance(directory, Path):
+            path = directory / name
+            expected = path.lstat()
+            if not _plain(expected, stat.S_ISREG):
+                raise ValueError("regular file required")
+            fd = os.open(path, flags)
+        else:
+            fd = os.open(name, flags | os.O_NOFOLLOW, dir_fd=directory)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise ValueError("regular file required") from None
         raise
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        opened = os.fstat(fd)
+        if (not _plain(opened, stat.S_ISREG)
+                or (expected is not None and not os.path.samestat(expected, opened))):
             raise ValueError("regular file required")
         with os.fdopen(fd, "rb", closefd=False) as stream:
             raw = stream.read(limit + 1)
@@ -62,10 +77,23 @@ def _sha(value):
 
 def verify_receipts(directory):
     """Return manifest, its digest and raw output bytes after receipt checks only."""
+    directory = Path(directory)
+    if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+        # These callers use trusted local paths. Check the opened files against
+        # their entries and refuse if the receipt directory changed during verification.
+        expected = directory.lstat()
+        if not _plain(expected, stat.S_ISDIR):
+            raise ValueError("extract directory required")
+        result = _verify_receipts(directory)
+        if not os.path.samestat(expected, directory.lstat()):
+            raise ValueError("extract directory changed")
+        return result
     try:
-        fd = os.open(Path(directory), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except NotADirectoryError:
-        raise ValueError("extract directory required") from None
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError("extract directory required") from None
+        raise
     try:
         return _verify_receipts(fd)
     finally:
@@ -104,13 +132,15 @@ def _verify_receipts(directory):
     if any(type(v) is not int or v < 0 for section in (counts, limits) for v in section.values()):
         raise ValueError("invalid extract counts or limits")
     min_input_bytes = 2 if identity["format"] == "json-array" else 0
-    if (not 0 < limits["max_line_bytes"] < sys.maxsize
+    line_limit = limits["max_line_bytes"]
+    if (not max(1, min_input_bytes) <= line_limit < sys.maxsize
             or not 0 < limits["max_input_bytes"] < sys.maxsize
             or not 65536 <= limits["max_db_bytes"] <= 1024**4
             or limits["max_depth"] > 10_000
             or limits["max_entities"] == 0
             or not min_input_bytes <= identity["bytes"] <= limits["max_input_bytes"]
             or counts["entities"] > min(limits["max_entities"], identity["bytes"])
+            or identity["bytes"] > (counts["entities"] + min_input_bytes) * line_limit
             or (counts["entities"] == 0 and counts["invalid_claims"] != 0)):
         raise ValueError("inconsistent extract counts or limits")
     _shape(manifest["outputs"], FILES)

@@ -30,6 +30,8 @@ def receipt():
 
 @pytest.mark.parametrize(("section", "key", "value"), [
     ("limits", "max_line_bytes", 0),
+    ("limits", "max_line_bytes", 1),
+    ("limits", "max_line_bytes", 2),
     ("limits", "max_db_bytes", 4096),
     ("limits", "max_depth", 10_001),
     ("limits", "max_input_bytes", 1),
@@ -51,8 +53,17 @@ def test_extract_receipt_rejects_invalid_utf8(receipt):
         verify_receipts(receipt.directory)
 
 
+def test_verify_receipts_without_directory_descriptors(receipt, monkeypatch):
+    monkeypatch.setattr(os, "supports_dir_fd", set())
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    assert verify_receipts(receipt.directory)[0] == receipt.manifest
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires a POSIX FIFO")
-def test_extract_receipt_rejects_fifo_and_directory_symlink(receipt, tmp_path):
+@pytest.mark.parametrize("fallback", [False, True])
+def test_extract_receipt_rejects_fifo_and_directory_symlink(receipt, tmp_path, monkeypatch, fallback):
+    if fallback:
+        monkeypatch.setattr(os, "supports_dir_fd", set())
     alias = tmp_path / "alias"
     alias.symlink_to(receipt.directory, target_is_directory=True)
     with pytest.raises(ValueError, match="directory"):

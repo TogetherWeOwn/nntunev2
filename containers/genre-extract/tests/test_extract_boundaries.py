@@ -2,11 +2,10 @@
 
 import bz2
 import gzip
-import os
+import subprocess
+import sys
 
-import pytest
-
-from test_extract import ExtractCase, dumps, item_entity, rows, stmt
+from test_extract import EXTRACT, ExtractCase, dumps, item_entity, rows, stmt
 
 
 class TestExtractBoundaries(ExtractCase):
@@ -30,8 +29,13 @@ class TestExtractBoundaries(ExtractCase):
                                                  P136=[stmt("P136", "Q2")])]))
         self.assertEqual(rows(self.ok(path), "artist_genres.jsonl"), [])
 
-    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires a POSIX FIFO")
-    def test_fifo_is_refused_without_a_writer(self):
-        path = os.path.join(self.tmp, "input.json")
-        os.mkfifo(path)
-        self.fails(path)
+def test_regular_file_without_nonblock(tmp_path):
+    source, out = tmp_path / "input.json", tmp_path / "output"
+    source.write_bytes(b"[]\n")
+    run = ("import os, runpy, sys\nfrom types import SimpleNamespace\n"
+           "sys.argv.pop(0)\nmain = runpy.run_path(sys.argv[0])['main']\n"
+           "main.__globals__['os'] = SimpleNamespace(open=os.open, fstat=os.fstat)\n"
+           "raise SystemExit(main())")
+    subprocess.run([sys.executable, "-I", "-c", run, EXTRACT, "--input", str(source),
+                    "--output", str(out), "--dump-version", "synthetic-v1"], check=True, timeout=15)
+    assert (out / "manifest.json").is_file()
