@@ -5,14 +5,14 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { finalSmokeFixture, recoveryFixture } from './fixtures/production-worker-transport.mjs';
 import { admitRecovery, intentFile } from './production-maintenance/recovery-evidence.mjs';
+import worker from './production-maintenance/worker.mjs';
 import { evaluateHealthWindow } from '../workers/observability/evaluate-health-window.mjs';
 import { renderHealthAlert } from '../workers/observability/render-health-alert.mjs';
 import provider from '../.github/scripts/private_trial_provider_preflight.cjs';
 import cleanup from '../.github/scripts/staging_trial_cleanup.cjs';
 
-const checkedAt = '2026-10-01T12:00:00Z';
-const now = () => Date.parse(checkedAt);
-const fixture = { checkedAt, now, sha: 'a'.repeat(40), workerId: 'b'.repeat(32),
+const now = () => Date.parse('2026-10-01T12:00:00Z');
+const fixture = { checkedAt: new Date(now()).toISOString(), now, sha: 'a'.repeat(40), workerId: 'b'.repeat(32),
   version: '12345678-1234-1234-1234-123456789abc' };
 
 test('rollback rejects invalid context and stale or superseded recovery evidence', async (t) => {
@@ -43,6 +43,7 @@ test('rollback rejects invalid context and stale or superseded recovery evidence
   transport.fail.nextRead = true;
   assert.match(await run('recover', { ...env, CLAIM_VERIFIED: 'true' }), /allocation verified/);
   assert.equal(calls.filter((method) => method === 'POST').length, 1);
+  assert.equal(worker.fetch(new Request('https://fixture.invalid/', { method: 'POST' })).status, 503);
 });
 
 test('health windows and alerts reject evidence they cannot represent safely', () => {
@@ -86,7 +87,7 @@ test('provider preflight refuses ambiguous replies and isolates its fetch overri
 
 test('cleanup requires an exact status and byte receipt', async () => {
   assert.equal(await cleanup.cleanupVerdict(new Response('confirmed')), 'confirmed');
-  for (const response of [new Response('\ufeffconfirmed'), new Response('confirmed', { status: 409 })]) {
-    assert.equal(await cleanup.cleanupVerdict(response), 'unconfirmed');
+  for (const [body, status] of [['\ufeffconfirmed', 200], ['confirm', 200], ['confirmed', 409]]) {
+    assert.equal(await cleanup.cleanupVerdict(new Response(body, { status })), 'unconfirmed');
   }
 });
