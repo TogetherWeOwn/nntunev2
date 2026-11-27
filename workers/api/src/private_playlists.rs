@@ -2,7 +2,8 @@
 //! Register only as part of the Library and playlist cutovers.
 
 use super::*;
-use crate::library::{check_name, clamp_page_size, new_public_id, page_cursor};
+use crate::library::{check_name, clamp_page_size, new_public_id, page_cursor, MAX_ITEMS};
+use crate::meter_sink::is_uuid_shaped;
 use crate::postgres::{PgConnect, PgQuery};
 use serde_json::{json, Value};
 use tokio_postgres::types::{ToSql, Type};
@@ -67,6 +68,48 @@ SELECT $2, $3::text::uuid, next.position FROM next WHERE next.position < $4
 RETURNING jsonb_build_object('id', id, 'position', position)::text"
 );
 
+// The legacy array is read-only. New entries occupy the suffix after its
+// reserved slots. Reorder requires a complete permutation of that suffix and
+// reuses its occupied positions, including when there are gaps.
+const REORDER: &str = concat!(
+    "
+WITH entries AS (
+  SELECT e.id, e.track_id, e.position, row_number() OVER (ORDER BY e.position) AS ordinal
+  FROM playlist_tracks e JOIN playlists p ON p.id = e.playlist_id
+  WHERE p.id = $2 AND NOT e.is_legacy
+    AND e.position >= jsonb_array_length(p.items) AND e.position < $4
+), moves AS (
+  SELECT e.id, e.track_id, e.position, slot.position AS destination
+  FROM unnest($3::text[]) WITH ORDINALITY AS requested(id, ordinal)
+  JOIN entries e ON e.id = requested.id::uuid
+  JOIN entries slot ON slot.ordinal = requested.ordinal
+), valid AS (
+  SELECT 1 WHERE cardinality($3) > 0
+    AND (SELECT count(*) FROM entries) = cardinality($3)
+    AND (SELECT count(DISTINCT id) FROM moves) = cardinality($3)
+    AND NOT EXISTS (SELECT FROM moves m WHERE m.position <> m.destination AND NOT EXISTS (",
+    owned_membership!(),
+    " AND lt.track_id = m.track_id LIMIT 1 FOR SHARE OF l, lt))
+), reordered AS (
+  UPDATE playlist_tracks e SET position = m.destination FROM moves m, valid
+  WHERE e.playlist_id = $2 AND e.id = m.id AND m.position <> m.destination
+)
+SELECT '{\"reordered\":true}' FROM valid"
+);
+
+// Leave the other positions stable, including dormant tombstones. Append
+// keeps using the next tail position, so deleting an interior row leaves a gap.
+const REMOVE: &str = concat!(
+    "
+DELETE FROM playlist_tracks e USING playlists p
+WHERE p.id = $2 AND e.playlist_id = p.id AND e.id = $3::text::uuid AND NOT e.is_legacy
+  AND e.position >= jsonb_array_length(p.items) AND e.position < $4
+  AND EXISTS (",
+    owned_membership!(),
+    " AND lt.track_id = e.track_id LIMIT 1 FOR SHARE OF l, lt)
+RETURNING jsonb_build_object('id', e.id)::text"
+);
+
 const DELETE_REQUEST: &str = "
 WITH existing AS (
   SELECT id FROM delete_operations WHERE user_id = $1 AND scope = 'playlist' AND container_id = $2
@@ -86,15 +129,20 @@ pub(super) enum Command<'a> {
     Create(String),
     Rename(&'a str, String),
     Append(&'a str, String),
+    Reorder(&'a str, Vec<String>),
+    Remove(&'a str, String),
     Delete(&'a str),
 }
 
 impl<'a> Command<'a> {
     fn handle(&self) -> Option<&'a str> {
         match self {
-            Self::Read(id) | Self::Rename(id, _) | Self::Append(id, _) | Self::Delete(id) => {
-                Some(id)
-            }
+            Self::Read(id)
+            | Self::Rename(id, _)
+            | Self::Append(id, _)
+            | Self::Reorder(id, _)
+            | Self::Remove(id, _)
+            | Self::Delete(id) => Some(id),
             Self::Create(_) | Self::List(_, _) => None,
         }
     }
@@ -119,14 +167,23 @@ fn validate(cmd: Command<'_>) -> Result<(u16, Command<'_>), Response> {
         Command::List(ref after, _) if after.as_deref().is_some_and(|id| !handle_shape(id)) => {
             Err(invalid_request())
         }
-        Command::Append(_, ref track) if !crate::meter_sink::is_uuid_shaped(track) => {
+        Command::Append(_, ref id) | Command::Remove(_, ref id) if !is_uuid_shaped(id) => {
+            Err(invalid_request())
+        }
+        Command::Reorder(_, ref ids)
+            if ids.is_empty()
+                || ids.len() > MAX_ITEMS
+                || ids.iter().any(|id| !is_uuid_shaped(id)) =>
+        {
             Err(invalid_request())
         }
         Command::Create(name) => Ok((201, Command::Create(title(name)?))),
         Command::Rename(id, name) => Ok((200, Command::Rename(id, title(name)?))),
         Command::Append(..) => Ok((201, cmd)),
         Command::Delete(_) => Ok((202, cmd)),
-        Command::List(..) | Command::Read(_) => Ok((200, cmd)),
+        Command::List(..) | Command::Read(_) | Command::Reorder(..) | Command::Remove(..) => {
+            Ok((200, cmd))
+        }
     }
 }
 
@@ -223,6 +280,8 @@ pub(super) async fn execute(
         None
     };
     let target = (&target as &(dyn ToSql + Sync), Type::INT8);
+    let max_items = MAX_ITEMS as i32;
+    let cap = (&max_items as &(dyn ToSql + Sync), Type::INT4);
     let result = match cmd {
         Command::Create(name) => {
             let id = new_public_id().map_err(|_| StoreError)?;
@@ -231,10 +290,19 @@ pub(super) async fn execute(
         }
         Command::Rename(_, name) => value(&tx, RENAME, &[target, (&name, Type::TEXT)]).await?,
         Command::Append(_, track) => {
-            let max_items = crate::library::MAX_ITEMS as i32;
-            let cap = (&max_items as &(dyn ToSql + Sync), Type::INT4);
             let params = [owner(), target, (&track, Type::TEXT), cap];
             value(&tx, APPEND, &params).await?
+        }
+        Command::Reorder(_, entries) => {
+            value(
+                &tx,
+                REORDER,
+                &[owner(), target, (&entries, Type::TEXT_ARRAY), cap],
+            )
+            .await?
+        }
+        Command::Remove(_, entry) => {
+            value(&tx, REMOVE, &[owner(), target, (&entry, Type::TEXT), cap]).await?
         }
         Command::Delete(id) => {
             value(&tx, DELETE_REQUEST, &[owner(), (&id, Type::TEXT), target]).await?
