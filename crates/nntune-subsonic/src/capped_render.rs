@@ -210,12 +210,12 @@ fn xml(value: &Value, name: &str, out: &mut Sink<'_>, depth: usize) -> fmt::Resu
             let mut text = None;
             let mut has_children = false;
             for (key, val) in entries {
+                if depth == MAX_DEPTH && !matches!(val, Value::Null) {
+                    return Err(fmt::Error);
+                }
                 match val {
                     Value::Null => {}
                     Value::Bool(_) | Value::Int(_) | Value::Str(_) => {
-                        if depth == MAX_DEPTH {
-                            return Err(fmt::Error);
-                        }
                         if key == "value" && matches!(val, Value::Str(_)) {
                             if let Value::Str(s) = val {
                                 text = Some(s.as_str());
@@ -318,7 +318,7 @@ mod tests {
     fn nested_values_match_existing_wire_formats() {
         let docs = [
             Value::Null,
-            Value::List(vec![Value::Null, Value::List(vec![Value::Int(7)])]),
+            Value::List(vec![Value::List(vec![Value::Int(7)])]),
             Value::map(vec![
                 ("empty", Value::List(vec![Value::Null])),
                 ("value", Value::Bool(false)),

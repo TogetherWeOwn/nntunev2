@@ -41,9 +41,24 @@ fn xml_map_lists_charge_the_list_and_its_entry() {
 }
 
 #[test]
+fn xml_counts_empty_and_all_null_map_lists_at_the_limit() {
+    for list in [vec![], vec![Value::Null]] {
+        let leaf = Value::map(vec![("item", Value::List(list))]);
+        let wrap = |doc| Value::map(vec![("child", doc)]);
+        let doc = wraps(63, leaf, wrap);
+        assert!(encoded_len(&doc, Format::Xml, 4_096).is_ok());
+        rejects_before_writing(&wrap(doc), Format::Xml);
+    }
+}
+
+#[test]
 fn xml_requires_one_root_after_flattening_top_level_lists() {
     let empty = || Value::List(vec![]);
-    for doc in [empty(), Value::List(vec![Value::Int(1), Value::Int(2)])] {
+    for doc in [
+        empty(),
+        Value::List(vec![Value::Int(1), Value::Int(2)]),
+        Value::List(vec![Value::Null, Value::List(vec![Value::Int(7)])]),
+    ] {
         rejects_before_writing(&doc, Format::Xml);
     }
     let doc = Value::List(vec![empty(), Value::List(vec![Value::Int(1)]), empty()]);
