@@ -17,12 +17,43 @@ import recall
 
 
 class RecallTest(unittest.TestCase):
+    def test_truncated_baseline_is_not_gate_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            golden, pg, snap, out = (Path(tmp) / name for name in ("golden", "pg", "snap", "out"))
+            golden.write_text("1\tAlbum\tplain\tunique\tid\n")
+            pg.write_text("1\t1\tid\n")
+            snap.write_text("1\t1\tid\n")
+            with patch.object(sys, "argv", ["recall.py", *map(str, (golden, pg, snap, out))]):
+                with self.assertRaisesRegex(SystemExit, "baseline.*timing"):
+                    recall.main()
+            self.assertFalse(out.exists())
+
+    def test_baseline_literal_handles_backslashes_and_apostrophes(self):
+        self.assertEqual(pg_baseline.literal(r"Don't\stop"), r"E'Don''t\\stop'")
+
+    def test_baseline_rejects_malformed_query_id_before_psql(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            golden, out = (Path(tmp) / name for name in ("golden", "out"))
+            golden.write_text("two words\tAlbum\n")
+            with patch.object(pg_baseline.subprocess, "run") as run:
+                with self.assertRaisesRegex(SystemExit, "invalid golden query row"):
+                    pg_baseline.search(golden, out)
+                run.assert_not_called()
+
+    def test_duplicate_rank_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hits = Path(tmp) / "hits"
+            hits.write_text("1\t1\tid\n1\t1\tother\n")
+            with self.assertRaisesRegex(SystemExit, "invalid hit rank"):
+                recall.load_hits(hits)
+
     def test_one_hit_regression_below_display_precision_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             golden, pg, snap, out = [root / name for name in ("golden", "pg", "snap", "out")]
             golden.write_text("".join(f"{i}\tAlbum\tplain\tunique\tid\n" for i in range(100000)))
-            pg.write_text("".join(f"{i}\t1\tid\n" for i in range(74001)))
+            pg.write_text("".join((f"{i}\t1\tid\n" if i < 74001 else "") + f"{i}\t0\t\t\t\t1\n"
+                                  for i in range(100000)))
             snap.write_text("".join(f"{i}\t1\tid\n" for i in range(74000)))
             with patch.object(sys, "argv", ["recall.py", *map(str, (golden, pg, snap, out))]):
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -37,7 +68,7 @@ class RecallTest(unittest.TestCase):
             root = Path(tmp)
             golden, pg, snap, out = [root / name for name in ("golden", "pg", "snap", "out")]
             golden.write_bytes(b"1\tFresh Album\tplain\tunique\tid\r\n")
-            pg.write_text("1\t1\tid\n")
+            pg.write_text("1\t1\tid\n1\t0\t\t\t\t1\n")
             snap.touch()
             with patch.object(sys, "argv", ["recall.py", *map(str, (golden, pg, snap, out))]):
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -79,7 +110,7 @@ class RecallTest(unittest.TestCase):
             golden, pg, snap, out, prior = [root / name for name in ("golden", "pg", "snap", "out", "prior")]
             golden.write_text("1\tFresh Album\tplain\tunique\tid\n")
             prior.write_text("1\tOld Album\tplain\tunique\tid\n")
-            pg.write_text("1\t1\tid\n")
+            pg.write_text("1\t1\tid\n1\t0\t\t\t\t1\n")
             snap.write_text("1\t1\tid\n")
             with patch.object(sys, "argv", ["recall.py", *map(str, (golden, pg, snap, out)), "--exclude", str(prior)]):
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -99,21 +130,21 @@ class RecallTest(unittest.TestCase):
             self.assertFalse(out.exists())
 
     def test_baseline_newlines_do_not_consume_ranks(self):
-        rows = [{"mbid": f"id{i}", "label": "Album\n@@not-a-query\tTime: 9",
+        rows = [{"mbid": f"id{i}", "label": "Album\n@@not-a-query\tTime: 9\u2028Live",
                  "score": 0.5, "artist_mbid": None, "artist_name": "Artist\r\nName"}
                 for i in range(5)]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             golden, out = root / "golden", root / "hits"
             golden.write_text("1\tAlbum\tplain\tunique\tid4\n")
-            stdout = "@@1\n" + "\n".join(json.dumps(row) for row in rows) + "\nTime: 1 ms\n"
+            stdout = "@@1\n" + "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\nTime: 1 ms\n"
             with patch.object(pg_baseline.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout)) as run:
                 pg_baseline.search(golden, out)
             self.assertIn("row_to_json", run.call_args.kwargs["input"])
             hits, timings = recall.load_hits(out)
             self.assertEqual(hits["1"], [f"id{i}" for i in range(5)])
             self.assertEqual(timings, [1.0])
-            self.assertEqual(len(out.read_text().splitlines()), 6)
+            self.assertEqual(len(out.read_text().split("\n")), 7)
 
 
 if __name__ == "__main__":

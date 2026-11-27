@@ -40,6 +40,7 @@ impl Input {
         if path.extension().is_some_and(|ext| ext == "gz") {
             let mut child = Command::new("gzip")
                 .arg("-dc")
+                .arg("--")
                 .arg(path)
                 .stdout(Stdio::piped())
                 .spawn()
@@ -288,7 +289,6 @@ impl KindWriter {
 
 /// Bucket ranges for `passes` passes over the input.
 fn pass_ranges(passes: usize) -> Vec<std::ops::Range<usize>> {
-    let passes = passes.clamp(1, 256);
     (0..passes)
         .map(|p| (BUCKETS * p / passes)..(BUCKETS * (p + 1) / passes))
         .collect()
@@ -528,25 +528,28 @@ fn run(args: &[String]) -> Fallible<()> {
     let kind = args.get(1).ok_or(usage)?;
     let out = PathBuf::from(args.get(2).ok_or(usage)?);
     let input = PathBuf::from(args.get(3).ok_or(usage)?);
-    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-    let passes_at = |i: usize, default: usize| {
-        args.get(i)
-            .map(|p| p.parse::<usize>().map_err(|_| usage.to_owned()))
-            .unwrap_or(Ok(default))
+    let passes = match (kind.as_str(), args.len()) {
+        ("artist", 4) => 1,
+        ("recording", 4) | ("release", 5) => 4,
+        ("recording", 5) | ("release", 6) => args
+            .last()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|passes| (1..=256).contains(passes))
+            .ok_or("passes must be 1..=256")?,
+        _ => return Err(usage.to_owned()),
     };
+    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     match kind.as_str() {
         "artist" => {
             let stats = build_entity(&out, "artist", &input, 6, 1, artist_row)?;
             write_stats(&out, "artist", &stats)
         }
         "recording" => {
-            let passes = passes_at(4, 4)?;
             let stats = build_entity(&out, "recording", &input, 6, passes, recording_row)?;
             write_stats(&out, "recording", &stats)
         }
         "release" => {
             let artist_tsv = PathBuf::from(args.get(4).ok_or(usage)?);
-            let passes = passes_at(5, 4)?;
             let stats = build_entity(&out, "release", &input, 8, 1, |f| {
                 Ok(match release_fields(f)? {
                     Ok((mbid, row)) => Ok((
@@ -576,6 +579,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_passes_fail_before_opening_paths() {
+        for passes in ["0", "257"] {
+            let args = ["snapshot_build", "recording", file!(), "", passes].map(str::to_owned);
+            assert_eq!(run(&args).unwrap_err(), "passes must be 1..=256");
+        }
+    }
 
     #[test]
     fn copy_text_decodes_postgres_escapes() {

@@ -6,7 +6,9 @@ Run: python3 workers/mb/spike/test_bench.py
 
 import sys
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench  # noqa: E402
@@ -30,6 +32,19 @@ def report(search: dict | None = None) -> dict:
 
 
 class GateTest(unittest.TestCase):
+    def test_http_error_status_survives_a_broken_error_body(self):
+        error = urllib.error.HTTPError("https://mb.test", 503, "unavailable", {}, None)
+        with patch.object(error, "read", side_effect=OSError), patch.object(
+            bench.OPENER, "open", side_effect=error
+        ):
+            self.assertEqual(bench.fetch("https://mb.test", "synthetic")["status"], 503)
+
+    def test_redirect_never_builds_a_second_request(self):
+        handler = next(h for h in bench.OPENER.handlers
+                       if isinstance(h, bench.urllib.request.HTTPRedirectHandler))
+        original = bench.urllib.request.Request("https://mb.test", headers={"x-mb-snapshot-bench": "synthetic"})
+        self.assertIsNone(handler.redirect_request(original, None, 302, "", {}, "https://other.test"))
+
     def test_all_ok_and_fast_passes(self):
         verdict = bench.gate(report())
         self.assertTrue(verdict["all_requests_ok"])

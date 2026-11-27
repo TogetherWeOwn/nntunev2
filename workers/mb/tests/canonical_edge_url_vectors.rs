@@ -30,10 +30,8 @@
 //!     bytes, counted on the trimmed value — the handler's rule), no
 //!     control characters;
 //!   - `type` exactly one of `artist|release|recording`;
-//!   - `limit` absent, unparsable as `u32`, or non-zero (zero is the
-//!     handler's 400; `+10`/` 10` spellings do not parse as `u32` and fall
-//!     back exactly as `search_route` falls back);
-//!   - `offset` absent, unparsable as `u32`, or at or below 1000
+//!   - `limit` absent or a non-zero `u32`;
+//!   - `offset` absent or a `u32` at or below 1000
 //!     (`MAX_SEARCH_OFFSET`).
 //!
 //!   These rewrite to
@@ -44,8 +42,8 @@
 //!   WHATWG `application/x-www-form-urlencoded` (space as `+`, everything
 //!   outside `[A-Za-z0-9*._-]` as uppercase-hex `%XX` — the same encoding
 //!   the canonical output must decode back through), the effective limit
-//!   is 25 when absent/unparsable/above 25 (`MAX_PAGE_SIZE`), the
-//!   effective offset is 0 when absent/unparsable, parameters appear in
+//!   is 25 when absent or above 25 (`MAX_PAGE_SIZE`), the
+//!   effective offset is 0 when absent, parameters appear in
 //!   exactly that order, and unknown parameters are dropped.
 //! - EVERYTHING ELSE returns the input unchanged, byte for byte: other
 //!   paths, unparsable input (including a search URL whose query is not
@@ -120,14 +118,11 @@ fn parameter_order_and_unknown_params_share_one_edge_key() {
 
 #[test]
 fn limit_forms_share_the_effective_limit_edge_key() {
-    // Default + clamp group: absent, empty/unparsable, exactly the page
+    // Default + clamp group: absent, exactly the page
     // size and everything above it all serve `limit: 25` — one key.
     assert_group(
         &[
             "https://mb.test/v1/mb/search?q=blue+monday&type=recording",
-            "https://mb.test/v1/mb/search?q=blue+monday&type=recording&limit=",
-            "https://mb.test/v1/mb/search?q=blue+monday&type=recording&limit=abc",
-            "https://mb.test/v1/mb/search?q=blue+monday&type=recording&limit=-5",
             "https://mb.test/v1/mb/search?q=blue+monday&type=recording&limit=25",
             "https://mb.test/v1/mb/search?q=blue+monday&type=recording&limit=26",
             "https://mb.test/v1/mb/search?q=blue+monday&type=recording&limit=1000",
@@ -148,13 +143,11 @@ fn limit_forms_share_the_effective_limit_edge_key() {
 
 #[test]
 fn offset_forms_share_the_effective_offset_edge_key() {
-    // Default group: absent, empty/unparsable, `0` and zero-padded `0`
+    // Default group: absent, `0` and zero-padded `0`
     // all serve the first page.
     assert_group(
         &[
             "https://mb.test/v1/mb/search?q=blue+monday&type=artist&limit=10",
-            "https://mb.test/v1/mb/search?q=blue+monday&type=artist&limit=10&offset=",
-            "https://mb.test/v1/mb/search?q=blue+monday&type=artist&limit=10&offset=abc",
             "https://mb.test/v1/mb/search?q=blue+monday&type=artist&limit=10&offset=0",
             "https://mb.test/v1/mb/search?q=blue+monday&type=artist&limit=10&offset=000",
         ],
@@ -275,6 +268,10 @@ fn unserved_requests_are_returned_unchanged() {
         "https://mb.test/v1/mb/search?q=blue+monday&type=ARTIST".to_string(),
         "https://mb.test/v1/mb/search?q=blue+monday&type=artist&limit=0".to_string(),
         "https://mb.test/v1/mb/search?q=blue+monday&type=artist&limit=00".to_string(),
+        "https://mb.test/v1/mb/search?q=blue+monday&type=artist&limit=".to_string(),
+        "https://mb.test/v1/mb/search?q=blue+monday&type=artist&limit=-5".to_string(),
+        "https://mb.test/v1/mb/search?q=blue+monday&type=artist&offset=abc".to_string(),
+        "https://mb.test/v1/mb/search?q=blue+monday&type=artist&offset=4294967296".to_string(),
         // Above the offset cap the handler serves a synthetic empty page
         // that never touches KV; keying it on a capped offset would
         // serve a real page's body for the wrong offset (and vice versa).

@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+from golden import read_tsv, validate_match_query
 
 PSQL = shlex.split(os.environ.get("PSQL", "docker exec -i mbpg psql -U postgres")) + [
     "-v", "ON_ERROR_STOP=1", "-X", "-q",
@@ -48,7 +51,7 @@ def psql(sql: str, *, stdin=None, extra=()) -> str:
 
 
 def copy_in(table: str, path: Path) -> None:
-    decompress = ["gzip", "-dc", str(path)] if path.suffix == ".gz" else ["cat", str(path)]
+    decompress = (["gzip", "-dc"] if path.suffix == ".gz" else ["cat"]) + ["--", str(path)]
     with subprocess.Popen(decompress, stdout=subprocess.PIPE) as source:
         psql(f"COPY {table} FROM STDIN", stdin=source.stdout)
         if source.wait() != 0:
@@ -79,7 +82,7 @@ def load(directory: Path) -> None:
 
 
 def literal(text: str) -> str:
-    return "'" + text.replace("'", "''") + "'"
+    return "E'" + text.replace("\\", "\\\\").replace("'", "''") + "'"
 
 
 def normalize_query(raw: str) -> str:
@@ -89,8 +92,9 @@ def normalize_query(raw: str) -> str:
 def search(golden: Path, out: Path) -> None:
     lines = ["\\timing on", "\\pset format unaligned", "\\pset tuples_only on",
              f"PREPARE s(text) AS SELECT row_to_json(hit) FROM ({RELEASE_SEARCH_SQL}) hit;"]
-    for row in golden.read_text(encoding="utf-8").splitlines():
-        cols = row.split("\t")
+    for cols in read_tsv(golden):
+        if len(cols) < 2 or not re.fullmatch(r"[a-zA-Z0-9_-]+", cols[0]) or validate_match_query(cols[1]) is None:
+            raise SystemExit("pg_baseline: invalid golden query row")
         lines.append(f"\\echo @@{cols[0]}")
         lines.append(f"EXECUTE s({literal(normalize_query(cols[1]))});")
     script = "\n".join(lines) + "\n"
@@ -98,7 +102,7 @@ def search(golden: Path, out: Path) -> None:
                             capture_output=True, text=True)
     current, rank = None, 0
     with out.open("w", encoding="utf-8") as target:
-        for line in result.stdout.splitlines():
+        for line in result.stdout.split("\n"):
             if line.startswith("@@"):
                 current, rank = line[2:], 0
             elif line.startswith("Time: ") and current is not None:

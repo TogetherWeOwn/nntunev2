@@ -716,6 +716,16 @@ fn cache_miss_reads_repo_and_caches_fresh_success() {
 }
 
 #[test]
+fn mismatched_repository_entity_is_never_served_or_cached() {
+    let cache = SeededCache::empty();
+    let repo = FakeRepo::found(fresh_entity(Kind::Recording));
+    let resp = run_lookup(Kind::Release, MBID, &repo, &cache);
+    assert_eq!(resp.status, 500);
+    assert_eq!(resp.cache_ttl, None);
+    assert!(cache.puts.borrow().is_empty());
+}
+
+#[test]
 fn uncached_missing_row_is_404_without_put() {
     let repo = FakeRepo::missing();
     let cache = SeededCache::empty();

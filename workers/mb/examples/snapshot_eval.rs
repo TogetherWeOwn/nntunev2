@@ -14,7 +14,7 @@
 //! MBID (the input is sampled from the same dump, so every one must hit).
 
 use nntune_mb::snapshot::{RangeSource, SnapshotRepo};
-use nntune_mb::{Kind, MbRepo, RepoError, RepoStage};
+use nntune_mb::{Kind, MbRepo, RepoError, RepoStage, MAX_QUERY_CHARS};
 use std::future::Future;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -67,11 +67,10 @@ fn block_on<F: Future>(future: F) -> F::Output {
 /// The HTTP layer's search normalization (trim, lowercase, collapse runs
 /// of whitespace) — the repository receives this form.
 fn normalize_query(raw: &str) -> String {
-    raw.trim()
-        .to_lowercase()
-        .split_whitespace()
+    raw.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+        .to_lowercase()
 }
 
 fn clean(field: &str) -> String {
@@ -79,7 +78,7 @@ fn clean(field: &str) -> String {
 }
 
 fn validate_lookup_sample(found: u64, missing: u64) -> Result<(), String> {
-    if found + missing == 0 {
+    if found == 0 && missing == 0 {
         return Err("no nonblank sampled MBIDs".to_owned());
     }
     if missing > 0 {
@@ -88,22 +87,28 @@ fn validate_lookup_sample(found: u64, missing: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn run(args: &[String]) -> Result<(), String> {
+fn run(args: &[String], stdin: impl BufRead) -> Result<(), String> {
     let usage = "usage: snapshot_eval <search <dir>|lookup <dir> <kind>>";
     let mode = args.get(1).ok_or(usage)?;
     let dir = PathBuf::from(args.get(2).ok_or(usage)?);
     let repo = SnapshotRepo::new(DirSource { dir }, "");
-    let stdin = std::io::stdin();
     let mut stdout = std::io::BufWriter::new(std::io::stdout());
     match mode.as_str() {
-        "search" => {
+        "search" if args.len() == 3 => {
             let mut queries = 0u64;
-            for line in stdin.lock().lines() {
+            for line in stdin.lines() {
                 let line = line.map_err(|e| e.to_string())?;
                 let mut cols = line.split('\t');
                 let (Some(id), Some(q)) = (cols.next(), cols.next()) else {
-                    continue;
+                    return Err(format!("query row {} is missing a TSV column", queries + 1));
                 };
+                let q = q.trim();
+                if id.is_empty()
+                    || !(2..=MAX_QUERY_CHARS).contains(&q.chars().count())
+                    || q.chars().any(char::is_control)
+                {
+                    return Err(format!("invalid search input at row {}", queries + 1));
+                }
                 queries += 1;
                 let hits = block_on(repo.search(Kind::Release, &normalize_query(q), 5, 0))
                     .map_err(|e| format!("query {id}: repository failure {:?}", e.stage()))?;
@@ -120,12 +125,15 @@ fn run(args: &[String]) -> Result<(), String> {
                     .map_err(|e| e.to_string())?;
                 }
             }
+            if queries == 0 {
+                return Err("no search queries".to_owned());
+            }
             eprintln!("snapshot_eval: {queries} queries");
         }
-        "lookup" => {
+        "lookup" if args.len() == 4 => {
             let kind = Kind::parse(args.get(3).cloned()).ok_or(usage)?;
             let (mut found, mut missing) = (0u64, 0u64);
-            for line in stdin.lock().lines() {
+            for line in stdin.lines() {
                 let mbid = line.map_err(|e| e.to_string())?;
                 let mbid = mbid.trim();
                 if mbid.is_empty() {
@@ -149,6 +157,14 @@ fn run(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn malformed_or_empty_search_input_is_rejected() {
+        let args = ["snapshot_eval", "search", "unused"].map(str::to_owned);
+        for input in ["", "missing column\n", "\tvalid query\n", "1\t \n"] {
+            assert!(super::run(&args, input.as_bytes()).is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
     fn empty_lookup_sample_is_not_success() {
         assert!(super::validate_lookup_sample(0, 0).is_err());
         assert!(super::validate_lookup_sample(0, 1).is_err());
@@ -159,7 +175,7 @@ mod tests {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if let Err(err) = run(&args) {
+    if let Err(err) = run(&args, std::io::stdin().lock()) {
         eprintln!("snapshot_eval: {err}");
         std::process::exit(1);
     }

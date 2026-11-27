@@ -14,6 +14,7 @@ and `recording.txt` (one MBID per line).
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -27,7 +28,15 @@ from pathlib import Path
 
 REQUESTS = 1000
 CONCURRENCY = 50
-TIMING = re.compile(r'snapshot;dur=([0-9.]+);desc="reads=([0-9]+)"')
+TIMING = re.compile(r'snapshot;dur=([0-9]{1,16}(?:\.[0-9]+)?);desc="reads=([0-9]{1,16})"')
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect())
 
 
 def fetch(url: str, token: str) -> dict:
@@ -37,13 +46,13 @@ def fetch(url: str, token: str) -> dict:
     })
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with OPENER.open(request, timeout=30) as response:
             response.read()
             status, timing = response.status, response.headers.get("server-timing", "")
     except urllib.error.HTTPError as err:
-        err.read()
-        status, timing = err.code, err.headers.get("server-timing", "")
-    except Exception:  # noqa: BLE001 - a transport failure is a data point
+        with err:
+            status, timing = err.code, err.headers.get("server-timing", "")
+    except (OSError, http.client.HTTPException):
         status, timing = 0, ""
     elapsed = (time.perf_counter() - started) * 1000
     match = TIMING.search(timing or "")

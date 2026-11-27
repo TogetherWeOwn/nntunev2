@@ -111,8 +111,8 @@ pub const MAX_PAGE_SIZE: usize = 25;
 /// part of the documented contract in `README.md`.
 pub const MAX_SEARCH_OFFSET: u32 = 1_000;
 
-/// Upper bound on `q` length, in chars. Bounds trigram work and KV keys.
-const MAX_QUERY_CHARS: usize = 100;
+/// Upper bound on trimmed `q` length, in chars. Bounds trigram work and KV keys.
+pub const MAX_QUERY_CHARS: usize = 100;
 
 /// Hyperdrive / KV binding names: must match `wrangler.toml`.
 const MB_DB_BINDING: &str = "MB_DB";
@@ -425,6 +425,22 @@ fn form_encode_component(value: &str) -> String {
     out
 }
 
+fn search_pagination(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<(Option<u32>, Option<u32>), ApiError> {
+    let parse = |key, message| {
+        params
+            .get(key)
+            .map(|raw| raw.parse::<u32>())
+            .transpose()
+            .map_err(|_| ApiError::invalid_request(message))
+    };
+    Ok((
+        parse("limit", "limit must be an unsigned 32-bit integer")?,
+        parse("offset", "offset must be an unsigned 32-bit integer")?,
+    ))
+}
+
 /// Canonical edge-cache key for a request URL.
 ///
 /// A served search (path exactly `/v1/mb/search` with handler-valid
@@ -508,26 +524,16 @@ pub fn canonical_edge_url(url: &str) -> String {
     if kind_str != "artist" && kind_str != "release" && kind_str != "recording" {
         return url.to_string();
     }
-    let effective_limit = match params.get("limit") {
-        None => MAX_PAGE_SIZE as u32,
-        Some(spelling) => match spelling.parse::<u32>() {
-            Ok(0) => return url.to_string(),
-            Ok(n) => n.min(MAX_PAGE_SIZE as u32),
-            Err(_) => MAX_PAGE_SIZE as u32,
-        },
+    let Ok((limit, offset)) = search_pagination(&params) else {
+        return url.to_string();
     };
-    let effective_offset = match params.get("offset") {
-        None => 0,
-        Some(spelling) => match spelling.parse::<u32>() {
-            Ok(n) => {
-                if n > MAX_SEARCH_OFFSET {
-                    return url.to_string();
-                }
-                n
-            }
-            Err(_) => 0,
-        },
-    };
+    let effective_limit = limit
+        .unwrap_or(MAX_PAGE_SIZE as u32)
+        .min(MAX_PAGE_SIZE as u32);
+    let effective_offset = offset.unwrap_or(0);
+    if effective_limit == 0 || effective_offset > MAX_SEARCH_OFFSET {
+        return url.to_string();
+    }
     let normalized_q = normalize_query(raw_q);
     format!(
         "{}://{}/v1/mb/search?q={}&type={}&limit={}&offset={}",
@@ -619,10 +625,10 @@ fn number_fits_i32(n: &serde_json::Number) -> bool {
 /// or mistyped fields) is a miss so the poisoned entry is overwritten by
 /// the success-only cache path.
 fn cached_lookup_body_is_fresh_shape(kind: Kind, mbid: &str, body: &str) -> bool {
-    let value: serde_json::Value = match serde_json::from_str(body) {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
+    serde_json::from_str(body).is_ok_and(|value| lookup_value_has_fresh_shape(kind, mbid, &value))
+}
+
+fn lookup_value_has_fresh_shape(kind: Kind, mbid: &str, value: &serde_json::Value) -> bool {
     let obj = match value.as_object() {
         Some(obj) => obj,
         None => return false,
@@ -632,8 +638,7 @@ fn cached_lookup_body_is_fresh_shape(kind: Kind, mbid: &str, body: &str) -> bool
         _ => return false,
     }
     match obj.get("mbid") {
-        Some(serde_json::Value::String(cached)) if cached.to_lowercase() == mbid.to_lowercase() => {
-        }
+        Some(serde_json::Value::String(cached)) if cached.eq_ignore_ascii_case(mbid) => {}
         _ => return false,
     }
     fn required_str(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
@@ -728,20 +733,20 @@ pub enum Entity {
 }
 
 impl Entity {
-    fn to_json(&self, kind: Kind) -> serde_json::Value {
-        let mut value = match self {
-            Entity::Artist(a) => serde_json::to_value(a),
-            Entity::Release(r) => serde_json::to_value(r),
-            Entity::Recording(r) => serde_json::to_value(r),
-        }
-        .unwrap_or(serde_json::Value::Null);
+    fn to_json(&self) -> serde_json::Result<serde_json::Value> {
+        let (kind, value) = match self {
+            Entity::Artist(a) => (Kind::Artist, serde_json::to_value(a)),
+            Entity::Release(r) => (Kind::Release, serde_json::to_value(r)),
+            Entity::Recording(r) => (Kind::Recording, serde_json::to_value(r)),
+        };
+        let mut value = value?;
         if let serde_json::Value::Object(map) = &mut value {
             map.insert(
                 "kind".to_string(),
                 serde_json::Value::String(kind.as_str().to_string()),
             );
         }
-        value
+        Ok(value)
     }
 }
 
@@ -1171,7 +1176,13 @@ pub async fn handle_lookup<R: MbRepo, C: SuccessCache>(
     }
     match repo.lookup(kind, &mbid.to_lowercase()).await {
         Ok(Some(entity)) => {
-            let body = entity.to_json(kind).to_string();
+            let Ok(value) = entity.to_json() else {
+                return error_response(ApiError::internal_error());
+            };
+            if !lookup_value_has_fresh_shape(kind, mbid, &value) {
+                return error_response(ApiError::internal_error());
+            }
+            let body = value.to_string();
             cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
             success_response(body, LOOKUP_CACHE_TTL_S)
         }
@@ -1795,8 +1806,8 @@ fn is_valid_cached_search(
 /// Search core: validate → bound → KV → DB serving `GET /v1/mb/search` with
 /// `limit`/`offset`. `limit`: `None` defaults to
 /// [`MAX_PAGE_SIZE`]; `Some(0)` is a 400; `1..=MAX_PAGE_SIZE` is honored;
-/// anything above is clamped, never rejected. `offset`: `None` (and, at the
-/// HTTP layer, unparsable) defaults to `0`; `0..=MAX_SEARCH_OFFSET` queries
+/// anything above is clamped, never rejected. `offset`: `None` defaults
+/// to `0`; `0..=MAX_SEARCH_OFFSET` queries
 /// as before; anything above short-circuits to a 200 with `"results": []`
 /// (effective `limit`/`offset` echoed) BEFORE the KV lookup and the repo
 /// call, so no cache key is minted and no `OFFSET` scan runs. Past the end
@@ -2806,9 +2817,27 @@ mod http_layer {
         let url = req.url()?;
         let query: std::collections::HashMap<String, String> =
             url.query_pairs().into_owned().collect();
-        let limit = query.get("limit").and_then(|v| v.parse::<u32>().ok());
-        let offset = query.get("offset").and_then(|v| v.parse::<u32>().ok());
         let raw_q = query.get("q").map(String::as_str).unwrap_or("");
+        let log_outcome = |status| {
+            emit(
+                outcome_level(status),
+                &trace_id,
+                "mb.search.completed",
+                serde_json::json!({"kind": kind_label(&query), "status_code": status, "build_sha": build_sha}),
+            );
+        };
+        let (limit, offset) = match search_pagination(&query) {
+            Ok(page) => page,
+            Err(err) => {
+                let api = if raw_q.trim().is_empty() {
+                    empty_query_response()
+                } else {
+                    error_response(err)
+                };
+                log_outcome(api.status);
+                return serve(url.to_string(), api, &trace_id).await;
+            }
+        };
         if let Some(hit) = edge_hit(req, |body| {
             let Some(kind) = Kind::parse(query.get("type").cloned()) else {
                 return false;
@@ -2848,9 +2877,6 @@ mod http_layer {
             trace_id: trace_id.clone(),
         };
         let cache = EdgeCache::from_env(&ctx.env);
-        // Unparsable `limit`/`offset` fall back to the defaults (`None`):
-        // a full first page. An explicit `limit=0` still reaches the handler
-        // as `Some(0)` and is rejected there, never silently defaulted.
         let api = handle_search_paged(
             &repo,
             &cache,
@@ -2862,12 +2888,7 @@ mod http_layer {
         .await;
         // The raw query text never logs (free-form user input); the line
         // carries the parsed kind plus the outcome status only.
-        emit(
-            outcome_level(api.status),
-            &trace_id,
-            "mb.search.completed",
-            serde_json::json!({"kind": kind_label(&query), "status_code": api.status, "build_sha": build_sha}),
-        );
+        log_outcome(api.status);
         serve(url.to_string(), api, &trace_id).await
     }
 

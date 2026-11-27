@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import random
+import re
 import sys
 import unicodedata
 from collections import defaultdict
@@ -36,26 +37,25 @@ from pathlib import Path
 NULL = r"\N"
 FILE_TYPES = {"flac", "mp3", "ogg", "opus", "m4a", "wav", "rar", "zip", "7z", "par2", "nfo"}
 VARIANTS = ("plain", "scene", "underscore", "upper")
+COPY_ESCAPE = re.compile(rb"\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|.)", re.DOTALL)
+COPY_SIMPLE = dict(zip(b"bfnrtv", (b"\b", b"\f", b"\n", b"\r", b"\t", b"\v")))
 
 
 def copy_text(field: str) -> str | None:
-    """PostgreSQL COPY text decoding for the few escapes names carry."""
+    """Decode PostgreSQL COPY text escapes bytewise before validating UTF-8."""
     if field == NULL:
         return None
     if "\\" not in field:
         return field
-    out, i = [], 0
-    simple = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "\\": "\\"}
-    while i < len(field):
-        ch = field[i]
-        if ch != "\\" or i + 1 == len(field):
-            out.append(ch)
-            i += 1
-            continue
-        nxt = field[i + 1]
-        out.append(simple.get(nxt, nxt))
-        i += 2
-    return "".join(out)
+    def decode(match: re.Match[bytes]) -> bytes:
+        escape = match[1]
+        if escape[:1] in b"01234567":
+            return bytes([int(escape, 8) & 0xff])
+        if escape.startswith(b"x") and len(escape) > 1:
+            return bytes([int(escape[1:], 16)])
+        return COPY_SIMPLE.get(escape[0], escape)
+
+    return COPY_ESCAPE.sub(decode, field.encode("utf-8")).decode("utf-8")
 
 
 def normalize_match_text(raw: str) -> str:
@@ -191,7 +191,7 @@ def read_tsv(path: Path):
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8", newline="") as source:
         for line in source:
-            yield line.rstrip("\n").split("\t")
+            yield line.rstrip("\r\n").split("\t")
 
 
 def curated(directory: Path, table: str) -> Path:

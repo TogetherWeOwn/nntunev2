@@ -20,9 +20,10 @@
 //!      honored; anything above is **clamped** to `MAX_PAGE_SIZE`, never
 //!      rejected. The effective value is echoed as the numeric `limit` field
 //!      in the success body.
-//!    - `offset`: `None`/unparsable defaults to `0`; an offset past the end
+//!    - `offset`: `None` defaults to `0`; an offset past the end
 //!      of the result set is a 200 with `"results": []`, never an error and
 //!      never a scan. The effective value is echoed as `offset`.
+//!    - The HTTP route rejects malformed and overflowing page parameters.
 //!    - Success body: `{"q", "type", "limit", "offset", "results"}` — the
 //!      existing `q` (normalized)/`type`/`results` keys plus the echoes.
 //! 3. `MbRepo::search` gains the page: `async fn search(&self, kind: Kind,
@@ -161,6 +162,17 @@ fn result_mbids(body: &serde_json::Value) -> Vec<String> {
         .iter()
         .map(|row| row["mbid"].as_str().unwrap().to_string())
         .collect()
+}
+
+#[test]
+fn malformed_pagination_coordinates_are_client_errors() {
+    for key in ["limit", "offset"] {
+        for raw in ["", "-1", "invalid", "4294967296"] {
+            let params = [(key.to_owned(), raw.to_owned())].into();
+            let error = super::search_pagination(&params).unwrap_err();
+            assert_eq!(error.status, 400, "{key}={raw}");
+        }
+    }
 }
 
 #[test]

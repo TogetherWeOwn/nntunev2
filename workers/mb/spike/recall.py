@@ -14,22 +14,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 
 from golden import query_group, read_tsv
 
 
-def load_hits(path: Path) -> tuple[dict[str, list[str]], list[float]]:
+def load_hits(path: Path, query_ids: set[str] | None = None, *, baseline=False) -> tuple[dict[str, list[str]], list[float]]:
     hits: dict[str, list[str]] = defaultdict(list)
     timings: list[float] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        cols = line.split("\t")
+    timed = set()
+    for cols in read_tsv(path):
+        if len(cols) < 3 or not cols[0] or (query_ids is not None and cols[0] not in query_ids):
+            raise SystemExit(f"recall: invalid hit row in {path}")
+        qid = cols[0]
         if cols[1] == "0":
-            timings.append(float(cols[5]))
+            ms = float(cols[5]) if len(cols) == 6 else math.nan
+            if qid in timed or not math.isfinite(ms) or ms < 0 or (query_ids is not None and not baseline):
+                raise SystemExit(f"recall: invalid timing row in {path}")
+            timed.add(qid)
+            timings.append(ms)
             continue
-        if int(cols[1]) <= 5:
-            hits[cols[0]].append(cols[2])
+        if qid in timed or cols[1] != str(len(hits[qid]) + 1) or len(hits[qid]) == 5 or not cols[2]:
+            raise SystemExit(f"recall: invalid hit rank or identity in {path}")
+        hits[qid].append(cols[2])
+    if baseline and timed != query_ids:
+        raise SystemExit("recall: baseline timing rows do not cover the golden set")
     return hits, timings
 
 
@@ -49,15 +60,20 @@ def main() -> int:
     parser.add_argument("--exclude", type=Path, action="append", default=[],
                         help="Refuse gate evidence if a query group occurs in this prior TSV (repeatable)")
     args = parser.parse_args()
-    golden = [line.split("\t") for line in args.golden.read_text(encoding="utf-8").splitlines()]
+    golden = list(read_tsv(args.golden))
     if not golden:
         raise SystemExit("recall: empty golden set is not gate evidence")
+    if any(len(row) != 5 or not all(row) or not all(row[4].split(",")) for row in golden):
+        raise SystemExit("recall: invalid golden row")
+    query_ids = {row[0] for row in golden}
+    if len(query_ids) != len(golden):
+        raise SystemExit("recall: duplicate golden query ID")
     excluded = {query_group(row[1]) for path in args.exclude for row in read_tsv(path)}
     overlap = {query_group(row[1]) for row in golden} & excluded
     if overlap:
         raise SystemExit(f"recall: {len(overlap)} query groups overlap an excluded set; not gate evidence")
-    pg, pg_ms = load_hits(args.pg_hits)
-    snap, _ = load_hits(args.snapshot_hits)
+    pg, pg_ms = load_hits(args.pg_hits, query_ids, baseline=True)
+    snap, _ = load_hits(args.snapshot_hits, query_ids)
     groups: dict[str, dict[str, list[int]]] = defaultdict(lambda: {"pg": [0, 0], "snapshot": [0, 0]})
     wins, losses = [], []
     for qid, q, variant, stratum, acceptable in golden:

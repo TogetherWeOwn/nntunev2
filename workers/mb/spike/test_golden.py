@@ -52,6 +52,7 @@ class GoldenPortTest(unittest.TestCase):
     def test_copy_text(self):
         self.assertIsNone(golden.copy_text(r"\N"))
         self.assertEqual(golden.copy_text(r"a\tb\\c"), "a\tb\\c")
+        self.assertEqual(golden.copy_text(r"\303\xA9"), "é")
 
 
 class GoldenSamplingTest(unittest.TestCase):
