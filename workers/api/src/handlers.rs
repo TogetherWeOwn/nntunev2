@@ -7638,10 +7638,10 @@ where
     let now = billing_now_i64(ctx.now);
     let outcome = if exact {
         crate::billing_reconcile::reconcile_exact_target(subscription_id, input, &remote, now)
-            .ok_or(())?
     } else {
-        crate::billing_reconcile::reconcile_subscription(&input, &remote, now)
-    };
+        crate::billing_reconcile::reconcile_complete_snapshot(&input, &remote, now)
+    }
+    .ok_or(())?;
     if ctx.cfg.paid_billing_enabled() {
         ctx.store
             .store_paid_reconcile_outcome(user_id, &outcome)

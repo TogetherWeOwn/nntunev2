@@ -7,10 +7,12 @@
 
 pub const CRON: &str = "0 * * * *";
 pub const BATCH_SIZE: i64 = 16;
+// Scheduled events carry integer epoch milliseconds in the JavaScript Date range.
+const MAX_EPOCH_MILLIS: f64 = 8_640_000_000_000_000.0;
 
 /// Accept only the hourly trigger with a usable scheduled timestamp.
 pub fn scheduled_hour(cron: &str, millis: f64) -> Option<i64> {
-    (cron == CRON && millis.is_finite() && millis >= 0.0)
+    (cron == CRON && (0.0..=MAX_EPOCH_MILLIS).contains(&millis) && millis.fract() == 0.0)
         .then(|| (millis / 3_600_000.0).floor() as i64)
 }
 

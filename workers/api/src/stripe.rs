@@ -377,13 +377,6 @@ where
     })
 }
 
-/// Stripe object helper: unknown fields are ignored by default (no
-/// `deny_unknown_fields` anywhere here); every field the worker does not
-/// read is simply absent from the struct.
-fn default_false() -> bool {
-    false
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Customer {
     pub id: String,
@@ -534,13 +527,11 @@ impl Invoice {
 /// `{"object":"list","data":[...],"has_more":...}`. The endpoint never
 /// returns a bare invoice array, so the transport deserializes this
 /// envelope (never `Vec<Invoice>` directly) and follows `has_more` with
-/// `starting_after` until the list is exhausted. Unknown envelope fields
-/// are ignored.
+/// `starting_after` until the list is exhausted. Both fields are required
+/// to distinguish an explicitly exhausted list from a missing page.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct InvoiceList {
-    #[serde(default)]
     pub data: Vec<Invoice>,
-    #[serde(default = "default_false")]
     pub has_more: bool,
 }
 

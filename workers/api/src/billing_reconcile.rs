@@ -29,8 +29,8 @@
 //!   invoices whose lines resolve through `plan_prices` to the subscription
 //!   item's plan, bound to the known customer + subscription + item. Any
 //!   other line (one-off, credit, free-price, unknown price, another plan,
-//!   non-positive amount, open-ended) confers nothing and is skipped for
-//!   coverage; the applied item price itself MUST resolve or the whole
+//!   non-positive amount, open-ended or reversed period) confers nothing
+//!   and is skipped for coverage; the applied item price MUST resolve or the whole
 //!   pass fails closed.
 //! - Only `active` and `past_due` advance. `incomplete`, `unpaid` and
 //!   `paused` are known non-entitling states: recorded verbatim with no
@@ -73,6 +73,8 @@
 //!   collected independently from validated lines across all plans. Anchored on
 //!   `status_transitions.paid_at`; invoices without it are skipped: no
 //!   anchor, no coverage, no history row.
+//! - A missing or unfinished line page on a bound paid invoice makes the
+//!   snapshot retryable before any subscription or history write.
 //!
 //! New purchases disable on fail-closed only (the stored verbatim row is
 //! nonterminal and unresolvable, so the purchase path cannot proceed past
@@ -151,6 +153,8 @@ pub enum FailClosedReason {
     /// The remote status is not a known Checkout-shape state — including
     /// `trialing`, which the reseed card owns elsewhere.
     UnknownStatus,
+    /// A bound paid invoice has missing or unfinished line pagination.
+    IncompleteInvoiceLines,
 }
 
 /// The subscription row to persist (verbatim remote status by design —
@@ -205,7 +209,8 @@ pub struct ReconcileOutcome {
     pub row: ReconciledRow,
     pub history: Vec<PaidInvoiceRow>,
     pub fail_closed: Option<FailClosedReason>,
-    /// Explicit stale proof suppresses the subscription write, not history.
+    /// Explicit stale proof suppresses the subscription write. A refused
+    /// incomplete snapshot also sets this flag and carries no history.
     pub explicit_stale: bool,
     /// The plan the pass read (the stored plan at fold time) and the
     /// anchor it read (the stored anchor at fold time): the write's
@@ -291,6 +296,9 @@ fn qualify_line(
     let period = period?;
     let end = period.end?;
     let start = period.start.unwrap_or(end);
+    if start > end {
+        return None;
+    }
     Some(QualifiedLine { plan, start, end })
 }
 
@@ -307,7 +315,17 @@ pub(crate) fn reconcile_exact_target(
     local.live = local
         .live
         .filter(|row| row.stripe_subscription_id == requested_id);
-    Some(reconcile_subscription(&local, remote, now_unix))
+    reconcile_complete_snapshot(&local, remote, now_unix)
+}
+
+/// Incomplete transport evidence is retryable and must never reach a writer.
+pub(crate) fn reconcile_complete_snapshot(
+    local: &ReconcileInput,
+    remote: &RemoteSubscription,
+    now_unix: i64,
+) -> Option<ReconcileOutcome> {
+    let outcome = reconcile_subscription(local, remote, now_unix);
+    (outcome.fail_closed != Some(FailClosedReason::IncompleteInvoiceLines)).then_some(outcome)
 }
 
 /// Shared by the webhook and API/inline paths: fold one retrieved remote
@@ -329,7 +347,7 @@ pub fn reconcile_subscription(
     }
     // Customer binding: exact once the account holds one; a fresh account
     // adopts the retrieved customer. An unbound remote object is not ours.
-    let Some(remote_customer) = sub.customer.clone() else {
+    let Some(remote_customer) = sub.customer.clone().filter(|id| !id.trim().is_empty()) else {
         return fail_closed(local, sub, None, None, FailClosedReason::CustomerMismatch);
     };
     if let Some(bound) = local.stripe_customer_id.as_deref() {
@@ -337,10 +355,32 @@ pub fn reconcile_subscription(
             return fail_closed(local, sub, None, None, FailClosedReason::CustomerMismatch);
         }
     }
+    let bound_paid = |invoice: &Invoice| {
+        invoice.status == "paid"
+            && invoice.customer.as_deref() == Some(remote_customer.as_str())
+            && invoice.subscription.as_deref() == Some(sub.id.as_str())
+    };
+    if remote.invoices.iter().any(|invoice| {
+        !invoice.livemode
+            && bound_paid(invoice)
+            && invoice.lines.as_ref().is_none_or(|lines| lines.has_more)
+    }) {
+        let mut outcome = fail_closed(
+            local,
+            sub,
+            Some(remote_customer),
+            None,
+            FailClosedReason::IncompleteInvoiceLines,
+        );
+        outcome.explicit_stale = true;
+        return outcome;
+    }
     // Exactly one priced item: zero or several is unresolvable, never
     // first-picked.
     let (item_id, price_id) = match sub.single_item() {
-        Some((item_id, Some(price_id))) => (item_id.to_string(), price_id.to_string()),
+        Some((item_id, Some(price_id))) if !item_id.trim().is_empty() => {
+            (item_id.to_string(), price_id.to_string())
+        }
         _ => {
             return fail_closed(
                 local,
@@ -363,14 +403,24 @@ pub fn reconcile_subscription(
         );
     };
 
+    let anchor_invoice_in_snapshot = |anchor: &str| {
+        remote.invoices.iter().find(|invoice| {
+            invoice.id == anchor
+                && !invoice.livemode
+                && bound_paid(invoice)
+                && invoice.paid_at().is_some()
+        })
+    };
+
     let status = sub.status.as_str();
     let previous = local.live.as_ref();
     if is_terminal_status(status) || is_held_status(status) {
         if let Some(kept) = previous.filter(|row| {
             row.stripe_subscription_id == sub.id
-                && row.paid_invoice_id.as_ref().is_some_and(|anchor| {
-                    !remote.invoices.iter().any(|invoice| &invoice.id == anchor)
-                })
+                && row
+                    .paid_invoice_id
+                    .as_ref()
+                    .is_some_and(|anchor| anchor_invoice_in_snapshot(anchor).is_none())
         }) {
             // The exhausted listing proves staleness even without folding
             // money. Do not re-pin an equal-end anchor: the write must still
@@ -451,8 +501,8 @@ pub fn reconcile_subscription(
     }
 
     // Advance path (`active` / `past_due`): fold every bound paid invoice.
-    // A live or misbound invoice fails the pass; a merely unhelpful one
-    // (wrong sub, unpaid, unanchored, no qualifying line) is skipped.
+    // A live invoice fails the pass. Foreign, unpaid and unanchored
+    // invoices and invoices with no qualifying line are skipped.
     //
     // Coverage advances ONLY from lines resolving to the subscription
     // item's plan; history rows cover every confirmed paid service invoice
@@ -475,12 +525,7 @@ pub fn reconcile_subscription(
                 FailClosedReason::WrongLivemode,
             );
         }
-        if invoice.status != "paid" {
-            continue;
-        }
-        if invoice.customer.as_deref() != Some(remote_customer.as_str())
-            || invoice.subscription.as_deref() != Some(sub.id.as_str())
-        {
+        if !bound_paid(invoice) || invoice.id.trim().is_empty() {
             continue;
         }
         let Some(paid_at) = invoice.paid_at() else {
@@ -493,8 +538,6 @@ pub fn reconcile_subscription(
             continue;
         };
         let exact_coverage = invoice.amount_paid > 0
-            && !invoice.id.trim().is_empty()
-            && !lines.has_more
             && currency.len() == 3
             && currency.bytes().all(|b| b.is_ascii_lowercase());
         let mut covered_periods = Vec::new();
@@ -601,7 +644,7 @@ pub fn reconcile_subscription(
     // write (the guard keeps the greatest confirmed end), and the
     // retained plan/anchor are kept with it there.
     let stale = match stored_anchor {
-        Some(ref anchor) => !remote.invoices.iter().any(|inv| &inv.id == anchor),
+        Some(ref anchor) => anchor_invoice_in_snapshot(anchor).is_none(),
         None => matches!((new_end, previous_end), (Some(end), Some(prev)) if end < prev),
     };
     if stale {
@@ -625,13 +668,10 @@ pub fn reconcile_subscription(
     // older is unreachable here (stale returns above).
     let recovered = new_end.is_some_and(|end| previous_end.is_none_or(|prev| end > prev));
     let tied = !recovered && new_end.is_some() && new_end == previous_end;
-    let stored_anchor_paid_at = stored_anchor.as_deref().and_then(|anchor| {
-        remote
-            .invoices
-            .iter()
-            .find(|inv| inv.id == anchor)
-            .and_then(|inv| inv.paid_at())
-    });
+    let stored_anchor_paid_at = stored_anchor
+        .as_deref()
+        .and_then(anchor_invoice_in_snapshot)
+        .and_then(Invoice::paid_at);
     let relabels = tied
         && anchor_invoice.is_some()
         && match (&stored_anchor, anchor_paid_at, stored_anchor_paid_at) {
@@ -1898,6 +1938,9 @@ mod tests {
             );
             if matches!(case, "customer" | "subscription") {
                 assert!(outcome.history.is_empty(), "{case}");
+            }
+            if case == "partial" {
+                assert!(reconcile_complete_snapshot(&fresh(), &remote, NOW).is_none());
             }
         }
     }
