@@ -93,6 +93,25 @@ pub fn retry_delay_secs(attempt: u32) -> u32 {
     (payload_retry_delay_ms(retry_index) / 1000) as u32
 }
 
+/// Parse a delta-seconds header without letting integer overflow shorten
+/// the delay. A malformed header falls back to the caller's default.
+pub(crate) fn pool_retry_after(header: Option<&str>, default: u32, cap: u32) -> u32 {
+    let Some(digits) = header.map(|value| value.trim_matches([' ', '\t'])) else {
+        return default;
+    };
+    if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+        return default;
+    }
+    digits
+        .bytes()
+        .fold(0u32, |seconds, digit| {
+            seconds
+                .saturating_mul(10)
+                .saturating_add(u32::from(digit - b'0'))
+        })
+        .clamp(1, cap)
+}
+
 /// Character limit for untrusted failure detail stored in the DLQ.
 pub const MAX_DLQ_DETAIL_CHARS: usize = 512;
 
@@ -286,10 +305,9 @@ pub fn decide_checkpoint(
         // the budget ceiling, where a genuine transient failure would.
         // Checked after the permanent arm, so a hand-built permanent
         // error can never smuggle itself into a continuation. A corrupt
-        // attempt 0 still quarantines (it would loop with no accountable
-        // delivery count).
+        // attempt outside the delivery budget still quarantines.
         Err(e) if e.made_progress => {
-            if cp.attempt == 0 {
+            if !(1..=MAX_ATTEMPTS).contains(&cp.attempt) {
                 fail_checkpoint(cp, e.code, &e.detail);
                 Disposition::Quarantine(Box::new(quarantine(msg, cp.attempt, &e)))
             } else {
