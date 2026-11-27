@@ -7,6 +7,18 @@ use crate::value::Value;
 mod album_list;
 mod search;
 
+const MAX_PAGE_SIZE: usize = 500;
+// Match the staging mirror's 1,024-row snapshot ceiling.
+const MAX_PAGE_OFFSET: usize = 1_024;
+const MAX_LOOKUP_ID_BYTES: usize = 1_024;
+
+fn page_param(params: &Params, key: &str, default: usize, max: usize) -> Option<usize> {
+    match params.get(key) {
+        Some(value) => value.parse::<usize>().ok().filter(|&n| n <= max),
+        None => Some(default),
+    }
+}
+
 #[cfg(any(test, feature = "ledger-wasm-test"))]
 pub use album_list::album_list_boundaries;
 #[cfg(any(test, feature = "ledger-wasm-test"))]
@@ -66,7 +78,10 @@ impl<'a> MemberBrowse<'a> {
             "getAlbumList" | "getAlbumList2" => self.album_list_document(budget, name, params)?,
             "search2" | "search3" => self.search_document(budget, name, params)?,
             _ => {
-                let Some(id) = params.get("id").filter(|id| !id.is_empty()) else {
+                let Some(id) = params.get("id").filter(|id| {
+                    (1..=MAX_LOOKUP_ID_BYTES).contains(&id.len())
+                        && !id.chars().any(char::is_control)
+                }) else {
                     return charged_error_document(
                         budget,
                         code::REQUIRED_PARAM_MISSING,
@@ -77,9 +92,7 @@ impl<'a> MemberBrowse<'a> {
                 let album = || self.albums.iter().find(|album| album.id == id);
                 let artist = || self.artists.iter().find(|artist| artist.id == id);
                 match name {
-                    "getSong" => match resolve_song(id).filter(|&song| {
-                        song.id == id && self.songs.iter().any(|row| std::ptr::eq(row, song))
-                    }) {
+                    "getSong" => match self.unique_song(id, resolve_song) {
                         Some(song) => {
                             let item = song_item(budget, song)?;
                             charged_ok_document(budget, [("song", item)])?
@@ -150,6 +163,19 @@ impl<'a> MemberBrowse<'a> {
             }
         };
         Ok(Some(doc))
+    }
+
+    fn unique_song(
+        &self,
+        id: &str,
+        resolve_song: impl FnOnce(&str) -> Option<&'a Song>,
+    ) -> Option<&'a Song> {
+        let mut matches = self.songs.iter().filter(|song| song.id == id);
+        let row = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        resolve_song(id).filter(|&song| std::ptr::eq(row, song))
     }
 
     fn songs_for(&self, album: &'a Album) -> impl Iterator<Item = &'a Song> + Clone {

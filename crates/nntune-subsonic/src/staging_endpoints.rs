@@ -1,8 +1,11 @@
 //! Charged endpoint documents for the unmounted staging adapter.
 
 use crate::construction_budget::{BudgetExceeded, ConstructionBudget};
-use crate::envelope::charged_ok_document;
+use crate::envelope::{charged_error_document, charged_ok_document, code};
 use crate::value::Value;
+
+// Match the staging account projection's octet limit.
+const MAX_LICENSE_EMAIL_BYTES: usize = 1_024;
 
 /// Construct a document for an already-authenticated request. The caller
 /// admits the account email before dispatch. These endpoints do not read the
@@ -14,6 +17,9 @@ pub fn basic_document(
 ) -> Result<Option<Value>, BudgetExceeded> {
     let document = match name {
         "ping" => charged_ok_document(budget, [])?,
+        "getLicense" if !valid_license_email(email) => {
+            charged_error_document(budget, code::GENERIC, "License unavailable.")?
+        }
         "getLicense" => {
             let email = Value::charged_str(budget, email)?;
             let license =
@@ -33,6 +39,14 @@ pub fn basic_document(
         _ => return Ok(None),
     };
     Ok(Some(document))
+}
+
+fn valid_license_email(email: &str) -> bool {
+    (1..=MAX_LICENSE_EMAIL_BYTES).contains(&email.len())
+        && !email.trim().is_empty()
+        && !email
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '\u{fffe}' | '\u{ffff}'))
 }
 
 #[cfg(any(test, feature = "ledger-wasm-test"))]
