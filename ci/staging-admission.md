@@ -282,6 +282,12 @@ also calls for separate checks of ledger-based cohort revocation, refused and
 pre-revoked invites, and the absence of cohort payment history and Stripe
 credentials.
 
+The bounded offline slice for rank 113 is mapped in
+[`docs/ops/private-staging-evidence-map.md`](../docs/ops/private-staging-evidence-map.md).
+It names the synthetic encrypted-upload, Library, playback, and refusal
+observations and records which exact-build and encrypted-storage claims remain
+for the protected staging owner.
+
 Each applicable criterion requires the `private-music` class and the case name
 below. These are the assertions the bounded reporter must use for each case.
 
