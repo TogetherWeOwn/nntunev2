@@ -13,6 +13,12 @@ export function createFavoritesExport(options: {
 	const download = createM3UDownload();
 	const unsafeId = 'Could not export favorites: a favorite has an unsafe track id.';
 
+	function snapshotForExport(): QueueState {
+		const snapshot = options.snapshot();
+		if (snapshot.tracks.some((track) => typeof track.id !== 'string')) throw new Error(unsafeId);
+		return snapshot;
+	}
+
 	function clear(): void {
 		generation += 1;
 		options.clearFeedback();
@@ -22,10 +28,10 @@ export function createFavoritesExport(options: {
 		clear();
 		const capturedGeneration = generation;
 		if (!alive || options.isEmpty()) return;
-		const snapshot = options.snapshot();
 		const key = options.currentKey();
 		let text: string;
 		try {
+			const snapshot = snapshotForExport();
 			// The text formatter alone does not validate track IDs.
 			formatQueueM3U(snapshot);
 			text = formatQueueText(snapshot);
@@ -51,7 +57,7 @@ export function createFavoritesExport(options: {
 		const key = options.currentKey();
 		let m3u: string;
 		try {
-			m3u = formatQueueM3U(options.snapshot());
+			m3u = formatQueueM3U(snapshotForExport());
 		} catch {
 			options.setFeedback(key, unsafeId);
 			return;

@@ -5,6 +5,7 @@ export function selectedRowRecoveryIds(
 ): { nextId: string | null; previousId: string | null } {
 	const removedIndex = displayedIds.indexOf(removedId);
 	const survivors = new Set(selectedIds);
+	survivors.delete(removedId);
 	return {
 		nextId: removedIndex < 0
 			? null

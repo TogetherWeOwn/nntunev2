@@ -49,6 +49,17 @@ async function loadOne<T>(read: () => Promise<T>): Promise<LoadOutcome<T>> {
 	}
 }
 
+function assertSubscriptionState(subscription: SubscriptionDTO): void {
+	const { state, planId, status, currentPeriodEnd, graceUntil, cancelAtPeriodEnd } = subscription;
+	const noRow = planId === null && status === null && currentPeriodEnd === null &&
+		graceUntil == null && !cancelAtPeriodEnd;
+	const hasRow = planId !== null && status !== null;
+	const consistent = state === 'active'
+		? hasRow && (status === 'active' || status === 'past_due')
+		: noRow || (state === 'lapsed' && hasRow);
+	if (!consistent) throw new Error('Inconsistent subscription state');
+}
+
 /**
  * Billing page loader over the api worker's billing/usage endpoints.
  *
@@ -85,7 +96,11 @@ export const load: PageLoad = async ({ fetch }) => {
 	// Independent reads share one deadline window; loadOne keeps failures isolated.
 	const sent = owner && await owner.run(() => ({
 		reads: Promise.all([
-			loadOne(() => fetchSubscription(fetch, owner)),
+			loadOne(async () => {
+				const subscription = await fetchSubscription(fetch, owner);
+				assertSubscriptionState(subscription);
+				return subscription;
+			}),
 			loadOne(() => fetchUsage(fetch, owner))
 		] as const)
 	}));
@@ -99,8 +114,10 @@ export const load: PageLoad = async ({ fetch }) => {
 	// the notice with a Retry. A 404 on usage stays non-fatal: a fresh
 	// account may genuinely have nothing metered yet, and the meters
 	// simply don't render.
-	const subscription: SubscriptionDTO | null = sub.value;
-	const usage: UsageDTO | null = use.status === 404 ? null : use.value;
+	const signedOut = sub.status === 401 || use.status === 401;
+	// The requests run concurrently. A denial invalidates the other result too.
+	const subscription: SubscriptionDTO | null = signedOut ? null : sub.value;
+	const usage: UsageDTO | null = signedOut ? null : use.value;
 	// Limit statuses are already surfaced by the global paywall listener; do
 	// not stack a generic billing-outage notice beside it. A 429 still needs
 	// the page Retry control once its countdown allows another attempt.
@@ -108,7 +125,6 @@ export const load: PageLoad = async ({ fetch }) => {
 	const retryableLimit = sub.status === 429 || use.status === 429;
 	const subFailed = sub.failed && !isLimitStatus(sub.status);
 	const usageFailed = use.failed && use.status !== 404 && !isLimitStatus(use.status);
-	const signedOut = sub.status === 401 || use.status === 401;
 
 	const { plan, planUnknown } = resolveEffectivePlan(subscription);
 	const manageBillingOnly =
@@ -121,7 +137,7 @@ export const load: PageLoad = async ({ fetch }) => {
 	// while the page renders Manage billing as the sole action. A lapsed
 	// subscriber must never start a new checkout — that would double-subscribe
 	// them next to the invoice they already owe.
-	const canUpgrade = !manageBillingOnly && subscription?.canChangePlan !== false;
+	const canUpgrade = !planUnknown && !manageBillingOnly && subscription?.canChangePlan !== false;
 	if (!canUpgrade && usageStatus) usageStatus = { ...usageStatus, upgradeTo: null };
 
 	const notices: string[] = [];

@@ -13,6 +13,6 @@ export const GET: RequestHandler = () => {
 
 	return new Response(body, {
 		status: 200,
-		headers: { 'content-type': 'text/plain; charset=utf-8' }
+		headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache' }
 	});
 };

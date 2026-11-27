@@ -1,4 +1,20 @@
 import { defineEnvVars } from '@sveltejs/kit/env';
+import { cspSources } from './lib/security/headers.js';
+
+function parseApiBaseUrl(value = ''): string {
+	if (value === '') return value;
+	const invalid = () => new Error('Use an absolute HTTPS API base URL without credentials, a query, or a fragment.');
+	// Reject syntax the URL parser could silently repair or discard before
+	// clients append their endpoint paths. Keep supported path prefixes.
+	const authority = /^https?:\/\/([^/]+)/i.exec(value)?.[1];
+	if (!authority || authority.includes('@') || /[\\?#\s\p{Cc}]/u.test(value)) throw invalid();
+	try {
+		cspSources(value, { allowHttpLoopback: import.meta.env.DEV });
+	} catch {
+		throw invalid();
+	}
+	return value;
+}
 
 /**
  * Public runtime environment for the web frontend. Declared here (SvelteKit 3
@@ -27,6 +43,6 @@ export const variables = defineEnvVars({
 	PUBLIC_API_BASE_URL: {
 		public: true,
 		description: 'Base URL of the workers/api worker. Empty means same-origin.',
-		schema: (value) => value ?? ''
+		schema: parseApiBaseUrl
 	}
 });

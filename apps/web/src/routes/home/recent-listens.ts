@@ -51,7 +51,8 @@ async function readFirstPage(baseUrl: string, signal: AbortSignal): Promise<Rece
 			const { playback_id, track_id, event, recorded_at } = (row ?? {}) as Record<string, unknown>;
 			if (
 				typeof playback_id !== 'string' || !PLAYBACK_ID.test(playback_id) ||
-				typeof track_id !== 'string' || !track_id || encoder.encode(track_id).length > 128 ||
+				typeof track_id !== 'string' || !track_id || /\p{Cc}/u.test(track_id) ||
+				encoder.encode(track_id).length > 128 ||
 				(event !== 'start' && event !== 'complete' && event !== 'skip') ||
 				typeof recorded_at !== 'number' || !Number.isSafeInteger(recorded_at) ||
 				recorded_at < 0 || recorded_at > MAX_UNIX_SECONDS

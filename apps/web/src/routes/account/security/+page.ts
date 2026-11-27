@@ -1,7 +1,7 @@
 import { redirect } from '@sveltejs/kit';
 import type { PageLoad } from './$types';
 import { PUBLIC_API_BASE_URL } from '$app/env/public';
-import { ApiClient, ApiError } from '#lib/api/client.js';
+import { BillingApiError, fetchSubscription } from '#lib/billing/billingClient.js';
 import { captureAuthFence } from '#lib/auth-fence.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
 import { invalidateLibraryCache } from '#lib/library/cache.js';
@@ -12,14 +12,16 @@ export const ssr = false;
 
 export const load: PageLoad = async ({ fetch }) => {
 	const owner = await captureAuthFence();
-	// Keep the status-only check on browsers without Web Locks. With a
+	// Keep the session check on browsers without Web Locks. With a
 	// fence available, a refused capture may indicate an active transition.
 	if (!owner && typeof window !== 'undefined' && globalThis.navigator?.locks) return { sessionCheckFailed: true };
-	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, fetchFn: fetch, session: owner && { owner } });
 	// One account snapshot, independent of subscription entitlement.
-	const probe = () => client.get<unknown>('/v1/me/subscription').then(() => true, (error: unknown) => error);
+	const baseUrl = PUBLIC_API_BASE_URL.replace(/\/+$/, '');
+	const probe = () => fetchSubscription((path, init) => fetch(`${baseUrl}${path}`, {
+		...init, headers: { accept: 'application/json' }, cache: 'no-store', redirect: 'error'
+	}), owner).then(() => true, (error: unknown) => error);
 	const result = owner ? await (await owner.run(() => ({ result: probe() })))?.result : await probe();
-	if (result instanceof ApiError && result.status === 401) {
+	if (result instanceof BillingApiError && result.status === 401) {
 		const clear = () => {
 			invalidateLibraryCache();
 			clearSignedInEmail();

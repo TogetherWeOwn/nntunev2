@@ -14,8 +14,18 @@ import type { Handle } from '@sveltejs/kit/hooks';
  */
 export const handle: Handle = async ({ event, resolve }) => {
 	const response = await resolve(event);
+	try {
+		return applySecurityHeaders(response);
+	} catch (error) {
+		if (!(error instanceof TypeError)) throw error;
+		// Fetch responses and Response.redirect() can have immutable headers.
+		return applySecurityHeaders(new Response(response.body, response));
+	}
+};
+
+function applySecurityHeaders(response: Response): Response {
 	for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
 		response.headers.set(name, value);
 	}
 	return response;
-};
+}
