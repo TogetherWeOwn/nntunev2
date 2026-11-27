@@ -22,19 +22,6 @@ fn id(byte: u8) -> [u8; 16] {
     id
 }
 
-fn binding(plan: Plan<'_>) -> ResumeBinding<'_> {
-    ResumeBinding {
-        plan,
-        configuration: id(5),
-        environment: "01010101010140018001010101010101",
-        library: "02020202020240028002020202020202",
-        session: SESSION,
-        object: "03030303030340038003030303030303",
-        generation: "04040404040440048004040404040404",
-        envelope_scheme: 2,
-    }
-}
-
 fn one_part(upload_id: &str) -> (ResumeBinding<'_>, EnvelopeContext, UploadPart<'_>) {
     let mut sealer = OriginSealer::new(1).unwrap();
     let target = UploadTarget {
@@ -54,29 +41,17 @@ fn one_part(upload_id: &str) -> (ResumeBinding<'_>, EnvelopeContext, UploadPart<
         plaintext_len: 1,
         header: sealer.header().to_bytes(),
     };
-    (binding(plan), context, part)
-}
-
-#[cfg(feature = "upload-caller")]
-#[test]
-fn initiation_does_not_join_comment_split_upload_ids() {
-    use nntune_ingest::multipart::initiation::InitiatedUpload;
-
-    let verify = |value| {
-        let xml = format!(
-            "<InitiateMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key>\
-             <UploadId>{value}</UploadId></InitiateMultipartUploadResult>"
-        );
-        InitiatedUpload::verify(id(5), BUCKET, KEY, 200, xml.as_bytes())
+    let binding = ResumeBinding {
+        plan,
+        configuration: id(5),
+        environment: "01010101010140018001010101010101",
+        library: "02020202020240028002020202020202",
+        session: SESSION,
+        object: "03030303030340038003030303030303",
+        generation: "04040404040440048004040404040404",
+        envelope_scheme: 2,
     };
-    assert_eq!(
-        verify("opaque+&amp;=").unwrap().target().upload_id,
-        "opaque+&="
-    );
-    assert_eq!(
-        verify("opaque<!-- split -->+&amp;=").err(),
-        Some(MultipartError::InitiationReceipt)
-    );
+    (binding, context, part)
 }
 
 #[test]

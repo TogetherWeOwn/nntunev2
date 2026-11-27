@@ -191,19 +191,21 @@ pub async fn handoff<'a>(
         tx.commit().await.map_err(db_error)?;
         return upload(id.ok_or(Pending)?, deadline);
     }
-    if now() >= deadline
-        || tx
-            .execute_typed(
-                CLAIM,
-                &[
-                    (&scope.session, Type::TEXT),
-                    (&object, Type::TEXT),
-                    (&bucket, Type::TEXT),
-                ],
-            )
-            .await
-            .map_err(db_error)?
-            != 1
+    if now() >= deadline {
+        return Err(Refused);
+    }
+    if tx
+        .execute_typed(
+            CLAIM,
+            &[
+                (&scope.session, Type::TEXT),
+                (&object, Type::TEXT),
+                (&bucket, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(db_error)?
+        != 1
     {
         return Err(Refused);
     }
@@ -211,10 +213,7 @@ pub async fn handoff<'a>(
 
     // A committed claim is exclusive even if this future is dropped, the
     // response is lost, the lease is consumed, or the second commit fails.
-    if now() >= deadline {
-        return Err(Pending);
-    }
-    let receipt = initiate(deadline, &marker).await.map_err(|()| Pending)?;
+    let receipt = initiate_committed_claim(deadline, &marker, initiate).await?;
     let target = receipt.target();
     if receipt.configuration() != configuration || target.bucket != bucket || target.key != key {
         return Err(Pending);
@@ -239,6 +238,27 @@ pub async fn handoff<'a>(
     }
     tx.commit().await.map_err(db_error)?;
     upload(target.upload_id.to_owned(), deadline)
+}
+
+async fn initiate_committed_claim<'a>(
+    deadline: SystemTime,
+    marker: &str,
+    initiate: impl AsyncFnOnce(SystemTime, &str) -> Result<InitiatedUpload<'a>, ()>,
+) -> Result<InitiatedUpload<'a>, HandoffError> {
+    if now() >= deadline {
+        return Err(Pending);
+    }
+    initiate(deadline, marker).await.map_err(|()| Pending)
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn expired_committed_claim_remains_pending_without_initiation() {
+    let result = initiate_committed_claim(UNIX_EPOCH, "fixture", async |_, _| {
+        panic!("expired claim attempted initiation");
+    })
+    .await;
+    assert_eq!(result.err(), Some(Pending));
 }
 
 pub async fn begin(db: &mut Client) -> Result<Transaction<'_>, HandoffError> {

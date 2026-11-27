@@ -142,16 +142,15 @@ impl<'a> SessionCompletion<'a> {
         })
         .await
         .map_err(|()| DispatchError::Unconfirmed(None))?;
+        let version = response.version.as_deref();
+        let reply = VersionedCompletionReply {
+            configuration: response.configuration,
+            status: response.status,
+            body: &response.body,
+            version_headers: version.as_slice(),
+        };
         self.completion
-            .verify_versioned_reply(
-                self.context,
-                VersionedCompletionReply {
-                    configuration: response.configuration,
-                    status: response.status,
-                    body: &response.body,
-                    version_headers: response.version.as_deref().as_slice(),
-                },
-            )
+            .verify_versioned_reply(self.context, reply)
             .map_err(|error| DispatchError::Unconfirmed(Some(error)))
     }
 
@@ -167,6 +166,21 @@ impl<'a> SessionCompletion<'a> {
             CompletionReadRequest<'a>,
             SystemTime,
         ) -> Result<CompletionReadResponse, ()>,
+    ) -> Result<CompletedVersionedMedia, DispatchError> {
+        self.dispatch_durable_with_clock(upload, send, read, now)
+            .await
+    }
+
+    #[cfg(any(target_arch = "wasm32", feature = "upload-caller", test))]
+    async fn dispatch_durable_with_clock(
+        self,
+        upload: &DurableUpload<'_>,
+        send: impl AsyncFnOnce(CompletionRequest<'a>, SystemTime) -> Result<CompletionResponse, ()>,
+        read: impl AsyncFnOnce(
+            CompletionReadRequest<'a>,
+            SystemTime,
+        ) -> Result<CompletionReadResponse, ()>,
+        now: impl Fn() -> SystemTime,
     ) -> Result<CompletedVersionedMedia, DispatchError> {
         let until = upload.usable_until();
         if now() >= until || !upload.matches(self.binding, self.context) {
@@ -238,14 +252,16 @@ impl<'a> SessionCompletion<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multipart::{resume_checkpoint::CheckpointPart, Plan};
+    use crate::multipart::Plan;
     use nntune_core::origin_sealer::OriginSealer;
-    use sha2::{Digest, Sha256};
-    use std::time::UNIX_EPOCH;
+    use std::{
+        cell::Cell,
+        time::{Duration, UNIX_EPOCH},
+    };
 
     #[tokio::test]
-    async fn an_expired_durable_upload_stops_before_transport() {
-        let mut sealer = OriginSealer::new(1).unwrap();
+    async fn durable_completion_respects_expiry_before_and_during_transport() {
+        let sealer = OriginSealer::new(1).unwrap();
         let mut identities = [[0; 16]; 6];
         for id in &mut identities {
             id[6] = 0x40;
@@ -274,31 +290,67 @@ mod tests {
             generation: &id,
             envelope_scheme: 2,
         };
-        let mut partition = plan.partition();
-        partition.push(&sealer.seal_chunk(&[42]).unwrap()).unwrap();
-        let part = partition.finish().unwrap().unwrap();
-        let (_, number, body, checksum) = part.request();
-        let etag = "\"test-tag\"";
-        let checkpoint = ResumeCheckpoint {
-            binding,
-            parts: &[CheckpointPart {
-                number,
-                len: body.len(),
-                etag,
-                digest: Sha256::digest(body).into(),
-            }],
-        };
-        let verified = part.verify_reply(etag.into(), checksum).unwrap();
-        let completion =
-            SessionCompletion::prepare(binding, &context, vec![verified], &checkpoint).unwrap();
-        let upload = DurableUpload::new(target, &context, binding.session, UNIX_EPOCH);
-        let result = completion
-            .dispatch_durable(
-                &upload,
-                async |_, _| panic!("expired upload dispatched a completion request"),
-                async |_, _| panic!("expired upload dispatched a read"),
-            )
-            .await;
-        assert_eq!(result.err(), Some(DispatchError::InvalidRequest));
+        let part =
+            crate::multipart::UploadPart::new(plan, 1, vec![0; plan.ciphertext_len as usize]);
+        let deadline = UNIX_EPOCH + Duration::from_secs(1);
+        let upload = DurableUpload::new(target, &context, binding.session, deadline);
+        for (expiry_phase, successful_post) in
+            [(0, false), (1, false), (1, true), (2, false), (3, false)]
+        {
+            let phase = Cell::new(0);
+            let now = || {
+                if phase.get() >= expiry_phase {
+                    deadline
+                } else {
+                    UNIX_EPOCH
+                }
+            };
+            let receipt = part
+                .verify_reply("\"test-tag\"".into(), part.request().3)
+                .unwrap();
+            let completion = plan.complete(vec![receipt]).unwrap();
+            let checksum = completion.checksum.clone();
+            let (_, len) = completion.object();
+            let body = format!("<CompleteMultipartUploadResult><Bucket>test-bucket</Bucket><Key>{key}</Key><ChecksumSHA256>{checksum}</ChecksumSHA256></CompleteMultipartUploadResult>");
+            let session = SessionCompletion {
+                binding,
+                completion,
+                context: &context,
+            };
+            let result = session
+                .dispatch_durable_with_clock(
+                    &upload,
+                    async |_, _| {
+                        phase.set(1);
+                        successful_post
+                            .then(|| CompletionResponse {
+                                configuration: binding.configuration,
+                                status: 200,
+                                body: body.into_bytes(),
+                                version: Some("fixture-version".into()),
+                            })
+                            .ok_or(())
+                    },
+                    async |_, _| {
+                        phase.set(2);
+                        Ok(CompletionReadResponse {
+                            configuration: binding.configuration,
+                            content_length: Some(len),
+                            composite_sha256: Some(checksum),
+                            marker: Some(upload.completion_marker().into()),
+                            version: Some("fixture-version".into()),
+                        })
+                    },
+                    now,
+                )
+                .await;
+            assert_eq!(phase.get(), expiry_phase.min(2));
+            let expected = match expiry_phase {
+                0 => Some(DispatchError::InvalidRequest),
+                3 => None,
+                _ => Some(DispatchError::Unconfirmed(None)),
+            };
+            assert_eq!(result.err(), expected);
+        }
     }
 }
