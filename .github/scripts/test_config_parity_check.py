@@ -47,6 +47,16 @@ def write_json(path, obj):
 
 
 class ParityCheckTests(unittest.TestCase):
+    def test_invalid_json_returns_input_error(self):
+        for data in (b'{"unused":NaN}', b'\xff', b'9' * 10000):
+            with self.subTest(data=data[:32]), tempfile.TemporaryDirectory() as tmp:
+                staging = Path(tmp) / "staging.json"
+                staging.write_bytes(data)
+                code, out, err = run_check(staging, ROOT / "config" / "prod.json")
+                self.assertEqual(2, code, out + err)
+                self.assertIn("staging file is not valid JSON", err)
+                self.assertNotIn("Traceback", err)
+
     def test_shipped_staging_vs_prod_is_green(self):
         code, out, _ = run_check(ROOT / "config" / "prod.json", ROOT / "config" / "prod.json")
         self.assertEqual(code, 0, out)
@@ -116,6 +126,8 @@ class ParityCheckTests(unittest.TestCase):
         # Pins validate_schema: neutering it must not turn these green.
         cases = {
             "bad version": ("schema_version", 2),
+            "boolean version": ("schema_version", True),
+            "fractional representation of version": ("schema_version", 1.0),
         }
         for label, (field, value) in cases.items():
             with self.subTest(label):

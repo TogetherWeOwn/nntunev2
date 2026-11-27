@@ -60,6 +60,7 @@ def evaluate_burst(bodies):
 
 def evaluate_negative(body):
     value = observations(body, "unscoped")
+    check(body["child_expected"] is None, "unscoped control reported a captured child span")
     for item in [*value["tasks"], value["child"]]:
         check(isinstance(item, dict) and item.keys() == {"before", "mid", "end", "after"},
               "malformed control observation")
@@ -207,6 +208,8 @@ class SelfTest(unittest.TestCase):
 
     def test_negative_control(self):
         evaluate_negative(self.body(False))
+        with self.assertRaisesRegex(ValueError, "captured child span"):
+            evaluate_negative({**self.body(False), "child_expected": "unexpected"})
         with self.assertRaises(ValueError):
             evaluate_scoped([{**self.body(False), "mode": "scoped"}])
         with self.assertRaises(ValueError):

@@ -22,8 +22,8 @@ def main():
     node = shutil.which("node")
     if not bindgen or not node:
         raise SystemExit("wasm-bindgen and node must be available on PATH")
-    with candidate_path.open("rb") as source:
-        candidate = source.read(sealed.MAX_CANDIDATE_BYTES + 1)
+    candidate = sealed.snapshot_build_output(candidate_path)
+    output_dir = sealed.fresh_bindgen_output(output_dir)
 
     def verify(snapshot):
         if not snapshot.startswith(b"\x00asm\x01\x00\x00\x00"):
@@ -39,7 +39,7 @@ def main():
     )
     subprocess.run(
         [os.path.abspath(node), "-e", "require(process.argv[1]).run_ledger_tests()",
-         str((output_dir / "nntune_api.js").resolve())],
+         str(output_dir / "nntune_api.js")],
         check=True,
     )
 

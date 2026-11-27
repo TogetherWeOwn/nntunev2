@@ -191,15 +191,13 @@ def measure_worker(root: Path, spec: dict) -> tuple[int | None, int | None, str]
     """Measure raw + gzip bytes for one worker's ``.wasm`` artifact."""
     path = wasm_path(root, spec)
     try:
+        if not path.resolve().is_relative_to(root.resolve()):
+            return None, None, "artifact resolves outside the repository root"
         if not path.is_file():
-            try:
-                shown = path.relative_to(root)
-            except ValueError:
-                shown = path
-            return None, None, f"missing artifact: {shown}"
+            return None, None, f"missing artifact: {path}"
         raw = path.stat().st_size
         compressed = gzip_size(path)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         return None, None, f"unreadable artifact: {exc}"
     return raw, compressed, "ok"
 
@@ -239,7 +237,9 @@ def evaluate(rows: list[dict], budget: int) -> list[str]:
     for row in rows:
         if row["status"] != "ok":
             failures.append(f"{row['worker']}: {row['status']}")
-        elif row["compressed"] is not None and row["compressed"] > budget:
+        elif any(type(row.get(key)) is not int or row[key] <= 0 for key in ("raw", "compressed")):
+            failures.append(f"{row['worker']}: invalid measurement")
+        elif row["compressed"] > budget:
             failures.append(
                 f"{row['worker']}: {row['compressed']} compressed bytes "
                 f"exceeds budget of {budget}"

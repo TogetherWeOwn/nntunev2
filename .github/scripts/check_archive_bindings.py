@@ -160,21 +160,24 @@ def archive_bindings(repo_root: Path) -> list[tuple[Path, str]]:
         ]
     except (OSError, ValueError) as exc:
         raise ManifestError(f"cannot decode tracked repository paths: {exc}") from exc
-    candidates = sorted(
-        repo_root / relative_path
-        for relative_path in relative_paths
-        if (
-            _is_manifest_candidate(relative_path)
-            or _is_unsupported_json_candidate(repo_root / relative_path)
-        )
-        and (repo_root / relative_path).is_file()
-    )
-    manifests = [
-        path
-        for path in candidates
-        if path.name.lower().endswith(SUPPORTED_MANIFEST_SUFFIXES)
-    ]
-    unsupported = [path for path in candidates if path not in manifests]
+    manifests, unsupported = [], []
+    root = repo_root.resolve()
+    for relative_path in sorted(relative_paths):
+        toml = _is_manifest_candidate(relative_path)
+        if not toml and not relative_path.name.lower().endswith((".json", ".jsonc")):
+            continue
+        path = repo_root / relative_path
+        try:
+            if not path.resolve().is_relative_to(root):
+                raise ManifestError(f"tracked config resolves outside the repository: {path}")
+            if not path.is_file():
+                raise ManifestError(f"tracked config is missing or not a regular file: {path}")
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ManifestError(f"cannot inspect tracked config {path}: {exc}") from exc
+        if toml:
+            manifests.append(path)
+        elif _is_unsupported_json_candidate(path):
+            unsupported.append(path)
     if unsupported:
         paths = ", ".join(str(path) for path in unsupported)
         raise ManifestError(
@@ -241,13 +244,19 @@ def _bucket_names(manifest: Path) -> list[str] | None:
             raise ManifestError(f"invalid env entry in {manifest}")
         r2_bindings.extend(bindings_from(env))
 
+    bucket_keys = ("bucket_name", "preview_bucket_name")
     for binding in r2_bindings:
         if not isinstance(binding, dict):
             raise ManifestError(f"invalid r2_buckets entry in {manifest}")
-        for key in ("bucket_name", "preview_bucket_name"):
-            value = binding.get(key)
-            if isinstance(value, str):
-                found.append(value)
+        if not any(key in binding for key in bucket_keys):
+            raise ManifestError(f"R2 binding has no bucket name in {manifest}")
+        for key in bucket_keys:
+            if key not in binding:
+                continue
+            value = binding[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ManifestError(f"invalid {key} in {manifest}")
+            found.append(value)
     return found
 
 

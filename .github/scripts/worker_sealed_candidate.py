@@ -16,6 +16,12 @@ MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
 SEALS = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
 
 
+def fresh_bindgen_output(path: Path) -> Path:
+    """Reserve a new output directory so a probe cannot reuse generated JS."""
+    path.mkdir(parents=True)
+    return path.resolve()
+
+
 def snapshot_build_output(path) -> bytes:
     """Read a bounded regular output without following its final symlink.
 
@@ -58,7 +64,7 @@ def consume_sealed(candidate: bytes, verify, command: list[str], *, cwd, env, ru
     """Verify a sealed snapshot, then pass that exact snapshot to a child.
 
     Linux memfd seals prevent writes and truncation even through another open
-    descriptor. The verifier must raise on rejection; its return value is ignored.
+    descriptor. The verifier must return None on success and raise on rejection.
     The child must open its final argument as the input file. This makes no claim
     about where candidate came from or what the consumer does.
     """
@@ -83,7 +89,8 @@ def consume_sealed(candidate: bytes, verify, command: list[str], *, cwd, env, ru
             snapshot = sealed.read(MAX_CANDIDATE_BYTES + 1)
         if snapshot != candidate:
             raise ValueError("sealed candidate differs from input")
-        verify(snapshot)
+        if verify(snapshot) is not None:
+            raise ValueError("verifier must return None on success and raise on rejection")
         run([*command, path], cwd=cwd, env=env, pass_fds=(fd,), check=True)
         return hashlib.sha256(snapshot).hexdigest()
     finally:

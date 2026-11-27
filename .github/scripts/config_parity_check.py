@@ -76,7 +76,8 @@ def fail_input(message):
 def load_json(path, label):
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh, object_pairs_hook=object_without_duplicates), None
+            return json.load(fh, object_pairs_hook=object_without_duplicates,
+                             parse_constant=reject_json_constant), None
     except DuplicateMemberError as exc:
         return None, (
             f"{label} file contains a duplicate JSON member name "
@@ -84,7 +85,7 @@ def load_json(path, label):
         )
     except FileNotFoundError:
         return None, f"{label} file not found: {path}"
-    except json.JSONDecodeError as exc:
+    except (ValueError, RecursionError) as exc:
         return None, f"{label} file is not valid JSON: {path} ({exc})"
     except OSError as exc:
         return None, f"{label} file unreadable: {path} ({exc})"
@@ -116,7 +117,8 @@ def validate_schema(schema):
     errors = []
     if not isinstance(schema, dict):
         return ["schema root must be a JSON object"]
-    if schema.get("schema_version") != 1:
+    version = schema.get("schema_version")
+    if type(version) is not int or version != 1:
         errors.append("schema_version must be 1")
     keys = schema.get("keys")
     if not isinstance(keys, dict) or not keys:
@@ -166,6 +168,10 @@ def validate_env(label, data, keys):
         if err:
             errors.append(err)
     return errors
+
+
+def reject_json_constant(_):
+    raise ValueError("non-standard JSON constant")
 
 
 def check_parity(schema, staging, prod):

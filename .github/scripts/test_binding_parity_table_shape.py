@@ -162,6 +162,23 @@ class TestMalformedTableShape(unittest.TestCase):
     def test_r2_int_malformed_shape_exits_two(self):
         self.assert_malformed_shape_fails_closed(R2_INT_WRANGLER, TypeError)
 
+    def test_empty_non_array_binding_table_is_rejected(self):
+        for assignment in ('r2_buckets = {}', 'queues = { producers = "" }', 'assets = false'):
+            with self.subTest(assignment=assignment), tempfile.TemporaryDirectory() as tmp:
+                root = make_repo(tmp, wrangler=assignment)
+                with self.assertRaisesRegex(ParityError, "must be"):
+                    run_check(root)
+
+    def test_mapped_config_cannot_resolve_outside_root(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
+            root = make_repo(tmp)
+            config = next(root.rglob("wrangler.toml"))
+            external = Path(outside) / config.name
+            config.rename(external)
+            config.symlink_to(external)
+            with self.assertRaisesRegex(ParityError, "outside the repository"):
+                run_check(root)
+
     def test_valid_config_control_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_repo(tmp)
