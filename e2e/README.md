@@ -275,6 +275,13 @@ checks. The [protected FLAC probe](helpers/staging-playback-probe.ts) is dormant
 Its [hosted offline fixture](fixtures/private-music/staging-playback-probe.spec.ts)
 checks the request and response contract without making staging requests.
 
+The [vendored formula](tests/demo-audio-contract.spec.ts) and [Web audio handler
+tests](../apps/web/src/routes/api/demo/audio/audio.test.ts) pin full WAV bytes
+and range behavior offline. The [Web artwork test](../apps/web/src/routes/api/demo/artwork/artwork.test.ts)
+pins the synthetic placeholder. The ordinary staging suite uses those
+routes in the audio contract, sessionless demo and served-routes specs. The
+demo page hosts local browser tests, including the Axe matrix below.
+
 1. Qualify the replacement under the existing opt-in private staging job.
    Keep the native seek, resume and queue checks in
    [the private browser journey](private-staging/journey.spec.ts). Collect
@@ -303,11 +310,13 @@ checks the request and response contract without making staging requests.
    Preserve decoder and Media Session teardown coverage on supported exit
    surfaces ([decoder](../apps/web/tests/security-auth-transition.spec.ts),
    [Media Session](../apps/web/tests/library-system-transport.spec.ts)).
-   In the retirement change, move the two anonymous `/library` and `/api/library`
-   tests from [demo-media-sessionless.spec.ts](tests/demo-media-sessionless.spec.ts)
-   into a dedicated Library spec with their request setup and assertion bodies
-   intact. Keep them in the ordinary staging run. Replace the demo audio and
-   artwork live tests with no-follow `404` route-absence checks for all three
+   In the retirement change, move the anonymous `/library` browser test and
+   its offline verdict tests from [demo-media-sessionless.spec.ts](tests/demo-media-sessionless.spec.ts)
+   into a dedicated Library spec with their request setup and assertions intact.
+   Keep that browser test and the separate `/api/library` generic 401 check in
+   [api-worker-anonymous.spec.ts](tests/api-worker-anonymous.spec.ts) in the
+   ordinary staging run. Replace the demo audio and artwork live tests with
+   no-follow `404` route-absence checks for all three
    retired paths, behind Access and without an app session. Retain the manifest,
    pricing and retired-provider checks in [served-routes.spec.ts](tests/served-routes.spec.ts).
    Remove the vendored WAV formula and its tests with its route, and update the
