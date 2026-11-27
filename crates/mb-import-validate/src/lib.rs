@@ -240,31 +240,41 @@ pub fn escape_poison_field(raw: &str) -> String {
 /// Chunk ranges still pending, as 1-based inclusive `(start, end)` line
 /// spans over the whole dump file. `completed` is the cursor value
 /// (lines already committed); `total` the current file line count.
-///
-/// # Panics
-/// Panics before allocating or returning any ranges if the plan would exceed
-/// 16 MiB of ranges. Increase `size` to plan larger inputs.
-pub fn plan_chunks(completed: u64, total: u64, size: u64) -> Vec<(u64, u64)> {
-    const MAX_RANGES: u64 = 1_048_576;
-    if size == 0 || completed >= total {
-        return Vec::new();
+/// Ranges are generated as the caller consumes them.
+pub fn plan_chunks(completed: u64, total: u64, size: u64) -> ChunkPlan {
+    ChunkPlan {
+        completed,
+        total,
+        size,
     }
-    let count = (total - completed).div_ceil(size);
-    assert!(
-        count <= MAX_RANGES,
-        "chunk plan exceeds 16 MiB of ranges; increase chunk size"
-    );
-    let mut chunks = Vec::with_capacity(count as usize);
-    let mut start = completed + 1;
-    while start <= total {
-        let end = start.saturating_add(size - 1).min(total);
-        chunks.push((start, end));
-        if end == total {
-            break;
+}
+
+/// Allocation-free iterator over the pending chunk ranges.
+#[derive(Clone, Debug)]
+pub struct ChunkPlan {
+    completed: u64,
+    total: u64,
+    size: u64,
+}
+
+impl Iterator for ChunkPlan {
+    type Item = (u64, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.size == 0 || self.completed >= self.total {
+            return None;
         }
-        start = end + 1;
+        let start = self.completed + 1;
+        let end = self.completed.saturating_add(self.size).min(self.total);
+        self.completed = end;
+        Some((start, end))
     }
-    chunks
+}
+
+impl PartialEq<Vec<(u64, u64)>> for ChunkPlan {
+    fn eq(&self, expected: &Vec<(u64, u64)>) -> bool {
+        Iterator::eq(self.clone(), expected.iter().copied())
+    }
 }
 
 /// Column kinds the importer validates before COPY. Every `Ok` value is
@@ -430,7 +440,7 @@ fn decode_copy_field(value: &str) -> Result<String, &'static str> {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if matches!(bytes[i], 0 | b'\r' | b'\n') {
+        if matches!(bytes[i], b'\r' | b'\n') {
             return Err(reason::BAD_ESCAPE);
         }
         if bytes[i] != b'\\' {
@@ -567,7 +577,7 @@ fn is_timestamp(value: &str) -> bool {
     let split = bare.find('T').or_else(|| bare.find(' '));
     let (date, time) = match split {
         Some(i) => (&bare[..i], Some(&bare[i + 1..])),
-        None => (bare, None),
+        None => (bare.as_str(), None),
     };
     if !is_date(date) {
         return false;
@@ -596,9 +606,9 @@ fn is_curated_timestamp(timestamp: &str) -> bool {
 }
 
 /// Strip one trailing `Z` or `±hh[:mm]` zone; `None` means malformed zone.
-fn split_zone(value: &str) -> Option<&str> {
+fn split_zone(value: &str) -> Option<String> {
     if let Some(bare) = value.strip_suffix('Z').or_else(|| value.strip_suffix('z')) {
-        return Some(bare);
+        return Some(bare.to_string());
     }
     // Find a trailing ±hh or ±hh:mm, scanning from the end.
     let bytes = value.as_bytes();
@@ -611,7 +621,7 @@ fn split_zone(value: &str) -> Option<&str> {
     if i > 0 && (bytes[i - 1] == b'+' || bytes[i - 1] == b'-') && i > 1 {
         let bare = &value[..i - 1];
         if !bare.bytes().any(|b| b == b'T' || b == b't' || b == b' ') {
-            return Some(value);
+            return Some(value.to_string());
         }
         let zone = &value[i - 1..];
         let digits = match zone.len() {
@@ -633,11 +643,11 @@ fn split_zone(value: &str) -> Option<&str> {
         };
         // PostgreSQL rejects timezone displacements above 15 hours.
         if hh <= 15 && mm <= 59 {
-            return Some(bare);
+            return Some(bare.to_string());
         }
         return None;
     }
-    Some(value)
+    Some(value.to_string())
 }
 
 fn is_date(date: &str) -> bool {

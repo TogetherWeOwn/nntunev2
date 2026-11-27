@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{decode_required, is_curated_timestamp, reason, FieldKind};
+use super::{decode_copy_field, decode_required, is_curated_timestamp, reason, FieldKind};
 
 /// Size limit for an uncompressed fixture slice, not a full dump.
 pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -73,7 +73,7 @@ pub fn lookup(bytes: &[u8], kind: EntityKind, query: &str) -> Result<Vec<AliasMa
         let mbid = FieldKind::Uuid.check(mbid, true).map_err(invalid)?;
         let name = decode_required(name).map_err(invalid)?;
         let locale = (!locale.is_empty())
-            .then(|| decode_required(locale))
+            .then(|| decode_copy_field(locale))
             .transpose()
             .map_err(invalid)?;
         let sort_name = decode_required(sort_name).map_err(invalid)?;

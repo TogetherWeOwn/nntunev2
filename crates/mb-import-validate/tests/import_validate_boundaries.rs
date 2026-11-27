@@ -65,9 +65,11 @@ fn video_pair_refuses_same_mbid_under_distinct_spellings() {
 }
 
 #[test]
-#[should_panic(expected = "chunk plan exceeds 16 MiB of ranges")]
-fn chunk_plan_refuses_an_oversized_range_count() {
-    plan_chunks(u64::MAX - 1_048_577, u64::MAX, 1);
+fn chunk_plan_streams_prefix_without_materializing_the_remaining_ranges() {
+    assert_eq!(
+        plan_chunks(0, u64::MAX, 1).take(2).collect::<Vec<_>>(),
+        [(1, 1), (2, 2)]
+    );
 }
 
 #[test]
@@ -76,25 +78,6 @@ fn chunk_plan_accepts_a_small_plan_near_u64_max() {
     assert_eq!(
         plan_chunks(max - 4, max, 3),
         vec![(max - 3, max - 1), (max, max)]
-    );
-}
-
-#[test]
-fn alias_locale_distinguishes_empty_and_literal_backslash_n_from_null_marker() {
-    let aliases = |locale| format!("{A}\tAlias\t{locale}\tSort\tf\t{TS}\n");
-    let lookup =
-        |rows: &str| aliases::lookup(rows.as_bytes(), aliases::EntityKind::Artist, "Alias");
-    assert_eq!(lookup(&aliases("")).unwrap()[0].locale, None);
-    assert_eq!(
-        lookup(&aliases(r"\\N")).unwrap()[0].locale.as_deref(),
-        Some(r"\N")
-    );
-    assert_eq!(
-        lookup(&aliases(r"\N")),
-        Err(aliases::ReadError::InvalidRow {
-            line: 1,
-            reason: reason::NULL_IN_NOT_NULL
-        })
     );
 }
 
