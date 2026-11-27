@@ -67,12 +67,18 @@ DO $$
 DECLARE
     object_one CONSTANT UUID := 'c0000000-0000-4000-8000-000000000001';
     object_two CONSTANT UUID := 'c0000000-0000-4000-8000-000000000002';
+    object_three CONSTANT UUID := 'c0000000-0000-4000-8000-000000000003';
     root_one CONSTANT UUID := 'f0000000-0000-4000-8000-000000000001';
     root_two CONSTANT UUID := 'f0000000-0000-4000-8000-000000000002';
+    root_three CONSTANT UUID := 'f0000000-0000-4000-8000-000000000003';
     key_one CONSTANT TEXT := 'media/c0000000000040008000000000000001/d0000000000040008000000000000001';
     key_two CONSTANT TEXT := 'media/c0000000000040008000000000000002/d0000000000040008000000000000002';
+    key_three CONSTANT TEXT := 'media/c0000000000040008000000000000003/d0000000000040008000000000000003';
     insert_sql CONSTANT TEXT := 'INSERT INTO public.storage_s3_locator_intents VALUES (%L,%L,%L,%L,%L,%L)';
     sample TEXT;
+    locator_snapshot JSONB;
+    intent_snapshot JSONB;
+    envelope_snapshot JSONB;
 BEGIN
     IF EXISTS (SELECT FROM public.storage_s3_locator_intents) THEN
         RAISE EXCEPTION 'migration must not invent locations';
@@ -88,10 +94,16 @@ BEGIN
     END IF;
 
     PERFORM pg_temp.expect_locator_error(format(insert_sql, object_one, root_two, 'media-test', key_one, 'ver+1/=', NULL), '23503');
-    FOREACH sample IN ARRAY ARRAY[key_two, upper(key_one), key_one || '/extra', replace(key_one, '/d', '/e')] LOOP
+    PERFORM pg_temp.expect_locator_error(format(insert_sql, object_three, root_three, 'media-test', key_three, 'ver+3/=', NULL), '23503');
+    FOREACH sample IN ARRAY ARRAY[
+        key_two, upper(key_one), key_one || '/extra', replace(key_one, '/d', '/e'),
+        '../' || key_one, '/' || key_one, key_one || '/..',
+        'media/c0000000000040008000000000000001/../d0000000000040008000000000000001',
+        'media/%2e%2e/d0000000000040008000000000000001'
+    ] LOOP
         PERFORM pg_temp.expect_locator_error(format(insert_sql, object_one, root_one, 'media-test', sample, 'ver+1/=', NULL), '23514');
     END LOOP;
-    FOREACH sample IN ARRAY ARRAY['a', repeat('a', 64), '01.2.3.4', 'bad..bucket', 'bad.-bucket', 'Bad-bucket'] LOOP
+    FOREACH sample IN ARRAY ARRAY['a', repeat('a', 64), '01.2.3.4', 'bad..bucket', 'bad.-bucket', 'Bad-bucket', 'bad/bucket', '../bucket'] LOOP
         PERFORM pg_temp.expect_locator_error(format(insert_sql, object_one, root_one, sample, key_one, 'ver+1/=', NULL), '23514');
     END LOOP;
     FOREACH sample IN ARRAY ARRAY['', 'null', 'two words', E'pin\n', repeat('v', 1025)] LOOP
@@ -102,27 +114,57 @@ BEGIN
     END LOOP;
     PERFORM pg_temp.expect_locator_error(format(insert_sql, object_one, root_one, 'media-test', key_one, NULL, NULL), '23514');
     PERFORM pg_temp.expect_locator_error(format(insert_sql, object_one, root_one, 'media-test', key_one, 'ver+1/=', '"opaque"'), '23514');
+    IF EXISTS (SELECT FROM public.storage_s3_locator_intents) THEN
+        RAISE EXCEPTION 'rejected locator inserts must not persist rows';
+    END IF;
 
     EXECUTE format(insert_sql, object_one, root_one, 'media-test.v1', key_one, 'ver+1/=', NULL);
     EXECUTE format(insert_sql, object_two, root_two, 'media-test.v1', key_two, NULL, '"opaque-9"');
+
+    SELECT jsonb_agg(to_jsonb(l) ORDER BY l.object_id) INTO locator_snapshot FROM public.storage_s3_locator_intents l;
+    SELECT jsonb_agg(to_jsonb(i) ORDER BY i.object_id) INTO intent_snapshot FROM public.storage_object_intents i;
+    SELECT jsonb_agg(to_jsonb(e) ORDER BY e.object_id, e.root_version_id) INTO envelope_snapshot FROM public.storage_object_envelope_intents e;
+
     PERFORM pg_temp.expect_locator_error(format(insert_sql, object_one, root_one, 'other-bucket', key_one, 'different', NULL), '23505');
+    EXECUTE format(insert_sql || ' ON CONFLICT (object_id) DO NOTHING',
+                   object_one, root_one, 'other-bucket', key_one, 'different', NULL);
+    PERFORM pg_temp.expect_locator_error(
+        format(insert_sql || ' ON CONFLICT (object_id) DO UPDATE SET s3_bucket = EXCLUDED.s3_bucket',
+               object_one, root_one, 'other-bucket', key_one, 'different', NULL),
+        '23514'
+    );
+    PERFORM pg_temp.expect_locator_error(format(insert_sql, object_one, root_one, 'bad/bucket', key_one, 'different', NULL), '23514');
+    PERFORM pg_temp.expect_locator_error(format(insert_sql, object_one, root_one, 'media-test.v1', key_one || '/..', 'different', NULL), '23514');
+    PERFORM pg_temp.expect_locator_error('UPDATE public.storage_s3_locator_intents SET s3_bucket = ''other-bucket''', '23514');
+    PERFORM pg_temp.expect_locator_error('UPDATE public.storage_s3_locator_intents SET s3_etag = s3_etag', '23514');
+    PERFORM pg_temp.expect_locator_error('DELETE FROM public.storage_s3_locator_intents', '23514');
+    PERFORM pg_temp.expect_locator_error('TRUNCATE public.storage_s3_locator_intents', '23514');
+
     IF (SELECT count(*) FROM public.storage_s3_locator_intents) <> 2 OR NOT EXISTS (
         SELECT FROM public.storage_s3_locator_intents l
         JOIN public.storage_object_envelope_intents e USING (object_id, root_version_id)
         JOIN public.storage_object_intents i USING (object_id)
-        WHERE l.object_id = object_one AND l.s3_version_id = 'ver+1/='
+        WHERE l.object_id = object_one AND l.s3_bucket = 'media-test.v1' AND l.s3_key = key_one
+          AND l.s3_version_id = 'ver+1/=' AND l.s3_etag IS NULL
           AND i.plaintext_bytes = 65537 AND i.envelope_bytes = 65617
           AND substring(e.wrapped_record FROM 123 FOR 48) = i.header_tag
     ) OR NOT EXISTS (
-        SELECT FROM public.storage_s3_locator_intents WHERE object_id = object_two AND s3_etag = '"opaque-9"'
+        SELECT FROM public.storage_s3_locator_intents l
+        JOIN public.storage_object_envelope_intents e USING (object_id, root_version_id)
+        JOIN public.storage_object_intents i USING (object_id)
+        WHERE l.object_id = object_two AND l.s3_bucket = 'media-test.v1' AND l.s3_key = key_two
+          AND l.s3_version_id IS NULL AND l.s3_etag = '"opaque-9"'
+          AND i.plaintext_bytes = 65537 AND i.envelope_bytes = 65617
+          AND substring(e.wrapped_record FROM 123 FOR 48) = i.header_tag
     ) THEN
         RAISE EXCEPTION 'locator pins and bound envelope geometry did not round trip';
     END IF;
+    IF (SELECT jsonb_agg(to_jsonb(l) ORDER BY l.object_id) FROM public.storage_s3_locator_intents l) IS DISTINCT FROM locator_snapshot
+       OR (SELECT jsonb_agg(to_jsonb(i) ORDER BY i.object_id) FROM public.storage_object_intents i) IS DISTINCT FROM intent_snapshot
+       OR (SELECT jsonb_agg(to_jsonb(e) ORDER BY e.object_id, e.root_version_id) FROM public.storage_object_envelope_intents e) IS DISTINCT FROM envelope_snapshot
+       OR (SELECT to_jsonb(s) FROM public.track_sources s WHERE track_id = '10000000-0000-4000-8000-000000000001')
+          IS DISTINCT FROM (SELECT row_data FROM legacy_source_snapshot) THEN
+        RAISE EXCEPTION 'rejected locator mutations altered stored metadata';
+    END IF;
 END $$;
-
-SELECT pg_temp.expect_locator_error(s, '23514') FROM (VALUES
-    ('UPDATE public.storage_s3_locator_intents SET s3_etag = s3_etag'),
-    ('DELETE FROM public.storage_s3_locator_intents'),
-    ('TRUNCATE public.storage_s3_locator_intents')
-) AS cases(s);
 ROLLBACK;
