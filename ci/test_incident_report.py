@@ -159,7 +159,7 @@ class FakeAPI(ir.API):
             self.run_gets += 1
             return self.run if self.run_gets == 1 else self.current
         if "/jobs" in path:
-            return {"jobs": self.jobs[window]}
+            return {"jobs": self.jobs[window], "total_count": len(self.jobs)}
         if re.search(r"/issues/\d+/comments", path):
             return []
         if path.startswith("/actions/workflows/"):
@@ -168,6 +168,46 @@ class FakeAPI(ir.API):
 
 
 class ReportTests(unittest.TestCase):
+    def test_truncated_jobs_cannot_clear_a_production_incident(self):
+        job = {"name": "deploy-production", "conclusion": "success", "steps": [
+            {"number": 3, "name": "Verify production serves the promoted build",
+             "conclusion": "success"}]}
+        key = "<!-- incident-key: deploy-production.yml:deploy-production -->"
+        api = FakeAPI(run=make_run(workflow="deploy-production.yml", event="workflow_dispatch"),
+                      jobs=[job], issues=[issue(7, body=key)])
+        request = api.request
+
+        def truncated(method, path, body=None):
+            response = request(method, path, body)
+            return dict(response, total_count=2) if "/jobs" in path else response
+
+        api.request = truncated
+        with self.assertRaisesRegex(ir.ReportError, "^GitHub job listing incomplete$"):
+            ir.report(api, 10)
+        self.assertEqual(api.writes, [])
+
+    def test_conflicting_production_smoke_steps_cannot_clear_an_incident(self):
+        step = {"number": 3, "name": "Verify production serves the promoted build",
+                "conclusion": "success"}
+        job = {"name": "deploy-production", "conclusion": "success",
+               "steps": [step, dict(step, number=4, conclusion="failure")]}
+        key = "<!-- incident-key: deploy-production.yml:deploy-production -->"
+        api = FakeAPI(run=make_run(workflow="deploy-production.yml", event="workflow_dispatch"),
+                      jobs=[job], issues=[issue(7, body=key)])
+        with self.assertRaisesRegex(ir.ReportError, "^GitHub gate evidence is ambiguous$"):
+            ir.report(api, 10)
+        self.assertEqual(api.writes, [])
+
+    def test_malformed_failed_step_number_never_reaches_a_report(self):
+        for number in ("synthetic-token member@example.invalid", True, None):
+            with self.subTest(number=number):
+                job = smoke("failure", step="failure")
+                job["steps"][0]["number"] = number
+                api = FakeAPI(jobs=[job])
+                with self.assertRaisesRegex(ir.ReportError, "^GitHub failing step number malformed$"):
+                    ir.report(api, 10)
+                self.assertEqual(api.writes, [])
+
     def test_failure_opens_then_repeat_comments(self):
         api = FakeAPI(jobs=[smoke("failure")])
         self.assertEqual(ir.report(api, 10), [f"opened: {SMOKE}"])
@@ -267,6 +307,7 @@ class ReportTests(unittest.TestCase):
     def test_untrusted_runs_rejected(self):
         bad = [{"head_repository": {"full_name": "evil/fork"}}, {"head_branch": "feature"},
                {"event": "pull_request"}, {"status": "in_progress"}, {"head_sha": "abc"},
+               {"id": 11}, {"run_attempt": "synthetic-private-text"},
                {"path": ".github/workflows/ci.yml"}, {"event": "schedule", "path":
                 ".github/workflows/deploy.yml"}, {"event": "push", "path":
                 ".github/workflows/deploy-production.yml"}]
@@ -452,7 +493,8 @@ class StatefulAPI(ir.API):
             rows = [r for r in self.runs if r["path"].endswith("/" + m.group(1))]
             return {"workflow_runs": rows[window]}
         if (m := re.search(r"/actions/runs/(\d+)/attempts/(\d+)/jobs", path)):
-            return {"jobs": self.jobs.get((int(m.group(1)), int(m.group(2))), [])[window]}
+            rows = self.jobs.get((int(m.group(1)), int(m.group(2))), [])
+            return {"jobs": rows[window], "total_count": len(rows)}
         if (m := re.search(r"/issues/(\d+)/comments", path)):
             return self.comments.get(int(m.group(1)), [])[window]
         return self.issues[window]
@@ -687,6 +729,22 @@ def fail_final_patch(api, number, marker, mode):
 
 
 class CommentDeliveryTests(unittest.TestCase):
+    def test_pending_notification_uses_safe_metadata_after_issue_edit(self):
+        for kind in ("failure", "recovery"):
+            with self.subTest(kind=kind):
+                state = {"run_id": 9, "attempt": 1, "kind": kind,
+                         "cursor": None, "delivered": False}
+                private = "synthetic-token member@example.invalid"
+                edited = issue(7, state="open", body=MARKER + "\n" + private +
+                               "\n<!-- incident-delivery: " + json.dumps(state) + " -->")
+                api = StatefulAPI(issues=[edited])
+                self.assertEqual(ir.reconcile_pending(api, api.issues, False),
+                                 [f"delivered #7: {KEY}"])
+                comment = api.comments[7][0]["body"]
+                self.assertNotIn(private, comment)
+                self.assertIn(f"https://github.com/{ir.REPO}/actions/runs/9/attempts/1", comment)
+                self.assertIn(occurrence(9, kind=kind), comment)
+
     def api(self, conclusion="failure", run_id=10, issues=None, **kw):
         return StatefulAPI(runs=[make_run(run_id)], jobs={(run_id, 1): [smoke(conclusion)]},
                            issues=[issue(7)] if issues is None else issues, **kw)
