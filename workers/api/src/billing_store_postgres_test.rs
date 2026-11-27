@@ -1208,21 +1208,17 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
         true
     );
     assert_eq!(after_cancel.1, committed.1);
-    let locks_available = async || {
-        let row = observer
-            .query_one(
-                "SELECT pg_try_advisory_xact_lock(hashtext($1)), NOT EXISTS (
+    let lock_probe = "SELECT pg_try_advisory_xact_lock(hashtext($1)), NOT EXISTS (
                     SELECT FROM pg_locks WHERE relation = 'public.subscriptions'::regclass
                       AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-                      AND mode = 'ShareRowExclusiveLock' AND granted)",
-                &[&USER],
-            )
-            .await
-            .unwrap();
+                      AND mode = 'ShareRowExclusiveLock' AND granted)";
+    let locks_available = async || {
+        let row = observer.query_one(lock_probe, &[&USER]).await.unwrap();
         (row.get::<_, bool>(0), row.get::<_, bool>(1))
     };
     renewed.subscription.status = "past_due".into();
-    for retrieval_failed in [true, false] {
+    for invoices in [None, Some(renewed.invoices)] {
+        let retrieval_failed = invoices.is_none();
         let result = with_store(CALLER_CONNECTION, 1, async |store| {
             store
                 .reconcile_locked_subscription(
@@ -1234,9 +1230,7 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
                     },
                     async |_| {
                         assert_eq!(locks_available().await, (false, true));
-                        (!retrieval_failed)
-                            .then(|| renewed.invoices.clone())
-                            .ok_or(StoreError)
+                        invoices.ok_or(StoreError)
                     },
                     NEW_END,
                 )

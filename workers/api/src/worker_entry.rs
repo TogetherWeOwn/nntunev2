@@ -9374,6 +9374,12 @@ mod tests {
                     .split_once("async fn subsonic_member_catalogue_with_cap(")
                     .unwrap();
                 helper.split_once("\n    async fn ").unwrap().0
+            } else if operation == "load_reconcile_input" {
+                assert!(method.contains("self.load_reconcile_input_on("));
+                let (_, helper) = production
+                    .split_once("async fn load_reconcile_input_on(")
+                    .unwrap();
+                helper.split_once("\n    async fn ").unwrap().0
             } else {
                 method
             };
