@@ -541,6 +541,7 @@ class SnapshotAndResume(GitCase):
         for name, mutate in (
                 ("bracket differs", lambda e: e["after"].update(changed_files=1)),
                 ("event differs", lambda e: e["event"]["base"].update(ref="release")),
+                ("malformed event repository ID", lambda e: e["event"]["base"]["repo"].update(id=True)),
                 ("attempt zero", lambda e: e.update(attempt=0)),
                 ("attempt above bound", lambda e: e.update(attempt=snapshot.MAX_ATTEMPTS + 1)),
                 ("attempt bool", lambda e: e.update(attempt=True)),
@@ -552,6 +553,18 @@ class SnapshotAndResume(GitCase):
             with self.subTest(name), self.assertRaises(history.HistoryError):
                 snapshot.snapshot_coverage(self.root, self.base, self.head, files_text,
                                            json.dumps(data), self.expected(), history.EvidenceBudget())
+
+    def test_api_json_refuses_nonstandard_numbers(self):
+        with self.subTest("snapshot"), self.assertRaises(history.HistoryError):
+            snapshot.decode('{"count": NaN}')
+        with self.subTest("coverage"), self.assertRaises(history.HistoryError):
+            metadata = '{"base":{"sha":"b"},"head":{"sha":"h"},"changed_files":0,"unused":Infinity}'
+            history.api_coverage('[[]]', metadata, "b", "h")
+
+    def test_repository_has_two_non_dot_components(self):
+        for repository in ("owner/.", "./repo"):
+            with self.subTest(repository=repository), self.assertRaises(history.HistoryError):
+                snapshot.project_metadata(meta(base_repo=(1, repository)))
 
     def test_snapshot_effective_base_must_descend_from_event_base(self):
         files_text, _, evidence = self.evidence()

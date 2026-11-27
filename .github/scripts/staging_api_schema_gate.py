@@ -11,7 +11,6 @@ tracking rows (written by ``apply_migration.py`` on every apply) against
 once under its current name+sha256 or under a ``renamed_from`` original
 name+sha256, and no unlisted rows may exist.
 """
-import json
 import os
 import pathlib
 import re
@@ -20,7 +19,7 @@ import sys
 import urllib.parse
 import urllib.request
 
-from migration_history import HistoryError, parse_manifest, read_input
+from migration_history import FILE_RE, SHA_RE, HistoryError, decode_json, parse_manifest, read_input
 
 
 class GateError(Exception):
@@ -60,8 +59,6 @@ def _stage(category, fn, *args):
         raise CategorizedFailure(category) from exc
 
 
-FILE_RE = re.compile(r"^\d{4}_[A-Za-z0-9_]+\.sql$")
-SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_ROWS_OUTPUT = 1_000_000
 
 
@@ -125,16 +122,16 @@ def parse_rows(stdout):
     if len(stdout) > MAX_ROWS_OUTPUT:
         raise CategorizedFailure("schema")
     try:
-        payload = json.loads(stdout)
-    except ValueError as exc:
+        payload = decode_json(stdout)
+    except HistoryError as exc:
         raise CategorizedFailure("schema") from exc
     if not isinstance(payload, list):
         raise CategorizedFailure("schema")
     rows = []
     for item in payload:
         if (not isinstance(item, list) or len(item) != 2
-                or not isinstance(item[0], str) or not FILE_RE.match(item[0])
-                or not isinstance(item[1], str) or not SHA_RE.match(item[1])):
+                or not isinstance(item[0], str) or not FILE_RE.fullmatch(item[0])
+                or not isinstance(item[1], str) or not SHA_RE.fullmatch(item[1])):
             raise CategorizedFailure("schema")
         rows.append((item[0], item[1]))
     return rows
@@ -204,17 +201,17 @@ def fetch_config(env):
         raw = response.read(65537)
     if len(raw) > 65536:
         raise GateError("oversized staging binding response")
-    return json.loads(raw)
+    return decode_json(raw)
 
 
-def connection_env(env, payload):
+def connection_env(env, payload=...):
     url = urllib.parse.urlsplit(env.get("PLANETSCALE_MIGRATOR_URL_STAGING", ""))
     database = urllib.parse.unquote(url.path.removeprefix("/"))
     if (url.scheme not in ("postgres", "postgresql") or not url.hostname
             or not url.username or not url.password or url.fragment
             or database != "nntunev2_staging"):
         raise GateError("missing or invalid staging database configuration")
-    query = urllib.parse.parse_qs(url.query, strict_parsing=True)
+    query = urllib.parse.parse_qs(url.query, strict_parsing=True, keep_blank_values=True)
     # `sslrootcert=system` (libpq's system trust store, as PlanetScale issues
     # it) is accepted only because the gate pins the system CA bundle below;
     # any other root cert would point verification at an arbitrary file.
@@ -224,15 +221,17 @@ def connection_env(env, payload):
     sslmode = query.get("sslmode", ["verify-full"])[0]
     if sslmode != "verify-full":
         raise GateError("staging schema check requires verified TLS")
-    if payload is None:
+    if payload is ...:
         url.port  # raises on a malformed port
         return None
+    if not isinstance(payload, dict):
+        raise GateError("invalid staging binding response")
     origin = payload.get("result", {}).get("origin", {})
     if (payload.get("success") is not True or origin.get("scheme") not in ("postgres", "postgresql")
             or origin.get("database") != database
             or not isinstance(origin.get("host"), str)
             or origin["host"].lower().rstrip(".") != url.hostname.lower().rstrip(".")
-            or origin.get("port") != (url.port or 5432)):
+            or type(origin.get("port")) is not int or origin["port"] != (url.port or 5432)):
         raise GateError("staging database does not match the selected binding")
     # No URL/password in argv, inherited service files, passfiles, or arbitrary
     # libpq options. Never inherit alternative credentials after a failure.
@@ -259,7 +258,7 @@ def validate_inputs(env):
             for k in ("CLOUDFLARE_ACCOUNT_ID", "HYPERDRIVE_ID_STAGING")):
         raise GateError("missing or invalid staging binding configuration")
     # connection_env validates the migrator URL before reading the payload.
-    connection_env(env, None)
+    connection_env(env)
 
 
 def _run_sql(run, child, sql):

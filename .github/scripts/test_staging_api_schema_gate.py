@@ -150,6 +150,17 @@ class SchemaGateTests(unittest.TestCase):
         self.assertCategory("binding")
         self.assertEqual(self.calls, [])
 
+    def test_invalid_provider_shapes_prevent_database_connection(self):
+        valid = self.payload
+        self.payload = None
+        with self.subTest(payload=None):
+            self.assertCategory("binding")
+        self.payload = valid
+        self.payload["result"]["origin"]["port"] = 5432.0
+        with self.subTest(port=5432.0):
+            self.assertCategory("binding")
+        self.assertEqual(self.calls, [])
+
     def test_fetch_exception_is_binding_and_skips_database(self):
         def boom(env):
             raise OSError("synthetic-private-provider-error")
@@ -323,6 +334,8 @@ class ParseRowsTests(unittest.TestCase):
                        # A tab/newline inside a stored value cannot
                        # frame-shift rows: it fails the filename shape.
                        '[["0002_alpha.sql\\t0003_beta.sql", "' + A_SHA + '"]]\n',
+                       rows_json(("0002_alpha.sql\n", A_SHA)),
+                       rows_json(("0002_alpha.sql", A_SHA + "\n")),
                        "x" * (gate.MAX_ROWS_OUTPUT + 1)):
             with self.subTest(output=output[:30]):
                 with self.assertRaises(gate.CategorizedFailure) as caught:

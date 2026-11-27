@@ -4,6 +4,7 @@ import os
 import pathlib
 import re
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -22,12 +23,20 @@ def rendered_rows(target):
 
 
 class BackfillTests(unittest.TestCase):
+    def test_check_rejects_line_ending_drift_and_missing_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "backfill.sql"
+            args = ["--target", "app", "--check", str(path)]
+            path.write_bytes(backfill.render("app").replace("\n", "\r\n").encode())
+            self.assertEqual(backfill.main(args), 1)
+            path.unlink()
+            self.assertEqual(backfill.main(args), 1)
+
     def test_committed_files_match_the_generator(self):
         for target in backfill.TARGETS:
             committed = (REPO / "docs" / "ops" /
                          f"schema-migrations-backfill-2026-11-03-{target}.sql")
-            self.assertEqual(committed.read_text(encoding="utf-8"),
-                             backfill.render(target))
+            self.assertEqual(committed.read_bytes(), backfill.render(target).encode("utf-8"))
 
     def test_app_backfill_satisfies_the_gate_immediately(self):
         # The app file records exactly the frozen (2026-11-03) merged

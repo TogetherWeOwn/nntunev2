@@ -117,6 +117,21 @@ class ManifestShapeTestCase(unittest.TestCase):
 
 
 class TestManifestShapeExitTwo(ManifestShapeTestCase):
+    def test_symlinked_migration_directory_refuses(self):
+        self.write_migration("0001_first.sql")
+        self.write_manifest([self.manifest_entry("0001_first.sql")])
+        original = self.migrations.rename(self.root / "original")
+        self.migrations.symlink_to(original, target_is_directory=True)
+        self.assert_shape_exit_two(*self.run_gate_inprocess(), "regular")
+
+    def test_symlinked_manifest_refuses(self):
+        self.write_migration("0001_first.sql")
+        self.write_manifest([self.manifest_entry("0001_first.sql")])
+        manifest = self.migrations / "manifest.toml"
+        original = manifest.rename(self.root / "original.toml")
+        manifest.symlink_to(original)
+        self.assert_shape_exit_two(*self.run_gate_inprocess(), "regular")
+
     def test_zero_migration_tables_exits_two(self):
         # Singular [migration] table: zero [[migration]] array entries.
         self.write_migration("0001_first.sql")

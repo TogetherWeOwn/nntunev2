@@ -42,13 +42,20 @@ def require_commit(root, sha):
     return sha
 
 
+def unique_event_object(pairs):
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise BaseError("Actions event payload contains duplicate keys")
+    return fields
+
+
 def event_payload(env):
     try:
         with open(env["GITHUB_EVENT_PATH"], "rb") as stream:
             raw = stream.read(32 * 1024 * 1024 + 1)
         if len(raw) > 32 * 1024 * 1024:
             raise BaseError("Actions event payload exceeds the byte bound")
-        payload = json.loads(raw)
+        payload = json.loads(raw, object_pairs_hook=unique_event_object)
         if not isinstance(payload, dict):
             raise BaseError("Actions event payload must be a JSON object")
         return payload
@@ -58,8 +65,8 @@ def event_payload(env):
 
 def resolve(root, env):
     event = env.get("GITHUB_EVENT_NAME", "")
-    if not event:
-        raise BaseError("GITHUB_EVENT_NAME is required; cannot infer comparison semantics")
+    if event not in ("pull_request", "push", "merge_group", "workflow_dispatch", "workflow_call", "schedule"):
+        raise BaseError("missing or unsupported Actions event")
     tested = event_sha(env.get("GITHUB_SHA"), "GITHUB_SHA")
     if git(root, "rev-parse", "--verify", "HEAD^{commit}") != tested:
         raise BaseError("checkout HEAD does not match GITHUB_SHA")
@@ -84,8 +91,8 @@ def resolve(root, env):
             raise BaseError("queue checkout does not match event merge group head")
         base = require_commit(root, event_sha(group["base_sha"], "merge group base"))
         git(root, "merge-base", "--is-ancestor", base, tested)
-    elif event == "push" and payload.get("before", "") not in ("", "0" * 40):
-        base = require_commit(root, event_sha(payload["before"], "push before"))
+    elif event == "push" and payload.get("before") != "0" * 40:
+        base = require_commit(root, event_sha(payload.get("before"), "push before"))
     else:
         try:
             base = git(root, "rev-parse", "--verify", "refs/heads/main^{commit}")

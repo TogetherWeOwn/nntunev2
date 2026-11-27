@@ -24,6 +24,11 @@ URL_FULL = ("postgresql://migrator:secretpw@ep.example.com"
 
 def manifest_text():
     return f"""[[migration]]
+file = "0001_mb_mirror.sql"
+sha256 = "{MIRROR_SHA}"
+target = "mirror"
+
+[[migration]]
 file = "0054_first.sql"
 sha256 = "{APP_SHA}"
 target = "app"
@@ -32,11 +37,6 @@ target = "app"
 file = "0055_second.sql"
 sha256 = "{APP_SHA}"
 target = "app"
-
-[[migration]]
-file = "0001_mb_mirror.sql"
-sha256 = "{MIRROR_SHA}"
-target = "mirror"
 """
 
 
@@ -152,6 +152,11 @@ class StagingApplyTests(unittest.TestCase):
         self.assertEqual(summary.count("```"), 2)
         self.assertEqual(json.loads(summary.split("```json\n")[1].split("```\n")[0])["rows"][0]["applied_by"], "[redacted]")
         response.stdout = json.dumps({"database": "production", "rows": [row]})
+        with patch.object(staging_apply.subprocess, "run", return_value=response):
+            with self.assertRaises(staging_apply.StagingApplyError):
+                staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
+        response.stdout = '{"plain_table":false,"plain_table":true,' + json.dumps(
+            {"database": DB, "rows": [row]})[1:]
         with patch.object(staging_apply.subprocess, "run", return_value=response):
             with self.assertRaises(staging_apply.StagingApplyError):
                 staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
@@ -309,6 +314,17 @@ class StagingApplyTests(unittest.TestCase):
         finally:
             staging_apply.subprocess.run = original
 
+    def test_apply_rejects_del_actor_before_subprocess(self):
+        from unittest.mock import patch
+
+        data, trusted, root = self._roots(manifest_text())
+        env = {staging_apply.SECRET_ENV: URL_REQUIRE, "APPLY_PROGRESS": str(root / "progress")}
+        with patch.object(staging_apply.subprocess, "run") as runner:
+            runner.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with self.assertRaisesRegex(staging_apply.StagingApplyError, "printable text"):
+                staging_apply.apply_files(trusted, data, "0054_first.sql", "operator\x7f", "single", DB, env)
+            runner.assert_not_called()
+
     def test_plan_files_single_unknown_file_refuses(self):
         entries = staging_apply.load_entries(
             str(self._roots(manifest_text())[0]))
@@ -327,6 +343,20 @@ class StagingApplyTests(unittest.TestCase):
         normalized = staging_apply.normalize_url(URL_REQUIRE, DB)
         self.assertIn("sslmode=verify-full", normalized)
         self.assertNotIn("require", normalized)
+
+    def test_normalize_rejects_malformed_connection_options(self):
+        for url in (URL_REQUIRE.replace(".com", ".com:invalid"), URL_REQUIRE + "&sslrootcert=",
+                    URL_REQUIRE.removesuffix("require"), URL_REQUIRE.replace("require", "invalid")):
+            with self.subTest(url=url), self.assertRaises(staging_apply.StagingApplyError):
+                staging_apply.normalize_url(url, DB)
+
+    def test_manifest_cannot_use_symlinked_migrations_directory(self):
+        data, _, root = self._roots(manifest_text())
+        migrations = data / "migrations"
+        original = migrations.rename(root / "other-migrations")
+        migrations.symlink_to(original, target_is_directory=True)
+        with self.assertRaises(staging_apply.StagingApplyError):
+            staging_apply.load_entries(data)
 
     def test_evidence_child_env_forces_verify_full_over_require(self):
         env = staging_apply.evidence_child_env(URL_REQUIRE, DB)
@@ -350,7 +380,7 @@ class StagingApplyTests(unittest.TestCase):
             # Row exists only under the pre-rename name.
             return SimpleNamespace(
                 returncode=0,
-                stdout="0054_original.sql\t" + APP_SHA + "\t2026-11-11\tci")
+                stdout=f"0054_original.sql\t{APP_SHA}\t2026-11-11\tci\n".encode())
 
         original = staging_apply.subprocess.run
         staging_apply.subprocess.run = fake_psql
@@ -367,6 +397,19 @@ class StagingApplyTests(unittest.TestCase):
         entry = staging_apply.find_entry(entries, "0054_renamed.sql")
         self.assertEqual(sorted(staging_apply.entry_names(entry)),
                          ["0054_original.sql", "0054_renamed.sql"])
+
+    def test_evidence_rejects_unverified_rows(self):
+        from unittest.mock import patch
+
+        data, _, root = self._roots(renamed_manifest_text())
+        env = {staging_apply.SECRET_ENV: URL_REQUIRE,
+               "GITHUB_STEP_SUMMARY": str(root / "summary"), "APPLY_PROGRESS": str(root / "progress")}
+        valid = f"0054_original.sql\t{APP_SHA}\t2026-11-11\tci\n"
+        for row in (valid.replace(APP_SHA, MIRROR_SHA), valid + valid):
+            with self.subTest(row=row), patch.object(staging_apply.subprocess, "run") as runner:
+                runner.return_value = SimpleNamespace(returncode=0, stdout=row.encode())
+                with self.assertRaises(staging_apply.StagingApplyError):
+                    staging_apply.run_evidence(data, "0054_renamed.sql", "0054_renamed.sql", "success", DB, env)
 
     # First-failure stop with applied-prefix evidence.
     def test_first_failure_stops_and_reports_applied_prefix(self):
@@ -410,7 +453,7 @@ class StagingApplyTests(unittest.TestCase):
                "PATH": os.environ["PATH"], "HOME": "/tmp"}
 
         def fake_psql(argv, **kwargs):
-            return SimpleNamespace(returncode=0, stdout="")
+            return SimpleNamespace(returncode=0, stdout=b"")
 
         original = staging_apply.subprocess.run
         staging_apply.subprocess.run = fake_psql

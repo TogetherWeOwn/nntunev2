@@ -83,6 +83,8 @@ class SyntheticAcquisitionAdmission(unittest.TestCase):
                 None,
                 admission.Declaration(True, "o/r", sha(1), sha(2), "refs/heads/fence"),
                 admission.Declaration(1, "o/r", "", sha(2), "refs/heads/fence"),
+                admission.Declaration(1, "o/r", sha(0), sha(2), "refs/heads/fence"),
+                admission.Declaration(1, "o/r", sha(1), sha(0), "refs/heads/fence"),
                 admission.Declaration(1, "o/r", sha(1), sha(2), "topic"),
                 admission.Declaration(1, "o/r", sha(1), sha(2), "refs/")):
             with self.subTest(declaration=declaration), self.assertRaises(history.HistoryError):

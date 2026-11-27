@@ -321,14 +321,14 @@ def resolve_entry(entries, filename, sha256):
 
 
 def quote_literal(value, label="applied-by"):
-    if any(ord(ch) < 0x20 for ch in value) or not value.strip():
+    if migration_history.LEDGER_CONTROL_RE.search(value) or not value.strip():
         raise ApplyError(f"{label} must be non-empty printable text")
     return "'" + value.replace("'", "''") + "'"
 
 
 def validate_expected_database(expected_database):
     if not isinstance(expected_database, str) \
-            or not DATABASE_RE.match(expected_database):
+            or not DATABASE_RE.fullmatch(expected_database):
         raise ApplyError(
             "--expect-database must be a plain database name ([A-Za-z0-9_]+)")
     return expected_database
@@ -464,12 +464,17 @@ def compose(file_path, manifest_path, applied_by, record_only=False,
     validate_expected_database(expect_database)
     path = pathlib.Path(file_path)
     filename = path.name
-    if not FILE_RE.match(filename):
+    if not FILE_RE.fullmatch(filename):
         raise ApplyError(f"not a numbered migration filename: {filename}")
     try:
-        contents = path.read_bytes()
+        if path.is_symlink() or not path.is_file():
+            raise ApplyError("migration must be a regular file")
+        with path.open("rb") as stream:
+            contents = stream.read(migration_history.MAX_BLOB + 1)
     except OSError as exc:
         raise ApplyError(f"cannot read migration: {exc}") from exc
+    if len(contents) > migration_history.MAX_BLOB:
+        raise ApplyError("migration input bound exceeded")
     sha256 = hashlib.sha256(contents).hexdigest()
     entries = load_manifest(manifest_path)
     target, identity, priors = resolve_entry(entries, filename, sha256)
@@ -487,12 +492,16 @@ def compose(file_path, manifest_path, applied_by, record_only=False,
 
 def connection_env(database_url):
     """libpq env from a URL; credentials never reach argv."""
-    url = urllib.parse.urlsplit(database_url)
+    try:
+        url = urllib.parse.urlsplit(database_url)
+        port = url.port
+        query = urllib.parse.parse_qs(url.query, strict_parsing=True, keep_blank_values=True)
+    except ValueError:
+        raise ApplyError("DATABASE_URL is missing or malformed") from None
     database = urllib.parse.unquote(url.path.removeprefix("/"))
     if (url.scheme not in ("postgres", "postgresql") or not url.hostname
             or not url.username or not database or url.fragment):
         raise ApplyError("DATABASE_URL is missing or malformed")
-    query = urllib.parse.parse_qs(url.query, strict_parsing=True)
     if set(query) - {"sslmode", "sslrootcert"} or len(query.get("sslmode", [])) > 1:
         raise ApplyError("DATABASE_URL carries unsupported connection options")
     # libpq's `sslrootcert=system` is honoured by pinning the system CA
@@ -502,13 +511,15 @@ def connection_env(database_url):
         raise ApplyError("DATABASE_URL sslrootcert must be system when present")
     sslmode = query.get("sslmode", [None])[0]
     local = url.hostname in ("localhost", "127.0.0.1", "::1")
+    if sslmode is not None and sslmode not in ("disable", "allow", "prefer", "require", "verify-ca", "verify-full"):
+        raise ApplyError("DATABASE_URL carries unsupported connection options")
     if sslmode != "verify-full" and not local:
         raise ApplyError("DATABASE_URL requires sslmode=verify-full off localhost")
     child = {k: v for k, v in os.environ.items()
              if k in ("PATH", "HOME", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR")}
     child.update({
         "PGHOST": url.hostname,
-        "PGPORT": str(url.port or 5432),
+        "PGPORT": str(port or 5432),
         "PGDATABASE": database,
         "PGUSER": urllib.parse.unquote(url.username),
         "PGCONNECT_TIMEOUT": "10",

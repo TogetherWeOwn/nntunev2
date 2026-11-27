@@ -11,21 +11,12 @@ import time
 
 from migration_history import (COMMIT_RE, MAX_FILES, MAX_INPUT, MAX_OUTPUT,
                                EvidenceBudget, GitHistory, HistoryError,
-                               api_coverage, read_input, unique_object)
+                               api_coverage, decode_json as decode, read_input)
 
 MAX_ATTEMPTS = 3
 REQUEST_TIMEOUT = 15
 COLLECTION_TIMEOUT = 60
-REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
-
-
-def decode(text):
-    try:
-        return json.loads(text, object_pairs_hook=unique_object)
-    except HistoryError:
-        raise
-    except (ValueError, RecursionError) as exc:
-        raise HistoryError("invalid API JSON") from exc
+REPO_RE = re.compile(r"(?!\.{1,2}/)[A-Za-z0-9_.-]+/(?!\.{1,2}\Z)[A-Za-z0-9_.-]+\Z")
 
 
 def project_metadata(data):
@@ -208,7 +199,8 @@ def snapshot_coverage(root, base, head, files_text, snapshot_text, expected, bud
     try:
         before = project_metadata(snapshot["before"])
         after = project_metadata(snapshot["after"])
-        if before != after or snapshot["event"] != expected:
+        saved_event = snapshot["event"]
+        if before != after or project_metadata(saved_event) != expected or saved_event != expected:
             raise HistoryError("API snapshot brackets/event differ")
         if type(snapshot["attempt"]) is not int or not 1 <= snapshot["attempt"] <= MAX_ATTEMPTS:
             raise HistoryError("invalid snapshot attempt")

@@ -73,7 +73,10 @@ def main(argv=None):
     status = 0
     try:
         files_text, metadata_text = read_input(args.files_file), read_input(args.metadata_file)
-        manifest_text = read_input(args.root / args.manifest)
+        manifest_path = args.root / args.manifest
+        if not manifest_path.resolve().is_relative_to(args.root.resolve()):
+            raise HistoryError("manifest must stay inside the checkout")
+        manifest_text = read_input(manifest_path)
         if args.event_file:
             budget = resumed_budget(metadata_text)
             budget.consume(len(files_text.encode()) + len(metadata_text.encode()))
@@ -97,7 +100,7 @@ def main(argv=None):
         else:
             coverage = api_coverage(files_text, metadata_text, args.base_sha, args.head_sha)
             edges = verify(args.root, args.base_sha, args.head_sha, manifest_text, coverage)
-    except (HistoryError, OSError, UnicodeError) as exc:
+    except (HistoryError, OSError, UnicodeError, RuntimeError) as exc:
         diagnostic = str(exc)[:1024]
         if active_pass:
             outcomes[active_pass]["outcome"] = "failed"

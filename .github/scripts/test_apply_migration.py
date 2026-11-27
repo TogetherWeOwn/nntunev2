@@ -6,6 +6,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -40,7 +41,7 @@ class MirrorPinTests(unittest.TestCase):
     def test_mirror_entry_drift_refuses(self):
         for name, sha in runtime_cases.MIRROR_FILES:
             for field, before, after in (
-                    ("file", name, "9998_renamed_mirror.sql"),
+                    ("file", name, f"{name[:5]}renamed_mirror.sql"),
                     ("sha256", sha, "0" * 64),
                     ("target", "mirror", "app")):
                 with self.subTest(file=name, field=field):
@@ -83,8 +84,8 @@ class MirrorPinTests(unittest.TestCase):
                 reordered[left], reordered[right] = reordered[right], reordered[left]
                 self.manifest.write_text(
                     "[[migration]]".join(reordered), encoding="utf-8")
-                with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
-                    runtime_cases.assert_frozen_mirror(self.manifest)
+                with self.assertRaisesRegex(apply_migration.ApplyError, "strictly increasing"):
+                    apply_migration.load_manifest(self.manifest)
 
     def test_mirror_file_byte_drift_refuses(self):
         for name, _sha in runtime_cases.MIRROR_FILES:
@@ -142,6 +143,40 @@ class ComposeTests(unittest.TestCase):
         # Plain insert: the in-transaction guard already refused any
         # recorded identity, so ON CONFLICT would only mask a race.
         self.assertNotIn("ON CONFLICT", sql)
+
+    def test_compose_refuses_symlinked_sql(self):
+        self.fixture()
+        path = self.root / "0002_alpha.sql"
+        original = path.rename(self.root / "original.sql")
+        path.symlink_to(original)
+        with self.assertRaises(apply_migration.ApplyError):
+            self.compose()
+
+    def test_compose_refuses_sql_above_the_blob_bound(self):
+        self.fixture()
+        with mock.patch.object(apply_migration.migration_history, "MAX_BLOB", 1):
+            with self.assertRaisesRegex(apply_migration.ApplyError, "bound exceeded"):
+                self.compose()
+
+    def test_quote_literal_rejects_del_actor(self):
+        with self.assertRaisesRegex(apply_migration.ApplyError, "printable text"):
+            apply_migration.quote_literal("operator\x7f")
+
+    def test_apply_rejects_out_of_order_prerequisites(self):
+        self.write_manifest([
+            ("0002_alpha.sql", "app", "SELECT 2;\n", []),
+            ("0001_first.sql", "app", "SELECT 1;\n", []),
+        ])
+        with self.assertRaisesRegex(apply_migration.ApplyError, "strictly increasing"):
+            self.compose()
+
+    def test_malformed_connection_options_raise_redacted_apply_error(self):
+        base = "postgresql://u:fixture-password@localhost"
+        for suffix in (":invalid/app", "/app?sslrootcert=", "/app?sslmode=require&sslmode="):
+            with self.subTest(suffix=suffix):
+                with self.assertRaises(apply_migration.ApplyError) as error:
+                    apply_migration.connection_env(base + suffix)
+                self.assertNotIn("fixture-password", str(error.exception))
 
     def test_runner_infrastructure_uses_catalog_namespace(self):
         self.fixture()
