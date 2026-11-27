@@ -40,6 +40,12 @@ pub enum MultipartError {
 
 type Result<T> = std::result::Result<T, MultipartError>;
 
+pub(crate) fn valid_version_id(version: &str) -> bool {
+    (1..=1024).contains(&version.len())
+        && version != "null"
+        && version.bytes().all(|b| b.is_ascii_graphic() && b != b',')
+}
+
 /// Opaque provider identity supplied by the caller; not an authorization check.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UploadTarget<'a> {
@@ -280,7 +286,7 @@ impl<'a> Completion<'a> {
         use MultipartError::{CompletionIdentity, CompletionVersion};
         // Bound the allocation and refuse coalesced field values. Do not trim,
         // decode or replace an opaque version (including with an ETag).
-        if version.len() > 1024 || version.contains(',') {
+        if !valid_version_id(version) {
             return Err(CompletionVersion);
         }
         let (target, ciphertext_len) = self.object();
@@ -312,6 +318,7 @@ impl<'a> Completion<'a> {
         let mut next = || reader.next().map_err(|_| CompletionBody);
         let (mut depth, mut root_ns, mut matched, mut typed) = (0, None, false, false);
         let (mut saw_bucket, mut saw_key) = (false, false);
+        let (mut saw_location, mut saw_etag) = (false, false);
         loop {
             match next()? {
                 StartElement { name, .. } => {
@@ -336,7 +343,17 @@ impl<'a> Completion<'a> {
                             *seen = true;
                             continue;
                         }
-                        (1, "Location" | "ETag", _) => {}
+                        (1, field @ ("Location" | "ETag"), n) if n == root_ns.as_deref() => {
+                            let seen = if field == "Location" {
+                                &mut saw_location
+                            } else {
+                                &mut saw_etag
+                            };
+                            if *seen {
+                                return Err(CompletionBody);
+                            }
+                            *seen = true;
+                        }
                         _ => return Err(CompletionBody),
                     }
                     depth += 1;
@@ -403,4 +420,40 @@ fn s3_receipt_reader(body: &[u8]) -> Result<xml::EventReader<&[u8]>> {
         .override_encoding(Some(Encoding::Utf8))
         .allow_multiple_root_elements(false)
         .create_reader(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nntune_core::origin_sealer::OriginSealer;
+
+    #[test]
+    fn optional_completion_fields_are_unique_and_in_the_receipt_namespace() {
+        let target = UploadTarget {
+            bucket: "test",
+            key: "fixture",
+            upload_id: "upload",
+        };
+        let sealer = OriginSealer::new(1).unwrap();
+        let plan = Plan::new(target, sealer.header(), 1).unwrap();
+        let completion = Completion {
+            plan,
+            parts: vec![],
+            checksum: "digest-1".into(),
+        };
+        let verify = |fields| {
+            let body = format!(
+                "<CompleteMultipartUploadResult>{fields}<ChecksumSHA256>digest-1</ChecksumSHA256></CompleteMultipartUploadResult>"
+            );
+            completion.verify_reply(200, body.as_bytes())
+        };
+        assert_eq!(verify("<Location>uri</Location><ETag>tag</ETag>"), Ok(()));
+        for fields in [
+            "<Location>one</Location><Location>two</Location>",
+            "<ETag>one</ETag><ETag>two</ETag>",
+            "<ETag xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">tag</ETag>",
+        ] {
+            assert_eq!(verify(fields), Err(MultipartError::CompletionBody));
+        }
+    }
 }

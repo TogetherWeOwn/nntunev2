@@ -2,7 +2,10 @@ use std::time::SystemTime;
 
 use tokio_postgres::{types::Type, Client, IsolationLevel, Row, Transaction};
 
-use super::{stage_completed_candidate, uuid, CandidateIntent, InventoryAppendError};
+use super::{
+    candidate_geometry, stage_completed_candidate, uuid, valid_inventory_versions, CandidateIntent,
+    InventoryAppendError,
+};
 use crate::multipart::{
     readback_inventory::{ReadbackScope, VerifiedCompletedReadback},
     session_outcome::{CommittedOutcome, CompletionScope},
@@ -133,7 +136,7 @@ pub async fn read_completion(
         .await
         .map_err(|_| Indeterminate)?
         .ok_or(Refused)?;
-    let result = decode_outcome(&row).map_err(|_| Indeterminate)?;
+    let result = decode_outcome(&row, scope.offset)?;
     tx.commit().await.map_err(|_| Indeterminate)?;
     Ok(result)
 }
@@ -172,9 +175,7 @@ pub async fn protect_completion_reuse(
         .await
         .map_err(|_| Indeterminate)?
         .ok_or(Refused)?;
-    let outcome = decode_outcome(&row)
-        .map_err(|_| Indeterminate)?
-        .ok_or(Refused)?;
+    let outcome = decode_outcome(&row, scope.offset)?.ok_or(Refused)?;
     let until = authorize(scope, &outcome).await?;
     let usable_until = tx
         .query_typed_opt(
@@ -200,7 +201,21 @@ pub async fn protect_completion_reuse(
     })
 }
 
-fn decode_outcome(row: &Row) -> Result<Option<CommittedOutcome>, tokio_postgres::Error> {
+fn decode_outcome(row: &Row, offset: i64) -> Result<Option<CommittedOutcome>, OutcomeError> {
+    let outcome = decode_pins(row).map_err(|_| Indeterminate)?;
+    if let Some(pins) = &outcome {
+        let geometry = u64::try_from(offset)
+            .ok()
+            .and_then(candidate_geometry)
+            .ok_or(Indeterminate)?;
+        if !valid_inventory_versions(geometry, &pins.media_version, &pins.page_versions) {
+            return Err(Indeterminate);
+        }
+    }
+    Ok(outcome)
+}
+
+fn decode_pins(row: &Row) -> Result<Option<CommittedOutcome>, tokio_postgres::Error> {
     let Some(map) = row.try_get(0)? else {
         return Ok(None);
     };

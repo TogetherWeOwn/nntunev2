@@ -150,8 +150,11 @@ pub fn build_search_dispatch(
     page: u32,
 ) -> Result<QueueMsg, &'static str> {
     let q = query.trim();
-    if q.is_empty() || q.chars().count() > 200 {
+    if q.is_empty() || q.chars().take(201).count() > 200 {
         return Err("query must be 1..=200 chars");
+    }
+    if q.chars().any(char::is_control) {
+        return Err("query must not contain control characters");
     }
     if !validate_indexer_ref(indexer_ref) {
         return Err("indexer_ref must be a vault handle");
@@ -277,6 +280,9 @@ mod tests {
         assert!(bad_user(""));
         assert!(build_search_dispatch(USER, "", INDEXER, &[], 10, 0).is_err());
         assert!(build_search_dispatch(USER, &"x".repeat(201), INDEXER, &[], 10, 0).is_err());
+        for query in ["a\0b", "a\nb", "a\u{85}b"] {
+            assert!(build_search_dispatch(USER, query, INDEXER, &[], 10, 0).is_err());
+        }
         assert!(
             build_search_dispatch(USER, "q", "https://indexer.example?apikey=x", &[], 10, 0)
                 .is_err()

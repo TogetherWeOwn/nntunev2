@@ -4,7 +4,9 @@ use tokio_postgres::{
     Error, Transaction,
 };
 
-use super::{candidate_hashes, uuid, CandidateIntent, LOCK_SQL};
+use super::{
+    candidate_geometry, candidate_hashes, uuid, valid_inventory_versions, CandidateIntent, LOCK_SQL,
+};
 use crate::multipart::readback_inventory::{ReadbackScope, VerifiedCompletedReadback};
 
 // The claim FK binds the digest, and ordered hashes bind the constrained map pages.
@@ -47,6 +49,7 @@ const STAGE_WINNER_SQL: &str = "INSERT INTO public.storage_validated_digest_winn
     WHERE p.media_version = $12::text AND p.page_versions = $13::text[]
       AND e.root_version_id = $14::text::uuid AND e.wrapped_record = $15::bytea
       AND c.expires_at > pg_catalog.clock_timestamp()
+      AND pg_catalog.to_timestamp($16::bigint::double precision) > pg_catalog.clock_timestamp()
     RETURNING 1";
 
 // This separate statement runs after all insert triggers and foreign-key checks.
@@ -198,6 +201,7 @@ async fn write_verified(
         return Err(Identity);
     }
     let origin = verified.origin();
+    let geometry = candidate_geometry(intent.plaintext_len).ok_or(Identity)?;
     let hashes: Vec<&[u8]> = candidate_hashes(intent, origin)
         .map_err(|_| Identity)?
         .iter()
@@ -210,10 +214,13 @@ async fn write_verified(
         .map(|(_, pin)| pin.version)
         .collect::<Option<Vec<_>>>()
         .ok_or(Identity)?;
+    if !valid_inventory_versions(geometry, media_version, &page_versions) {
+        return Err(Identity);
+    }
     let [environment, library, object, sealing_generation, provider] =
         intent.identities.map(|id| uuid(&id));
     let digest = origin.plaintext_sha256().as_slice();
-    let length = i64::try_from(intent.plaintext_len).map_err(|_| Identity)?;
+    let length = geometry.plaintext_len() as i64;
 
     let map = uuid(&intent.map_id);
     let header = intent.header.as_slice();
@@ -266,7 +273,13 @@ async fn write_verified(
             .is_some())
     }
     .await;
-    if matches!(result, Ok(true)) {
+    let result = match (result, write) {
+        (Ok(true), Write::StageWinner(until)) => check_retention(&savepoint, until).await,
+        (Ok(true), Write::AppendInventory) => Ok(()),
+        (Ok(false), _) => Err(MissingOrFenced),
+        (Err(error), _) => Err(InventoryAppendError::from_db(error)),
+    };
+    if result.is_ok() {
         return savepoint
             .commit()
             .await
@@ -276,7 +289,5 @@ async fn write_verified(
         .rollback()
         .await
         .map_err(InventoryAppendError::from_db)?;
-    Err(result
-        .err()
-        .map_or(MissingOrFenced, InventoryAppendError::from_db))
+    result
 }

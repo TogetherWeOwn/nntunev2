@@ -122,7 +122,7 @@ impl JobCheckpoint {
         manifest: crate::audio_manifest::AcceptedAudioManifest,
     ) -> Result<(), crate::audio_manifest::ManifestError> {
         use crate::audio_manifest::ManifestError;
-        if !manifest.is_for(&self.job_id, &self.user_id) {
+        if !self.owns_audio_manifest(&manifest) {
             return Err(ManifestError::Identity);
         }
         match self.audio_manifest() {
@@ -138,11 +138,22 @@ impl JobCheckpoint {
     pub fn validate_audio_manifest(&self) -> Result<(), crate::audio_manifest::ManifestError> {
         if self
             .audio_manifest()
-            .is_some_and(|m| !m.is_for(&self.job_id, &self.user_id))
+            .is_some_and(|m| !self.owns_audio_manifest(m))
         {
             return Err(crate::audio_manifest::ManifestError::Identity);
         }
         Ok(())
+    }
+
+    fn owns_audio_manifest(&self, manifest: &crate::audio_manifest::AcceptedAudioManifest) -> bool {
+        manifest.is_for(&self.job_id, &self.user_id)
+            && (self.source != JobSource::NzbUpload
+                || derive_idempotency_key(
+                    &self.user_id,
+                    manifest.original_content_sha256(),
+                    "upload",
+                )
+                .is_ok_and(|key| key == self.idempotency_key))
     }
 
     /// Preserve the legacy status shape, without serializing private selectors.
@@ -400,6 +411,46 @@ mod tests {
             transcode_next: 0,
             accepted_audio_manifest_v1: None,
         }
+    }
+
+    #[test]
+    fn upload_checkpoint_requires_the_manifest_digest_from_admission() {
+        use crate::audio_manifest::{
+            AcceptedAudioManifest, AudioEntry, AudioSelector, ManifestError,
+        };
+
+        let mut cp = checkpoint_at(JobState::Matching);
+        let manifest = |sha| {
+            AcceptedAudioManifest::from_entries(
+                &cp.job_id,
+                &cp.user_id,
+                sha,
+                vec![AudioEntry {
+                    audio_ordinal: 1,
+                    source_selector: AudioSelector {
+                        nzb_file_ordinal: 0,
+                        archive_member: None,
+                        audio_selection_index: 0,
+                    },
+                    artist_group_ref: 1,
+                    release_group_ref: 1,
+                    hints: Default::default(),
+                    embedded_art_selector: None,
+                }],
+            )
+            .unwrap()
+        };
+        let good = manifest(&"a".repeat(64));
+        let wrong = manifest(&"b".repeat(64));
+        assert_eq!(
+            cp.freeze_audio_manifest(wrong.clone()),
+            Err(ManifestError::Identity)
+        );
+        assert!(cp.audio_manifest().is_none());
+        assert_eq!(cp.freeze_audio_manifest(good), Ok(()));
+        assert_eq!(cp.validate_audio_manifest(), Ok(()));
+        cp.accepted_audio_manifest_v1 = Some(wrong);
+        assert_eq!(cp.validate_audio_manifest(), Err(ManifestError::Identity));
     }
 
     #[test]

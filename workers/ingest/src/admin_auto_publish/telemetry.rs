@@ -48,10 +48,12 @@ impl Outcome {
 
 fn classify(result: &Result<StageOutcome, PublicationError>) -> Labels {
     let (outcome, reason) = match result {
-        Ok(StageOutcome::Staged(_)) => (Outcome::Staged, None),
+        Ok(StageOutcome::Staged(ids)) if !ids.is_empty() => (Outcome::Staged, None),
         Ok(StageOutcome::NeedsReview(reason)) => (Outcome::NeedsReview, Some(*reason)),
         Err(PublicationError::Refused) => (Outcome::Refused, None),
-        Err(PublicationError::Indeterminate) => (Outcome::Indeterminate, None),
+        Ok(StageOutcome::Staged(_)) | Err(PublicationError::Indeterminate) => {
+            (Outcome::Indeterminate, None)
+        }
     };
     Labels { outcome, reason }
 }
@@ -116,6 +118,7 @@ mod tests {
             ),
             (Err(PublicationError::Refused), "refused"),
             (Err(PublicationError::Indeterminate), "indeterminate"),
+            (Ok(StageOutcome::Staged(vec![])), "indeterminate"),
         ] {
             assert_eq!(
                 serde_json::to_value(matcher_counter(&result)).unwrap(),

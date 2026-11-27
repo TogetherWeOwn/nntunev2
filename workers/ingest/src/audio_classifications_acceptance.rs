@@ -1,13 +1,10 @@
 //! Read the durable classification before minting fresh evidence.
 //!
-//! Unmounted until the publication consumer is ready. Only a present,
-//! owner/job/digest-bound checkpoint permits skipping evidence retrieval; a
-//! missing checkpoint, fenced original or read error refuses rather than
-//! authorizing regeneration. The classification checkpoint is consumed only
-//! when it was derived from the accepted manifest winner and frozen through
-//! the store, and only the database winner leaves this seam. KV is never
-//! acceptance authority, and classification grants no membership, catalogue
-//! or playback authority.
+//! Unmounted until the publication consumer is ready. A confirmed miss can
+//! trigger evidence retrieval. A fenced original or read error refuses it.
+//! Only a database winner consistent with the accepted manifest leaves this
+//! seam. KV is never acceptance authority, and classification grants no
+//! membership, catalogue or playback authority.
 
 use std::future::Future;
 
@@ -17,6 +14,8 @@ use crate::{
     },
     audio_classifications_store::StoreError,
     audio_manifest::{valid_identity, AcceptedAudioManifest},
+    audio_positions::PositionError,
+    audio_publication::prepare_publication,
 };
 
 #[allow(async_fn_in_trait)]
@@ -45,10 +44,6 @@ pub enum ClassificationAcceptanceError {
     InvalidWinner,
 }
 
-fn bound(checkpoint: &ClassificationCheckpoint, job: &str, owner: &str, hash: &str) -> bool {
-    checkpoint.is_for(job, owner) && checkpoint.original_content_sha256() == hash
-}
-
 /// A lazy evidence producer is invoked only for a confirmed miss, never for
 /// read errors, a persisted checkpoint or redelivery of an accepted
 /// classification. A concurrent first classification can beat our candidate:
@@ -74,6 +69,11 @@ where
     if !manifest.is_for(job_id, user_id) || manifest.original_content_sha256() != original_hash {
         return Err(ClassificationAcceptanceError::Identity);
     }
+    if manifest.effective_discs().is_none() {
+        return Err(ClassificationAcceptanceError::Classify(
+            ClassError::Positions(PositionError::UnfrozenDiscs),
+        ));
+    }
     let winner = match store
         .load(job_id, user_id, original_hash)
         .await
@@ -92,9 +92,8 @@ where
                 .map_err(ClassificationAcceptanceError::Store)?
         }
     };
-    if !bound(&winner, job_id, user_id, original_hash) {
-        return Err(ClassificationAcceptanceError::InvalidWinner);
-    }
+    prepare_publication(manifest, &winner)
+        .map_err(|_| ClassificationAcceptanceError::InvalidWinner)?;
     Ok(winner)
 }
 
@@ -136,5 +135,84 @@ impl ClassificationAcceptanceStore for PgClassificationAcceptanceStore<'_> {
             original_hash,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio_manifest::{AudioEntry, AudioSelector};
+
+    struct Store {
+        replay: bool,
+        winner: ClassificationCheckpoint,
+    }
+
+    impl ClassificationAcceptanceStore for Store {
+        async fn load(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<ClassificationCheckpoint>, StoreError> {
+            Ok(self.replay.then(|| self.winner.clone()))
+        }
+
+        async fn freeze(
+            &self,
+            _: &ClassificationCheckpoint,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<ClassificationCheckpoint, StoreError> {
+            assert!(!self.replay);
+            Ok(self.winner.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_a_winner_with_the_right_identity_and_wrong_geometry() {
+        let sha = "a".repeat(64);
+        let manifest = AcceptedAudioManifest::from_entries(
+            "job_a",
+            "owner",
+            &sha,
+            vec![AudioEntry {
+                audio_ordinal: 1,
+                source_selector: AudioSelector {
+                    nzb_file_ordinal: 0,
+                    archive_member: None,
+                    audio_selection_index: 0,
+                },
+                artist_group_ref: 1,
+                release_group_ref: 1,
+                hints: Default::default(),
+                embedded_art_selector: None,
+            }],
+        )
+        .unwrap();
+        let winner = classify_entries(&manifest, &[None]).unwrap();
+        let mut invalid = serde_json::to_value(&winner).unwrap();
+        invalid["entries"][0]["release_group_ref"] = 2.into();
+        let invalid = ClassificationCheckpoint::parse(&invalid.to_string()).unwrap();
+        for replay in [true, false] {
+            for (winner, valid) in [(winner.clone(), true), (invalid.clone(), false)] {
+                let store = Store { replay, winner };
+                let got =
+                    accept_classifications(&store, &manifest, "job_a", "owner", &sha, || async {
+                        assert!(!replay, "replays must skip fresh evidence");
+                        Ok(vec![None])
+                    })
+                    .await;
+                assert_eq!(
+                    got,
+                    if valid {
+                        Ok(store.winner)
+                    } else {
+                        Err(ClassificationAcceptanceError::InvalidWinner)
+                    }
+                );
+            }
+        }
     }
 }

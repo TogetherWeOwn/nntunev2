@@ -4,7 +4,9 @@ use std::future::Future;
 
 use tokio_postgres::{Client, Error, IsolationLevel, Row};
 
-use super::{candidate_hashes, uuid, CandidateIntent, OriginManifest, LOCK_SQL};
+use super::{
+    candidate_geometry, candidate_hashes, uuid, CandidateIntent, OriginManifest, LOCK_SQL,
+};
 use crate::digest_candidate_identity::{candidate_pages_match, CandidatePage};
 
 const OBSERVE_SQL: &str = "SELECT r.generation,
@@ -28,7 +30,7 @@ const OBSERVE_SQL: &str = "SELECT r.generation,
    AND r.plaintext_sha256 = $3 AND r.plaintext_bytes = $4
    AND i.object_id = $5::text::uuid AND i.generation_id = $6::text::uuid
    AND i.provider_configuration_version_id = $7::text::uuid AND i.header_tag = $8
-   AND i.envelope_bytes = 48 + i.plaintext_bytes + 16 * $10::integer
+   AND i.envelope_bytes = $12
  ORDER BY p.page_index LIMIT 513";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -53,11 +55,13 @@ pub(super) async fn observe_with_deadline<D: Future<Output = ()>>(
     let Ok(hashes) = candidate_hashes(intent, manifest) else {
         return DatabaseOutcome::Indeterminate;
     };
-    let Ok(length @ 1..=8_589_934_592) = i64::try_from(intent.plaintext_len) else {
+    let Some(geometry) = candidate_geometry(intent.plaintext_len) else {
         return DatabaseOutcome::Indeterminate;
     };
-    let chunks = ((length + 65535) / 65536) as i32;
-    let pages = (chunks + 255) / 256;
+    let length = geometry.plaintext_len() as i64;
+    let chunks = geometry.chunks() as i32;
+    let pages = geometry.pages() as i32;
+    let envelope_bytes = geometry.sealed_len() as i64;
     let [environment, library, object, sealing_generation, provider] =
         intent.identities.map(|id| uuid(&id));
     let digest = manifest.plaintext_sha256().as_slice();
@@ -95,6 +99,7 @@ pub(super) async fn observe_with_deadline<D: Future<Output = ()>>(
                         &map,
                         &chunks,
                         &pages,
+                        &envelope_bytes,
                     ],
                 )
                 .await?;
@@ -134,7 +139,10 @@ fn classify(
     }
     let mut pages = Vec::with_capacity(rows.len());
     for row in rows {
-        if !row.try_get::<_, bool>(1)? || !row.try_get::<_, bool>(3)? {
+        if row.try_get::<_, i64>(0)? != generation
+            || !row.try_get::<_, bool>(1)?
+            || !row.try_get::<_, bool>(3)?
+        {
             return Ok(Indeterminate);
         }
         pages.push(CandidatePage {
