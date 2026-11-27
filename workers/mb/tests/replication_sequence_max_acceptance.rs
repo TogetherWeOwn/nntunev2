@@ -3,8 +3,7 @@
 //! Card title says `u64::MAX`; the store (`migration 0017`
 //! `mb_replication_packet.sequence BIGINT`) and the probe
 //! ([`ReplicationSloProbe::evaluate`]) are `i64`, so `u64::MAX` is
-//! unrepresentable here and `i64::MAX` is the effective maximum. Every test
-//! below uses `i64::MAX` / `i64::MAX - 1` on that reading.
+//! unrepresentable here and `i64::MAX` is the effective maximum.
 //!
 //! What is pinned:
 //! - Evaluating through `i64::MAX` terminates: no wrap to 0/MIN, no panic,
@@ -18,6 +17,13 @@
 //!   pending packet at `MAX` counts as pending instead of breaching.
 //!
 //! An applied `MAX` ends the scan without reporting a gap at that slot.
+//!
+//! Sensitivity: mutate either `checked_add` arm in `workers/mb/src/replication.rs`
+//! (`report_gap`'s pending-cursor advance or `enumerate_unknown`'s step) to a
+//! wrapping/saturating step and this target goes red — e.g. a wrapping step
+//! turns the single-`MAX` cases into a capped 10_001-breach scan, and a
+//! saturating cursor turns the in-budget pending case into a spurious breach.
+//! Verified 2026-10-18 by local mutation (wrapping step) before restoring.
 
 use nntune_mb::replication::{
     PacketLedger, ReplicationSloProbe, MAX_MISSING_SEQUENCE_BREACHES, MAX_STRUCTURED_LOG_BREACHES,

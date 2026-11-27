@@ -3,6 +3,9 @@
 //! The builder owns the implementation; this file deliberately imports the
 //! public contract that implementation must provide.
 use nntune_mb::replication::{PacketLedger, ReplicationSloProbe};
+use serde_json::Value;
+
+const TWO_HOURS_SECS: i64 = 2 * 60 * 60;
 
 #[test]
 fn pending_age_overflow_exceeds_even_the_largest_lag_budget() {
@@ -19,9 +22,6 @@ fn pending_age_overflow_exceeds_even_the_largest_lag_budget() {
     assert_eq!(report.breaches[0].kind, "missing_sequence");
     assert_eq!(report.breaches[0].lag_secs, Some(i64::MAX));
 }
-use serde_json::Value;
-
-const TWO_HOURS_SECS: i64 = 2 * 60 * 60;
 
 #[test]
 fn ledger_preserves_publication_application_and_lag_per_packet() {

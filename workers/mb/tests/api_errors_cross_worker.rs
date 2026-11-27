@@ -276,7 +276,11 @@ fn docs_registry_matches_all_worker_registries() {
 fn mb_wire_mapping_redacts_server_and_foreign_errors() {
     const DETAIL: &str = "synthetic detail with \"quotes\", \\ and a newline\n";
     for row in parse_docs_table(DOCS) {
-        let mapped = mb_error::ApiError::by_code(&row.code, DETAIL);
+        let mapped = match row.code.as_str() {
+            "invalid_request" => mb_error::ApiError::invalid_request(DETAIL),
+            "not_found" => mb_error::ApiError::not_found(DETAIL),
+            _ => mb_error::ApiError::by_code(&row.code, DETAIL),
+        };
         let (code, status, retryable, message) = if row.owners.iter().any(|owner| owner == "mb") {
             (
                 row.code.as_str(),

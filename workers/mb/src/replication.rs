@@ -43,10 +43,8 @@ pub struct PendingPacket {
 
 /// Per-packet ledger. Recording a sequence again with the same `packet_id`
 /// replaces its prior record, making a retried applier write idempotent. A
-/// re-record with a *different* `packet_id` is rejected: the first record
-/// (id, timestamps, lag) is left untouched and the sequence is pinned as a
-/// `packet_id_conflict` the SLO probe surfaces, so probe health cannot read
-/// green while the ledger has seen a conflicting identity.
+/// changed or reused `packet_id` pins a `packet_id_conflict` on the
+/// attempted sequence. Invalid rows pin an `invalid_packet_record`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PacketLedger {
     records: Vec<PacketRecord>,
@@ -68,7 +66,8 @@ impl PacketLedger {
     /// pending state intact and are sticky breaches for the attempted sequence.
     ///
     /// Changing the ID of a recorded sequence or reusing its ID at another
-    /// sequence pins the attempted sequence in [`Self::packet_id_conflicts`].
+    /// sequence pins the attempted sequence in [`Self::packet_id_conflicts`],
+    /// including when the attempted row has invalid timestamps.
     /// Replaying the same sequence and ID replaces its timestamps and lag.
     pub fn record_packet(
         &mut self,
@@ -77,6 +76,17 @@ impl PacketLedger {
         published_at: i64,
         applied_at: i64,
     ) {
+        let existing = self
+            .records
+            .iter_mut()
+            .find(|r| r.sequence == sequence || r.packet_id == packet_id);
+        if existing
+            .as_ref()
+            .is_some_and(|r| r.sequence != sequence || r.packet_id != packet_id)
+        {
+            self.conflicts.insert(sequence);
+            return;
+        }
         let lag_secs = applied_at.checked_sub(published_at);
         let Some(lag_secs) = lag_secs.filter(|&lag| lag >= 0) else {
             self.invalid_records.insert(sequence);
@@ -94,15 +104,7 @@ impl PacketLedger {
             applied_at,
             lag_secs,
         };
-        if let Some(existing) = self
-            .records
-            .iter_mut()
-            .find(|r| r.sequence == sequence || r.packet_id == record.packet_id)
-        {
-            if existing.sequence != sequence || existing.packet_id != record.packet_id {
-                self.conflicts.insert(sequence);
-                return;
-            }
+        if let Some(existing) = existing {
             *existing = record;
         } else {
             self.records.push(record);
@@ -182,11 +184,11 @@ pub struct ReplicationSloReport {
 
 /// Evaluates the ledger through `latest_sequence`. Missing sequences are
 /// reported only between the first and latest observed sequences, since no
-/// earlier baseline is implied by this ledger. An empty ledger with a
-/// non-negative `latest_sequence` is an `empty_ledger` breach, not a health
-/// signal: no applied packet means no baseline, so a total stall must not
-/// read as SLO-healthy (pass a negative `latest_sequence` when nothing has
-/// been published yet). A missing sequence the ledger knows as pending
+/// earlier baseline is implied by this ledger. With no applied packets,
+/// a non-negative cursor or pending evidence triggers `empty_ledger`.
+/// A negative cursor with applied packets triggers `invalid_latest_sequence`.
+/// Rejected ledger rows remain breach evidence for the life of the ledger.
+/// A missing sequence the ledger knows as pending
 /// (see [`PacketLedger::record_published`]) counts toward `pending_count`
 /// when its age is in `0..=slo_secs` (ADR 0007). Unknown publication times
 /// and future timestamps breach as `missing_sequence` without a lag value.

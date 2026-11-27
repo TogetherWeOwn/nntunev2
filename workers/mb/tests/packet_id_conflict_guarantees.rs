@@ -23,8 +23,9 @@ fn record(
 fn repeated_conflicting_writes_yield_exactly_one_breach() {
     let mut ledger = PacketLedger::default();
     record(&mut ledger, "id-A", 5, 1_000, 1_120);
-    // Repeat the conflict with two more distinct identities.
-    record(&mut ledger, "id-B", 5, 2_000, 2_600);
+    // Invalid timestamps must still preserve the identity-conflict signal.
+    record(&mut ledger, "id-B", 5, 2_000, 1_999);
+    assert_eq!(ledger.packet_id_conflicts(), vec![5]);
     record(&mut ledger, "id-B", 5, 2_000, 2_600);
     record(&mut ledger, "id-C", 5, 3_000, 3_600);
 
