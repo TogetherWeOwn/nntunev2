@@ -102,6 +102,19 @@ fn overflow_preserves_spent_buckets_until_refill() {
 }
 
 #[test]
+fn pruning_reclaims_only_fully_refilled_buckets() {
+    let cfg = one_shot_cfg();
+    let mut store = SearchThrottleStore::new();
+    assert!(is_allow(&store.check(&key_for(0), &cfg, NOW - 1)));
+    for i in 1..CAP {
+        assert!(is_allow(&store.check(&key_for(i), &cfg, NOW)));
+    }
+    let first_refill = NOW + cfg.window_secs - 1;
+    assert!(is_allow(&store.check(&key_for(CAP), &cfg, first_refill)));
+    assert!(!is_allow(&store.check(&key_for(1), &cfg, first_refill)));
+}
+
+#[test]
 fn caps_ip_and_account_keys_independently() {
     let mut cfg = one_shot_cfg();
     cfg.max_attempts = CAP as u32 + 1;
