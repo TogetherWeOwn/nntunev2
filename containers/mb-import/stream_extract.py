@@ -7,9 +7,9 @@ Reads the uncompressed `mbdump.tar` stream on stdin in one pass. Each
 member that etl.py needs (`mbdump/<table>`, the keys of
 `etl.FIELD_COUNTS`) is written to `<out-dir>/<table>.gz` (gzip level 1,
 so the raw dump never lands on disk uncompressed); every other member is
-skipped unread. The dump's `TIMESTAMP`, `SCHEMA_SEQUENCE` and
+discarded while streaming. The dump's `TIMESTAMP`, `SCHEMA_SEQUENCE` and
 `REPLICATION_SEQUENCE` go to `<out-dir>/dump-meta.json`. A missing
-required table fails the run (exit 1) after the stream ends.
+required table fails the run (exit 1) and removes its outputs.
 
 Only the CC0 core archive (`mbdump.tar.bz2`) is ever fed here: the
 NC-licensed archives (`mbdump-derived`, `mbdump-edit`, ...) and
@@ -67,8 +67,6 @@ def members(source):
             member = tarfile.TarInfo.frombuf(header, "utf-8", "strict")
         except (tarfile.HeaderError, UnicodeError) as exc:
             raise ValueError("invalid header") from exc
-        # Core dumps use short regular names and directories. Reject extension
-        # headers and links before any member data is read or expanded.
         if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE):
             raise ValueError("unsupported member type")
         if member.size < 0 or (member.isdir() and member.size):
@@ -115,10 +113,10 @@ def extract(source, out_dir, rollback) -> int:
                 raise ValueError(f"{name}: duplicate member")
             if member.size > MAX_META_BYTES:
                 raise ValueError(f"{name}: metadata size limit exceeded")
-            raw = read_exact(source, member.size).strip()
-            if not raw or not raw.isascii() or not raw.decode("ascii").isprintable():
+            text = read_exact(source, member.size).strip().decode("ascii", "replace")
+            if (text or name != "REPLICATION_SEQUENCE") and (not text.isascii() or not text.isprintable()):
                 raise ValueError(f"{name}: invalid metadata")
-            meta[name] = raw.decode("ascii")
+            meta[name] = text
             continue
         table = wanted.get(name)
         if table is None:
@@ -140,17 +138,19 @@ def extract(source, out_dir, rollback) -> int:
         }
         print(f"stream_extract: {table} {member.size} bytes", file=sys.stderr, flush=True)
     missing = [table for table in REQUIRED_TABLES if table not in written]
-    with report.open("x", encoding="utf-8") as target:
-        json.dump({
-            "meta": meta,
-            "tables": written,
-            "skipped_members": skipped,
-            "seconds": round(time.monotonic() - started, 1),
-            "missing": missing,
-        }, target, indent=2, sort_keys=True)
+    report_text = json.dumps({
+        "meta": meta,
+        "tables": written,
+        "skipped_members": skipped,
+        "seconds": round(time.monotonic() - started, 1),
+        "missing": missing,
+    }, indent=2, sort_keys=True)
     if missing:
         print(f"stream_extract: missing required tables: {', '.join(missing)}", file=sys.stderr)
         return 1
+    with report.open("x", encoding="utf-8") as target:
+        rollback.callback(report.unlink)
+        target.write(report_text)
     rollback.pop_all()
     return 0
 

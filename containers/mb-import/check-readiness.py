@@ -20,7 +20,7 @@ TABLES = (
 SQL = Path(__file__).resolve().parents[2] / "workers/mb/src"
 SHA256 = re.compile(r"[0-9a-f]{64}")
 MBID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
-MAX_PAYLOAD = 512 * 1024
+MAX_SNAPSHOT_BYTES = 512 * 1024
 PSQL_TIMEOUT = 600
 
 
@@ -36,8 +36,8 @@ def track_row(track):
 
 def load_evidence(path):
     with path.open("rb") as source:
-        raw = source.read(MAX_PAYLOAD + 1)
-    if len(raw) > MAX_PAYLOAD:
+        raw = source.read(512 * 1024 + 1)
+    if len(raw) > 512 * 1024:
         raise ValueError
     evidence = json.loads(raw.decode("utf-8"))
     tables, probes = evidence["tables"], evidence["probes"]
@@ -94,8 +94,7 @@ def read_snapshot(tables, probes):
         statements.append(f"EXECUTE release_search(convert_from(decode('{query_hex}', 'hex'), 'UTF8'));")
         statements.append(f"EXECUTE release_recordings('{probe['release_mbid']}');")
     statements.append("ROLLBACK;")
-    raw = capture_psql("\n".join(statements))
-    lines = raw.decode("utf-8").splitlines()
+    lines = capture_psql("\n".join(statements)).decode("utf-8").splitlines()
     if len(lines) != len(TABLES) + 2 * len(probes):
         raise ValueError
     return [json.loads(line) for line in lines]
@@ -118,11 +117,11 @@ def capture_psql(sql):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0 or not selector.select(remaining):
                         raise subprocess.TimeoutExpired(argv, PSQL_TIMEOUT)
-                    chunk = os.read(process.stdout.fileno(), min(65536, MAX_PAYLOAD + 1 - len(payload)))
+                    chunk = os.read(process.stdout.fileno(), min(65536, MAX_SNAPSHOT_BYTES + 1 - len(payload)))
                     if not chunk:
                         break
                     payload.extend(chunk)
-                    if len(payload) > MAX_PAYLOAD:
+                    if len(payload) > MAX_SNAPSHOT_BYTES:
                         raise ValueError
                 status = process.wait(timeout=max(0, deadline - time.monotonic()))
                 if status:
