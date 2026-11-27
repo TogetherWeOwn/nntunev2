@@ -124,6 +124,11 @@ class LostCreateTests(unittest.TestCase):
 
     def test_lost_acknowledgement_rejects_unreviewed_connection_settings(self):
         intent = connection_intent()
+        unsafe_tls = ConnectionIntent(**{**intent.__dict__, "sslmode": "require"})
+        unsafe_cache = ConnectionIntent(**{**intent.__dict__, "caching_disabled": False})
+        reason = "connection settings are outside the reviewed contract"
+        self.assertEqual(decide_lost_create(unsafe_tls, [connection_readback(unsafe_tls)]).reason, reason)
+        self.assertEqual(decide_lost_create(unsafe_cache, [connection_readback(unsafe_cache)]).reason, reason)
         altered = connection_readback(intent, config_id="d" * 32, sslmode="require")
         self.assertEqual(decide_lost_create(intent, [altered]).action, "hold")
         with self.assertRaisesRegex(RecoveryInputError, "config ID"):
