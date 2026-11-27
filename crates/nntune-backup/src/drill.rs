@@ -818,14 +818,17 @@ mod tests {
 
     #[test]
     fn restored_bundle_is_verified_before_evidence() {
-        with_drill_bundle("corrupt-restore", |src, dst, _manifest, keyring| {
+        with_drill_bundle("corrupt-restore", |src, dst, mut manifest, keyring| {
             copy_dir(src, dst).unwrap();
-            std::fs::remove_file(dst.join(KEYRING_PATH)).unwrap();
+            manifest.files.retain(|file| file.path != KEYRING_PATH);
+            write_manifest(dst, &manifest);
+            assert!(dst.join(KEYRING_PATH).is_file());
+            bundle::verify_bundle(dst).unwrap();
             assert_eq!(
                 decrypt_restored_dir(dst, keyring, "test", now_unix()),
-                Err(DrillError::Bundle(BundleError::MissingFile {
-                    path: KEYRING_PATH.to_string(),
-                }))
+                Err(DrillError::InvalidEvidence(
+                    "unexpected bundle file inventory"
+                ))
             );
         });
     }
