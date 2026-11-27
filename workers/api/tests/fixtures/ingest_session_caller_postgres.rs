@@ -887,6 +887,7 @@ async fn prove_attempt(
             key: &page_key,
             status: 200,
             body: &[],
+            content_length: Some(0),
             version_headers: &[PAGE],
         })
         .unwrap()];

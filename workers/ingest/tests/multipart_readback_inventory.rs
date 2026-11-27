@@ -254,6 +254,7 @@ impl ReadbackFixture {
             key,
             status: 200,
             body: b"",
+            content_length: Some(0),
             version_headers: &[version],
         };
         let page = &self.page_bytes[index as usize];
@@ -418,6 +419,77 @@ async fn hands_off_seek_ranges_only_for_the_verified_flac_object() {
             None
         );
     }
+}
+
+#[tokio::test]
+async fn seek_readback_refuses_missing_or_untrusted_sidecar_bytes() {
+    use nntune_core::{digest_range::RangeError, digest_verifier::PageError};
+    use BodyReadbackError::{Content, Trailing, Truncated};
+    use EnrolledReadbackError::Body;
+
+    let fixture = ReadbackFixture::new(FLAC);
+    assert_eq!(
+        CompletedReadbackInventory::assemble(
+            BUCKET,
+            CONFIGURATION,
+            &fixture.context,
+            MAP_ID,
+            &fixture.origin,
+            &fixture.media,
+            &[],
+        )
+        .err(),
+        Some(InventoryError::Sidecars)
+    );
+
+    let receipts = [fixture.sidecar()];
+    assert_eq!(receipts[0].pin().1, FINAL_VERSION);
+    let inventory = fixture.inventory(&receipts);
+    let page = &fixture.page_bytes[0];
+    let mut altered = page.clone();
+    *altered.last_mut().unwrap() ^= 1;
+    let mut oversized = page.clone();
+    oversized.push(0);
+    // A purported seek payload with the right response length and version.
+    let mut malformed_seek = vec![0; page.len()];
+    malformed_seek[..5].copy_from_slice(&[0x83, 0, 0, 18, 0xff]);
+    let invalid_hash = || {
+        Content(ReadbackError::Frame(RangeError::Page(
+            PageError::HashMismatch,
+        )))
+    };
+    for (bytes, expected) in [
+        (&[][..], Truncated),
+        (&page[..page.len() - 1], Truncated),
+        (oversized.as_slice(), Trailing),
+        (altered.as_slice(), invalid_hash()),
+        (malformed_seek.as_slice(), invalid_hash()),
+    ] {
+        let result = inventory
+            .verify_with_flac_seek(SCOPE, fixture.envelope(), async |_, pin| {
+                let mut response = fixture.response(pin);
+                if pin.object_key == PAGE_KEY {
+                    assert_eq!(pin.version, Some(FINAL_VERSION));
+                    response.response.body = MemoryBody(Some(bytes));
+                }
+                Ok(response)
+            })
+            .await;
+        assert_eq!(result.err(), Some(Body(expected)));
+    }
+
+    let truncated_flac = ReadbackFixture::new(&FLAC[..FLAC.len() - 1]);
+    let receipts = [truncated_flac.sidecar()];
+    let inventory = truncated_flac.inventory(&receipts);
+    let result = inventory
+        .verify_with_flac_seek(SCOPE, truncated_flac.envelope(), async |_, pin| {
+            Ok(truncated_flac.response(pin))
+        })
+        .await;
+    assert_eq!(
+        result.err(),
+        Some(Body(Content(ReadbackError::MediaValidation)))
+    );
 }
 
 #[tokio::test]
@@ -1063,6 +1135,7 @@ fn assembles_only_complete_scoped_receipts_in_page_order() {
             key: &key,
             status: 200,
             body: b"",
+            content_length: Some(0),
             version_headers: &[version],
         })
         .unwrap()

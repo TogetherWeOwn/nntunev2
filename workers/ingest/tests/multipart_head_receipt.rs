@@ -11,7 +11,7 @@ use nntune_ingest::multipart::{
     session_completion::{
         CompletionRequest, CompletionResponse, DispatchError, PrepareError, SessionCompletion,
     },
-    MultipartError, Plan, UploadTarget, VersionedCompletionReply,
+    MultipartError, Plan, UploadTarget, VersionedCompletionReply, MAX_COMPLETION_BODY,
 };
 use sha2::{Digest, Sha256};
 
@@ -85,6 +85,41 @@ fn pins_only_the_exact_versioned_completion_response() {
         pinned.metadata().ciphertext_len(),
         HEADER_SIZE + 1 + TAG_SIZE
     );
+    let verify_head = |locator: &S3Locator| {
+        pinned.verify_head(
+            &context,
+            Some(HeadReceipt {
+                configuration: Some(id(5)),
+                locator: Some(locator),
+                content_length: Some(HEADER_SIZE + 1 + TAG_SIZE),
+            }),
+        )
+    };
+    assert_eq!(verify_head(pinned.metadata().locator()), Ok(()));
+    for binding in [
+        S3Binding::VersionId("Opaque+//=".into()),
+        S3Binding::VersionId("Opaque+%2f/=".into()),
+        S3Binding::Etag(format!("\"{version}\"")),
+    ] {
+        let observed = S3Locator::new(BUCKET.into(), KEY.into(), binding).unwrap();
+        assert_eq!(verify_head(&observed), Err(WrongObject));
+    }
+
+    let etag_only = format!("{bucket}{key}<ETag>&quot;{version}&quot;</ETag>");
+    assert_eq!(
+        check(&context, id(5), 200, &response(&etag_only), &[]).err(),
+        Some(CompletionVersion)
+    );
+    let mut bounded = body.clone();
+    bounded.extend(std::iter::repeat_n(' ', MAX_COMPLETION_BODY - body.len()));
+    assert!(check(&context, id(5), 200, &bounded, &[version]).is_ok());
+    bounded.push(' ');
+    for malformed in [&bounded, &body[..body.len() - 1]] {
+        assert_eq!(
+            check(&context, id(5), 200, malformed, &[version]).err(),
+            Some(CompletionBody)
+        );
+    }
 
     let long = "v".repeat(1025);
     for headers in [
