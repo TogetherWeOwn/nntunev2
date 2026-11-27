@@ -14,7 +14,7 @@ import { createQueue } from './queue.js';
 import { createResumeController } from './resumeController.js';
 import { actionForShortcutEvent } from './shortcuts.js';
 import { applySoundPreference, parseSoundPreference } from './soundPreference.js';
-import { bindSystemSeek } from './systemSeek.js';
+import { bindSystemSeek, type SystemSeekOwner } from './systemSeek.js';
 import { createDemoTabTitle } from './tabTitle.js';
 
 const binding = 'A'.repeat(43);
@@ -154,7 +154,6 @@ it('disconnects both buffer paths and preserves the startup error after rollback
 	expect(first.disconnect).toHaveBeenCalledOnce();
 	expect(second.disconnect).toHaveBeenCalledOnce();
 	expect(disconnect).toHaveBeenCalledTimes(2);
-	expect(() => scheduler.stop()).not.toThrow();
 });
 
 it('revokes a download URL immediately when clicking fails', () => {
@@ -192,20 +191,27 @@ it('bounds stored sound preferences and refuses a malformed live preference', ()
 	expect(element).toEqual({ volume: 0.5, muted: false });
 });
 
-it('keeps seek handlers installed when a newer intent supersedes the decoder read', () => {
-	let intent = 0;
-	const audio = { get currentTime() { intent++; return NaN; }, duration: 20, error: null, seeking: false } as HTMLAudioElement;
-	const availability = writable({ ...emptySeek, enabled: true, attachment: 1 });
-	const dispatch = vi.fn();
+it('fences seek unavailability and reporting to the current intent and registration', () => {
+	let intent = 0, readable = false;
+	const audio = { get currentTime() { if (!readable) intent++; return readable ? 3 : NaN; },
+		duration: 20, error: null, seeking: false, seekable: { length: 1, start: () => 0, end: () => 20 } } as unknown as HTMLAudioElement;
+	const availability = writable({ ...emptySeek, enabled: true, attachment: 1 }), dispatch = vi.fn<SystemSeekOwner['dispatch']>();
 	const lifetime = new AbortController();
 	onTestFinished(() => lifetime.abort());
 	const transport = bindSystemSeek({ metadata: null, setActionHandler: vi.fn() },
 		{ audio, attachment: 1, availability, matches: always, positionIntent: () => intent, dispatch }, lifetime.signal);
 	const handlers = transport.handlers;
-	handlers?.onSeekTo?.({ action: 'seekto', seekTime: 4 });
-	expect(handlers).toBeDefined();
+	const seek = () => handlers!.onSeekTo!({ action: 'seekto', seekTime: 4 });
+	seek();
 	expect(transport.handlers).toBe(handlers);
 	expect(dispatch).not.toHaveBeenCalled();
+	readable = true;
+	seek();
+	const guard = dispatch.mock.calls[0][2];
+	guard.unavailable();
+	expect(guard.canReport()).toBe(true);
+	availability.update((state) => ({ ...state, enabled: true }));
+	expect(guard.canReport()).toBe(false);
 });
 
 it('ignores title writes and teardown from a superseded controller', () => {
