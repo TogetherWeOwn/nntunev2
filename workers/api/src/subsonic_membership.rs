@@ -1,6 +1,6 @@
 //! Unmounted membership read. The app and mirror have separate snapshots.
 
-use super::{with_deadline, StoreError};
+use super::{subsonic_pg_page::debit_admission, with_deadline, StoreError};
 use crate::catalogue::{
     catalogue_member_releases_statement, catalogue_member_track_pairs_statement, is_catalogue_mbid,
 };
@@ -58,7 +58,8 @@ async fn preflight(
     let query = sql(
         budget,
         &[
-            "SELECT CASE WHEN row_count < $2 AND fields_ok AND used <= $3 THEN row_count END, used::int \
+            "SELECT CASE WHEN row_count < $2 AND fields_ok AND used <= $3 AND \
+             getdatabaseencoding() = 'UTF8' AND pg_client_encoding() = 'UTF8' THEN row_count END, used::int \
              FROM (SELECT count(*) AS row_count, COALESCE(bool_and(octet_length(release_mbid) <= 1024",
             if pairs { " AND COALESCE(octet_length(recording_mbid), 0) <= 1024" } else { "" },
             "), true) AS fields_ok, COALESCE(sum(",
@@ -82,11 +83,7 @@ async fn preflight(
         .map_err(|_| StoreError)?;
     let count: i64 = row.try_get(0).map_err(|_| StoreError)?;
     let used: i32 = row.try_get(1).map_err(|_| StoreError)?;
-    *remaining = remaining
-        .checked_sub(used)
-        .filter(|n| *n >= 0 && used >= 0)
-        .ok_or(StoreError)?;
-    usize::try_from(count).map_err(|_| StoreError)
+    debit_admission(count, used, limit, remaining)
 }
 
 async fn fetch<T: Ord>(
@@ -147,6 +144,23 @@ fn copy_id(budget: &mut ConstructionBudget, value: &str) -> Result<String, Store
     String::from_utf8(bytes).map_err(|_| StoreError)
 }
 
+fn copy_pair(
+    budget: &mut ConstructionBudget,
+    release: &str,
+    recording: Option<&str>,
+) -> Result<Option<(String, String)>, StoreError> {
+    let Some(recording) = recording.filter(|id| is_catalogue_mbid(id)) else {
+        return Ok(None);
+    };
+    if !is_catalogue_mbid(release) {
+        return Ok(None);
+    }
+    Ok(Some((
+        copy_id(budget, release)?,
+        copy_id(budget, recording)?,
+    )))
+}
+
 fn normalize_order<T: Ord>(ids: &mut Vec<T>) {
     // Unstable sort is in-place. Deduplicate after ASCII normalization.
     ids.sort_unstable();
@@ -163,7 +177,9 @@ pub(super) async fn read_membership(
 ) -> Result<StagingMembership, StoreError> {
     let limit = cap
         .checked_add(1)
-        .filter(|_| (0..=MEMBERSHIP_ROWS).contains(&cap))
+        .filter(|_| {
+            (0..=MEMBERSHIP_ROWS).contains(&cap) && (0..=SOURCE_TEXT_BYTES).contains(&remaining)
+        })
         .ok_or(StoreError)?;
     let tx = client.read_only_snapshot().await.map_err(|_| StoreError)?;
     tx.set_local_subsonic_timeouts()
@@ -199,15 +215,11 @@ pub(super) async fn read_membership(
         #[cfg(test)]
         fetches,
         |budget, row| {
-            let release: &str = row.try_get(0).map_err(|_| StoreError)?;
-            let recording: &str = row.try_get(1).map_err(|_| StoreError)?;
-            if !is_catalogue_mbid(release) || !is_catalogue_mbid(recording) {
-                return Ok(None);
-            }
-            Ok(Some((
-                copy_id(budget, release)?,
-                copy_id(budget, recording)?,
-            )))
+            copy_pair(
+                budget,
+                row.try_get(0).map_err(|_| StoreError)?,
+                row.try_get(1).map_err(|_| StoreError)?,
+            )
         },
     )
     .await?;
@@ -217,6 +229,21 @@ pub(super) async fn read_membership(
         pairs,
         remaining_text_bytes: remaining,
     })
+}
+
+#[cfg(test)]
+#[test]
+fn nullable_membership_pairs_are_never_projected() {
+    const UPPER: &str = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    const LOWER: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let mut budget = ConstructionBudget::new(0);
+    assert_eq!(copy_pair(&mut budget, UPPER, None).unwrap(), None);
+    assert_eq!(copy_pair(&mut budget, UPPER, Some("")).unwrap(), None);
+    let mut budget = ConstructionBudget::new(1024);
+    assert_eq!(
+        copy_pair(&mut budget, UPPER, Some(UPPER)).unwrap(),
+        Some((LOWER.to_owned(), LOWER.to_owned()))
+    );
 }
 
 pub(crate) async fn load_staging_membership(
