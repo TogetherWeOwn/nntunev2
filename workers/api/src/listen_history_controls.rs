@@ -13,13 +13,13 @@ struct ExportRequest {
     before_id: Option<String>,
 }
 
-fn valid_export_rows(rows: &[ListenRow], before_id: Option<&str>) -> bool {
+fn export_page(mut rows: Vec<ListenRow>, before_id: Option<&str>) -> Response {
     if rows.len() > EXPORT_PAGE_SIZE + 1 {
-        return false;
+        return internal();
     }
     let before = before_id.and_then(|cursor| cursor.split_once(':'));
     let mut seen = HashSet::with_capacity(rows.len());
-    rows.iter().all(|row| {
+    let valid = rows.iter().all(|row| {
         let phase = if row.event.phase() == 0 { "0" } else { "1" };
         let cursor = (row.playback_id.as_str(), phase);
         valid_playback_id(cursor.0)
@@ -28,7 +28,20 @@ fn valid_export_rows(rows: &[ListenRow], before_id: Option<&str>) -> bool {
             && row.recorded_at >= 0
             && before != Some(cursor)
             && seen.insert(cursor)
-    })
+    });
+    if !valid {
+        return internal();
+    }
+    let has_more = rows.len() > EXPORT_PAGE_SIZE;
+    rows.truncate(EXPORT_PAGE_SIZE);
+    let next_cursor = rows.last().filter(|_| has_more).map(|row| row.cursor());
+    json_response(
+        200,
+        serde_json::json!({
+            "events": rows, "next_cursor": next_cursor,
+            "retention": "account_lifetime",
+        }),
+    )
 }
 
 pub(super) async fn export<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -77,19 +90,8 @@ where
         .export_listen_events(&claims.user_id, before.as_ref())
         .await
     {
-        Ok(mut rows) if valid_export_rows(&rows, body.before_id.as_deref()) => {
-            let has_more = rows.len() > EXPORT_PAGE_SIZE;
-            rows.truncate(EXPORT_PAGE_SIZE);
-            let next_cursor = rows.last().filter(|_| has_more).map(|row| row.cursor());
-            json_response(
-                200,
-                serde_json::json!({
-                    "events": rows, "next_cursor": next_cursor,
-                    "retention": "account_lifetime",
-                }),
-            )
-        }
-        _ => internal(),
+        Ok(rows) => export_page(rows, body.before_id.as_deref()),
+        Err(_) => internal(),
     }
 }
 
@@ -142,12 +144,14 @@ mod tests {
             recorded_at: 0,
         };
         let anchor = row.cursor();
-        assert!(valid_export_rows(std::slice::from_ref(&row), None));
-        assert!(!valid_export_rows(
-            std::slice::from_ref(&row),
-            Some(&anchor)
-        ));
-        assert!(!valid_export_rows(&[row.clone(), row.clone()], None));
+        let refused = |rows, cursor: Option<&str>| {
+            let response = export_page(rows, cursor);
+            assert_eq!(response.status, 500);
+            assert!(!response.body.contains("synthetic-track"));
+        };
+        assert_eq!(export_page(vec![row.clone()], None).status, 200);
+        refused(vec![row.clone()], Some(&anchor));
+        refused(vec![row.clone(), row.clone()], None);
         for (playback_id, track_id, recorded_at) in [
             ("bad-id", "track", 0),
             (row.playback_id.as_str(), "track\n", 0),
@@ -159,7 +163,7 @@ mod tests {
                 recorded_at,
                 ..row.clone()
             };
-            assert!(!valid_export_rows(&[invalid], None));
+            refused(vec![invalid], None);
         }
     }
 }

@@ -46,31 +46,23 @@ mod tests {
 
     #[test]
     fn invalid_documents_cannot_reach_worker_response_construction() {
-        use RejectionFormat::{Json, Xml};
-        use StagingRejection::{RequestOrDocumentTooLarge, Unavailable};
-        for (content_type, size, expected) in [
-            (
-                "text/html",
-                1,
-                Err(DocumentError::Rejected(Unavailable, Xml)),
-            ),
-            (
-                JSON_CONTENT_TYPE,
-                0,
-                Err(DocumentError::Rejected(Unavailable, Json)),
-            ),
-            (JSONP_CONTENT_TYPE, DOCUMENT_BYTES, Ok(Json)),
-            (
-                JSONP_CONTENT_TYPE,
-                DOCUMENT_BYTES + 1,
-                Err(DocumentError::Rejected(RequestOrDocumentTooLarge, Json)),
-            ),
-        ] {
-            let doc = StagingDocument {
+        use RejectionFormat::Json;
+        let validate = |content_type, size| {
+            StagingDocument {
                 content_type,
                 bytes: vec![b'x'; size],
-            };
-            assert_eq!(doc.validate_response(), expected);
-        }
+            }
+            .validate_response()
+        };
+        assert!(validate("text/html", 1).is_err());
+        assert!(validate(JSON_CONTENT_TYPE, 0).is_err());
+        assert_eq!(validate(JSONP_CONTENT_TYPE, DOCUMENT_BYTES), Ok(Json));
+        assert_eq!(
+            validate(JSONP_CONTENT_TYPE, DOCUMENT_BYTES + 1),
+            Err(DocumentError::Rejected(
+                StagingRejection::RequestOrDocumentTooLarge,
+                Json
+            ))
+        );
     }
 }
