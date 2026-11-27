@@ -34,6 +34,7 @@ pub enum AcceptanceError {
     Identity,
     Store(FreezeError),
     Producer(ProducerError),
+    UnfrozenCandidate,
     InvalidWinner,
 }
 
@@ -71,6 +72,9 @@ where
             let candidate = prepare().await.map_err(AcceptanceError::Producer)?;
             if !bound(&candidate, job_id, user_id, original_hash) {
                 return Err(AcceptanceError::Identity);
+            }
+            if candidate.effective_discs().is_none() {
+                return Err(AcceptanceError::UnfrozenCandidate);
             }
             store
                 .freeze(&candidate, job_id, user_id, original_hash)

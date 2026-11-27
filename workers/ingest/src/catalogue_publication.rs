@@ -1,7 +1,10 @@
 //! Unmounted transaction for one verified occurrence in the shared catalogue.
 //! The S3 source table and the locator schema are currently rehearsal-only.
 
-use nntune_core::s3_locator::{S3Binding, S3Locator};
+use nntune_core::{
+    digest_geometry::DigestGeometry,
+    s3_locator::{S3Binding, S3Locator},
+};
 use tokio_postgres::{
     types::{ToSql, Type},
     Transaction,
@@ -33,6 +36,33 @@ pub struct PublishedObject<'a> {
     pub plaintext_sha256: &'a [u8; 32],
     pub root_version_id: [u8; 16],
     pub page_versions: &'a [&'a str],
+}
+
+impl PublishedObject<'_> {
+    /// Validate receipt shape before SQL checks the durable pins and custody.
+    pub fn version_pin(&self) -> Result<&str, PublicationError> {
+        let S3Binding::VersionId(version) = self.locator.binding() else {
+            return Err(PublicationError::Refused);
+        };
+        let length = self.intent.plaintext_len;
+        let geometry = DigestGeometry::new(length).ok_or(PublicationError::Refused)?;
+        if length == 0
+            || self.page_versions.len() != geometry.pages() as usize
+            || !valid_version_pin(version)
+            || self.page_versions.iter().any(|pin| !valid_version_pin(pin))
+        {
+            return Err(PublicationError::Refused);
+        }
+        Ok(version)
+    }
+}
+
+fn valid_version_pin(pin: &str) -> bool {
+    pin != "null"
+        && (1..=1024).contains(&pin.len())
+        && pin
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b',')
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -70,9 +100,7 @@ pub(crate) async fn stage_with_duration(
         .transpose()
         .map_err(|_| Refused)?;
     let track = &matched.track;
-    let S3Binding::VersionId(version) = result.locator.binding() else {
-        return Err(Refused);
-    };
+    let version = result.version_pin()?;
     let [environment, library, object, generation, configuration] = result.intent.identities;
     let bytes = i64::try_from(result.intent.plaintext_len).map_err(|_| Refused)?;
     if object != matched.object_id
@@ -81,11 +109,6 @@ pub(crate) async fn stage_with_duration(
         || matched.owner_id.contains('\0')
         || track.title.len() > MAX_TRACK_TITLE_BYTES
         || validate_track_row(track).is_err()
-        || !(1..=512).contains(&result.page_versions.len())
-        || result
-            .page_versions
-            .iter()
-            .any(|pin| pin.len() > 1024 || pin.contains('\0'))
     {
         return Err(Refused);
     }
@@ -145,7 +168,7 @@ pub(crate) async fn stage_with_duration(
                     (&hex::encode(result.root_version_id), Type::TEXT),
                     (&result.locator.bucket(), Type::TEXT),
                     (&result.locator.key(), Type::TEXT),
-                    (version, Type::TEXT),
+                    (&version, Type::TEXT),
                     (&result.page_versions, Type::TEXT_ARRAY),
                     (&result.intent.header.as_slice(), Type::BYTEA),
                     (&track_id, Type::TEXT),

@@ -11,6 +11,7 @@ use futures_util::{future::LocalBoxFuture, stream::LocalBoxStream, StreamExt};
 use crate::{
     audio_selection::{AudioSelectionPlan, DirectAudioSelection, PrefixReader, SelectionError},
     audio_tags::MAX_TAG_PREFIX_BYTES,
+    dispatch::content_sha256_hex,
     jobs::{validate_job_id, MAX_REPAIR_ROUNDS},
     pool_deadline::race_against_deadline,
     verify::{StagedFile, VerifyProgress},
@@ -65,6 +66,7 @@ impl<S: ScratchPrefixStore, D: Future<Output = ()> + Unpin> ScratchAudioReader<S
             || progress.missing_blocks != 0
             || progress.size_refused_blocks != 0
             || !progress.judging.is_empty()
+            || !progress.repair_set_ids.is_empty()
         {
             return Err(SelectionError::Identity);
         }
@@ -166,6 +168,10 @@ impl<S: ScratchPrefixStore, D: Future<Output = ()> + Unpin> PrefixReader
                     return Err(());
                 }
                 prefix.extend_from_slice(&chunk);
+            }
+            // A whole-object read can also confirm the digest from verification.
+            if length as u64 == expected.size && content_sha256_hex(&prefix) != expected.sha256 {
+                return Err(());
             }
             // No EOF poll after the exact range: dropping the stream cancels
             // any unread tail, including a store that ignored its range.

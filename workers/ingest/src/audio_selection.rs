@@ -111,9 +111,9 @@ impl AudioSelectionPlan {
 
 /// This is an internal capability, not a URL supplied by a client. The adapter
 /// resolves the selection through the same digest-bound original and verified
-/// round, validates scratch metadata and requests at most `cap` bytes. Oversize
-/// chunks are refused here before copying. A full prefix drops/cancels the body;
-/// no extra poll is spent to discover EOF beyond the allowed range.
+/// round, validates scratch metadata and returns 1 to `cap` bytes on success.
+/// Oversize chunks are refused here before copying. A full prefix drops/cancels
+/// the body without an extra poll for EOF beyond the allowed range.
 pub trait PrefixReader {
     fn prefix<'a>(
         &'a mut self,
@@ -157,6 +157,9 @@ pub async fn extract_hints(
                     return Err(SelectionError::Bounds);
                 }
                 prefix.extend_from_slice(&chunk);
+            }
+            if prefix.is_empty() {
+                return Err(SelectionError::Transport);
             }
             remaining -= prefix.len();
             read_flac_hints(&prefix).unwrap_or_default()
