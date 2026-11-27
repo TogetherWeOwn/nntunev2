@@ -38,9 +38,20 @@ impl FrameReader {
         let Some(header) = FrameHeader::parse(input, info)? else {
             return Ok(None);
         };
+        let channels = if header.channel_assignment <= 7 {
+            header.channel_assignment + 1
+        } else {
+            2
+        };
+        // Seek timing and PCM interpretation use a single STREAMINFO format.
+        if (header.sample_rate, header.bits_per_sample, channels)
+            != (info.sample_rate, info.bits_per_sample, info.channels)
+        {
+            return Err(());
+        }
         let mut first_channel = Vec::new();
-        let (channels_left, first_width, stereo) = if header.channel_assignment <= 7 {
-            (header.channel_assignment + 1, header.bits_per_sample, None)
+        let (first_width, stereo) = if header.channel_assignment <= 7 {
+            (header.bits_per_sample, None)
         } else {
             let stereo = Stereo::new(header.channel_assignment, header.bits_per_sample)?;
             // Subframes are serialized, not interleaved. Retain only the
@@ -48,23 +59,23 @@ impl FrameReader {
             first_channel
                 .try_reserve_exact(usize::from(header.block_size))
                 .map_err(|_| ())?;
-            (2, stereo.coded_widths()[0], Some(stereo))
+            (stereo.coded_widths()[0], Some(stereo))
         };
+        let channel = SubframeHeaderReader::new(first_width)?;
         let mut pcm = scratch.take();
         if let Some(pcm) = &mut pcm {
-            let len = usize::from(header.block_size) * usize::from(channels_left);
+            let len = usize::from(header.block_size) * usize::from(channels);
             pcm.clear();
             pcm.try_reserve_exact(len).map_err(|_| ())?;
             pcm.resize(len, 0);
         }
-        let channel = SubframeHeaderReader::new(first_width)?;
         let (prefix, rest) = input.split_at(header.len);
         let mut crc = FrameCrc::default();
         crc.update(prefix);
         *input = rest;
         Ok(Some(Self {
             header,
-            channels_left,
+            channels_left: channels,
             channel,
             samples: None,
             stereo,

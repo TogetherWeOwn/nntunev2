@@ -29,16 +29,18 @@ pub(crate) struct ResidualReader {
     partitions_left: u16,
     partition_size: u16,
     samples_left: u16,
+    max_folded: u32,
 }
 
 impl ResidualReader {
-    pub(crate) fn new(block_size: u16, predictor_order: u8) -> Self {
+    pub(crate) fn new(block_size: u16, predictor_order: u8, max_folded: u32) -> Self {
         Self {
             state: State::Header(block_size, predictor_order),
             parameter_bits: 0,
             partitions_left: 0,
             partition_size: 0,
             samples_left: 0,
+            max_folded: max_folded.min(MAX_FOLDED),
         }
     }
 
@@ -93,7 +95,7 @@ impl ResidualReader {
                     return Ok(self.sample((value << shift) >> shift, State::Raw(width)));
                 }
                 State::Unary(parameter, mut quotient) => {
-                    if !bits.unary(input, &mut quotient, MAX_FOLDED >> parameter)? {
+                    if !bits.unary(input, &mut quotient, self.max_folded >> parameter)? {
                         self.state = State::Unary(parameter, quotient);
                         return Ok(Residual::NeedInput);
                     }
@@ -101,7 +103,7 @@ impl ResidualReader {
                 }
                 State::Remainder(parameter, quotient) => {
                     let folded = (quotient << parameter) | field!(parameter) as u32;
-                    if folded > MAX_FOLDED {
+                    if folded > self.max_folded {
                         return Err(());
                     }
                     let sample = (folded >> 1) as i32 ^ -((folded & 1) as i32);
@@ -139,7 +141,7 @@ mod tests {
         let bytes = [0x04, 0xab, 0x78, 0x28, 0xff];
         for split in 0..=4 {
             let mut bits = BitInput::default();
-            let mut reader = ResidualReader::new(6, 1);
+            let mut reader = ResidualReader::new(6, 1, MAX_FOLDED);
             let (mut input, after_split) = bytes.split_at(split);
             let mut after_split = Some(after_split);
             for expected in [-1, 3, 0, 0, 0] {
@@ -165,7 +167,7 @@ mod tests {
         let bytes = [0x00, 0x40, 0b10_101101, 0xff];
         let (mut input, mut rest) = bytes.split_at(2);
         let mut bits = BitInput::default();
-        let mut reader = ResidualReader::new(1, 0);
+        let mut reader = ResidualReader::new(1, 0, MAX_FOLDED);
         assert_eq!(reader.read(&mut bits, &mut input), Ok(Residual::NeedInput));
         assert!(input.is_empty());
 
@@ -180,12 +182,12 @@ mod tests {
     fn five_bit_parameters_cover_signed_escape_and_folded_limit() {
         let mut bits = BitInput::default();
         let mut input = [0x43, 0xe3, 0x8f].as_slice();
-        let mut reader = ResidualReader::new(2, 0);
+        let mut reader = ResidualReader::new(2, 0, MAX_FOLDED);
         assert_eq!(reader.read(&mut bits, &mut input), Ok(Residual::Sample(-4)));
         assert_eq!(reader.read(&mut bits, &mut input), Ok(Residual::Sample(3)));
         assert_eq!(reader.read(&mut bits, &mut input), Ok(Residual::End));
         for (last, expected) in [(0xf0, Ok(Residual::Sample(i32::MAX))), (0xf8, Err(()))] {
-            let mut reader = ResidualReader::new(1, 0);
+            let mut reader = ResidualReader::new(1, 0, MAX_FOLDED);
             let mut bits = BitInput::default();
             assert_eq!(
                 reader.read(&mut bits, &mut [0x43, 0xc3].as_slice()),
@@ -206,7 +208,7 @@ mod tests {
             (6, 1, &[0x80]),
             (1, 0, &[0x43, 0xc1]),
         ] {
-            let mut reader = ResidualReader::new(size, order);
+            let mut reader = ResidualReader::new(size, order, MAX_FOLDED);
             let mut bits = BitInput::default();
             assert!(reader.read(&mut bits, &mut input).is_err());
             assert!(reader.read(&mut bits, &mut [].as_slice()).is_err());

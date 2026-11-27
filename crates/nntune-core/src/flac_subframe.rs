@@ -1,20 +1,29 @@
 //! Native FLAC subframe header and MSB-first bit input (RFC 9639 §9.2).
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Fixed(u8),
+    Unary,
+}
+
 #[derive(Default)]
 pub(crate) struct BitInput {
     value: u64,
     available: u8,
+    pending: Option<Field>,
 }
 
 impl BitInput {
     /// Pull only the bytes needed. On short input, retain the partial field
     /// for the next slice. The maximum field is a 33-bit stereo side sample.
     pub(crate) fn read(&mut self, input: &mut &[u8], width: u8) -> Result<Option<u64>, ()> {
-        if width > 33 {
+        let field = Field::Fixed(width);
+        if width > 33 || self.pending.is_some_and(|pending| pending != field) {
             return Err(());
         }
         while self.available < width {
             let Some((&byte, rest)) = input.split_first() else {
+                self.pending = Some(field);
                 return Ok(None);
             };
             *input = rest;
@@ -24,13 +33,14 @@ impl BitInput {
         self.available -= width;
         let value = self.value >> self.available;
         self.value &= (1 << self.available) - 1;
+        self.pending = None;
         Ok(Some(value))
     }
 
     /// Consume only the buffered low bits at the end of the final subframe.
-    /// A whole buffered byte can be part of an unfinished field, not padding.
+    /// Only a completed field can leave padding, even when fewer than eight bits remain.
     pub(crate) fn consume_zero_padding(&mut self) -> Result<(), ()> {
-        if self.available >= 8 || self.value != 0 {
+        if self.pending.is_some() || self.available >= 8 || self.value != 0 {
             return Err(());
         }
         self.available = 0;
@@ -44,6 +54,13 @@ impl BitInput {
         count: &mut u32,
         max: u32,
     ) -> Result<bool, ()> {
+        if self.pending.is_some_and(|pending| pending != Field::Unary) {
+            return Err(());
+        }
+        self.pending = Some(Field::Unary);
+        if *count > max {
+            return Err(());
+        }
         loop {
             if self.available == 0 {
                 let Some((&byte, rest)) = input.split_first() else {
@@ -61,6 +78,7 @@ impl BitInput {
             self.available -= run as u8 + u8::from(terminated);
             self.value &= (1 << self.available) - 1;
             if terminated {
+                self.pending = None;
                 return Ok(true);
             }
         }

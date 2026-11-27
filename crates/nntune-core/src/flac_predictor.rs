@@ -8,6 +8,7 @@ pub(crate) struct Predictor {
     order: usize,
     shift: u8,
     sample_bits: u8,
+    max_folded_residual: u32,
 }
 
 impl Predictor {
@@ -41,6 +42,7 @@ impl Predictor {
         let order = coefficients.len();
         if order > MAX_ORDER
             || warmup.len() != order
+            || coefficients.iter().any(|&c| !(-16384..=16383).contains(&c))
             || !fits_signed(0, sample_bits)
             || warmup
                 .iter()
@@ -54,17 +56,22 @@ impl Predictor {
             order,
             shift,
             sample_bits,
+            max_folded_residual: max_folded_residual(coefficients, shift, sample_bits),
         };
         predictor.history[..order].copy_from_slice(warmup);
         predictor.coefficients[..order].copy_from_slice(coefficients);
         Ok(predictor)
     }
 
+    pub(crate) fn max_folded_residual(&self) -> u32 {
+        self.max_folded_residual
+    }
+
     /// Failed range checks leave history unchanged; a decoder must refuse the subframe.
     pub(crate) fn restore(&mut self, residual: i32) -> Result<i64, ()> {
         let history = &mut self.history[..self.order];
-        // Even with 32 signed 16-bit coefficients and signed 33-bit samples,
-        // the sum's magnitude is at most 2^52 before shifting and adding the residual.
+        // Even with 32 signed 15-bit coefficients and signed 33-bit samples,
+        // the sum's magnitude is at most 2^51 before shifting and adding the residual.
         let prediction: i64 = self.coefficients[..self.order]
             .iter()
             .zip(history.iter().rev())
@@ -80,6 +87,22 @@ impl Predictor {
         }
         Ok(sample)
     }
+}
+
+fn max_folded_residual(coefficients: &[i16], shift: u8, sample_bits: u8) -> u32 {
+    let half = 1_i64 << (sample_bits - 1);
+    let (min, max) = coefficients
+        .iter()
+        .fold((0, 0), |(min, max), &coefficient| {
+            let a = i64::from(coefficient) * -half;
+            let b = i64::from(coefficient) * (half - 1);
+            (min + a.min(b), max + a.max(b))
+        });
+    // Residual = sample - prediction. Folding doubles positive residuals
+    // and maps a negative residual -n to 2n - 1.
+    let positive = 2 * (half - 1 - (min >> shift));
+    let negative = 2 * (half + (max >> shift)) - 1;
+    u32::try_from(positive.max(negative)).unwrap_or(u32::MAX)
 }
 
 pub(crate) fn fits_signed(sample: i64, bits: u8) -> bool {
@@ -141,6 +164,8 @@ mod tests {
         assert!(Predictor::lpc(&[], 0, &[], 8).is_err());
         assert!(Predictor::lpc(&[0; 33], 0, &[0; 33], 8).is_err());
         assert!(Predictor::lpc(&[1], 16, &[0], 8).is_err());
+        assert!(Predictor::lpc(&[16384], 0, &[0], 8).is_err());
+        assert!(Predictor::lpc(&[-16385], 0, &[0], 8).is_err());
 
         let mut predictor = Predictor::fixed(1, &[127], 8).unwrap();
         assert_eq!(predictor.restore(1), Err(()));
