@@ -190,7 +190,8 @@ impl DialPlan {
 }
 
 /// Static host shape (P1 lengths): 1..=253 ASCII bytes of dot-separated
-/// non-empty labels, with no scheme, path, userinfo, port suffix or space.
+/// non-empty labels, with no scheme, path, userinfo, port suffix, whitespace
+/// or control bytes.
 /// No per-label charset rule is invented: labels only need to be non-empty,
 /// and any `:` fails shape before literal parsing, so v6-literal hosts
 /// deny exactly like the mirrored validator quirk.
@@ -201,7 +202,7 @@ fn host_shape_ok(host: &str) -> bool {
     }
     if host
         .bytes()
-        .any(|b| matches!(b, b':' | b'/' | b'?' | b'#' | b'@') || b.is_ascii_whitespace())
+        .any(|b| matches!(b, b':' | b'/' | b'?' | b'#' | b'@' | b' ') || b.is_ascii_control())
     {
         return false;
     }
@@ -244,7 +245,8 @@ fn ip_forbidden(ip: &IpAddr) -> bool {
 }
 
 /// Vet a dial plan: exact NNTP port, mirrored host shape, plaintext
-/// acknowledgement, and ALL candidates parsed and publicly routable. Any
+/// acknowledgement, and ALL candidates parsed and publicly routable. For
+/// an IP literal, each candidate must equal that literal. Any
 /// failure denies the whole plan as [`LoaderDenial::ProviderUnavailable`]:
 /// the stored endpoint is unusable; the caller's own authorization is not
 /// decided here.
@@ -261,13 +263,14 @@ pub fn vet_dial_plan(req: &VetDialPlanRequest) -> Result<DialPlan, LoaderDenial>
     if req.candidates.is_empty() {
         return Err(LoaderDenial::ProviderUnavailable);
     }
+    let literal = req.host.parse::<IpAddr>().ok();
     let mut vetted: Option<IpAddr> = None;
     for raw in req.candidates.iter() {
         let ip: IpAddr = match raw.parse() {
             Ok(ip) => ip,
             Err(_) => return Err(LoaderDenial::ProviderUnavailable),
         };
-        if ip_forbidden(&ip) {
+        if ip_forbidden(&ip) || literal.is_some_and(|host_ip| host_ip != ip) {
             return Err(LoaderDenial::ProviderUnavailable);
         }
         if vetted.is_none() {
@@ -405,8 +408,8 @@ impl CapacityGrant {
 /// grant). Caps validate before any clamp — a zero/disabled plan denies as
 /// [`LoaderDenial::AuthorizationDenied`] (entitlement) and never routes
 /// through the pool clamp helper; every other violation denies as
-/// [`LoaderDenial::ProviderUnavailable`]. Provider oversize above 50 denies
-/// unless the plan is already at the ceiling, where the clamp absorbs it.
+/// [`LoaderDenial::ProviderUnavailable`]. The stored provider cap must be
+/// within 1..=50.
 /// Global 90%-of-bound refuses new work (overflow-safe; saturated counters
 /// deny); owner ceilings deny at the bound; any recorded prior resolve
 /// denies the retry; quarantine denies before slot accounting; lanes keep
@@ -417,10 +420,7 @@ pub fn derive_capacity(req: &CapacityRequest) -> Result<CapacityGrant, LoaderDen
     if req.plan_cap <= 0 {
         return Err(AuthorizationDenied);
     }
-    if req.provider_cap <= 0 {
-        return Err(ProviderUnavailable);
-    }
-    if req.provider_cap > MAX_EFFECTIVE_CONNECTIONS && req.plan_cap < MAX_EFFECTIVE_CONNECTIONS {
+    if !(1..=MAX_EFFECTIVE_CONNECTIONS).contains(&req.provider_cap) {
         return Err(ProviderUnavailable);
     }
     if req.object_bytes > req.bound_bytes {

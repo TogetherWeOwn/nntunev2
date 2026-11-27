@@ -40,9 +40,8 @@
 //!   the newest). Evicting a track frees its blob's bytes only once no
 //!   surviving track points at that blob, so eviction continues until the
 //!   cache is back at or under the cap.
-//! - The just-written entry is never evicted by its own insert, even when it
-//!   alone exceeds the cap (then it serves alone, over cap, rather than the
-//!   write vanishing).
+//! - The just-written entry survives eviction if it fits. An oversized
+//!   write leaves a miss for that track and keeps other entries.
 //! - Exactly at the cap is not over it: no eviction at equality.
 //! - Survivors keep the existing serve contract untouched: Fresh/`HIT`
 //!   inside `CACHE_FRESH_TTL_SECS`, Stale/`STALE` + revalidation owed inside
@@ -232,37 +231,26 @@ fn over_cap_insert_evicts_oldest_first() {
 }
 
 #[test]
-fn over_cap_insert_never_evicts_the_just_written_entry_even_alone_over_cap() {
-    // A single entry bigger than the whole cap still serves: the write must
-    // not vanish into its own eviction pass.
+fn oversized_write_leaves_a_miss_and_preserves_other_tracks() {
     let mut cache = ContentCache::with_max_bytes(100);
-    cache.put_track("huge", blob(0x09, 101));
-    assert_eq!(cache.total_bytes(), 101);
+    let huge = blob(0x09, 101);
     assert_eq!(
-        cache.eviction_count(),
-        0,
-        "nothing older exists and the just-written entry is exempt"
+        cache.put_track("huge", huge.clone()),
+        ContentCache::hex_hash(&huge)
     );
-    assert_eq!(
-        cache.get_track("huge").map(|d| d.len()),
-        Some(101),
-        "a lone over-cap entry serves instead of being evicted"
-    );
+    assert!(cache.get_track("huge").is_none());
+    assert_eq!(cache.total_bytes(), 0);
 
-    // The same protection when older entries exist: they all go, it stays.
-    let mut cache = ContentCache::with_max_bytes(100);
     cache.put_track("a", blob(0xA1, 40));
     cache.put_track("b", blob(0xB2, 40));
-    cache.put_track("huge", blob(0x09, 150));
-    assert!(cache.get_track("a").is_none());
-    assert!(cache.get_track("b").is_none());
-    assert_eq!(cache.eviction_count(), 2);
+    cache.put_track_at("a", huge, 1_000);
+    assert!(cache.get_track_at("a", 1_000).is_none());
     assert_eq!(
-        cache.total_bytes(),
-        150,
-        "only the just-written entry remains, over cap by itself"
+        cache.get_track("b").as_deref(),
+        Some(blob(0xB2, 40).as_slice())
     );
-    assert_eq!(cache.get_track("huge").map(|d| d.len()), Some(150));
+    assert_eq!(cache.total_bytes(), 40);
+    assert_eq!(cache.eviction_count(), 0);
 }
 
 #[test]
