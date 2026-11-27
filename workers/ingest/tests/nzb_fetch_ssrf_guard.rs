@@ -494,6 +494,10 @@ fn redirect_loop_blocked_at_cap_with_stable_4xx() {
     assert!((400..500).contains(&err.http_status()));
     // Initial fetch + 2 followed redirects, then the loop is cut off.
     assert_eq!(transport.calls.len(), 3);
+    cfg.max_redirects = u32::MAX;
+    transport.calls.clear();
+    assert_eq!(fetch_nzb(ALLOWED_URL, &cfg, &dns, &mut transport), Err(err));
+    assert_eq!(transport.calls.len(), MAX_REDIRECTS as usize + 1);
 }
 
 /// Every redirect hop is re-guarded from scratch: a hop to a forbidden

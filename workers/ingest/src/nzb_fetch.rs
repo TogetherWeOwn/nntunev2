@@ -72,10 +72,12 @@
 //! functionality delivered here. It does not prove pinned HTTPS, streaming
 //! limits, actual deadlines, route/config wiring or block-log emission.
 
-use std::net::IpAddr;
+use std::borrow::Cow;
+use std::net::{IpAddr, Ipv6Addr};
 
 use nntune_ssrf_guard::ip_is_forbidden;
 
+use crate::indexer_fetch::host_shape_ok;
 use crate::nzb_intake::MAX_NZB_BYTES;
 
 /// Default simulated chunk-delay budget (ms), not a wall-clock deadline.
@@ -86,6 +88,12 @@ pub const MAX_REDIRECTS: u32 = 3;
 /// Any other explicit port is malformed: the fetch would otherwise become
 /// a port-scan primitive.
 const ALLOWED_FETCH_PORT: u16 = 443;
+pub(crate) const MAX_FETCH_URL_BYTES: usize = 8 * 1024;
+
+pub(crate) fn valid_url_text(url: &str) -> bool {
+    let invalid_char = |c: char| c == '\\' || c.is_whitespace() || c.is_control();
+    url.len() <= MAX_FETCH_URL_BYTES && !url.chars().any(invalid_char)
+}
 
 /// Injected address lookup for library policy checks; no runtime DNS adapter
 /// is supplied. Return ALL records: any forbidden address in the set rejects.
@@ -257,7 +265,7 @@ fn split_host(authority: &str) -> Result<String, FetchRejection> {
         };
         let host = &bracketed[..bracket_end];
         let rest = &bracketed[bracket_end + 1..];
-        if host.is_empty() {
+        if host.parse::<Ipv6Addr>().is_err() {
             return Err(FetchRejection::MalformedUrl);
         }
         if let Some(digits) = rest.strip_prefix(':') {
@@ -285,7 +293,7 @@ fn split_host(authority: &str) -> Result<String, FetchRejection> {
 }
 
 fn check_port(digits: &str) -> Result<(), FetchRejection> {
-    if digits.is_empty() {
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(FetchRejection::MalformedUrl);
     }
     match digits.parse::<u16>() {
@@ -317,7 +325,7 @@ pub fn validate_fetch_url(
     config: &FetchConfig,
     dns: &dyn DnsResolver,
 ) -> Result<ValidatedUrl, FetchRejection> {
-    if url.chars().any(|c| c.is_whitespace()) {
+    if !valid_url_text(url) {
         return Err(FetchRejection::MalformedUrl);
     }
     let authority = split_authority(url)?;
@@ -327,7 +335,7 @@ pub fn validate_fetch_url(
     let raw_host = split_host(authority)?;
     let lower = raw_host.to_ascii_lowercase();
     let host = lower.strip_suffix('.').unwrap_or(&lower);
-    if host.is_empty() {
+    if host.parse::<IpAddr>().is_err() && !host_shape_ok(host) {
         return Err(FetchRejection::MalformedUrl);
     }
     if !host_allowlisted(host, config) {
@@ -361,7 +369,7 @@ pub fn validate_fetch_url(
 /// https scheme, path-absolute (`/path`) on the current host. Anything
 /// else is malformed — never silently joined.
 fn resolve_location(current_host: &str, location: &str) -> Result<String, FetchRejection> {
-    if location.is_empty() || location.chars().any(|c| c.is_whitespace()) {
+    if !valid_url_text(location) {
         return Err(FetchRejection::MalformedUrl);
     }
     if let Some(rest) = location.strip_prefix("//") {
@@ -407,7 +415,7 @@ fn is_redirect(status: u16) -> bool {
 /// use can be stopped by this API. Errors never return a partial result.
 ///
 /// Revalidates 301/302/303/307/308 locations and follows at most
-/// `config.max_redirects` hops. A missing Location or other non-2xx status
+/// `config.max_redirects` hops, up to `MAX_REDIRECTS`. A missing Location or other non-2xx status
 /// becomes UpstreamStatus(status). See the module's runtime follow-up before
 /// connecting this model to any URL-fetch route: only the admin-gated
 /// ingest path may call it, and only with operator-configured URLs.
@@ -417,7 +425,7 @@ pub fn fetch_nzb(
     dns: &dyn DnsResolver,
     transport: &mut dyn FetchTransport,
 ) -> Result<Vec<u8>, FetchRejection> {
-    let mut current = url.to_string();
+    let mut current = Cow::Borrowed(url);
     let mut followed: u32 = 0;
     let mut elapsed: u64 = 0;
     loop {
@@ -435,10 +443,10 @@ pub fn fetch_nzb(
             200..=299 => {
                 let mut body = Vec::new();
                 for chunk in &response.chunks {
-                    body.extend_from_slice(&chunk.bytes);
-                    if body.len() > config.max_bytes {
+                    if chunk.bytes.len() > config.max_bytes - body.len() {
                         return Err(FetchRejection::TooLarge);
                     }
+                    body.extend_from_slice(&chunk.bytes);
                 }
                 return Ok(body);
             }
@@ -446,11 +454,11 @@ pub fn fetch_nzb(
                 let Some(location) = response.location else {
                     return Err(FetchRejection::UpstreamStatus(status));
                 };
-                if followed >= config.max_redirects {
+                if followed >= config.max_redirects.min(MAX_REDIRECTS) {
                     return Err(FetchRejection::TooManyRedirects);
                 }
                 followed += 1;
-                current = resolve_location(&target.host, &location)?;
+                current = Cow::Owned(resolve_location(&target.host, &location)?);
             }
             status => return Err(FetchRejection::UpstreamStatus(status)),
         }
@@ -518,11 +526,11 @@ fn parse_log_host(url: &str) -> Option<String> {
     Some(host.to_string())
 }
 
-fn valid_log_port_suffix(suffix: &str) -> bool {
+pub(crate) fn valid_log_port_suffix(suffix: &str) -> bool {
     suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_log_port)
 }
 
-fn valid_log_port(port: &str) -> bool {
+pub(crate) fn valid_log_port(port: &str) -> bool {
     !port.is_empty()
         && port.bytes().all(|byte| byte.is_ascii_digit())
         && port.parse::<u16>().is_ok()
@@ -552,7 +560,7 @@ mod tests {
     #[test]
     fn explicit_non_443_port_is_malformed() {
         let cfg = FetchConfig {
-            allowed_hosts: vec!["nzb.example".to_string()],
+            allowed_hosts: FetchConfig::allowlist_from_env("nzb.example,nzb..example"),
             ..FetchConfig::default()
         };
         // A fetch URL naming any other explicit port is not an NZB-fetch
@@ -565,6 +573,15 @@ mod tests {
             validate_fetch_url("https://nzb.example:65536/x.nzb", &cfg, &NoDns),
             Err(FetchRejection::MalformedUrl)
         );
+        for url in [
+            "https://nzb.example:+443/x.nzb",
+            "https://[nzb.example]/x.nzb",
+            "https://nzb..example/x.nzb",
+            &format!("https://nzb.example/{}", "a".repeat(MAX_FETCH_URL_BYTES)),
+        ] {
+            let result = validate_fetch_url(url, &cfg, &PublicDns);
+            assert_eq!(result, Err(FetchRejection::MalformedUrl));
+        }
     }
 
     struct PublicDns;
@@ -632,6 +649,10 @@ mod tests {
             resolve_location("nzb.example", "/dl?src=https://cdn.example/x"),
             Ok("https://nzb.example/dl?src=https://cdn.example/x".to_string())
         );
+        let oversized = format!("/{}", "a".repeat(MAX_FETCH_URL_BYTES));
+        for location in [oversized.as_str(), r"/a\b", "/a\0b"] {
+            assert!(resolve_location("nzb.example", location).is_err());
+        }
     }
 
     #[test]

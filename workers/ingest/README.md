@@ -278,82 +278,82 @@ model** for the admin-ingest path, not delivered outbound fetching: when
 a live transport lands, only the admin-gated ingest path may call it,
 with operator-configured URLs. It is exported as
 `pub mod indexer_fetch` (`src/lib.rs:53`), but nothing outside its unit tests
-(`src/indexer_fetch.rs:502-654`) and
+(`src/indexer_fetch.rs:542-737`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
-(`src/indexer_fetch.rs:399`) or
-`validate_indexer_url` (`src/indexer_fetch.rs:305`): there is no route, queue-consumer or search-step
-call site, no non-test `DnsResolver` (`src/indexer_fetch.rs:52-54`) or `IndexerTransport`
-(`src/indexer_fetch.rs:159-161`) implementation
+(`src/indexer_fetch.rs:431`) or
+`validate_indexer_url` (`src/indexer_fetch.rs:337`): there is no route, queue-consumer or search-step
+call site, no non-test `DnsResolver` (`src/indexer_fetch.rs:57-59`) or `IndexerTransport`
+(`src/indexer_fetch.rs:178-180`) implementation
 for this module, no live DNS/TCP/TLS dial, no cancellation, no emitted
 HTTP response and no emitted decision log. Existing search and NZB upload
 routes are unchanged.
 
 ### What the model checks
 
-- `validate_indexer_url` (`src/indexer_fetch.rs:305`) checks https only
-  (`split_authority`, `src/indexer_fetch.rs:220`), no embedded credentials,
+- `validate_indexer_url` (`src/indexer_fetch.rs:337`) checks https only
+  (`split_authority`, `src/indexer_fetch.rs:252`), no embedded credentials,
   and a 443-only port allowlist (`ALLOWED_INDEXER_PORT = 443`,
-  `src/indexer_fetch.rs:42`; `split_host_port`/`check_port`,
-  `src/indexer_fetch.rs:242-297` — any other explicit port is refused in the
+  `src/indexer_fetch.rs:46`; `split_host_port`/`check_port`,
+  `src/indexer_fetch.rs:274-329` — any other explicit port is refused in the
   model before the transport trait would be called, so the modeled fetch
   cannot be aimed at another port as a scan primitive). Address ranges
   come from the shared guard crate (`v4_is_forbidden`/`ip_is_forbidden`
   single-owned in `crates/nntune-ssrf-guard/src/lib.rs:21-53`),
-  imported here (`src/indexer_fetch.rs:38`) and by the `workers/api`
+  imported here (`src/indexer_fetch.rs:40`) and by the `workers/api`
   vault guard (`workers/api/src/vault.rs:28`) — one list, no copies
   to keep in sync.
 - Every answer from the supplied `DnsResolver` is checked for forbidden
-  ranges (`ip_is_forbidden` from `crates/nntune-ssrf-guard/src/lib.rs:37`, imported at `src/indexer_fetch.rs:38`; one forbidden
-  record poisons the whole answer, `src/indexer_fetch.rs:335-338`):
+  ranges (`ip_is_forbidden` from `crates/nntune-ssrf-guard/src/lib.rs:37`, imported at `src/indexer_fetch.rs:40`; one forbidden
+  record poisons the whole answer, `src/indexer_fetch.rs:367-370`):
   loopback / link-local (incl. the cloud metadata endpoint) /
   private / unique-local / CGNAT / multicast / broadcast / documentation
   / reserved space (v4+v6, incl. IPv6 transition space with a
   public-looking payload); one forbidden record poisons the whole answer.
-  IP literals skip DNS, not policy (`src/indexer_fetch.rs:326-329`).
+  IP literals skip DNS, not policy (`src/indexer_fetch.rs:358-361`).
 - The intended DNS-pin contract shape: `fetch_indexer` validates each hop
   before calling the transport and hands it a `PinnedRequest`
-  (`src/indexer_fetch.rs:146-153`) carrying
+  (`src/indexer_fetch.rs:153-160`) carrying
   the vetted addresses, the original hostname as `sni_host` (for TLS
   SNI/certificate checks and the Host header), port 443 and
-  `dial_timeout_ms` in the per-hop `PinnedRequest` (`src/indexer_fetch.rs:411-418`).
+  `dial_timeout_ms` in the per-hop `PinnedRequest` (`src/indexer_fetch.rs:443-450`).
   In the model the host is resolved exactly once per hop, so a changed second
   DNS answer (rebinding) is never consulted by `fetch_indexer` itself.
 - Every redirect hop (301/302/303/307/308 per `is_redirect`,
-  `src/indexer_fetch.rs:379-381`; resolved per `resolve_location`,
-  `src/indexer_fetch.rs:354` — absolute / protocol-relative /
+  `src/indexer_fetch.rs:411-413`; resolved per `resolve_location`,
+  `src/indexer_fetch.rs:386` — absolute / protocol-relative /
   path-absolute) is re-validated from scratch and at most 3 hops are
-  followed (`MAX_REDIRECTS = 3`, `src/indexer_fetch.rs:48`; cap enforced at
-  `src/indexer_fetch.rs:445-450`); the original URL's `apikey=` value is not re-injected onto a
+  followed (`MAX_REDIRECTS = 3`, `src/indexer_fetch.rs:52`; cap enforced at
+  `src/indexer_fetch.rs:480-485`); the original URL's `apikey=` value is not re-injected onto a
   redirect target. See the unresolved redirect-policy discrepancy below.
 - Modeled deadlines: a supplied `connect_delay_ms` reaching the 5000 ms
-  dial timeout (`DIAL_TIMEOUT_MS`, `src/indexer_fetch.rs:44`; enforced with
-  `>=` at `src/indexer_fetch.rs:420-422`) returns the dial-timeout rejection, and supplied connect +
+  dial timeout (`DIAL_TIMEOUT_MS`, `src/indexer_fetch.rs:48`; enforced with
+  `>=` at `src/indexer_fetch.rs:452-454`) returns the dial-timeout rejection, and supplied connect +
   chunk delays accumulated across all hops reaching the 15000 ms total
-  timeout (`FETCH_TIMEOUT_MS`, `src/indexer_fetch.rs:46`; enforced with `>=`
-  at `src/indexer_fetch.rs:423-432`)
+  timeout (`FETCH_TIMEOUT_MS`, `src/indexer_fetch.rs:50`; enforced with `>=`
+  at `src/indexer_fetch.rs:455-464`)
   (the vault outbound numbers, reused) return the total-timeout
   rejection; at the deadline counts as expired, and partial bytes are not
   returned on a model rejection.
-- `url_host_for_log` (`src/indexer_fetch.rs:460`) extracts a sanitized host for a future host + code
+- `url_host_for_log` (`src/indexer_fetch.rs:495`) extracts a sanitized host for a future host + code
   decision log. Stable codes (`FetchRejection::code`,
-  `src/indexer_fetch.rs:92-105`) and their `http_status()` mappings
-  (`src/indexer_fetch.rs:108-119`: guard
+  `src/indexer_fetch.rs:98-112`) and their `http_status()` mappings
+  (`src/indexer_fetch.rs:115-126`: guard
   blocks 4xx, timeouts 504, upstream failures 502) are library values for
   the shared taxonomy envelope, not current HTTP responses:
   `indexer_fetch_bad_scheme`, `indexer_fetch_malformed_url`,
   `indexer_fetch_embedded_credentials`, `indexer_fetch_port_not_allowed`,
   `indexer_fetch_forbidden_address`, `indexer_fetch_unresolvable_host`,
   `indexer_fetch_too_many_redirects`, `indexer_fetch_dial_timeout`,
-  `indexer_fetch_timeout`, `indexer_fetch_upstream_status`. Full URLs
+  `indexer_fetch_timeout`, `indexer_fetch_too_large`, `indexer_fetch_upstream_status`. Full URLs
   must go through `newznab::redact_api_key` (`src/newznab.rs:191`) before any future log line;
   no such log is emitted today.
 
 ### Limits of the model
 
-`IndexerTransport::get(&PinnedRequest)` (`src/indexer_fetch.rs:159-161`)
+`IndexerTransport::get(&PinnedRequest)` (`src/indexer_fetch.rs:178-180`)
 is synchronous and returns a
-fully buffered `RawResponse` (`src/indexer_fetch.rs:165-170`) that already contains every body chunk.
-The delay checks run **after** that call returns (`src/indexer_fetch.rs:419-432`), on simulated/reported
+fully buffered `RawResponse` (`src/indexer_fetch.rs:184-189`). Assembling a successful response has a 2 MiB cap.
+The delay checks run **after** that call returns (`src/indexer_fetch.rs:451-464`), on simulated/reported
 `connect_delay_ms` and chunk `delay_ms` values — they are not wall-clock
 measurements. A hung transport cannot be cancelled, DNS/connect/TLS/header
 durations are not measured, and the body is assembled from the buffered
@@ -378,7 +378,7 @@ The required security policy still forbids redirects for indexer fetch:
 redirects, and the vault side encodes `INDEXER_ALLOW_REDIRECTS = false`
 (`workers/api/src/vault.rs:52`).
 This model instead follows up to 3 re-validated redirects
-(`MAX_REDIRECTS = 3`, `src/indexer_fetch.rs:48`). That discrepancy is **unresolved**: this README
+(`MAX_REDIRECTS = 3`, `src/indexer_fetch.rs:52`). That discrepancy is **unresolved**: this README
 does not relax the required policy, does not approve live redirect
 following, and does not authorize deployment of an indexer fetch
 transport. Changing the required policy needs an independent CISO
@@ -391,65 +391,65 @@ be wired to a live transport as if it were approved policy.
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
 `src/lib.rs:60`). No ingest route calls it (`fetch_nzb` at
-`src/nzb_fetch.rs:414` has no non-test call site; only
+`src/nzb_fetch.rs:422` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`
-`src/nzb_fetch.rs:199-201` implementation exists), `NZB_FETCH_ALLOWLIST` is not read from the
+`src/nzb_fetch.rs:207-209` implementation exists), `NZB_FETCH_ALLOWLIST` is not read from the
 Worker environment (`allowlist_from_env` takes an operator-supplied string,
-`src/nzb_fetch.rs:121-128`), and no block logs are emitted. Exporting `pub mod
+`src/nzb_fetch.rs:129-136`), and no block logs are emitted. Exporting `pub mod
 nzb_fetch` does not wire a fetch-from-URL feature. Existing search and NZB
 upload routes are unchanged.
 
 ### What the library checks
 
-- `validate_fetch_url` (`src/nzb_fetch.rs:315`) checks HTTPS
-  (`split_authority`, `src/nzb_fetch.rs:230`), no embedded credentials,
-  default/443 port (`ALLOWED_FETCH_PORT = 443`, `src/nzb_fetch.rs:88`;
-  `split_host`/`check_port`, `src/nzb_fetch.rs:253-298` — any other explicit
+- `validate_fetch_url` (`src/nzb_fetch.rs:323`) checks HTTPS
+  (`split_authority`, `src/nzb_fetch.rs:238`), no embedded credentials,
+  default/443 port (`ALLOWED_FETCH_PORT = 443`, `src/nzb_fetch.rs:90`;
+  `split_host`/`check_port`, `src/nzb_fetch.rs:261-306` — any other explicit
   port is `MalformedUrl`, never a fetch),
   and exact case-insensitive host allowlisting (`host_allowlisted`,
-  `src/nzb_fetch.rs:302-307`; subdomains are not
+  `src/nzb_fetch.rs:310-315`; subdomains are not
   implied). `FetchConfig::default()` denies every host
-  (`src/nzb_fetch.rs:106-115`). The parser accepts
+  (`src/nzb_fetch.rs:114-123`). The parser accepts
   a supplied comma-separated string such as `nzb.example,cdn.example`
-  (`allowlist_from_env`, `src/nzb_fetch.rs:121-128`); it
+  (`allowlist_from_env`, `src/nzb_fetch.rs:129-136`); it
   does not load environment configuration.
 - Every answer from the supplied resolver is checked for forbidden ranges
   (`ip_is_forbidden` from `crates/nntune-ssrf-guard/src/lib.rs:37`,
-  imported at `src/nzb_fetch.rs:77`; one forbidden record poisons
-  the whole answer, `src/nzb_fetch.rs:345-349`;
+  imported at `src/nzb_fetch.rs:78`; one forbidden record poisons
+  the whole answer, `src/nzb_fetch.rs:353-357`;
   the vault guard and both ingest fetchers share that one predicate —
   no per-module lists to keep in sync)
   (loopback, link-local/metadata, private, CGNAT, multicast, reserved and
   documentation, including IPv6 transition space). IP literals skip DNS,
-  not policy (`src/nzb_fetch.rs:336-339`). The result records vetted addresses
-  (`ValidatedUrl`, `src/nzb_fetch.rs:185-193`), not a network binding.
-- `fetch_nzb` (`src/nzb_fetch.rs:414`) models per-hop validation and at most
-  3 redirects (`MAX_REDIRECTS = 3`, `src/nzb_fetch.rs:84`; cap enforced at
-  `src/nzb_fetch.rs:449-454`; 301/302/303/307/308 per `is_redirect`,
-  `src/nzb_fetch.rs:393-395`). It checks
+  not policy (`src/nzb_fetch.rs:344-347`). The result records vetted addresses
+  (`ValidatedUrl`, `src/nzb_fetch.rs:193-201`), not a network binding.
+- `fetch_nzb` (`src/nzb_fetch.rs:422`) models per-hop validation and at most
+  3 redirects (`MAX_REDIRECTS = 3`, `src/nzb_fetch.rs:86`; cap enforced at
+  `src/nzb_fetch.rs:457-462`; 301/302/303/307/308 per `is_redirect`,
+  `src/nzb_fetch.rs:401-403`). It checks
   accumulated reported chunk delays across hops against 10000 ms
-  (`FETCH_TIMEOUT_MS`, `src/nzb_fetch.rs:82`; enforced with `>=` at
-  `src/nzb_fetch.rs:428-433`) and the
+  (`FETCH_TIMEOUT_MS`, `src/nzb_fetch.rs:84`; enforced with `>=` at
+  `src/nzb_fetch.rs:436-441`) and the
   final returned body against the 2 MiB intake cap (`MAX_NZB_BYTES`,
-  `src/nzb_intake.rs:42`, via `FetchConfig.max_bytes`,
-  `src/nzb_fetch.rs:103`; enforced at `src/nzb_fetch.rs:438-442`),
+  `src/nzb_intake.rs:44`, via `FetchConfig.max_bytes`,
+  `src/nzb_fetch.rs:111`; enforced at `src/nzb_fetch.rs:446-450`),
   returning stable
   rejection reasons without partial results.
-- `url_host_for_log` (`src/nzb_fetch.rs:468`) extracts a sanitized host. Stable codes/status mappings
-  (`FetchRejection::code`, `src/nzb_fetch.rs:148-161`;
-  `http_status`, `src/nzb_fetch.rs:164-177`)
+- `url_host_for_log` (`src/nzb_fetch.rs:476`) extracts a sanitized host. Stable codes/status mappings
+  (`FetchRejection::code`, `src/nzb_fetch.rs:156-169`;
+  `http_status`, `src/nzb_fetch.rs:172-185`)
   are library values for future route wiring, not current HTTP responses.
 
 ### Limits of the model
 
-`FetchTransport::get(&str)` (`src/nzb_fetch.rs:199-201`) receives only a URL, **not the validated
+`FetchTransport::get(&str)` (`src/nzb_fetch.rs:207-209`) receives only a URL, **not the validated
 addresses/hostname or a remaining deadline** (compare the call at
-`src/nzb_fetch.rs:427`, which passes only `&current`, never the
+`src/nzb_fetch.rs:435`, which passes only `&current`, never the
 `ValidatedUrl` addresses/host). It cannot enforce IP-pinned
 dialing, original-host TLS verification or DNS-rebinding resistance. A
-`RawResponse` (`src/nzb_fetch.rs:206-210`) already contains all body chunks: size and reported-delay
-checks happen **after buffering** (`src/nzb_fetch.rs:428-442`), not while streaming. DNS, connection,
+`RawResponse` (`src/nzb_fetch.rs:214-218`) already contains all body chunks: size and reported-delay
+checks happen **after buffering** (`src/nzb_fetch.rs:436-450`), not while streaming. DNS, connection,
 TLS and header durations are not measured; a hung transport cannot be
 cancelled. Do not attach a real HTTPS client to this simulator interface.
 
@@ -475,7 +475,7 @@ Stable codes: `nzb_fetch_bad_scheme`, `nzb_fetch_malformed_url`,
 `nzb_fetch_forbidden_address`, `nzb_fetch_unresolvable_host`,
 `nzb_fetch_too_many_redirects`, `nzb_fetch_timeout`, `nzb_fetch_too_large`,
 `nzb_fetch_upstream_status`. HTTP mappings are documented on the module's
-`FetchRejection` type (`http_status`, `src/nzb_fetch.rs:164-177`: 400
+`FetchRejection` type (`http_status`, `src/nzb_fetch.rs:172-185`: 400
 scheme/malformed/credentials/unresolvable/redirect-cap, 403
 not-allowlisted/forbidden-address, 504 timeout, 413 too-large, 502
 upstream-status); no route emits them in this slice.

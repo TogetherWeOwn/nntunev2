@@ -34,6 +34,8 @@
 //!
 //! Checks run in the order above: the first failure wins.
 
+use std::collections::HashSet;
+
 /// Intake config version. Bump whenever a default cap changes; refusals
 /// include this value so clients and dashboards can identify the policy.
 pub const INTAKE_CONFIG_VERSION: u32 = 1;
@@ -148,7 +150,7 @@ impl IntakeRejection {
 pub struct IntakeEstimate {
     pub file_count: usize,
     pub segment_count: usize,
-    /// Summed `bytes="…"` over all `<segment>` elements (saturating).
+    /// Exact sum of the `bytes="…"` attributes on all `<segment>` elements.
     pub declared_bytes: u64,
 }
 
@@ -296,9 +298,9 @@ fn count_elements(body: &str, name: &str, over: usize) -> Result<usize, ()> {
     Ok(count)
 }
 
-/// Skip ASCII whitespace, returning the new offset.
+/// Skip XML whitespace, returning the new offset.
 fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+    while matches!(bytes.get(i), Some(b' ' | b'\t' | b'\r' | b'\n')) {
         i += 1;
     }
     i
@@ -326,6 +328,9 @@ fn skip_quoted(bytes: &[u8], i: usize) -> Option<usize> {
     let q = bytes[i];
     let mut j = i + 1;
     while j < bytes.len() && bytes[j] != q {
+        if bytes[j] == b'<' {
+            return None;
+        }
         j += 1;
     }
     if j >= bytes.len() {
@@ -344,7 +349,7 @@ fn skip_quoted(bytes: &[u8], i: usize) -> Option<usize> {
 /// on bytes and never slices a `str` at a non-boundary.
 fn check_well_formed(body: &str) -> bool {
     let bytes = body.as_bytes();
-    let mut i = 0;
+    let mut i = if body.starts_with('\u{feff}') { 3 } else { 0 };
     let mut stack: Vec<(usize, usize)> = Vec::new();
     // NZBs nest ~4 deep (nzb > file > segments > segment); anything past
     // this is pathological nesting, not content.
@@ -353,6 +358,9 @@ fn check_well_formed(body: &str) -> bool {
 
     while i < bytes.len() {
         if bytes[i] != b'<' {
+            if stack.is_empty() && !matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+                return false;
+            }
             i += 1;
             continue;
         }
@@ -368,6 +376,9 @@ fn check_well_formed(body: &str) -> bool {
                 None => return false,
             }
         } else if rest.starts_with("<![CDATA[") {
+            if stack.is_empty() {
+                return false;
+            }
             match skip_terminated(bytes, i, 9, b"]]>") {
                 Some(end) => i = end,
                 None => return false,
@@ -378,7 +389,7 @@ fn check_well_formed(body: &str) -> bool {
                 None => return false,
             }
         } else if rest.starts_with("</") {
-            let mut j = skip_ws(bytes, i + 2);
+            let mut j = i + 2;
             let name_end = match read_name(bytes, j) {
                 Some(e) => e,
                 None => return false,
@@ -399,10 +410,15 @@ fn check_well_formed(body: &str) -> bool {
                 Some(e) => e,
                 None => return false,
             };
+            if saw_element && stack.is_empty() {
+                return false;
+            }
             saw_element = true;
+            let mut attributes = HashSet::new();
             let mut j = name_end;
             let mut self_closing = false;
             loop {
+                let previous = j;
                 j = skip_ws(bytes, j);
                 if j >= bytes.len() {
                     return false;
@@ -424,6 +440,9 @@ fn check_well_formed(body: &str) -> bool {
                     Some(e) => e,
                     None => return false,
                 };
+                if previous == j || !attributes.insert(&bytes[j..attr_end]) {
+                    return false;
+                }
                 j = skip_ws(bytes, attr_end);
                 if j < bytes.len() && bytes[j] == b'=' {
                     j = skip_ws(bytes, j + 1);
@@ -431,9 +450,9 @@ fn check_well_formed(body: &str) -> bool {
                         Some(e) => j = e,
                         None => return false,
                     }
+                } else {
+                    return false;
                 }
-                // Valueless attributes are tolerated (lenient); the `>`
-                // / `/>` checks at the loop top keep the tag bounded.
             }
             if !self_closing {
                 if stack.len() >= MAX_DEPTH {
@@ -450,8 +469,8 @@ fn check_well_formed(body: &str) -> bool {
 /// Sum the `bytes="…"` attributes of every `<segment…>` tag. The shared
 /// tokenizer ignores tag-like text inside non-element XML constructs and
 /// advances past each full tag, making the scan linear in document length.
-fn sum_segment_bytes(body: &str) -> Result<u64, ()> {
-    let mut total: u64 = 0;
+fn sum_segment_bytes(body: &str) -> Result<u128, ()> {
+    let mut total: u128 = 0;
     let mut offset = 0;
     while let Some(open) = next_open_tag(body, offset)? {
         let qualified_name = &body[open.start + 1..open.name_end];
@@ -494,14 +513,14 @@ fn sum_segment_bytes(body: &str) -> Result<u64, ()> {
                     }
                     match raw.parse::<u64>() {
                         Ok(n) => tag_value = Some(n),
-                        Err(_) => total = total.saturating_add(u64::MAX),
+                        Err(_) => total = u128::MAX,
                     }
                 }
                 k = value_end + 1;
             }
         }
         if let Some(n) = tag_value {
-            total = total.saturating_add(n);
+            total = total.saturating_add(u128::from(n));
         }
         offset = open.end;
     }
@@ -531,6 +550,11 @@ pub fn estimate_nzb_with_limits(
     if !(head_has_nzb || (head_has_xml && body.contains("<nzb"))) {
         return Err(IntakeRejection::NotNzb);
     }
+    let root = next_open_tag(body, 0).map_err(|_| IntakeRejection::Malformed)?;
+    if !root.is_some_and(|tag| body[tag.start + 1..tag.name_end].rsplit(':').next() == Some("nzb"))
+    {
+        return Err(IntakeRejection::NotNzb);
+    }
     if !check_well_formed(body) {
         return Err(IntakeRejection::Malformed);
     }
@@ -551,16 +575,16 @@ pub fn estimate_nzb_with_limits(
         });
     }
     let declared_bytes = sum_segment_bytes(body).map_err(|_| IntakeRejection::Malformed)?;
-    if declared_bytes > limits.max_declared_bytes {
+    if declared_bytes > u128::from(limits.max_declared_bytes) {
         return Err(IntakeRejection::DeclaredBytesOverCap {
-            declared: declared_bytes,
+            declared: u64::try_from(declared_bytes).unwrap_or(u64::MAX),
             max: limits.max_declared_bytes,
         });
     }
     Ok(IntakeEstimate {
         file_count,
         segment_count,
-        declared_bytes,
+        declared_bytes: declared_bytes as u64,
     })
 }
 
@@ -742,17 +766,30 @@ mod tests {
             other => panic!("expected too-large, got {other:?}"),
         }
         assert_eq!(
-            estimate_nzb("<html><body>hi</body></html>").unwrap_err(),
+            estimate_nzb("<nzb-lookalike/>").unwrap_err(),
             IntakeRejection::NotNzb
         );
         assert_eq!(
-            estimate_nzb(r#"{"json": "not xml"}"#).unwrap_err(),
+            estimate_nzb(r#"{"json": "not <xml"}"#).unwrap_err(),
             IntakeRejection::NotNzb
         );
     }
 
     #[test]
     fn malformed_shapes_all_fail_well_formedness() {
+        for doc in [
+            "<nzb/><file/>",
+            "<nzb/>trailing text",
+            "<nzb/><![CDATA[trailing text]]>",
+            "<nzb attr='<'/>",
+            "<nzb a='1'b='2'/>",
+            "<nzb></ nzb>",
+            "<nzb\u{c}/>",
+            "<nzb><segment bytes/></nzb>",
+            "<nzb><segment bytes='1' bytes='2'/></nzb>",
+        ] {
+            assert_eq!(estimate_nzb(doc), Err(IntakeRejection::Malformed));
+        }
         // Unclosed file element.
         assert_eq!(
             estimate_nzb(MALFORMED_NZB).unwrap_err(),
@@ -822,6 +859,7 @@ mod tests {
     #[test]
     fn well_formedness_accepts_legal_xml_shapes() {
         for doc in [
+            "\u{feff}<?xml?><nzb/>",
             "<?xml?><nzb><segment>x@y</segment></nzb>",
             "<?xml version=\"1.0\"?><nzb><!-- a comment --><segment>x@y</segment></nzb>",
             "<?xml?><nzb><segment/> </nzb>",
@@ -844,9 +882,16 @@ mod tests {
         // A single claim that overflows u64 is over any sane cap, not a parse
         // error to quibble over.
         let doc = "<?xml?><nzb><segment bytes=\"99999999999999999999999\">x@y</segment></nzb>";
-        match estimate_nzb(doc).unwrap_err() {
+        let combined = "<nzb><segment bytes='18446744073709551615'/><segment bytes='1'/></nzb>";
+        let limits = IntakeLimits {
+            max_declared_bytes: u64::MAX,
+            ..DEFAULT_LIMITS
+        };
+        let overflow = estimate_nzb_with_limits(doc, &limits);
+        assert_eq!(estimate_nzb_with_limits(combined, &limits), overflow);
+        match overflow.unwrap_err() {
             IntakeRejection::DeclaredBytesOverCap { declared, max } => {
-                assert!(declared > max);
+                assert_eq!((declared, max), (u64::MAX, u64::MAX));
             }
             other => panic!("expected declared-bytes rejection, got {other:?}"),
         }
