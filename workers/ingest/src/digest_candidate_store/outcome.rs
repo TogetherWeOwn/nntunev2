@@ -202,7 +202,13 @@ pub async fn protect_completion_reuse(
 }
 
 fn decode_outcome(row: &Row, offset: i64) -> Result<Option<CommittedOutcome>, OutcomeError> {
-    let outcome = decode_pins(row).map_err(|_| Indeterminate)?;
+    validate_outcome(decode_pins(row).map_err(|_| Indeterminate)?, offset)
+}
+
+fn validate_outcome(
+    outcome: Option<CommittedOutcome>,
+    offset: i64,
+) -> Result<Option<CommittedOutcome>, OutcomeError> {
     if let Some(pins) = &outcome {
         let geometry = u64::try_from(offset)
             .ok()
@@ -228,4 +234,43 @@ fn decode_pins(row: &Row) -> Result<Option<CommittedOutcome>, tokio_postgres::Er
         media_version: row.try_get(5)?,
         page_versions: row.try_get(6)?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_requires_exact_version_pins_for_the_final_offset() {
+        let offset = 256 * 65_536 + 1;
+        let outcome = |media_version: &str, pages: &[&str]| {
+            Some(CommittedOutcome {
+                map: "map".into(),
+                object: "object".into(),
+                generation: "generation".into(),
+                configuration: "configuration".into(),
+                root_version: "root".into(),
+                media_version: media_version.into(),
+                page_versions: pages.iter().map(|pin| (*pin).into()).collect(),
+            })
+        };
+        let pins = ["page-1", "page-2"];
+        assert!(matches!(validate_outcome(None, 0), Ok(None)));
+        assert!(matches!(
+            validate_outcome(outcome("media", &pins), offset),
+            Ok(Some(_))
+        ));
+        for (media, pages, length) in [
+            ("media", &pins[..1], offset),
+            ("media", &pins[..], offset - 1),
+            ("media", &pins[..], 0),
+            ("null", &pins[..], offset),
+            ("media", &["page", "a,b"][..], offset),
+        ] {
+            assert!(matches!(
+                validate_outcome(outcome(media, pages), length),
+                Err(Indeterminate)
+            ));
+        }
+    }
 }

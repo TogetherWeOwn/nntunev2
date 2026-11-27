@@ -153,9 +153,6 @@ pub fn build_search_dispatch(
     if q.is_empty() || q.chars().take(201).count() > 200 {
         return Err("query must be 1..=200 chars");
     }
-    if q.chars().any(char::is_control) {
-        return Err("query must not contain control characters");
-    }
     if !validate_indexer_ref(indexer_ref) {
         return Err("indexer_ref must be a vault handle");
     }
@@ -280,9 +277,6 @@ mod tests {
         assert!(bad_user(""));
         assert!(build_search_dispatch(USER, "", INDEXER, &[], 10, 0).is_err());
         assert!(build_search_dispatch(USER, &"x".repeat(201), INDEXER, &[], 10, 0).is_err());
-        for query in ["a\0b", "a\nb", "a\u{85}b"] {
-            assert!(build_search_dispatch(USER, query, INDEXER, &[], 10, 0).is_err());
-        }
         assert!(
             build_search_dispatch(USER, "q", "https://indexer.example?apikey=x", &[], 10, 0)
                 .is_err()
@@ -327,6 +321,24 @@ mod tests {
         assert_eq!(
             build_search_dispatch(USER, &format!("  {over}  "), INDEXER, &[], 10, 0).err(),
             Some("query must be 1..=200 chars")
+        );
+    }
+
+    #[test]
+    fn previously_queued_search_text_still_roundtrips() {
+        let query = "disc\ntrack\t01";
+        let msg = search(USER, query, INDEXER);
+        assert_eq!(msg.query.as_deref(), Some(query));
+        assert_eq!(
+            msg.idempotency_key,
+            derive_idempotency_key(
+                USER,
+                &content_sha256_hex(
+                    b"search:vault_idx_01-ab:disc\ntrack\t01:cats=:limit=25:page=0"
+                ),
+                "search/vault_idx_01-ab/p0l25/c",
+            )
+            .unwrap()
         );
     }
 

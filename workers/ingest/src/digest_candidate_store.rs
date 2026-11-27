@@ -40,7 +40,7 @@ JOIN locked_reservation AS r ON r.object_id = i.object_id
 WHERE i.environment_id = $1::text::uuid AND i.library_id = $2::text::uuid
   AND i.object_id = $3::text::uuid AND i.generation_id = $4::text::uuid
   AND i.provider_configuration_version_id = $5::text::uuid
-  AND i.plaintext_bytes = $7 AND i.header_tag = $8 AND i.envelope_bytes = $12";
+  AND i.plaintext_bytes = $7 AND i.header_tag = $8";
 
 use crate::digest_candidate_identity::candidate_hashes;
 pub use crate::digest_candidate_identity::{CandidateError, CandidateIntent};
@@ -109,7 +109,6 @@ async fn store_with_deadline<D: std::future::Future<Output = ()>>(
     let map = uuid(&intent.map_id);
     let geometry = candidate_geometry(intent.plaintext_len).ok_or(CandidateError::Identity)?;
     let length = geometry.plaintext_len() as i64;
-    let envelope_bytes = geometry.sealed_len() as i64;
     let header = intent.header.to_vec();
     let digest = manifest.plaintext_sha256().to_vec();
     let generation = intent.reservation_generation;
@@ -130,7 +129,6 @@ async fn store_with_deadline<D: std::future::Future<Output = ()>>(
                         &generation,
                         &hashes,
                         &digest,
-                        &envelope_bytes,
                     ],
                 )
                 .await
@@ -162,30 +160,6 @@ mod tests {
         let largest = candidate_geometry(1 << 33).unwrap();
         assert_eq!(largest.pages(), 512);
         assert_eq!(largest.sealed_len(), (1 << 33) + 131_072 * 16 + 48);
-    }
-
-    #[test]
-    fn inventory_versions_must_cover_every_page_and_be_unambiguous() {
-        let geometry = candidate_geometry(256 * 65_536 + 1).unwrap();
-        assert!(valid_inventory_versions(
-            geometry,
-            "opaque+/=",
-            &["same", "same"]
-        ));
-        assert!(!valid_inventory_versions(geometry, "media", &["page"]));
-        assert!(!valid_inventory_versions(
-            geometry,
-            "media",
-            &["a", "b", "c"]
-        ));
-        for invalid in ["", "null", "a,b", "a b", "a\nb", &"x".repeat(1025)] {
-            assert!(!valid_inventory_versions(geometry, invalid, &["a", "b"]));
-            assert!(!valid_inventory_versions(
-                geometry,
-                "media",
-                &["a", invalid]
-            ));
-        }
     }
 
     pub(super) fn id(value: u8) -> [u8; 16] {
