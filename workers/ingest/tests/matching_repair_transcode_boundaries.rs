@@ -22,10 +22,10 @@ const USER: &str = "user_fixture";
 const KEY: &str = "ingest:user_fixture:abc:upload";
 
 #[test]
-fn matching_refuses_invalid_scores_and_the_exact_margin() {
-    let body = r#"{"results":[{"mbid":"12345678-0000-0000-0000-000000000000","title":"Album","artist_name":"Artist","score":0.8}]}"#;
-    let base = parse_mb_search_response(200, body).unwrap().remove(0);
-    let invalid = body.replace("0.8", "1.1");
+fn matching_refuses_invalid_scores_and_preserves_margin() {
+    let body = r#"{"results":[{"mbid":"12345678-0000-0000-0000-000000000000","title":"Album","artist_name":"Artist","score":0.7}]}"#;
+    let mut base = parse_mb_search_response(200, body).unwrap().remove(0);
+    let invalid = body.replace("0.7", "1.1");
     assert_eq!(
         parse_mb_search_response(200, &invalid),
         Err(MatchFailure::Transient)
@@ -35,17 +35,18 @@ fn matching_refuses_invalid_scores_and_the_exact_margin() {
             score,
             ..base.clone()
         };
-        let hits = [malformed];
+        let hits = [malformed, base.clone()];
         assert!(pick_release_mbid("Album", &hits).is_none());
         assert!(pick_release_mbid("Artist - Album", &hits).is_none());
     }
     let mut rival = MbSearchHit {
         mbid: "87654321-0000-0000-0000-000000000000".into(),
-        score: 0.7,
+        score: 0.6,
         ..base.clone()
     };
     assert!(pick_release_mbid("Album", &[rival.clone(), base.clone()]).is_none());
-    rival.score = 0.69;
+    base.score = 0.6;
+    rival.score = 0.5;
     let expected = base.mbid.clone();
     assert_eq!(pick_release_mbid("Album", &[rival, base]), Some(expected));
 }

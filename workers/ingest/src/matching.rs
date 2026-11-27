@@ -474,7 +474,7 @@ pub fn pick_release_mbid(query: &str, hits: &[MbSearchHit]) -> Option<String> {
         return None;
     }
     if let Some(runner_up) = matching.iter().skip(1).find(|hit| hit.mbid != top.mbid) {
-        if top.score <= runner_up.score + MIN_MATCH_MARGIN {
+        if top.score - runner_up.score <= MIN_MATCH_MARGIN {
             return None;
         }
     }
