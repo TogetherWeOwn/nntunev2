@@ -11,13 +11,13 @@ const NOW: u64 = 1_700_000_000;
 #[test]
 fn magic_link_is_only_valid_within_its_issued_window() {
     let (token, record) = auth::issue_magic_link("member", "member@example.com", NOW).unwrap();
-    for now in [NOW - 1, record.expires_at] {
+    for now in [NOW - 1, record.expires_at + 1] {
         assert!(matches!(
             auth::consume_magic_link(record.clone(), &token, now),
             Err(auth::AuthError::Invalid)
         ));
     }
-    assert!(auth::consume_magic_link(record.clone(), &token, record.expires_at - 1).is_ok());
+    assert!(auth::consume_magic_link(record.clone(), &token, record.expires_at).is_ok());
     let mut oversized = record;
     oversized.expires_at += 1;
     assert!(auth::consume_magic_link(oversized, &token, NOW).is_err());

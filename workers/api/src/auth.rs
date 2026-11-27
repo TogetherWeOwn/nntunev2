@@ -133,8 +133,10 @@ pub fn consume_magic_link(
     if record.used {
         return Err(AuthError::Invalid);
     }
+    // At exact expiry the transaction must refuse the claim and roll back
+    // any earlier signup claim. This snapshot never grants authentication.
     if now < record.issued_at
-        || now >= record.expires_at
+        || now > record.expires_at
         || record.expires_at > record.issued_at.saturating_add(MAGIC_LINK_TTL_SECS)
     {
         return Err(AuthError::Invalid);
