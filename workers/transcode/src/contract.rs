@@ -9,13 +9,14 @@
 
 use nntune_core::par2::scratch::{sha256_hex, validate_staging_id};
 use nntune_core::transcode::{
-    canonical_sha256_hex, validate_transcode_input_key, validate_transcode_prefix,
+    canonical_sha256_hex, validate_transcode_input_key, validate_transcode_prefix, PROFILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 
 /// Body caps for the JSON documents this Worker reads.
 pub const MAX_REQUEST_BYTES: usize = 64 << 10;
 pub const MAX_RESULT_BYTES: usize = 1 << 20;
+const MAX_INGEST_REPLY_BYTES: usize = 64 << 10;
 /// Largest artifact fetched back from the Container: the profile
 /// ceiling (64 kbps over a 60-minute track is ~28.8 MB plus Ogg
 /// framing). Ingest owns the ceiling
@@ -57,6 +58,7 @@ impl ApiFault {
 /// and order match `workers/ingest/src/transcode.rs::TranscodeRequest`
 /// (pinned there by `request_json_shape_is_pinned_for_the_front`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TranscodeRequest {
     pub job_id: String,
     pub user_id: String,
@@ -86,14 +88,19 @@ fn validate_idempotency_key(raw: &str) -> bool {
         && !raw.contains('\0')
 }
 
-/// Parse and validate an ingest transcode request. The rules mirror
-/// ingest's `decide_transcode` exactly: a request ingest built must
-/// parse here, and anything else must not.
+fn parse_object<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
+    if !body.trim_ascii_start().starts_with(b"{") {
+        return None;
+    }
+    serde_json::from_slice(body).ok()
+}
+
+/// Validate the wire shape before `read_job_request` checks the staging identity.
 pub fn parse_request(body: &[u8]) -> Result<TranscodeRequest, ApiFault> {
     if body.len() > MAX_REQUEST_BYTES {
         return Err(ApiFault::new(413, "payload_too_large"));
     }
-    let req: TranscodeRequest = serde_json::from_slice(body).map_err(|_| ApiFault::invalid())?;
+    let req: TranscodeRequest = parse_object(body).ok_or_else(ApiFault::invalid)?;
     if !validate_job_id(&req.job_id)
         || !validate_user_id(&req.user_id)
         || !validate_idempotency_key(&req.idempotency_key)
@@ -105,6 +112,45 @@ pub fn parse_request(body: &[u8]) -> Result<TranscodeRequest, ApiFault> {
         return Err(ApiFault::invalid());
     }
     Ok(req)
+}
+
+/// Read a job envelope within one deadline and verify its staging
+/// identity before routing it or touching scratch state.
+pub async fn read_job_request<S, D>(
+    mut stream: S,
+    deadline: D,
+) -> Result<TranscodeRequest, ApiFault>
+where
+    S: futures_util::Stream<Item = Result<Vec<u8>, ()>> + Unpin,
+    D: std::future::Future<Output = ()> + Unpin,
+{
+    use futures_util::future::{select, Either};
+    use futures_util::StreamExt;
+
+    let read = Box::pin(async move {
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|()| ApiFault::invalid())?;
+            if !push_chunk_capped(&mut body, &chunk, MAX_REQUEST_BYTES) {
+                return Err(ApiFault::new(413, "payload_too_large"));
+            }
+        }
+        let req = parse_request(&body)?;
+        // Matches ingest's derive_transcode_staging v2 domain.
+        let sha = req.source_sha256.to_ascii_lowercase();
+        let identity = format!(
+            "{PROFILE_NAME}:v2:{}:{}:{sha}:{}",
+            req.job_id, req.scratch_prefix, req.input_key
+        );
+        if req.staging_id != sha256_hex(identity.as_bytes()) {
+            return Err(ApiFault::invalid());
+        }
+        Ok(req)
+    });
+    match select(deadline, read).await {
+        Either::Left(_) => Err(transcode_unavailable_fault()),
+        Either::Right((reply, _deadline)) => reply,
+    }
 }
 
 /// Terminal transcode status, stored in `out/result.json` and replied
@@ -177,8 +223,12 @@ pub fn plan(
     if bytes.len() > MAX_RESULT_BYTES {
         return Err(ApiFault::new(500, "transcode_unavailable"));
     }
-    let result: TranscodeResult =
-        serde_json::from_slice(bytes).map_err(|_| ApiFault::new(500, "transcode_unavailable"))?;
+    let invalid = || ApiFault::new(500, "transcode_unavailable");
+    let result: TranscodeResult = parse_object(bytes).ok_or_else(invalid)?;
+    validate_transcoded_result(&result).map_err(|_| invalid())?;
+    if !result.staging_id.is_empty() && !validate_staging_id(&result.staging_id) {
+        return Err(invalid());
+    }
     if !current_staging_id.is_empty() && result.staging_id == current_staging_id {
         Ok(Plan::AlreadyDone(result))
     } else {
@@ -192,6 +242,7 @@ pub fn plan(
 /// the ingest classifier's reads (`status`, `artifact_sha256`,
 /// `byte_size`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TranscodeReply {
     pub status: TranscodeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,21 +256,24 @@ pub struct TranscodeReply {
 /// `Done` outcome; rejections are the retryable 502
 /// `container_unavailable` fault the runtime already uses for a
 /// Container reply it cannot trust. An `Untranscodable` result
-/// carries no artifact to validate.
+/// must carry neither artifact field.
 pub fn validate_transcoded_result(result: &TranscodeResult) -> Result<(), ApiFault> {
-    if result.status != TranscodeStatus::Transcoded {
-        return Ok(());
-    }
-    let invalid = || ApiFault::new(502, "container_unavailable");
-    let Some(sha) = result.artifact_sha256.as_deref() else {
-        return Err(invalid());
-    };
-    if canonical_sha256_hex(sha).is_err() {
-        return Err(invalid());
-    }
-    match result.byte_size {
-        Some(size) if (1..=MAX_ARTIFACT_BYTES as u64).contains(&size) => Ok(()),
-        _ => Err(invalid()),
+    valid_artifact_claims(
+        result.status,
+        result.artifact_sha256.as_deref(),
+        result.byte_size,
+    )
+    .then_some(())
+    .ok_or_else(container_unavailable_fault)
+}
+
+fn valid_artifact_claims(status: TranscodeStatus, sha: Option<&str>, size: Option<u64>) -> bool {
+    match (status, sha, size) {
+        (TranscodeStatus::Untranscodable, None, None) => true,
+        (TranscodeStatus::Transcoded, Some(sha), Some(size)) => {
+            (1..=MAX_ARTIFACT_BYTES as u64).contains(&size) && canonical_sha256_hex(sha).is_ok()
+        }
+        _ => false,
     }
 }
 
@@ -342,27 +396,75 @@ pub enum ContainerOutcome {
 /// terminal; known 4xx/503 codes forward with their stable code;
 /// anything else is a retryable `container_unavailable`.
 pub fn classify_container_reply(status: u16, body: &[u8]) -> ContainerOutcome {
+    let unavailable = || ContainerOutcome::Forward(502, "container_unavailable".to_string());
+    if body.len() > MAX_RESULT_BYTES {
+        return unavailable();
+    }
     if status == 200 {
-        if body.len() <= MAX_RESULT_BYTES {
-            if let Ok(result) = serde_json::from_slice::<TranscodeResult>(body) {
-                return ContainerOutcome::Done(result);
-            }
-        }
-        return ContainerOutcome::Forward(502, "container_unavailable".to_string());
+        return parse_object(body).map_or_else(unavailable, ContainerOutcome::Done);
     }
-    let code = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
-        .filter(|code| {
-            code.len() <= 64
-                && code
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        });
+    let code =
+        parse_object::<ErrorReply>(body).and_then(|reply| container_error_code(&reply.error));
     match (status, code) {
-        (400 | 404 | 409 | 413 | 503, Some(code)) => ContainerOutcome::Forward(status, code),
-        _ => ContainerOutcome::Forward(502, "container_unavailable".to_string()),
+        (400 | 404 | 409 | 413 | 503, Some(code)) => {
+            ContainerOutcome::Forward(status, code.to_string())
+        }
+        _ => unavailable(),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ErrorReply {
+    error: String,
+}
+
+pub(crate) fn container_error_code(code: &str) -> Option<&'static str> {
+    match code {
+        "invalid_request" => Some("invalid_request"),
+        "not_found" => Some("not_found"),
+        "payload_too_large" => Some("payload_too_large"),
+        "transcode_input_conflict" => Some("transcode_input_conflict"),
+        "transcode_timeout" => Some("transcode_timeout"),
+        "transcode_resource" => Some("transcode_resource"),
+        "transcode_failed" => Some("transcode_failed"),
+        "scratch_input_mismatch" => Some("scratch_input_mismatch"),
+        _ => None,
+    }
+}
+
+/// Allow only bounded public envelopes to cross from the object to ingest.
+pub fn validate_do_reply(status: u16, body: &[u8]) -> Result<(), ApiFault> {
+    if body.len() > MAX_INGEST_REPLY_BYTES {
+        return Err(transcode_unavailable_fault());
+    }
+    let valid = if status == 200 {
+        parse_object::<TranscodeReply>(body).is_some_and(|reply| {
+            valid_artifact_claims(
+                reply.status,
+                reply.artifact_sha256.as_deref(),
+                reply.byte_size,
+            )
+        })
+    } else {
+        parse_object::<ErrorReply>(body).is_some_and(|reply| {
+            matches!(
+                (status, reply.error.as_str()),
+                (400, "invalid_request" | "scratch_input_mismatch")
+                    | (404, "not_found" | "scratch_missing")
+                    | (409, "transcode_input_conflict")
+                    | (413, "payload_too_large" | "scratch_input_mismatch")
+                    | (500, "transcode_unavailable")
+                    | (502, "container_unavailable")
+                    | (503, "scratch_unavailable" | "transcode_unavailable")
+                    | (
+                        503,
+                        "transcode_timeout" | "transcode_resource" | "transcode_failed"
+                    )
+            )
+        })
+    };
+    valid.then_some(()).ok_or_else(transcode_unavailable_fault)
 }
 
 /// Append one response chunk only when it fits under `cap`.
@@ -373,7 +475,7 @@ pub fn classify_container_reply(status: u16, body: &[u8]) -> ContainerOutcome {
 /// stays admissible (`>` rejects, never `>=`). The wasm runtime
 /// streams container replies and the artifact fetch through this.
 pub fn push_chunk_capped(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
-    if body.len() + chunk.len() > cap {
+    if body.len().saturating_add(chunk.len()) > cap {
         return false;
     }
     body.extend_from_slice(chunk);

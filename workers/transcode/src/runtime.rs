@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use futures_util::future::{select, Either};
 use futures_util::StreamExt;
 use worker::wasm_bindgen::JsValue;
 use worker::{
@@ -23,11 +24,12 @@ use worker::{
 };
 
 use crate::contract::{
-    artifact_key, classify_container_reply, container_transcode_body, container_unavailable_fault,
-    in_key, ingest_reply_body, parse_request, plan, push_chunk_capped, result_key, settle_do_reply,
-    transcode_unavailable_fault, validate_transcoded_result, verify_artifact, ApiFault,
-    ContainerOutcome, Plan, TranscodeRequest, TranscodeStatus, ARTIFACT_NAME, MAX_ARTIFACT_BYTES,
-    MAX_REQUEST_BYTES, MAX_RESULT_BYTES, MAX_TRANSCODE_INPUT_BYTES,
+    artifact_key, classify_container_reply, container_error_code, container_transcode_body,
+    container_unavailable_fault, in_key, ingest_reply_body, plan, push_chunk_capped,
+    read_job_request, result_key, settle_do_reply, transcode_unavailable_fault, validate_do_reply,
+    validate_transcoded_result, verify_artifact, ApiFault, ContainerOutcome, Plan,
+    TranscodeRequest, TranscodeStatus, ARTIFACT_NAME, MAX_ARTIFACT_BYTES, MAX_RESULT_BYTES,
+    MAX_TRANSCODE_INPUT_BYTES,
 };
 
 /// Durable Object binding + class fronting the Container.
@@ -46,6 +48,8 @@ const HEALTH_ATTEMPTS: u32 = 60;
 /// `CONTAINER_TRANSCODE_DEADLINE_MS` instead (same `*_MS: u64` shape as
 /// the sibling ingest MB deadline).
 const CONTAINER_FETCH_DEADLINE_MS: u64 = 10_000;
+/// Maximum wait for the small ingest or DO request envelope.
+const JOB_REQUEST_DEADLINE_MS: u64 = 10_000;
 /// `/transcode` deadline: the Container defaults to 300 s
 /// (`containers/transcode/src/lib.rs`) and the Worker never sets
 /// `timeout_secs`, so a legitimate encode may take up to 300 s before
@@ -77,20 +81,10 @@ fn fault_response(fault: &ApiFault) -> WorkerResult<Response> {
     )
 }
 
-/// Read a request body with a hard cap (streamed, never unbounded).
-async fn read_capped(req: &mut Request, cap: usize) -> Result<Vec<u8>, ApiFault> {
-    let mut stream = req
-        .stream()
-        .map_err(|_| ApiFault::new(400, "invalid_request"))?;
-    let mut body = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| ApiFault::new(400, "invalid_request"))?;
-        body.extend_from_slice(&chunk);
-        if body.len() > cap {
-            return Err(ApiFault::new(413, "payload_too_large"));
-        }
-    }
-    Ok(body)
+async fn read_request(req: &mut Request) -> Result<TranscodeRequest, ApiFault> {
+    let stream = req.stream().map_err(|_| ApiFault::invalid())?;
+    let deadline = Box::pin(Delay::from(Duration::from_millis(JOB_REQUEST_DEADLINE_MS)));
+    read_job_request(stream.map(|chunk| chunk.map_err(|_| ())), deadline).await
 }
 
 /// Read a response body with a hard cap (streamed, never unbounded).
@@ -129,11 +123,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
     if req.method() != Method::Post || req.path() != "/transcode" {
         return fault_response(&ApiFault::new(404, "not_found"));
     }
-    let body = match read_capped(&mut req, MAX_REQUEST_BYTES).await {
-        Ok(body) => body,
-        Err(fault) => return fault_response(&fault),
-    };
-    let parsed = match parse_request(&body) {
+    let parsed = match read_request(&mut req).await {
         Ok(parsed) => parsed,
         Err(fault) => return fault_response(&fault),
     };
@@ -142,17 +132,18 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
         .and_then(|ns| ns.id_from_name(&parsed.job_id)?.get_stub())
     {
         Ok(stub) => stub,
-        Err(error) => {
-            console_log!("transcode DO unavailable: {:?}", error);
-            return fault_response(&transcode_unavailable_fault());
-        }
+        Err(_) => return fault_response(&transcode_unavailable_fault()),
+    };
+    let body = match serde_json::to_string(&parsed) {
+        Ok(body) => body,
+        Err(_) => return fault_response(&transcode_unavailable_fault()),
     };
     let headers = Headers::new();
     let _ = headers.set("content-type", "application/json");
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
-        .with_body(Some(JsValue::from_str(&String::from_utf8_lossy(&body))));
+        .with_body(Some(JsValue::from_str(&body)));
     let request = match Request::new_with_init("https://transcode-do/transcode", &init) {
         Ok(request) => request,
         Err(_) => return fault_response(&transcode_unavailable_fault()),
@@ -161,12 +152,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
     // fetch and owns it through body completion, releasing it on every exit.
     let deadline = Box::pin(Delay::from(Duration::from_millis(DO_TRANSCODE_DEADLINE_MS)));
     let fetch = Box::pin(async {
-        let mut response = stub.fetch_with_request(request).await.map_err(|error| {
-            console_log!(
-                "transcode DO call failed job={}: {:?}",
-                parsed.job_id,
-                error
-            );
+        let mut response = stub.fetch_with_request(request).await.map_err(|_| {
+            console_log!("transcode DO call failed job={}", parsed.job_id);
         })?;
         let status = response.status_code();
         // The shared reader preserves Empty and materialised bodies, checking
@@ -186,9 +173,15 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
         };
         Ok((status, stream))
     });
-    match settle_do_reply(fetch, deadline).await {
+    let reply = settle_do_reply(fetch, deadline)
+        .await
+        .and_then(|(status, bytes)| {
+            validate_do_reply(status, &bytes)?;
+            Ok((status, bytes))
+        });
+    match reply {
         Ok((status, bytes)) => json_response(status, bytes),
-        Err(_) => fault_response(&ApiFault::new(503, "transcode_unavailable")),
+        Err(fault) => fault_response(&fault),
     }
 }
 
@@ -208,11 +201,7 @@ impl DurableObject for TranscodeContainer {
         if req.method() != Method::Post || req.path() != "/transcode" {
             return fault_response(&ApiFault::new(404, "not_found"));
         }
-        let body = match read_capped(&mut req, MAX_REQUEST_BYTES).await {
-            Ok(body) => body,
-            Err(fault) => return fault_response(&fault),
-        };
-        let parsed = match parse_request(&body) {
+        let parsed = match read_request(&mut req).await {
             Ok(parsed) => parsed,
             Err(fault) => return fault_response(&fault),
         };
@@ -221,9 +210,13 @@ impl DurableObject for TranscodeContainer {
         if self.state.id().name().as_deref() != Some(parsed.job_id.as_str()) {
             return fault_response(&ApiFault::invalid());
         }
-        match self.run(&parsed).await {
-            Ok(result_body) => json_response(200, result_body),
-            Err(fault) => fault_response(&fault),
+        // Bound the object's own work as well as the caller's wait.
+        // Expiry drops local work; already dispatched I/O can still settle.
+        let deadline = Box::pin(Delay::from(Duration::from_millis(DO_TRANSCODE_DEADLINE_MS)));
+        match select(deadline, Box::pin(self.run(&parsed))).await {
+            Either::Right((Ok(body), _)) => json_response(200, body),
+            Either::Right((Err(fault), _)) => fault_response(&fault),
+            Either::Left(_) => fault_response(&transcode_unavailable_fault()),
         }
     }
 }
@@ -282,7 +275,10 @@ impl TranscodeContainer {
         let mut result = match classify_container_reply(status, &reply) {
             ContainerOutcome::Done(result) => result,
             ContainerOutcome::Forward(status, code) => {
-                return Err(ApiFault::new(status, leak_code(code)));
+                return Err(container_error_code(&code)
+                    .map_or_else(container_unavailable_fault, |code| {
+                        ApiFault::new(status, code)
+                    }));
             }
         };
         validate_transcoded_result(&result)?;
@@ -551,24 +547,6 @@ impl TranscodeContainer {
             Some(Err(_)) => Err(ApiFault::new(503, "scratch_unavailable")),
             None => Err(ApiFault::new(502, "container_unavailable")),
         }
-    }
-}
-
-/// Codes forwarded from the Container are validated lowercase
-/// identifiers (see `classify_container_reply`); leaking them into the
-/// `'static` fault keeps the reply allocation-free of owned strings.
-/// The set is closed and tiny.
-fn leak_code(code: String) -> &'static str {
-    match code.as_str() {
-        "invalid_request" => "invalid_request",
-        "not_found" => "not_found",
-        "payload_too_large" => "payload_too_large",
-        "transcode_input_conflict" => "transcode_input_conflict",
-        "transcode_timeout" => "transcode_timeout",
-        "transcode_resource" => "transcode_resource",
-        "transcode_failed" => "transcode_failed",
-        "scratch_input_mismatch" => "scratch_input_mismatch",
-        _ => "container_unavailable",
     }
 }
 
