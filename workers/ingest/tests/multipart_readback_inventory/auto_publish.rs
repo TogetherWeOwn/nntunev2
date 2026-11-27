@@ -368,6 +368,8 @@ pub(super) async fn exercise(
     // Use a dedicated one-track release so both uploads match a complete
     // recording list and the committed replacement leaves other fixtures intact.
     let replacement_release = "ab370000-0000-4000-8000-000000000000";
+    let prior_job = "catalogue-replacement-prior";
+    let next_job = "catalogue-replacement-next";
     let recordings = json!({
         "release_mbid": replacement_release,
         "recordings": [{
@@ -432,10 +434,11 @@ pub(super) async fn exercise(
     };
 
     let mut tx = writer.transaction().await.unwrap();
-    let StageOutcome::Staged(ids) = replace(&mut tx, 1, job.job_id, None).await.unwrap() else {
+    let StageOutcome::Staged(prior_ids) = replace(&mut tx, 1, prior_job, None).await.unwrap()
+    else {
         panic!("the original upload must stage one track");
     };
-    let [track] = ids.as_slice() else {
+    let [track] = prior_ids.as_slice() else {
         panic!("the original upload must stage one track");
     };
     tx.commit().await.unwrap();
@@ -445,15 +448,15 @@ pub(super) async fn exercise(
         };
         (track.clone(), job_id.to_owned(), version.clone())
     };
-    let old = expected(1, job.job_id);
-    let new = expected(0, "catalogue-new");
+    let old = expected(1, prior_job);
+    let new = expected(0, next_job);
     assert_ne!(old.2, new.2);
     assert_eq!(observed().await, old);
 
     let mut tx = writer.transaction().await.unwrap();
     for error in [PublicationError::Indeterminate, PublicationError::Refused] {
         // Compare within the writer transaction so even uncommitted writes fail.
-        let result = replace(&mut tx, 0, "catalogue-new", Some(&error)).await;
+        let result = replace(&mut tx, 0, next_job, Some(&error)).await;
         assert_eq!(result, Err(error));
         assert_eq!(
             pointer(
@@ -468,7 +471,7 @@ pub(super) async fn exercise(
     assert_eq!(observed().await, old);
 
     let mut tx = writer.transaction().await.unwrap();
-    let replacement = replace(&mut tx, 0, "catalogue-new", None).await.unwrap();
+    let replacement = replace(&mut tx, 0, next_job, None).await.unwrap();
     assert_eq!(replacement, StageOutcome::Staged(vec![track.clone()]));
     assert_eq!(
         pointer(

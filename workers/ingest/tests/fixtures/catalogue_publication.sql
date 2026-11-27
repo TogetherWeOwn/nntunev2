@@ -11,7 +11,9 @@ INSERT INTO public.users (id, email, created_at) VALUES
 INSERT INTO public.ingest_jobs (id, user_id, idempotency_key, accepted_at, status) VALUES
     ('catalogue-old', 'catalogue-owner', 'first', 100, 'done'),
     ('catalogue-new', 'catalogue-owner', 'second', 10, 'done'),
-    ('catalogue-queued', 'catalogue-owner', 'third', 101, 'queued');
+    ('catalogue-queued', 'catalogue-owner', 'third', 101, 'queued'),
+    ('catalogue-replacement-prior', 'catalogue-owner', 'replacement-prior', 102, 'done'),
+    ('catalogue-replacement-next', 'catalogue-owner', 'replacement-next', 103, 'done');
 
 -- The old object comes from the publisher regression. Inject an independent
 -- synthetic winner in that same immutable scope to exercise pointer replacement.
