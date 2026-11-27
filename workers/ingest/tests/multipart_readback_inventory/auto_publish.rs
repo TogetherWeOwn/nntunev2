@@ -379,6 +379,22 @@ pub(super) async fn exercise(
         .get::<_, String>(0)
     };
     let before = publication().await;
+
+    // A committed publication already owns both source pointers. A later
+    // upload outcome that is indeterminate or disagrees with its receipt must
+    // stop before the catalogue transaction can move either pointer.
+    let mut tx = writer.transaction().await.unwrap();
+    for evidence in [Indeterminate(&uploads), Conflicting(&uploads, 5)] {
+        let result = apply(&mut tx, evidence, false, 2).await;
+        assert!(matches!(
+            result,
+            Err(PublicationError::Indeterminate | PublicationError::Refused)
+        ));
+        assert_eq!(publication().await, before);
+    }
+    tx.rollback().await.unwrap();
+    assert_eq!(publication().await, before);
+
     let locator = nntune_core::s3_locator::S3Locator::new(
         both[1].receipt.locator.bucket().into(),
         both[1].receipt.locator.key().into(),
