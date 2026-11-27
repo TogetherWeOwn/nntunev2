@@ -21,16 +21,6 @@ fn exceeds_cap(current: usize, incoming: usize, cap: usize) -> bool {
     current.checked_add(incoming).is_none_or(|len| len > cap)
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn length_overflow_is_oversized() {
-        assert!(super::exceeds_cap(usize::MAX, 1, usize::MAX));
-        assert!(!super::exceeds_cap(4, 6, 10));
-        assert!(super::exceeds_cap(4, 7, 10));
-    }
-}
-
 /// Accumulates body chunks under a byte cap and a declared `Content-Length`.
 pub struct FormBody {
     declared: Option<usize>,
@@ -95,5 +85,15 @@ impl FormBody {
             return Err(BodyFault::Unreadable);
         }
         String::from_utf8(self.bytes).map_err(|_| BodyFault::Unreadable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn length_overflow_is_oversized() {
+        assert!(super::exceeds_cap(usize::MAX, 1, usize::MAX));
+        assert!(!super::exceeds_cap(4, 6, 10));
+        assert!(super::exceeds_cap(4, 7, 10));
     }
 }
