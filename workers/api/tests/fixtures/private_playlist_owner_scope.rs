@@ -1,3 +1,14 @@
+async fn playlist_entry_snapshot(db: &Client, id: &str) -> String {
+    db.query_one_scalar(
+        "SELECT jsonb_build_array(p.items, (SELECT jsonb_agg(to_jsonb(e) ORDER BY e.position)
+          FROM public.playlist_tracks e WHERE e.playlist_id = p.id))::text
+         FROM public.playlists p WHERE p.public_id = $1",
+        &[&id],
+    )
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 #[ignore = "run by prepare_migrated_stores.sh against its disposable clone"]
 async fn owner_scope_and_fences_via_route() {
@@ -243,6 +254,243 @@ async fn owner_scope_and_fences_via_route() {
         .unwrap();
     assert_eq!(ops, 0);
 
+    // A backfilled prefix can repeat the same track as a normalized entry.
+    // Only the normalized suffix may be edited, even at the append cap.
+    assert_eq!(
+        db.execute(
+            "UPDATE public.playlists SET items = '[\"legacy-owned\",\"unresolved\"]' WHERE public_id = $1",
+            &[&id],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute(
+            "UPDATE public.playlist_tracks SET position = 2 WHERE id = $1::text::uuid",
+            &[&entry_id],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let legacy_id: String = db
+        .query_one_scalar(
+            "INSERT INTO public.playlist_tracks (playlist_id, track_id, position, is_legacy)
+             SELECT id, $2::text::uuid, 0, true FROM public.playlists WHERE public_id = $1
+             RETURNING id::text",
+            &[&id, &owned_track],
+        )
+        .await
+        .unwrap();
+    let shared = json_body(
+        route(&ctx, &owner_req, &mut db, Append(id, shared_track.clone())).await,
+        201,
+        "append shared",
+    );
+    let shared_id = shared["id"].as_str().unwrap();
+    let cap = crate::library::MAX_ITEMS;
+    assert_eq!(
+        db.execute(
+            "UPDATE public.playlist_tracks SET position = $2 WHERE id = $1::text::uuid",
+            &[&shared_id, &((cap - 1) as i32)],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let original = playlist_entry_snapshot(&db, id).await;
+    let reversed = || Reorder(id, vec![shared_id.into(), entry_id.into()]);
+    let remove = || Remove(id, shared_id.into());
+
+    for (req, expected, label) in [
+        (&other_req, not_found(), "peer with shared track"),
+        (
+            &req_for(None, Some(ORIGIN), None),
+            generic_auth(),
+            "no cookie",
+        ),
+        (
+            &req_for(
+                owner_req.cookie.clone(),
+                Some("https://wrong.example"),
+                None,
+            ),
+            generic_auth(),
+            "bad origin",
+        ),
+        (
+            &req_for(
+                owner_req.cookie.clone(),
+                Some(ORIGIN),
+                Some("Bearer fixture"),
+            ),
+            not_found(),
+            "authorization header",
+        ),
+    ] {
+        for cmd in [reversed(), remove()] {
+            let got = route(&ctx, req, &mut db, cmd).await;
+            assert_eq!(
+                (got.status, got.body),
+                (expected.status, expected.body.clone()),
+                "{label}"
+            );
+        }
+    }
+    let other_id = json_body(
+        route(&ctx, &other_req, &mut db, Create("Peer Draft".into())).await,
+        201,
+        "peer playlist",
+    );
+    let other_id = other_id["id"].as_str().unwrap();
+    let other_entry = json_body(
+        route(
+            &ctx,
+            &other_req,
+            &mut db,
+            Append(other_id, shared_track.clone()),
+        )
+        .await,
+        201,
+        "peer entry",
+    );
+    let other_entry = other_entry["id"].as_str().unwrap();
+    let other_snapshot = playlist_entry_snapshot(&db, other_id).await;
+    for (cmd, expected) in [
+        (
+            Reorder(id, vec![entry_id.into(), other_entry.into()]),
+            not_found(),
+        ),
+        (Remove(id, other_entry.into()), not_found()),
+        (
+            Reorder(id, vec![entry_id.into(), legacy_id.clone()]),
+            not_found(),
+        ),
+        (Remove(id, legacy_id.clone()), not_found()),
+        (
+            Reorder(id, vec![entry_id.into(), entry_id.to_uppercase()]),
+            not_found(),
+        ),
+        (Reorder(id, vec![entry_id.into()]), not_found()),
+        (
+            Reorder(
+                id,
+                vec![entry_id.into(), shared_id.into(), other_entry.into()],
+            ),
+            not_found(),
+        ),
+        (Reorder(id, vec![]), invalid_request()),
+        (
+            Reorder(id, vec![entry_id.into(); cap + 1]),
+            invalid_request(),
+        ),
+        (Reorder(id, vec!["invalid".into()]), invalid_request()),
+        (Remove(id, "invalid".into()), invalid_request()),
+    ] {
+        check(
+            route(&ctx, &owner_req, &mut db, cmd).await,
+            expected,
+            "invalid edit",
+        );
+    }
+    for (fence, clear_fence) in [
+        (
+            "UPDATE public.playlists SET is_public = true WHERE public_id = $1",
+            "UPDATE public.playlists SET is_public = false WHERE public_id = $1",
+        ),
+        (
+            "UPDATE public.playlists SET deleting_at = now() WHERE public_id = $1",
+            "UPDATE public.playlists SET deleting_at = NULL WHERE public_id = $1",
+        ),
+    ] {
+        assert_eq!(db.execute(fence, &[&id]).await.unwrap(), 1);
+        for cmd in [reversed(), remove()] {
+            check(
+                route(&ctx, &owner_req, &mut db, cmd).await,
+                not_found(),
+                "fenced playlist",
+            );
+        }
+        assert_eq!(db.execute(clear_fence, &[&id]).await.unwrap(), 1);
+    }
+    let fence_library = "UPDATE public.libraries SET deleting_at = now() WHERE id = $1::text::uuid";
+    assert_eq!(db.execute(fence_library, &[&owner_lib]).await.unwrap(), 1);
+    for cmd in [reversed(), remove()] {
+        check(
+            route(&ctx, &owner_req, &mut db, cmd).await,
+            not_found(),
+            "fenced Library",
+        );
+    }
+    assert_eq!(playlist_entry_snapshot(&db, id).await, original);
+    assert_eq!(playlist_entry_snapshot(&db, other_id).await, other_snapshot);
+    let reopen_library = "UPDATE public.libraries SET deleting_at = NULL WHERE id = $1::text::uuid";
+    assert_eq!(db.execute(reopen_library, &[&owner_lib]).await.unwrap(), 1);
+
+    for _ in 0..2 {
+        check(
+            route(&ctx, &owner_req, &mut db, reversed()).await,
+            json_response(200, json!({"reordered": true})),
+            "owner reorder and retry",
+        );
+    }
+    let reordered = json_body(
+        route(&ctx, &owner_req, &mut db, Read(id)).await,
+        200,
+        "reordered read",
+    );
+    assert_eq!(
+        reordered["legacy_items"],
+        json!(["legacy-owned", "unresolved"])
+    );
+    assert_eq!(
+        reordered["entries"],
+        json!([
+            {"id": legacy_id, "position": 0, "track_id": owned_track},
+            {"id": shared_id, "position": 2, "track_id": shared_track},
+            {"id": entry_id, "position": cap - 1, "track_id": owned_track},
+        ])
+    );
+    check(
+        route(&ctx, &owner_req, &mut db, remove()).await,
+        json_response(200, json!({"id": shared_id})),
+        "owner removal",
+    );
+    check(
+        route(&ctx, &owner_req, &mut db, remove()).await,
+        not_found(),
+        "removal retry",
+    );
+    check(
+        route(&ctx, &owner_req, &mut db, reversed()).await,
+        not_found(),
+        "stale reorder",
+    );
+    let appended_again = json_body(
+        route(&ctx, &owner_req, &mut db, Append(id, shared_track.clone())).await,
+        201,
+        "append after removal at cap",
+    );
+    let new_entry = appended_again["id"].as_str().unwrap();
+    assert_ne!(new_entry, shared_id);
+    assert_eq!(appended_again["position"], cap - 1);
+    let remaining = json_body(
+        route(&ctx, &owner_req, &mut db, Read(id)).await,
+        200,
+        "removed read",
+    );
+    assert_eq!(remaining["legacy_items"], reordered["legacy_items"]);
+    assert_eq!(
+        remaining["entries"],
+        json!([
+            reordered["entries"][0],
+            {"id": entry_id, "position": cap - 2, "track_id": owned_track},
+            {"id": new_entry, "position": cap - 1, "track_id": shared_track},
+        ])
+    );
+    let edited = playlist_entry_snapshot(&db, id).await;
+
     // Owner rename commits trimmed title; fencing the account blocks every command.
     assert_eq!(
         json_body(
@@ -272,6 +520,11 @@ async fn owner_scope_and_fences_via_route() {
         ("fenced read", Read(id)),
         ("fenced rename", Rename(id, "Blocked".into())),
         ("fenced append", Append(id, shared_track)),
+        (
+            "fenced reorder",
+            Reorder(id, vec![new_entry.into(), entry_id.into()]),
+        ),
+        ("fenced remove", Remove(id, new_entry.into())),
         ("fenced delete", Delete(id)),
     ] {
         check(
@@ -301,5 +554,6 @@ async fn owner_scope_and_fences_via_route() {
         .await
         .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
         .unwrap();
-    assert_eq!(state, ("Updated Draft".into(), 1, 1, 0));
+    assert_eq!(state, ("Updated Draft".into(), 1, 3, 0));
+    assert_eq!(playlist_entry_snapshot(&db, id).await, edited);
 }
