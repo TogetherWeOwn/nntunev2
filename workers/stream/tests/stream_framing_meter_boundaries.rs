@@ -50,6 +50,21 @@ fn yenc_rejects_ambiguous_control_fields() {
 }
 
 #[test]
+fn yenc_rejects_invalid_signed_sizes() {
+    for article in [
+        b"=ybegin size=+1 name=a\nA\n=yend size=1\n".as_slice(),
+        b"=ybegin size=1 name=a\nA\n=yend size=+1\n",
+    ] {
+        assert!(decode(article).is_err());
+    }
+}
+
+#[test]
+fn yenc_rejects_invalid_total_without_part() {
+    assert!(decode(b"=ybegin size=1 total=1 name=a\nA\n=yend size=1\n").is_err());
+}
+
+#[test]
 fn yenc_part_metadata_must_agree() {
     let part = |header: &str, trailer: &str| {
         format!("=ybegin size=1 {header}name=a\n=ypart begin=1 end=1\nA\n=yend size=1{trailer}\n")
