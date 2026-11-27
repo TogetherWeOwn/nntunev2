@@ -3,7 +3,10 @@
 use std::fmt::Write as _;
 
 #[cfg(any(target_arch = "wasm32", feature = "upload-caller", test))]
-use {super::session_upload::DurableUpload, std::time::SystemTime};
+use {
+    super::session_upload::{now, DurableUpload},
+    std::time::SystemTime,
+};
 
 use nntune_core::media_envelope::EnvelopeContext;
 use quick_xml::escape::escape;
@@ -123,18 +126,11 @@ impl<'a> SessionCompletion<'a> {
         &self,
         send: impl AsyncFnOnce(CompletionRequest<'a>) -> Result<CompletionResponse, ()>,
     ) -> Result<CompletedVersionedMedia, DispatchError> {
+        self.validate_request()
+            .map_err(|_| DispatchError::InvalidRequest)?;
         let (target, _) = self.completion.object();
-        if !valid_upload_id(target.upload_id) {
-            return Err(DispatchError::InvalidRequest);
-        }
         let mut body = format!("<CompleteMultipartUpload xmlns=\"{S3_XML_NAMESPACE}\">");
         for (number, etag, checksum) in self.manifest() {
-            if etag
-                .chars()
-                .any(|c| c.is_control() || matches!(c, '\u{fffe}' | '\u{ffff}'))
-            {
-                return Err(DispatchError::InvalidRequest);
-            }
             write!(body, "<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag><ChecksumSHA256>{checksum}</ChecksumSHA256></Part>", escape(etag))
                 .map_err(|_| DispatchError::InvalidRequest)?;
         }
@@ -146,13 +142,16 @@ impl<'a> SessionCompletion<'a> {
         })
         .await
         .map_err(|()| DispatchError::Unconfirmed(None))?;
-        self.verify_completion(VersionedCompletionReply {
+        let version = response.version.as_deref();
+        let reply = VersionedCompletionReply {
             configuration: response.configuration,
             status: response.status,
             body: &response.body,
-            version_headers: response.version.as_deref().as_slice(),
-        })
-        .map_err(|error| DispatchError::Unconfirmed(Some(error)))
+            version_headers: version.as_slice(),
+        };
+        self.completion
+            .verify_versioned_reply(self.context, reply)
+            .map_err(|error| DispatchError::Unconfirmed(Some(error)))
     }
 
     /// Under the original durable upload lease, retry an ambiguous transport
@@ -168,15 +167,31 @@ impl<'a> SessionCompletion<'a> {
             SystemTime,
         ) -> Result<CompletionReadResponse, ()>,
     ) -> Result<CompletedVersionedMedia, DispatchError> {
-        if !upload.matches(self.binding, self.context) {
+        self.dispatch_durable_with_clock(upload, send, read, now)
+            .await
+    }
+
+    #[cfg(any(target_arch = "wasm32", feature = "upload-caller", test))]
+    async fn dispatch_durable_with_clock(
+        self,
+        upload: &DurableUpload<'_>,
+        send: impl AsyncFnOnce(CompletionRequest<'a>, SystemTime) -> Result<CompletionResponse, ()>,
+        read: impl AsyncFnOnce(
+            CompletionReadRequest<'a>,
+            SystemTime,
+        ) -> Result<CompletionReadResponse, ()>,
+        now: impl Fn() -> SystemTime,
+    ) -> Result<CompletedVersionedMedia, DispatchError> {
+        let until = upload.usable_until();
+        if now() >= until || !upload.matches(self.binding, self.context) {
             return Err(DispatchError::InvalidRequest);
         }
-        let until = upload.usable_until();
         match self
             .dispatch_once(async |request| send(request, until).await)
             .await
         {
-            Err(DispatchError::Unconfirmed(None)) => {}
+            Ok(_) if now() >= until => return Err(DispatchError::Unconfirmed(None)),
+            Err(DispatchError::Unconfirmed(None)) if now() < until => {}
             result => return result,
         }
         let (target, ciphertext_len) = self.completion.object();
@@ -191,7 +206,8 @@ impl<'a> SessionCompletion<'a> {
         )
         .await
         .map_err(|()| DispatchError::Unconfirmed(None))?;
-        if observed.configuration != self.binding.configuration
+        if now() >= until
+            || observed.configuration != self.binding.configuration
             || observed.content_length != Some(ciphertext_len)
             || observed.composite_sha256.as_deref() != Some(self.completion.checksum.as_str())
             || observed.marker.as_deref() != Some(upload.completion_marker())
@@ -215,6 +231,126 @@ impl<'a> SessionCompletion<'a> {
         &self,
         reply: VersionedCompletionReply<'_>,
     ) -> Result<CompletedVersionedMedia, MultipartError> {
+        self.validate_request()?;
         self.completion.verify_versioned_reply(self.context, reply)
+    }
+
+    fn validate_request(&self) -> Result<(), MultipartError> {
+        if !valid_upload_id(self.completion.object().0.upload_id) {
+            return Err(MultipartError::CompletionIdentity);
+        }
+        if self.manifest().any(|(_, etag, _)| {
+            etag.chars()
+                .any(|c| c.is_control() || matches!(c, '\u{fffe}' | '\u{ffff}'))
+        }) {
+            return Err(MultipartError::PartReceipt);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::multipart::Plan;
+    use nntune_core::origin_sealer::OriginSealer;
+    use std::{
+        cell::Cell,
+        time::{Duration, UNIX_EPOCH},
+    };
+
+    #[tokio::test]
+    async fn durable_completion_respects_expiry_before_and_during_transport() {
+        let sealer = OriginSealer::new(1).unwrap();
+        let mut identities = [[0; 16]; 6];
+        for id in &mut identities {
+            id[6] = 0x40;
+            id[8] = 0x80;
+        }
+        let context = EnvelopeContext {
+            identities,
+            plaintext_len: 1,
+            header: sealer.header().to_bytes(),
+        };
+        let id = hex::encode(identities[0]);
+        let key = format!("media/{id}/{id}");
+        let target = UploadTarget {
+            bucket: "test-bucket",
+            key: &key,
+            upload_id: "opaque",
+        };
+        let plan = Plan::new(target, sealer.header(), 1).unwrap();
+        let binding = ResumeBinding {
+            plan,
+            configuration: identities[5],
+            environment: &id,
+            library: &id,
+            session: "fixture-session",
+            object: &id,
+            generation: &id,
+            envelope_scheme: 2,
+        };
+        let part =
+            crate::multipart::UploadPart::new(plan, 1, vec![0; plan.ciphertext_len as usize]);
+        let deadline = UNIX_EPOCH + Duration::from_secs(1);
+        let upload = DurableUpload::new(target, &context, binding.session, deadline);
+        for (expiry_phase, successful_post) in
+            [(0, false), (1, false), (1, true), (2, false), (3, false)]
+        {
+            let phase = Cell::new(0);
+            let now = || {
+                if phase.get() >= expiry_phase {
+                    deadline
+                } else {
+                    UNIX_EPOCH
+                }
+            };
+            let receipt = part
+                .verify_reply("\"test-tag\"".into(), part.request().3)
+                .unwrap();
+            let completion = plan.complete(vec![receipt]).unwrap();
+            let checksum = completion.checksum.clone();
+            let (_, len) = completion.object();
+            let body = format!("<CompleteMultipartUploadResult><Bucket>test-bucket</Bucket><Key>{key}</Key><ChecksumSHA256>{checksum}</ChecksumSHA256></CompleteMultipartUploadResult>");
+            let session = SessionCompletion {
+                binding,
+                completion,
+                context: &context,
+            };
+            let result = session
+                .dispatch_durable_with_clock(
+                    &upload,
+                    async |_, _| {
+                        phase.set(1);
+                        successful_post
+                            .then(|| CompletionResponse {
+                                configuration: binding.configuration,
+                                status: 200,
+                                body: body.into_bytes(),
+                                version: Some("fixture-version".into()),
+                            })
+                            .ok_or(())
+                    },
+                    async |_, _| {
+                        phase.set(2);
+                        Ok(CompletionReadResponse {
+                            configuration: binding.configuration,
+                            content_length: Some(len),
+                            composite_sha256: Some(checksum),
+                            marker: Some(upload.completion_marker().into()),
+                            version: Some("fixture-version".into()),
+                        })
+                    },
+                    now,
+                )
+                .await;
+            assert_eq!(phase.get(), expiry_phase.min(2));
+            let expected = match expiry_phase {
+                0 => Some(DispatchError::InvalidRequest),
+                3 => None,
+                _ => Some(DispatchError::Unconfirmed(None)),
+            };
+            assert_eq!(result.err(), expected);
+        }
     }
 }

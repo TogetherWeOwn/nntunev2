@@ -39,6 +39,11 @@ impl<'a> InitiatedUpload<'a> {
             return Err(InitiationReceipt);
         }
         let mut reader = s3_receipt_reader(body).map_err(|_| InitiationReceipt)?;
+        // The shared reader coalesces text across ignored comments. Require
+        // receipt field values to come from uninterrupted XML text.
+        if body.windows(4).any(|bytes| bytes == b"<!--") {
+            return Err(InitiationReceipt);
+        }
         let mut next = || -> Result<xml::reader::XmlEvent> {
             loop {
                 match reader.next().map_err(|_| InitiationReceipt)? {
@@ -87,4 +92,26 @@ impl<'a> InitiatedUpload<'a> {
             upload_id: upload_id.ok_or(InitiationReceipt)?,
         })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn initiation_does_not_join_comment_split_upload_ids() {
+    const BUCKET: &str = "test-bucket";
+    const KEY: &str = "test-key";
+    let verify = |value| {
+        let xml = format!(
+            "<InitiateMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key>\
+             <UploadId>{value}</UploadId></InitiateMultipartUploadResult>"
+        );
+        InitiatedUpload::verify([5; 16], BUCKET, KEY, 200, xml.as_bytes())
+    };
+    assert_eq!(
+        verify("opaque+&amp;=").unwrap().target().upload_id,
+        "opaque+&="
+    );
+    assert_eq!(
+        verify("opaque<!-- split -->+&amp;=").err(),
+        Some(InitiationReceipt)
+    );
 }

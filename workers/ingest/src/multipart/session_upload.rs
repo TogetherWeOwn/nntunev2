@@ -2,7 +2,9 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nntune_core::{media_envelope::EnvelopeContext, s3_locator::S3MediaMetadata};
+use nntune_core::{
+    media_envelope::EnvelopeContext, origin_sealer::MAX_NEW_PLAINTEXT, s3_locator::S3MediaMetadata,
+};
 use sha2::{Digest, Sha256};
 use tokio_postgres::{error::SqlState, types::Type, Client, IsolationLevel, Transaction};
 
@@ -46,7 +48,7 @@ pub struct DurableUpload<'a> {
 }
 
 impl<'a> DurableUpload<'a> {
-    #[cfg(all(target_arch = "wasm32", feature = "s3-completion-wasm-test"))]
+    #[cfg(any(test, all(target_arch = "wasm32", feature = "s3-completion-wasm-test")))]
     pub(super) fn new(
         target: UploadTarget<'a>,
         context: &'a EnvelopeContext,
@@ -99,6 +101,13 @@ pub(super) fn completion_marker(lease: &str) -> String {
     )
 }
 
+pub(super) fn now() -> SystemTime {
+    #[cfg(target_arch = "wasm32")]
+    return UNIX_EPOCH + Duration::from_millis(worker::Date::now().as_millis());
+    #[cfg(not(target_arch = "wasm32"))]
+    SystemTime::now()
+}
+
 /// Commit the scoped object claim and provider ID before returning a target.
 /// The initiator must use the exact trusted configuration, bucket and key.
 pub async fn handoff<'a>(
@@ -112,7 +121,9 @@ pub async fn handoff<'a>(
 ) -> Result<DurableUpload<'a>, HandoffError> {
     let (bucket, key) = target;
     let [_, environment, library, object, generation, configuration] = context.identities;
-    if (environment, library, generation) != (scope.environment, scope.library, scope.seal)
+    if now() >= usable_until
+        || !(1..=MAX_NEW_PLAINTEXT).contains(&context.plaintext_len)
+        || (environment, library, generation) != (scope.environment, scope.library, scope.seal)
         || !S3MediaMetadata::matches_target(bucket, key, context)
     {
         return Err(Refused);
@@ -157,6 +168,9 @@ pub async fn handoff<'a>(
         ))
     };
     let upload = |id: String, usable_until| {
+        if now() >= usable_until {
+            return Err(Refused);
+        }
         if !valid_upload_id(&id) {
             return Err(Indeterminate);
         }
@@ -177,6 +191,9 @@ pub async fn handoff<'a>(
         tx.commit().await.map_err(db_error)?;
         return upload(id.ok_or(Pending)?, deadline);
     }
+    if now() >= deadline {
+        return Err(Refused);
+    }
     if tx
         .execute_typed(
             CLAIM,
@@ -196,7 +213,7 @@ pub async fn handoff<'a>(
 
     // A committed claim is exclusive even if this future is dropped, the
     // response is lost, the lease is consumed, or the second commit fails.
-    let receipt = initiate(deadline, &marker).await.map_err(|()| Pending)?;
+    let receipt = initiate_committed_claim(deadline, &marker, initiate).await?;
     let target = receipt.target();
     if receipt.configuration() != configuration || target.bucket != bucket || target.key != key {
         return Err(Pending);
@@ -221,6 +238,27 @@ pub async fn handoff<'a>(
     }
     tx.commit().await.map_err(db_error)?;
     upload(target.upload_id.to_owned(), deadline)
+}
+
+async fn initiate_committed_claim<'a>(
+    deadline: SystemTime,
+    marker: &str,
+    initiate: impl AsyncFnOnce(SystemTime, &str) -> Result<InitiatedUpload<'a>, ()>,
+) -> Result<InitiatedUpload<'a>, HandoffError> {
+    if now() >= deadline {
+        return Err(Pending);
+    }
+    initiate(deadline, marker).await.map_err(|()| Pending)
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn expired_committed_claim_remains_pending_without_initiation() {
+    let result = initiate_committed_claim(UNIX_EPOCH, "fixture", async |_, _| {
+        panic!("expired claim attempted initiation");
+    })
+    .await;
+    assert_eq!(result.err(), Some(Pending));
 }
 
 pub async fn begin(db: &mut Client) -> Result<Transaction<'_>, HandoffError> {
