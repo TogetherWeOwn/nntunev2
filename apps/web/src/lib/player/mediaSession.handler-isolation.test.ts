@@ -178,16 +178,16 @@ describe('mediaSession early handler isolation', () => {
 		const state = createQueue([DEMO_TRACKS[0]!]), queue = writable(state);
 		const audio = new EventTarget() as HTMLAudioElement;
 		let track = currentTrack(state);
-		const playCurrent = vi.fn(async () => {});
+		const playCurrent = vi.fn(async () => { throw new Error('fixture play rejected'); });
 		bindSystemTransport(queue, audio, () => track, { playCurrent, pauseCurrent: vi.fn() }, abort.signal,
 			{ audio, attachment: 0, availability: writable(emptySeek), matches: () => !!track, positionIntent: () => 0, dispatch: vi.fn() });
 		const play = handlers.get('play')!;
-		expect(session.metadata).toBeInstanceOf(FakeMetadata);
+		play();
 		track = null;
 		queue.set(createQueue([DEMO_TRACKS[1]!]));
 		expect(session.metadata).toBeNull();
 		expect(handlers.get('play')).toBeNull();
 		play();
-		expect(playCurrent).not.toHaveBeenCalled();
+		expect(playCurrent).toHaveBeenCalledOnce();
 	});
 });
