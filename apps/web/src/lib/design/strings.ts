@@ -12,7 +12,7 @@ import type { IconName } from './icons.js';
  */
 export type DesignStringKey = `design.icon.${IconName}`;
 
-export const DESIGN_STRINGS_EN: Record<DesignStringKey, string> = {
+export const DESIGN_STRINGS_EN: Readonly<Record<DesignStringKey, string>> = Object.freeze({
 	'design.icon.play': 'Play',
 	'design.icon.pause': 'Pause',
 	'design.icon.skip-back': 'Previous track',
@@ -62,8 +62,9 @@ export const DESIGN_STRINGS_EN: Record<DesignStringKey, string> = {
 	'design.icon.refresh-cw': 'Retry',
 	'design.icon.grip-vertical': 'Reorder',
 	'design.icon.video': 'Video'
-};
+});
 
-export function designString(key: DesignStringKey): string {
-	return DESIGN_STRINGS_EN[key];
+export function designString(key: unknown): string {
+	return typeof key === 'string' && Object.hasOwn(DESIGN_STRINGS_EN, key)
+		? DESIGN_STRINGS_EN[key as DesignStringKey] : '';
 }

@@ -2,10 +2,10 @@ import { PUBLIC_API_BASE_URL } from '$app/env/public';
 import { SvelteMap } from 'svelte/reactivity';
 import { ApiClient, ApiError } from '../api/client.js';
 import type { AccountSession } from '../auth-fence.js';
-import type { LibraryItem } from './cache.js';
+import { isLibraryItem, type LibraryItem } from './cache.js';
 import { loadLikes, MAX_LIKES, trackLikeTarget } from './likes.js';
 import type { LibraryRefreshUpdate } from './refresh.js';
-import { verifyLibrarySession } from './session-verification.js';
+import { validBinding, verifyLibrarySession } from './session-verification.js';
 import { createTrackLikeControls, type TrackLikeOwner } from './track-like-controls.js';
 import { loadTrackTaste, type TrackTaste } from './taste.js';
 
@@ -72,7 +72,8 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 	async function publish(receipt: LibraryRefreshUpdate, items: readonly LibraryItem[]) {
 		const overlap = refreshing;
 		const { sessionBinding: binding, accountSession, runIfCurrent: run } = receipt;
-		if (!binding || !accountSession || !run || !receipt.isCurrent() || !receipt.authoritative || receipt.authBoundary) return retire();
+		if (!validBinding(binding) || !accountSession?.isCurrent() || !run || !receipt.isCurrent() ||
+			receipt.authoritative !== true || receipt.authBoundary !== false || !Array.isArray(items)) return retire();
 		// A pending or failed write needs a new read after it settles. A different
 		// account always gets its own read after the catalogue has been verified.
 		const started = overlap?.owner.binding === binding && overlap.owner.accountSession === accountSession &&
@@ -82,7 +83,7 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 		const session = { owner: accountSession, binding };
 		const readClient = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal, session });
 		const guarded = <T,>(work: () => T) => run(() => {
-			if (!signal.aborted && receipt.isCurrent()) return work();
+			if (!signal.aborted && accountSession.isCurrent() && receipt.isCurrent()) return work();
 		});
 		try {
 			// Retire the old owner immediately, but let its already-dispatched
@@ -99,7 +100,14 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 			if (!check) return;
 			if (!await check.response) throw new Error('Likes session could not be verified');
 			await guarded(() => {
-				const targets = new Map(items.map(({ id, like_target_id }) => [id, trackLikeTarget(id, like_target_id)]));
+				const targets = new Map<string, string | undefined>();
+				for (const item of items) {
+					if (!isLibraryItem(item)) continue;
+					const { id, like_target_id } = item;
+					const target = trackLikeTarget(id, like_target_id);
+					// Repeat occurrences can share a target. Conflicting resolutions disable this ID.
+					targets.set(id, !targets.has(id) || targets.get(id) === target ? target : undefined);
+				}
 				const liked = new Set(list.items.filter((item) => item.kind === 'track').map((item) => item.targetId));
 				// A full response cannot prove the absence of an older like.
 				const unlisted = list.items.length < MAX_LIKES ? false : undefined;

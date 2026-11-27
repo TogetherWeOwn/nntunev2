@@ -12,6 +12,11 @@ export function listen<K extends keyof Events>(
 	return () => target.removeEventListener(type, listener, capture);
 }
 
-export function stopListening(listeners: Array<() => void>): void {
-	for (const stop of listeners) stop();
+export function stopListening(listeners: readonly (() => void)[]): void {
+	const failures: unknown[] = [];
+	for (const stop of listeners) {
+		try { stop(); } catch (error) { failures.push(error); }
+	}
+	if (failures.length === 1) throw failures[0];
+	if (failures.length > 1) throw new AggregateError(failures, 'Listener teardown failed');
 }

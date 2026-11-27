@@ -12,10 +12,10 @@
 const SHA40 = /^[0-9a-f]{40}$/;
 
 export function parseBuildSha(value: unknown): string {
-	return typeof value === 'string' && SHA40.test(value) ? value : 'unknown';
+	return isBuildShaKnown(value) ? value : 'unknown';
 }
 
-export function isBuildShaKnown(sha?: string): boolean {
+export function isBuildShaKnown(sha?: unknown): sha is string {
 	return typeof sha === 'string' && SHA40.test(sha);
 }
 

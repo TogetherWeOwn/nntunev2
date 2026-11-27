@@ -1,6 +1,7 @@
 import { SvelteSet } from 'svelte/reactivity';
-import { setTrackLike } from './likes.js';
+import { setTrackLike, trackLikeTarget } from './likes.js';
 import type { LibraryRefreshUpdate } from './refresh.js';
+import { validBinding } from './session-verification.js';
 import { saveTrackTaste, type TasteSignal, type TrackTaste } from './taste.js';
 
 export interface TrackLikeOwner {
@@ -40,13 +41,18 @@ export function createTrackLikeControls(
 	const pendingByOwner = new WeakMap<TrackLikeOwner, Set<string>>();
 
 	return (id: string) => {
+		// The host supplies the resolved target. Preserve exact mixed-case job IDs.
+		if (!trackLikeTarget(id, id)) return;
 		const owner = currentOwner();
 		const receipt = owner?.readiness();
 		const run = receipt?.runIfCurrent;
-		if (!owner || !receipt || !run || !receipt.authoritative || receipt.authBoundary || !receipt.isCurrent()) return;
+		if (!owner || !receipt || !run) return;
 		const binding = owner.binding;
+		const ready = () => receipt.authoritative === true && receipt.authBoundary === false && receipt.isCurrent() &&
+			(receipt.sessionBinding === undefined || receipt.sessionBinding === binding);
+		if (!validBinding(binding) || !ready()) return;
 		const liked = owner.liked(id);
-		if (liked === undefined) return;
+		if (typeof liked !== 'boolean') return;
 		let pending = pendingByOwner.get(owner);
 		if (!pending) {
 			pending = new SvelteSet();
@@ -57,9 +63,9 @@ export function createTrackLikeControls(
 		const saved = taste?.read(id);
 		const visible = saved?.signal === 'love' || (saved?.until != null && saved.until <= Date.now() / 1000) ? null : saved;
 		const stillCurrent = () => currentOwner() === owner && owner.readiness() === receipt &&
-			receipt.isCurrent() && owner.liked(id) === liked && taste?.read(id) === saved;
+			owner.binding === binding && owner.taste === taste && ready() && owner.liked(id) === liked && taste?.read(id) === saved;
 		const write = async <T,>(start: () => Promise<T>, confirm: (value: T) => void, preference?: typeof taste) => {
-			const canWrite = () => stillCurrent() && (preference?.isCurrent?.() ?? true);
+			const canWrite = () => stillCurrent() && (!preference?.isCurrent || preference.isCurrent() === true);
 			if (!canWrite() || inFlight.has(id)) return;
 			inFlight.add(id);
 			let finish!: () => void;
@@ -79,7 +85,7 @@ export function createTrackLikeControls(
 				if (!('error' in result) && preference) {
 					const proof = await run(() => canWrite() ? { result: preference.verify().catch(() => false) } : undefined);
 					if (!proof) return;
-					verified = await proof.result;
+					verified = await proof.result === true;
 				}
 				await run(() => {
 					if (!canWrite()) return;
@@ -103,8 +109,11 @@ export function createTrackLikeControls(
 				(confirmedId) => owner.confirm(id, confirmedId, !liked)),
 			taste: taste && saved !== undefined ? {
 				saved: visible?.signal,
-				set: (signal: TasteSignal | null) => signal === null && !visible ? Promise.resolve() :
-					write(() => saveTrackTaste(owner.client, binding, id, signal), (value) => taste.confirm(id, value), taste)
+				set: async (signal: TasteSignal | null) => {
+					if (signal === null && !visible) return;
+					if (signal !== null && signal !== 'dislike' && signal !== 'hide' && signal !== 'ban' && signal !== 'snooze') return;
+					await write(() => saveTrackTaste(owner.client, binding, id, signal), (value) => taste.confirm(id, value), taste);
+				}
 			} : undefined
 		};
 	};

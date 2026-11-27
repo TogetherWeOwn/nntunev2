@@ -1,4 +1,5 @@
-import type { LibraryItem } from './cache.js';
+import { isLibraryItem, type LibraryItem } from './cache.js';
+import { displayArtist } from './order.js';
 
 export interface ArtistGroup {
 	key: string | null;
@@ -16,10 +17,12 @@ function compareArtistKeys(a: string | null, b: string | null): number {
 
 /** Stable partition of the displayed view; never sorts or edits the input rows. */
 export function groupLibraryItems(items: readonly LibraryItem[]): ArtistGroup[] {
+	if (!Array.isArray(items)) return [];
 	const groups = new Map<string | null, ArtistGroup>();
 	for (const track of items) {
-		const artist = typeof track.artist === 'string' ? track.artist.trim() : '';
-		const key = artist ? artist.toLowerCase() : null;
+		if (!isLibraryItem(track)) continue;
+		const artist = displayArtist(track)?.trim();
+		const key = artist?.toLowerCase() ?? null;
 		let group = groups.get(key);
 		if (!group) {
 			group = { key, label: artist || 'Unknown artist', items: [] };
