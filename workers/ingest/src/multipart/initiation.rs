@@ -39,6 +39,11 @@ impl<'a> InitiatedUpload<'a> {
             return Err(InitiationReceipt);
         }
         let mut reader = s3_receipt_reader(body).map_err(|_| InitiationReceipt)?;
+        // The shared reader coalesces text across ignored comments. Require
+        // receipt field values to come from uninterrupted XML text.
+        if body.windows(4).any(|bytes| bytes == b"<!--") {
+            return Err(InitiationReceipt);
+        }
         let mut next = || -> Result<xml::reader::XmlEvent> {
             loop {
                 match reader.next().map_err(|_| InitiationReceipt)? {
