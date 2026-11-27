@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2443,6 +2444,16 @@ class ArchiveTests(Base):
         archive = make_zip([("staging-admission.json~extra", "{}")])
         self.refused("invalid receipt archive member", sa.read_archive, archive.replace(b"~extra", b"\0extra"))
 
+    def test_refuses_nonregular_and_unsupported_compression_members(self):
+        for mode, compression in ((stat.S_IFLNK, zipfile.ZIP_DEFLATED),
+                                  (stat.S_IFREG, zipfile.ZIP_BZIP2)):
+            with self.subTest(mode=mode, compression=compression):
+                entry = zipfile.ZipInfo("staging-admission.json")
+                entry.create_system = 3
+                entry.external_attr = (mode | 0o644) << 16
+                entry.compress_type = compression
+                self.refused("invalid receipt archive member", sa.read_archive, make_zip([(entry, "{}")]))
+
     def test_refuses_nonfinite_json(self):
         for token in ("NaN", "Infinity", "-Infinity", "1e999"):
             with self.subTest(token=token):
@@ -2650,6 +2661,14 @@ class StagingPushReadbackTests(unittest.TestCase):
         job = snapshot["jobs"][f"runs/{RUN_ID}/attempts/1/jobs"]["jobs"][-1]
         job["started_at"] = iso(6)
         self.assert_pending(snapshot)
+
+    def test_journey_cannot_start_before_either_deploy_finishes(self):
+        for index in range(len(sa.DEPLOY_STEPS)):
+            with self.subTest(lane=index):
+                snapshot = self.snapshot()
+                jobs = snapshot["jobs"][f"runs/{RUN_ID}/attempts/1/jobs"]["jobs"]
+                jobs[index]["completed_at"] = iso(-8)
+                self.assert_pending(snapshot)
 
     def test_incomplete_or_changed_attempt_evidence_stays_pending(self):
         jobs_route = f"runs/{RUN_ID}/attempts/1/jobs"

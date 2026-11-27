@@ -107,9 +107,11 @@ def nominate(evidence, *, squash, repo, repository_id):
                     for job in required_jobs.values()), "job completed before it started")
         # The ordinary journey follows both deploy jobs in the shared writer
         # group. Queued runs can complete in a different order from creation.
-        completed = timestamp(required_jobs[JOURNEY]["completed_at"])
-        require(all(timestamp(required_jobs[name]["completed_at"]) <= completed for name in DEPLOY_STEPS),
-                "journey completed before deployment")
+        journey = required_jobs[JOURNEY]
+        started = timestamp(journey["started_at"])
+        require(all(timestamp(required_jobs[name]["completed_at"]) <= started for name in DEPLOY_STEPS),
+                "journey started before deployment finished")
+        completed = timestamp(journey["completed_at"])
         candidates.append((completed, head, str(run_id), attempt))
 
     require(candidates, "no eligible staging attempt")
