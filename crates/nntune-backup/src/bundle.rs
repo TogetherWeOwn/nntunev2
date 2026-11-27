@@ -126,22 +126,21 @@ pub struct BundleWriter {
     tool: String,
     tables: Vec<TableCount>,
     keyring_versions: BTreeMap<u32, ()>,
-    staged: BTreeSet<String>,
+    staged: BTreeMap<String, String>,
 }
 
-fn check_content_path(rel: &str) -> Result<(), BundleError> {
-    let mut parts = rel.split('/');
+fn content_path_key(rel: &str) -> Result<String, BundleError> {
+    let key = rel.to_uppercase();
+    let first = key.split_once('/').map_or(key.as_str(), |(first, _)| first);
     if rel.contains(['\\', ':', '\0'])
-        || parts
-            .clone()
-            .any(|part| part.is_empty() || part.ends_with(['.', ' ']))
-        || parts
-            .next()
-            .is_some_and(|part| part.eq_ignore_ascii_case(MANIFEST_FILE))
+        || rel
+            .split('/')
+            .any(|p| p.is_empty() || p.ends_with(['.', ' ']))
+        || first.eq_ignore_ascii_case(MANIFEST_FILE)
     {
         return Err(BundleError::Io("invalid bundle path".into()));
     }
-    Ok(())
+    Ok(key)
 }
 
 fn missing(rel: &str) -> BundleError {
@@ -215,19 +214,19 @@ impl BundleWriter {
             created_at_unix,
             tables: Vec::new(),
             keyring_versions: BTreeMap::new(),
-            staged: BTreeSet::new(),
+            staged: BTreeMap::new(),
         }
     }
 
     /// Stage one new file under its canonical bundle-relative path.
     pub fn stage_file(&mut self, rel: &str, bytes: &[u8]) -> Result<(), BundleError> {
-        check_content_path(rel)?;
-        if self.staged.contains(rel) {
+        let key = content_path_key(rel)?;
+        if self.staged.contains_key(&key) {
             return Err(BundleError::DuplicatePath);
         }
         let path = entry_path(&self.dir, rel, true)?;
         write_new_file(&path, bytes)?;
-        self.staged.insert(rel.to_string());
+        self.staged.insert(key, rel.into());
         Ok(())
     }
 
@@ -244,7 +243,7 @@ impl BundleWriter {
 
     pub fn finish(self) -> Result<Manifest, BundleError> {
         let mut files = Vec::with_capacity(self.staged.len());
-        for rel in &self.staged {
+        for rel in self.staged.values() {
             let (bytes, sha256_hex) = hash_file(open_bundle_file(&self.dir, rel)?)?;
             files.push(BundleFile {
                 path: rel.clone(),
@@ -252,6 +251,7 @@ impl BundleWriter {
                 bytes,
             });
         }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
         let manifest = Manifest {
             format_version: BUNDLE_FORMAT_VERSION,
             env: self.env,
@@ -290,8 +290,7 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, BundleError> {
     }
     let mut paths = BTreeSet::new();
     for file in &manifest.files {
-        check_content_path(&file.path)?;
-        if !paths.insert(&file.path) {
+        if !paths.insert(content_path_key(&file.path)?) {
             return Err(BundleError::DuplicatePath);
         }
     }
@@ -404,10 +403,8 @@ mod tests {
         std::fs::remove_dir_all(dir.join("blobs")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, dir.join("blobs")).unwrap();
-        assert!(matches!(
-            read_manifest(&dir.join("blobs/.")),
-            Err(BundleError::Io(_))
-        ));
+        let root = dir.join("blobs/.");
+        assert!(matches!(read_manifest(&root), Err(BundleError::Io(_))));
         #[cfg(unix)]
         assert!(matches!(verify_bundle(&dir), Err(BundleError::Io(_))));
         let _ = std::fs::remove_dir_all(&dir);
@@ -423,35 +420,38 @@ mod tests {
         const PRIVATE: &str = "synthetic-member@example.invalid";
         let rel = format!("data/{PRIVATE}");
         w.stage_file(&rel, b"x").unwrap();
-        assert_eq!(
-            w.stage_file(&rel, b"overwrite"),
-            Err(BundleError::DuplicatePath)
-        );
-        let manifest = w.finish().unwrap();
+        for alias in [&rel, &rel.to_uppercase()] {
+            assert_eq!(w.stage_file(alias, b"y"), Err(BundleError::DuplicatePath));
+        }
+        assert!(writer_in(&dir).stage_file(&rel, b"y").is_err());
+        assert_eq!(fs::read(dir.join(&rel)).unwrap(), b"x");
+        let mut manifest = w.finish().unwrap();
         assert_eq!(verify_bundle(&dir), Ok(manifest.clone()));
-
-        let mut duplicate = manifest.clone();
-        duplicate.files.push(manifest.files[0].clone());
         let path = dir.join(MANIFEST_FILE);
-        fs::write(&path, serde_json::to_vec(&duplicate).unwrap()).unwrap();
-        assert_eq!(verify_bundle(&dir), Err(BundleError::DuplicatePath));
-
+        manifest.files.push(manifest.files[0].clone());
+        for alias in [&rel, &rel.to_uppercase()] {
+            manifest.files[1].path.clone_from(alias);
+            fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert_eq!(verify_bundle(&dir), Err(BundleError::DuplicatePath));
+        }
+        manifest.files.pop();
         for bad in [
             format!("../{PRIVATE}"),
             format!("data/./{PRIVATE}"),
             "manifest.json".into(),
         ] {
-            let mut invalid = manifest.clone();
-            invalid.files[0].path = bad;
-            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
-            assert_eq!(
-                verify_bundle(&dir),
-                Err(BundleError::Io("invalid bundle path".into()))
-            );
+            manifest.files[0].path = bad;
+            fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert!(matches!(read_manifest(&dir), Err(BundleError::Io(_))));
         }
+        manifest.files[0].path.clone_from(&rel);
         fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         fs::write(dir.join(&rel), b"").unwrap();
         let mismatch = verify_bundle(&dir).unwrap_err();
+        fs::remove_file(dir.join(&rel)).unwrap();
+        fs::create_dir(dir.join(&rel)).unwrap();
+        let err = verify_bundle(&dir).unwrap_err();
+        assert_eq!(err, BundleError::Io("invalid bundle file type".into()));
         fs::write(&path, format!(r#"{{"format_version":"{PRIVATE}"}}"#)).unwrap();
         let malformed = read_manifest(&dir).unwrap_err();
         for err in [mismatch, malformed] {
@@ -465,8 +465,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nntune-backup-test-{}-8", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut manifest = writer_in(&dir).finish().unwrap();
-        assert_eq!(verify_bundle(&dir), Ok(manifest.clone()));
-        manifest.format_version += 1;
+        manifest.format_version = BUNDLE_FORMAT_VERSION + 1;
         let path = dir.join(MANIFEST_FILE);
         fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert_eq!(

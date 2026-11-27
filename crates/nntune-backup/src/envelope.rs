@@ -350,17 +350,12 @@ mod tests {
     #[test]
     fn authenticated_unknown_versions_are_refused() {
         let (kek, dek, nonce) = (test_kek(0x11), test_kek(0x22), [0; NONCE_LEN]);
-        for (version, format) in [(2, 1), (3, 1), (2, 2)] {
+        for (version, format) in [(3, 1), (2, 2)] {
             let seal = |key: &[u8], purpose, kek_version, msg: &[u8]| {
+                let aad = aad_v2(purpose, "u", "u:t", version, format, kek_version);
                 Aes256Gcm::new_from_slice(key)
                     .unwrap()
-                    .encrypt(
-                        &Nonce::from(nonce),
-                        Payload {
-                            msg,
-                            aad: &aad_v2(purpose, "u", "u:t", version, format, kek_version),
-                        },
-                    )
+                    .encrypt(&Nonce::from(nonce), Payload { msg, aad: &aad })
                     .unwrap()
             };
             let env = Envelope {
@@ -370,12 +365,7 @@ mod tests {
                 ciphertext: seal(&dek, PURPOSE_PAYLOAD, None, b"synthetic"),
             };
             let opened = open_media_key(&kek, "u", "u:t", version, format, 7, &env);
-            let expected = if (version, format) == (2, 1) {
-                Ok(b"synthetic".to_vec())
-            } else {
-                Err(EnvelopeError::Crypto)
-            };
-            assert_eq!(opened, expected);
+            assert_eq!(opened, Err(EnvelopeError::Crypto));
         }
     }
 
@@ -400,6 +390,16 @@ mod tests {
         assert_eq!(open(&env, 7), Err(EnvelopeError::CorruptStoredData));
 
         let identity = "x".repeat(MAX_IDENTITY_BYTES + 1);
+        for (owner, payload) in [
+            ("u", env.ciphertext.as_slice()),
+            (identity.as_str(), b"x"),
+            ("u", b""),
+        ] {
+            assert!(matches!(
+                seal_media_key(&kek, 7, owner, "u:t", payload),
+                Err(EnvelopeError::CorruptStoredData)
+            ));
+        }
         let env = seal_media_key(&kek, 7, "u", "u:t", b"synthetic").unwrap();
         assert_eq!(
             open_media_key(&kek, "u", &identity, 2, 1, 7, &env),
