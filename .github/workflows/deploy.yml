@@ -423,13 +423,15 @@ jobs:
           # Mirror pin: the generated config binds HYPERDRIVE_ID_MB for the
           # catalogue slice-1 mirror probes (`MB_DB` in src/worker_entry.rs),
           # likewise bypassing binding-parity. The API and MB Workers use
-          # the same staging mirror connection. The var is
-          # optional: absent or empty omits the MB_DB block (no-enrichment
-          # mode); a present id must equal the staging manifest id exactly.
+          # the same staging mirror connection. An unset or empty var omits
+          # MB_DB (no enrichment); a set var must match the staging manifest.
           mb = next(b for b in api["binding"] if b["binding"] == "MB_DB")
-          mb_worker = next(w for w in manifest["worker"] if w["name"] == "mb")
-          mb_worker_db = next(b for b in mb_worker["binding"] if b["binding"] == "MB_DB")
-          assert mb["staging"] == mb_worker_db["staging"], \
+          mb_worker = next((w for w in manifest["worker"] if w["name"] == "mb"), {})
+          mb_worker_staging = next(
+              (b.get("staging") for b in mb_worker.get("binding", []) if b["binding"] == "MB_DB"),
+              None,
+          )
+          assert mb_worker_staging and mb["staging"] == mb_worker_staging, \
               "api and mb must use the same MB_DB staging inventory id"
           mirror_id = os.environ.get("HYPERDRIVE_ID_MB", "")
           if mirror_id:
@@ -721,7 +723,7 @@ jobs:
   # no HTTP surface to serve. Passes the public BUILD_SHA var so worker log
   # records carry the deploy SHA (never a secret); secrets live only in
   # Cloudflare and are never written here. The MB mirror Hyperdrive config is
-  # a shared read mirror and may stay cached, so there is no cache-disabled
+  # a read-only mirror and may stay cached, so there is no cache-disabled
   # gate here (unlike the app Hyperdrive lanes). Skips with a notice until
   # the Operator wires HYPERDRIVE_ID_MB (a skip is not evidence). Production
   # is never touched: the generated config has no production env table and

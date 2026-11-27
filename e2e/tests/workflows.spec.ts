@@ -2090,7 +2090,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     expect(section).toMatch(
       /^(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/v1\/\*"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/library"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-codes"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-accounts"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/healthz"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/ingest"\n[ \t]+zone_name = "nntune\.com"\n/m,
     );
-    // Optional shared mirror binding: generated only when HYPERDRIVE_ID_MB is
+    // Optional staging mirror binding: generated only when HYPERDRIVE_ID_MB is
     // non-empty, and then pinned to the api MB_DB manifest inventory id.
     expect(section).toContain('HYPERDRIVE_ID_MB must equal the api MB_DB inventory id');
     expect(section).toContain('mirror: absent (no-enrichment mode)');
@@ -2121,7 +2121,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
   // HYPERDRIVE_ID_MB to the committed mb MB_DB staging inventory id, the
   // generated staging worker name, and Workers Logs observability at full
   // head sampling (the build_sha evidence is read there). The MB mirror
-  // Hyperdrive config is a shared read mirror and may stay cached, so this
+  // Hyperdrive config is a read-only mirror and may stay cached, so this
   // lane carries no cache-disabled gate (unlike the app Hyperdrive lanes).
   const assertStagingMb = (body: string) => {
     const section = jobSection(body, 'staging-mb');

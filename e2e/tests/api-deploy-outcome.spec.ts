@@ -244,7 +244,13 @@ staging = "dummy-hyperdrive-staging"
 [[worker.binding]]
 binding = "MB_DB"
 staging = "dummy-mb-mirror"
-prod = "dummy-mb-mirror"
+prod = "dummy-prod-mirror"
+[[worker]]
+name = "mb"
+[[worker.binding]]
+binding = "MB_DB"
+staging = "dummy-mb-mirror"
+prod = "dummy-prod-mirror"
 `);
       const env = {
         API_RP_ID_STAGING: 'staging.nntune.com',
