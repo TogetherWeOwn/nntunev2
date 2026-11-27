@@ -12,6 +12,9 @@ const deployments = `/scripts/${name}/deployments`;
 const page = '?page=1&per_page=100';
 const hex = (s, length) => typeof s === 'string' && s.length === length && !/[^0-9a-f]/.test(s);
 const uuid = (s) => typeof s === 'string' && s.length === 36 && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(s);
+const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const validDomain = (domain) => typeof domain === 'string' && domain.length <= 253 &&
+  /\.[a-z]{2,}$/.test(domain) && domain.split('.').every((label) => dnsLabel.test(label));
 const allocation = (version_id, percentage = 100) => ({ version_id, percentage });
 const matches = (entry, expected) => Array.isArray(entry?.versions) && entry.versions.length === expected.length &&
   expected.every((v) => entry.versions.some((actual) =>
@@ -32,8 +35,10 @@ function moduleDigest(version) {
   const [module, ...extra] = Array.isArray(version.modules) ? version.modules : [];
   const content = module?.content_base64;
   if (extra.length || version.main_module !== 'worker.mjs' || module?.name !== 'worker.mjs' ||
-      typeof content !== 'string' || Buffer.from(content, 'base64').toString('base64') !== content) return null;
-  return createHash('sha256').update(Buffer.from(content, 'base64')).digest('hex');
+      module.content_type !== 'application/javascript+module' || typeof content !== 'string' || !content) return null;
+  const bytes = Buffer.from(content, 'base64');
+  if (bytes.toString('base64') !== content) return null;
+  return createHash('sha256').update(bytes).digest('hex');
 }
 
 export function rollbackNotice(command, error) {
@@ -46,6 +51,9 @@ export function rollbackNotice(command, error) {
 }
 
 export async function finalSmokeRollback(command, env, request = fetch, now = Date.now, probe = smoke) {
+  if (!['check-seed', 'record', 'pin-final', 'restore', 'prepare-recovery', 'recover'].includes(command)) {
+    throw new Error('Invalid rollback operation');
+  }
   const prepare = command === 'prepare-recovery';
   const recovery = prepare || command === 'recover';
   if (recovery) recoveryContext(env);
@@ -54,15 +62,17 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
     GITHUB_RUN_ATTEMPT: attempt, RUNNER_TEMP: temp, INTENT_KEY: key, ROLLBACK_CUSTODY: custody } = env;
   const run = recovery ? env.RECOVERY_RUN_ID : env.GITHUB_RUN_ID;
   const context = { schema: 1, repository, workflow, job: 'deploy-production', account, worker, sha, domain, run, attempt };
-  if (!hex(account, 32) || !hex(worker, 32) || !hex(sha, 40) || !token || !hex(key, 64) || !temp ||
-      !repository || !/^[1-9][0-9]{0,19}$/.test(run ?? '') || attempt !== '1' ||
+  if (!hex(account, 32) || !hex(worker, 32) || !hex(sha, 40) || typeof token !== 'string' ||
+      !/^[\x21-\x7e]{1,512}$/.test(token) || !hex(key, 64) || typeof temp !== 'string' || !temp ||
+      typeof repository !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
+      typeof run !== 'string' || !/^[1-9][0-9]{0,19}$/.test(run) || attempt !== '1' ||
       (!recovery && (env.GITHUB_JOB !== context.job || env.GITHUB_EVENT_NAME !== 'workflow_dispatch' ||
         env.GITHUB_REF !== 'refs/heads/main' || env.GITHUB_SHA !== sha || env.GITHUB_WORKFLOW_SHA !== sha ||
         env.GITHUB_WORKFLOW_REF !== `${repository}/${workflow}@refs/heads/main`)) ||
-      typeof domain !== 'string' || domain.length > 253 || !/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/.test(domain)) {
+      !validDomain(domain)) {
     throw new Error('Invalid protected production rollback context');
   }
-  const proof = custody?.length <= 4096 ? JSON.parse(custody) : null;
+  const proof = typeof custody === 'string' && Buffer.byteLength(custody) <= 4096 ? JSON.parse(custody) : null;
   const { maintenance, previous, references, checked_at: checkedAt } = proof ?? {};
   const target = maintenance ?? previous;
   const stamp = Date.parse(checkedAt);
@@ -81,8 +91,10 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
     throw new Error('Missing or mismatched production rollback custody');
   }
   function requireFreshCustody() {
-    const elapsed = now() - stamp;
-    if (elapsed < 0 || elapsed > 1_800_000) throw new Error('Stale production rollback custody');
+    const sampledAt = now();
+    if (!Number.isSafeInteger(sampledAt) || sampledAt < stamp || sampledAt - stamp > 1_800_000) {
+      throw new Error('Stale production rollback custody');
+    }
   }
   const custodyDigest = createHash('sha256').update(custody).digest('hex');
   const aad = (path) => Buffer.from(JSON.stringify({ ...context, custody: custodyDigest, file: basename(path) }));
@@ -107,9 +119,19 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
   }
   const api = cloudflare(account, token, request);
   const pinned = `/workers/${worker}`;
+  async function readHistory() {
+    const history = await api(deployments + page, 'Deployment history');
+    const list = history.result.deployments;
+    requireCompletePage(history, list, list?.length, 'deployments');
+    if (list.length > 100 || !list.every((row, i) => uuid(row?.id) && typeof row.created_on === 'string' &&
+        Number.isFinite(Date.parse(row.created_on)) && (i === 0 || Date.parse(list[i - 1].created_on) > Date.parse(row.created_on))) ||
+        new Set(list.map((row) => row.id)).size !== list.length) throw new Error('Ambiguous deployment history');
+    return list;
+  }
   async function live(phase) {
     const { result } = await api(pinned, 'Worker identity and exposure');
-    if (result.id !== worker || result.name !== name || !Number.isFinite(Date.parse(result.deployed_on)) ||
+    if (result.id !== worker || result.name !== name || typeof result.deployed_on !== 'string' ||
+        !Number.isFinite(Date.parse(result.deployed_on)) ||
         !isDeepStrictEqual(result.references, references) || result.subdomain?.enabled !== false ||
         result.subdomain.previews_enabled !== false) throw new Error('Worker identity, routes or previews drifted');
     // Recovery cannot compare the receipt with this checkout, so it reads the module back.
@@ -125,13 +147,7 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
     if (readModule && digest !== maintenance.module_sha256) {
       throw new MaintenanceModuleMismatchError(maintenance.module_sha256, digest, phase);
     }
-    const history = await api(deployments + page, 'Deployment history');
-    const list = history.result.deployments;
-    requireCompletePage(history, list, list?.length, 'deployments');
-    if (list.length > 100 || !list.every((row, i) => uuid(row?.id) && Number.isFinite(Date.parse(row.created_on)) &&
-        (i === 0 || Date.parse(list[i - 1].created_on) > Date.parse(row.created_on))) ||
-        new Set(list.map((row) => row.id)).size !== list.length) throw new Error('Ambiguous deployment history');
-    return list;
+    return readHistory();
   }
 
   const tag = `${sha}-${run}-${attempt}`;
@@ -177,19 +193,29 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
     seal(finalPath, { nonce, deployment: rows[0].id });
     return;
   }
-  if (command !== 'restore' && !recovery) throw new Error('Invalid rollback operation');
-
   const reserved = recovery && !prepare && env.CLAIM_VERIFIED === 'true';
   const final = recovery && !reserved ? null : unseal(finalPath);
-  if (final && final.nonce !== nonce) throw new Error('Final allocation belongs to another rollback intent');
-  const isFinal = (rows) => (!final || rows[0]?.id === final.deployment) && rollout(rows);
+  if ((!recovery || reserved) && (final?.nonce !== nonce ||
+      (!uuid(final.deployment) && !(reserved && final.deployment === null)))) {
+    throw new Error('Final allocation belongs to another rollback intent');
+  }
+  const isFinal = (rows) => (final?.deployment == null || rows[0]?.id === final.deployment) && rollout(rows);
   const restored = (rows) => matches(rows[0], targetOnly) && rows[0].annotations?.['workers/message'] === message &&
     isFinal(rows.slice(1));
   const alreadyVerified = `Recorded ${targetLabel} allocation already verified`;
   if (reserved) {
-    const age = now() - final.checkedAt;
-    if (!Number.isFinite(age) || age < 0 || age > 120_000) throw new Error('Recovery allocation proof expired');
-    if (final.deployment === null) return alreadyVerified;
+    function requireFreshAllocation() {
+      const sampledAt = now();
+      if (!Number.isSafeInteger(sampledAt) || !Number.isSafeInteger(final.checkedAt) ||
+          sampledAt < final.checkedAt || sampledAt - final.checkedAt > 120_000) {
+        throw new Error('Recovery allocation proof expired');
+      }
+    }
+    requireFreshAllocation();
+    const before = final.deployment === null ? await live('preflight') : await readHistory();
+    requireFreshAllocation();
+    if (restored(before) && (final.deployment === null || restored(await live('preflight')))) return alreadyVerified;
+    if (final.deployment === null || !isFinal(before)) throw new Error('Stale intent or newer or foreign active deployment');
   } else {
     if (recovery) {
       const { result: version } = await api(`${pinned}/versions/${candidate}`, 'Recorded candidate version');

@@ -8,18 +8,15 @@
 // Validation (all required, no coercion or defaults; extras ignored):
 // verdict: {schema_version: 1, service: 'api', environment: 'staging',
 //   verdict: 'breach', reason: 'breach',
-//   counts: {valid: integer >= 0, red: integer 0..valid,
+//   counts: {valid: integer >= 2, red: integer 2..valid,
 //     malformed: integer >= 0},
 //   longest_red_span_ms: integer >= 0,
 //   red_for_ms: integer 1..3600000}
-// Only the exact pair verdict 'breach' + reason 'breach' renders. Coherence
-// is longest_red_span_ms >= red_for_ms only; a span below the threshold
-// contradicts the breach and fails closed. The renderer does not re-derive
-// evaluator semantics beyond this frozen contract.
-// context: {logsUrl, windowLabel}, both non-empty strings; logsUrl must
-// match /^https?:\/\/[^\/\s]\S*$/ (http/https, no whitespace) and parse
-// via WHATWG URL with an http/https protocol and a non-empty hostname;
-// windowLabel must contain a non-space character.
+// A breach requires at least two red samples and a span at or above the
+// threshold. All integers must be safe JavaScript integers.
+// context: {logsUrl, windowLabel}, both well-formed strings. The URL must
+// have an explicit HTTP(S) host and no credentials, controls or backslashes.
+// The window label must contain a non-space character.
 //
 // Bounds: content <= 2000 chars, exactly one embed, payload total
 // <= 6000 chars, <= 25 fields per embed, field names 1..256 chars,
@@ -39,7 +36,7 @@ const EXPECTED_SERVICE = 'api';
 const EXPECTED_ENVIRONMENT = 'staging';
 const BREACH = 'breach';
 
-const LOGS_URL_RE = /^https?:\/\/[^/\s]\S*$/;
+const LOGS_URL_RE = /^https?:\/\/[^/?#@]+(?:[/?#]|$)/;
 const NON_BLANK_RE = /\S/;
 const THRESHOLD_MIN = 1;
 const THRESHOLD_MAX = 3600000;
@@ -69,7 +66,7 @@ function isRecord(value) {
 }
 
 function isNonNegativeInteger(value) {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+  return Number.isSafeInteger(value) && value >= 0;
 }
 
 function extractCounts(counts) {
@@ -79,7 +76,7 @@ function extractCounts(counts) {
     const red = counts.red;
     const malformed = counts.malformed;
     if (!isNonNegativeInteger(valid)) return null;
-    if (!isNonNegativeInteger(red)) return null;
+    if (!isNonNegativeInteger(red) || red < 2) return null;
     if (!isNonNegativeInteger(malformed)) return null;
     if (red > valid) return null;
     return { valid, red, malformed };
@@ -121,11 +118,12 @@ function isValidLogsUrl(logsUrl) {
   // regex alone admits host-less URLs such as "https://?x=1" that would
   // render a dead logs link instead of failing closed. Pure string work,
   // no network; the original string is rendered verbatim on success.
-  if (typeof logsUrl !== 'string' || !LOGS_URL_RE.test(logsUrl)) return false;
+  if (typeof logsUrl !== 'string' || !logsUrl.isWellFormed() || !LOGS_URL_RE.test(logsUrl) ||
+      /[\s\x00-\x1f\x7f\\]/.test(logsUrl)) return false;
   try {
     const parsed = new URL(logsUrl);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-    if (parsed.hostname === '') return false;
+    if (!parsed.hostname || parsed.username || parsed.password) return false;
     return true;
   } catch {
     return false;
@@ -138,7 +136,7 @@ function extractContext(context) {
     const logsUrl = context.logsUrl;
     const windowLabel = context.windowLabel;
     if (!isValidLogsUrl(logsUrl)) return null;
-    if (typeof windowLabel !== 'string' || windowLabel.length < 1 || !NON_BLANK_RE.test(windowLabel)) {
+    if (typeof windowLabel !== 'string' || !windowLabel.isWellFormed() || !NON_BLANK_RE.test(windowLabel)) {
       return null;
     }
     return { logsUrl, windowLabel };

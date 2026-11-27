@@ -11,10 +11,10 @@
 //  red_for_ms: integer 1..3600000,
 //  min_samples: integer 1..100000}
 // Only the explicit staging API labels are accepted. Invalid policy or a
-// non-array samples root => null, no throw, never a fabricated verdict.
+// non-array samples root or more than 100000 entries => null.
 //
 // Per entry: non-objects, arrays, records whose t is not a non-negative
-// integer ms timestamp, or whose ok is not a boolean => malformed: skipped,
+// safe integer ms timestamp, or whose ok is not a boolean => malformed: skipped,
 // counted, and splitting contiguity, so no breach may span untrusted
 // evidence. Valid samples are ordered by t ascending (stable) within each
 // malformed-delimited segment before runs are scanned. A contiguous not-ok
@@ -73,10 +73,10 @@ function readPolicy(policy) {
 
 function classifySample(entry) {
   try {
-    if (!isRecord(entry)) return null;
+    if (!isRecord(entry) || !Object.hasOwn(entry, 't') || !Object.hasOwn(entry, 'ok')) return null;
     const t = entry.t;
     const ok = entry.ok;
-    if (typeof t !== 'number' || !Number.isInteger(t) || t < 0) return null;
+    if (!Number.isSafeInteger(t) || t < 0) return null;
     if (typeof ok !== 'boolean') return null;
     return { t, ok };
   } catch {
@@ -97,6 +97,8 @@ export function evaluateHealthWindow(samples, policy) {
     const validated = readPolicy(policy);
     if (validated === null) return null;
     if (!Array.isArray(samples)) return null;
+    const length = samples.length;
+    if (!Number.isSafeInteger(length) || length < 0 || length > MIN_SAMPLES_MAX) return null;
     const service = validated.service;
     const environment = validated.environment;
     const redForMs = validated.redForMs;
@@ -107,8 +109,8 @@ export function evaluateHealthWindow(samples, policy) {
     let malformed = 0;
     const segments = [];
     let current = [];
-    for (let i = 0; i < samples.length; i += 1) {
-      const sample = classifySample(samples[i]);
+    for (let i = 0; i < length; i += 1) {
+      const sample = Object.hasOwn(samples, i) ? classifySample(samples[i]) : null;
       if (sample === null) {
         malformed += 1;
         if (current.length > 0) {

@@ -25,11 +25,15 @@ def unique_object(pairs):
     return obj
 
 
+def reject_constant(_):
+    raise ValueError("invalid JSON constant")
+
+
 def read_summary():
     raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
     if len(raw) > MAX_INPUT_BYTES:
         raise ValueError("oversized summary")
-    data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object, parse_constant=reject_constant)
     if not isinstance(data, dict) or data.keys() != set(COUNT_FIELDS + CONFIRMATION_FIELDS):
         raise ValueError("invalid summary fields")
     for field in COUNT_FIELDS:
@@ -62,6 +66,10 @@ def verified_hyperdrive_count(pages):
             expected_width, expected_total = width, total
         if (width, total) != (expected_width, expected_total):
             return None
+        calculated_pages = (total + width - 1) // width
+        declared_pages = info.get("total_pages", calculated_pages)
+        if type(declared_pages) is not int or declared_pages not in ((0, 1) if total == 0 else (calculated_pages,)):
+            return None
         if count != len(results) or count != min(width, total - len(seen)):
             return None
         for config in results:
@@ -79,7 +87,8 @@ def replay_hyperdrive_count(path):
         with open(path, "rb") as replay:
             raw = replay.read(MAX_REPLAY_BYTES + 1)
         if len(raw) <= MAX_REPLAY_BYTES:
-            return verified_hyperdrive_count(json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object))
+            return verified_hyperdrive_count(json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object,
+                                                        parse_constant=reject_constant))
     except (ValueError, OSError, RecursionError):
         pass
     return None

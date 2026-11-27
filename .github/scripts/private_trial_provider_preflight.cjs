@@ -5,6 +5,7 @@ const { resolve } = require('node:path');
 const { isIP } = require('node:net');
 const { connect } = require('node:tls');
 const loadWorker = require('../../workers/ingest/tests/fixtures/worker_fixture_wasm.cjs');
+let probeInProgress = false;
 
 // Fetch discards any bytes after HEAD/204 headers. Request connection close
 // and read the TLS stream to EOF to verify that the wire reply ends there.
@@ -38,9 +39,9 @@ async function sendBodylessRequest(request) {
     if (!status) throw new Error('invalid provider status');
     const responseHeaders = new Headers();
     for (const field of fields) {
-      const colon = field.indexOf(':');
-      if (colon <= 0 || /[\x00-\x08\x0a-\x1f\x7f]/.test(field)) throw new Error('invalid provider header');
-      responseHeaders.append(field.slice(0, colon), field.slice(colon + 1));
+      const header = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):([\t\x20-\x7e\x80-\xff]*)$/.exec(field);
+      if (!header) throw new Error('invalid provider header');
+      responseHeaders.append(header[1], header[2]);
     }
     const response = new Response(null, { status: Number(status[1]), headers: responseHeaders });
     Object.defineProperty(response, 'url', { value: url.href });
@@ -54,21 +55,27 @@ async function sendBodylessRequest(request) {
 // Expose the verified header-only replies to the shared WASM sender. The
 // process runs a single probe and restores the original Fetch on completion.
 async function qualify(bundle, endpoint, region, scope, credential, send = sendBodylessRequest) {
+  if (probeInProgress) return 'unconfirmed';
+  probeInProgress = true;
   const fetch = globalThis.fetch;
-  globalThis.fetch = async (request) => {
-    const response = await send(request);
-    const length = response.headers.get('content-length');
-    const marker = response.headers.get('x-amz-delete-marker');
-    const transferEncoded = response.headers.has('transfer-encoding');
-    if (response.url !== request.url || response.headers.has('content-range')
-        || (marker !== null && marker !== 'false')
-        || (length !== null && (!/^\d+$/.test(length) || transferEncoded))
-        || (response.status === 204 && (transferEncoded || (length !== null && length !== '0')))) {
-      throw new Error('ambiguous provider response');
-    }
-    return response;
-  };
   try {
+    globalThis.fetch = async (request) => {
+      const url = new URL(request.url);
+      if (url.protocol !== 'https:' || url.origin !== new URL(endpoint).origin || url.username || url.password || url.hash ||
+          !['HEAD', 'DELETE'].includes(request.method) || request.body !== null ||
+          ['host', 'connection', 'transfer-encoding', 'content-length'].some((name) => request.headers.has(name))) {
+        throw new Error('invalid provider request');
+      }
+      const response = await send(request);
+      const length = response.headers.get('content-length');
+      const marker = response.headers.get('x-amz-delete-marker');
+      if (response.url !== request.url || response.body !== null || response.headers.has('content-range') ||
+          response.headers.has('transfer-encoding') || (marker !== null && marker !== 'false') ||
+          (length !== null && (!/^\d+$/.test(length) || (response.status === 204 && length !== '0')))) {
+        throw new Error('ambiguous provider response');
+      }
+      return response;
+    };
     const verdict = await loadWorker(resolve(bundle)).qualify_disposable_version(
       endpoint, region, scope, credential,
     );
@@ -77,6 +84,7 @@ async function qualify(bundle, endpoint, region, scope, credential, send = sendB
     // Do not print exceptions, headers, input or provider bodies.
   } finally {
     globalThis.fetch = fetch;
+    probeInProgress = false;
   }
   return 'unconfirmed';
 }

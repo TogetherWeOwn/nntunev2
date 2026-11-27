@@ -21,7 +21,11 @@ ROLE_RE = re.compile(r"[A-Za-z0-9_-]{1,63}")
 
 def read_source(root, name):
     path = root / name
-    if path.resolve() != path or not path.is_file():
+    try:
+        regular = path.is_relative_to(root) and path.resolve() == path and path.is_file()
+    except (OSError, RuntimeError, ValueError):
+        regular = False
+    if not regular:
         raise migrator.ApplyError("private trial source must be a regular file in its checkout")
     with path.open("rb") as source:
         contents = source.read(32769)
@@ -32,7 +36,10 @@ def read_source(root, name):
 
 def compose(trusted_root, data_root, writer, reader, *, database):
     """Use only fixed, reviewed sources. Return one transaction and its digest."""
-    if writer == reader or any(not ROLE_RE.fullmatch(role) or role.lower() == "public"
+    if database != "nntunev2_staging":
+        raise migrator.ApplyError("private trial schema requires the staging database")
+    if writer == reader or any(type(role) is not str or not ROLE_RE.fullmatch(role)
+                               or role.lower() == "public" or role.lower().startswith("pg_")
                                for role in (writer, reader)):
         raise migrator.ApplyError("configure distinct private trial writer and reader roles")
     trusted, data = Path(trusted_root).resolve(), Path(data_root).resolve()
@@ -61,7 +68,9 @@ BEGIN
                    WHERE file = '{BASELINE}' AND sha256 = '{baseline['sha256']}') THEN
         RAISE EXCEPTION '{migrator.MISSING_PRIOR}';
     END IF;
-    IF pg_catalog.has_schema_privilege('{writer}', 'public', 'CREATE')
+    IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname IN ('{writer}', '{reader}')
+               AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls))
+       OR pg_catalog.has_schema_privilege('{writer}', 'public', 'CREATE')
        OR pg_catalog.has_schema_privilege('{reader}', 'public', 'CREATE')
        OR NOT pg_catalog.has_schema_privilege('{writer}', 'public', 'USAGE')
        OR NOT pg_catalog.has_schema_privilege('{reader}', 'public', 'USAGE')

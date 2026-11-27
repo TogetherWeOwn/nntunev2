@@ -21,9 +21,9 @@ def valid_pin(pin: WorkerPin, worker: str) -> bool:
         type(pin) is WorkerPin
         and type(pin.worker) is str
         and pin.worker == worker
-        and valid(SHA, pin.build_sha)
-        and valid(UUID, pin.version_id)
-        and valid(UUID, pin.deployment_id)
+        and all(type(value) is str and valid(pattern, value) for pattern, value in (
+            (SHA, pin.build_sha), (UUID, pin.version_id), (UUID, pin.deployment_id),
+        ))
     )
 
 
@@ -41,10 +41,12 @@ def readback(
     point-in-time allocation evidence. Route health and access are separate.
     """
     if not (
-        valid(ACCOUNT, account)
+        type(account) is str and valid(ACCOUNT, account)
         and valid_pin(api, "nntune-api")
         and valid_pin(stream, "nntune-stream")
         and api.build_sha == stream.build_sha
+        and api.version_id != stream.version_id
+        and api.deployment_id != stream.deployment_id
     ):
         return {"identity": "unavailable", "reason": "invalid-pins"}
 
