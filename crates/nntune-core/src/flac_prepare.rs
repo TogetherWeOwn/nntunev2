@@ -72,6 +72,17 @@ impl FlacSeekIndex {
     /// Record the next contiguous validated frame. The end is an absolute
     /// plaintext offset, while embedded FLAC seek points are audio-relative.
     pub(crate) fn record_frame(&mut self, samples: u16, frame_end: u64) -> Result<(), ()> {
+        if samples == 0 || self.sample_rate == 0 {
+            return Err(());
+        }
+        let audio_len = frame_end
+            .checked_sub(self.audio_start)
+            .filter(|&len| len > self.audio_len)
+            .ok_or(())?;
+        let total_samples = self
+            .total_samples
+            .checked_add(u64::from(samples))
+            .ok_or(())?;
         let interval = 5 * u64::from(self.sample_rate);
         if self
             .points
@@ -81,14 +92,15 @@ impl FlacSeekIndex {
             if self.points.len() == MAX_SEEK_POINTS {
                 return Err(());
             }
+            self.points.try_reserve(1).map_err(|_| ())?;
             self.points.push(SeekPoint {
                 sample: self.total_samples,
                 offset: self.audio_len,
                 samples,
             });
         }
-        self.audio_len = frame_end - self.audio_start;
-        self.total_samples += u64::from(samples);
+        self.audio_len = audio_len;
+        self.total_samples = total_samples;
         Ok(())
     }
 
@@ -117,12 +129,15 @@ impl FlacSeekIndex {
         let start = self
             .points
             .partition_point(|p| u128::from(p.sample) <= first)
-            - 1;
+            .checked_sub(1)?;
         let end = self
             .points
             .partition_point(|p| u128::from(p.sample) < limit);
         let end_offset = self.points.get(end).map_or(self.audio_len, |p| p.offset);
-        Some(self.audio_start + self.points[start].offset..self.audio_start + end_offset)
+        Some(
+            self.audio_start.checked_add(self.points[start].offset)?
+                ..self.audio_start.checked_add(end_offset)?,
+        )
     }
 }
 
@@ -131,7 +146,8 @@ pub(crate) fn prepare<'a>(
     tags: &[(&str, &str)],
     validated_frames: impl IntoIterator<Item = FrameSpan>,
 ) -> Result<PreparedFlac<'a>, PrepareError> {
-    let (info, audio) = FlacPreamble::default()
+    let mut source = FlacPreamble::default();
+    let (info, audio) = source
         .push(input)
         .map_err(|()| PrepareError::Preamble)?
         .ok_or(PrepareError::Preamble)?;
@@ -140,6 +156,9 @@ pub(crate) fn prepare<'a>(
         if frame.bytes.start as u64 != seek.audio_len
             || frame.bytes.end <= frame.bytes.start
             || frame.bytes.end > audio.len()
+            || !source
+                .frame_sizes()
+                .contains(&((frame.bytes.end - frame.bytes.start) as u64))
             || frame.first_sample != seek.total_samples
             || frame.samples == 0
             || frame.samples > info.max_block
@@ -199,6 +218,7 @@ fn take_vorbis_field<'a>(bytes: &mut &'a [u8]) -> Option<&'a [u8]> {
 // Layout describes the unchanged frames, not the replacement catalogue tags.
 fn source_channel_mask(mut blocks: &[u8], channels: u8) -> Option<Option<u32>> {
     let mut mask = None;
+    let mut seen_comment = false;
     while let Some(([kind, a, b, c], rest)) = blocks.split_first_chunk::<4>() {
         let (mut payload, rest) =
             rest.split_at_checked(u32::from_be_bytes([0, *a, *b, *c]) as usize)?;
@@ -206,6 +226,10 @@ fn source_channel_mask(mut blocks: &[u8], channels: u8) -> Option<Option<u32>> {
         if kind & 127 != 4 {
             continue;
         }
+        if seen_comment {
+            return None;
+        }
+        seen_comment = true;
         take_vorbis_field(&mut payload)?; // vendor
         let (count, mut fields) = payload.split_first_chunk::<4>()?;
         for _ in 0..u32::from_le_bytes(*count) {
@@ -225,6 +249,9 @@ fn source_channel_mask(mut blocks: &[u8], channels: u8) -> Option<Option<u32>> {
             {
                 return None;
             }
+        }
+        if !fields.is_empty() {
+            return None;
         }
     }
     Some(mask)
@@ -271,3 +298,67 @@ fn vorbis_comments(tags: &[(&str, &str)], mask: Option<u32>) -> Result<Vec<u8>, 
 #[cfg(test)]
 #[path = "flac_prepare_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_nonadvancing_or_empty_seek_frames_without_changing_index() {
+        let mut seek = FlacSeekIndex::new(1, 42);
+        assert_eq!(seek.record_frame(5, 53), Ok(()));
+        for (samples, end) in [(0, 54), (5, 53), (5, 52), (5, 41)] {
+            assert_eq!(seek.record_frame(samples, end), Err(()));
+            assert_eq!(seek.duration_ms(), Some(5_000));
+            assert_eq!(seek.plaintext_range(0..5_000), Some(42..53));
+        }
+        assert_eq!(seek.record_frame(5, u64::MAX), Ok(()));
+        assert_eq!(seek.plaintext_range(5_000..10_000), Some(53..u64::MAX));
+    }
+
+    fn input(comments: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = b"fLaC\x80\0\0\x22\0\x10\0\x10\0\0\x0b\0\0\x0b".to_vec();
+        bytes.extend_from_slice(&((44_100_u64 << 44) | (7 << 36) | 16).to_be_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+        for (index, payload) in comments.iter().enumerate() {
+            bytes[4] = 0;
+            let last = u8::from(index + 1 == comments.len()) << 7;
+            block_header(&mut bytes, last | 4, payload.len());
+            bytes.extend_from_slice(payload);
+        }
+        bytes.extend_from_slice(&[255, 248, 105, 2, 0, 15, 183, 0, 42, 122, 221]);
+        bytes
+    }
+
+    const FRAME: FrameSpan = FrameSpan {
+        first_sample: 0,
+        samples: 16,
+        bytes: 0..11,
+    };
+
+    #[test]
+    fn refuses_frame_spans_outside_declared_byte_bounds() {
+        assert!(prepare(&input(&[]), &[], [FRAME]).is_ok());
+        for (min, max) in [(12, 0), (0, 10)] {
+            let mut bytes = input(&[]);
+            bytes[14] = min;
+            bytes[17] = max;
+            assert_eq!(
+                prepare(&bytes, &[], [FRAME]).err(),
+                Some(PrepareError::FrameGeometry)
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_ambiguous_source_comment_boundaries() {
+        let empty = &[0; 8];
+        assert!(prepare(&input(&[empty]), &[], [FRAME]).is_ok());
+        for comments in [&[empty.as_slice(), empty][..], &[&[0; 9][..]]] {
+            assert_eq!(
+                prepare(&input(comments), &[], [FRAME]).err(),
+                Some(PrepareError::Preamble)
+            );
+        }
+    }
+}

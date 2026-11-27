@@ -13,6 +13,7 @@ pub(crate) struct FlacStream {
     header: [u8; 16],
     filled: usize,
     frame: Option<FrameReader>,
+    frame_bytes: u64,
     pcm_md5: Option<md5::Context>,
     pcm_scratch: Option<Vec<i32>>,
     collect_seek: bool,
@@ -57,10 +58,21 @@ impl FlacStream {
             }
         }
         let continuity = self.continuity.as_mut().ok_or(())?;
+        let frame_sizes = self.preamble.frame_sizes();
         while let Some((&byte, rest)) = input.split_first() {
             if let Some(frame) = &mut self.frame {
-                if !frame.read(&mut input)? {
+                // Limit what the frame reader can consume, including its footer.
+                let available = (*frame_sizes.end() - self.frame_bytes).min(input.len() as u64);
+                let mut frame_input = &input[..available as usize];
+                let complete = frame.read(&mut frame_input)?;
+                let consumed = available as usize - frame_input.len();
+                self.frame_bytes += consumed as u64;
+                input = &input[consumed..];
+                if !complete && self.frame_bytes < *frame_sizes.end() {
                     return Ok(());
+                }
+                if !complete || !frame_sizes.contains(&self.frame_bytes) {
+                    return Err(());
                 }
                 let (header, pcm) = continuity.accept_with_pcm(self.frame.take().ok_or(())?)?;
                 if let Some(md5) = &mut self.pcm_md5 {
@@ -84,9 +96,10 @@ impl FlacStream {
                     continuity.stream_info(),
                     &mut self.pcm_scratch,
                 )? {
-                    if !header.is_empty() {
+                    if !header.is_empty() || self.filled as u64 >= *frame_sizes.end() {
                         return Err(());
                     }
+                    self.frame_bytes = self.filled as u64;
                     self.frame = Some(frame);
                     self.filled = 0;
                 } else if self.filled == self.header.len() {
@@ -152,19 +165,41 @@ mod tests {
 
     #[test]
     fn accepts_complete_flac_at_every_stream_split() {
-        let wire = [metadata(19).as_slice(), FIRST, TAIL].concat();
-        for split in 0..=wire.len() {
+        for frame_size in [0, FIRST.len() as u8] {
+            let mut prefix = metadata(19);
+            prefix[14] = frame_size;
+            prefix[17] = frame_size;
+            let wire = [prefix.as_slice(), FIRST, TAIL].concat();
+            for split in 0..=wire.len() {
+                let mut stream = FlacStream::default();
+                stream.push(&wire[..split]).unwrap();
+                stream.push(&[]).unwrap();
+                stream.push(&wire[split..]).unwrap();
+                assert_eq!(stream.finish_at_eof(), Ok(()), "split {split}");
+            }
             let mut stream = FlacStream::default();
-            stream.push(&wire[..split]).unwrap();
-            stream.push(&[]).unwrap();
-            stream.push(&wire[split..]).unwrap();
-            assert_eq!(stream.finish_at_eof(), Ok(()), "split {split}");
+            for byte in wire.chunks(1) {
+                stream.push(byte).unwrap();
+            }
+            assert_eq!(stream.finish_at_eof(), Ok(()));
         }
-        let mut stream = FlacStream::default();
-        for byte in wire.chunks(1) {
-            stream.push(byte).unwrap();
+    }
+
+    #[test]
+    fn rejects_incomplete_frame_at_declared_byte_limit_without_waiting_for_more() {
+        let limit = FIRST.len() - 1;
+        let mut wire = metadata(19);
+        wire[17] = limit as u8;
+        // Leave out the last CRC byte so EOF and the final frame length cannot
+        // account for the refusal. The decoder must fail during this push.
+        wire.extend_from_slice(&FIRST[..limit]);
+        for split in 0..wire.len() {
+            let mut stream = FlacStream::new(true);
+            assert_eq!(stream.push(&wire[..split]), Ok(()), "split {split}");
+            assert_eq!(stream.push(&wire[split..]), Err(()), "split {split}");
+            assert_eq!(stream.push(&FIRST[limit..]), Err(()), "split {split}");
+            assert!(stream.finish_with_index().is_err());
         }
-        assert_eq!(stream.finish_at_eof(), Ok(()));
     }
 
     fn admin_upload_clips() -> Vec<Vec<u8>> {
