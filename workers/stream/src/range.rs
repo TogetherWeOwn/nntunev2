@@ -39,20 +39,20 @@ pub enum RangeOutcome {
 
 /// Parse an all-digit numeral: nonempty ASCII digits only. Bare
 /// `str::parse::<u64>()` would also accept a leading `+`, and trimming
-/// would wash whitespace, so the digit check comes first; overflow still
-/// fails the trailing `parse`.
+/// would wash whitespace, so the digit check comes first. Saturating is
+/// sufficient for comparing an offset with any supported body length.
 fn parse_digits(s: &str) -> Option<u64> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    s.parse().ok()
+    Some(s.parse().unwrap_or(u64::MAX))
 }
 
 /// Parse `header` (the value of the `Range` header, if any) for a body of
 /// `len` bytes.
 pub fn parse(header: Option<&str>, len: u64) -> RangeOutcome {
     let spec = match header {
-        Some(h) => match h.trim().strip_prefix("bytes=") {
+        Some(h) => match h.trim_matches([' ', '\t']).strip_prefix("bytes=") {
             // The outer trim is HTTP outer-whitespace only; the numerals
             // themselves are taken verbatim so interior whitespace (or a
             // leading `+`) falls back to `Full` below.
@@ -103,7 +103,11 @@ pub fn parse(header: Option<&str>, len: u64) -> RangeOutcome {
                 Some(e) => e,
                 None => return RangeOutcome::Full,
             };
-            if start > end {
+            // Saturation can make distinct out-of-domain offsets equal.
+            // Compare their significant decimal digits to detect inversion.
+            let start_digits = start_s.trim_start_matches('0');
+            let end_digits = end_s.trim_start_matches('0');
+            if (start_digits.len(), start_digits) > (end_digits.len(), end_digits) {
                 return RangeOutcome::Full;
             }
             if start >= len {
@@ -293,6 +297,56 @@ mod tests {
             parse(Some("  bytes=0-9  "), 100),
             RangeOutcome::Partial(ByteRange { start: 0, end: 9 })
         );
+    }
+
+    #[test]
+    fn overflowing_numerals_resolve_against_the_body_without_wrapping() {
+        let whole = RangeOutcome::Partial(ByteRange {
+            start: 0,
+            end: u64::MAX - 1,
+        });
+        for header in [
+            "bytes=-18446744073709551616",
+            "bytes=0-18446744073709551616",
+        ] {
+            assert_eq!(parse(Some(header), u64::MAX), whole, "{header}");
+            assert_eq!(
+                parse(Some(header), 0),
+                RangeOutcome::Unsatisfiable,
+                "{header}"
+            );
+        }
+        for header in [
+            "bytes=18446744073709551616-",
+            "bytes=18446744073709551616-18446744073709551617",
+        ] {
+            assert_eq!(
+                parse(Some(header), u64::MAX),
+                RangeOutcome::Unsatisfiable,
+                "{header}"
+            );
+        }
+        for header in [
+            "bytes=18446744073709551617-18446744073709551616",
+            "bytes=18446744073709551616-0,0-1",
+        ] {
+            assert_eq!(
+                parse(Some(header), u64::MAX),
+                RangeOutcome::Full,
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_http_optional_whitespace_is_trimmed() {
+        assert_eq!(
+            parse(Some("\t bytes=-1 \t"), 10),
+            RangeOutcome::Partial(ByteRange { start: 9, end: 9 })
+        );
+        for header in ["\nbytes=-1", "bytes=-1\r", "\u{a0}bytes=-1"] {
+            assert_eq!(parse(Some(header), 10), RangeOutcome::Full);
+        }
     }
 
     #[test]

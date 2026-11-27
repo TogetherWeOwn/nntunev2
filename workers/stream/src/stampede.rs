@@ -33,8 +33,8 @@ use std::time::Duration;
 /// replaced once and briefly overlap its replacement; the waiters then take
 /// whichever success lands first. That bounded overlap avoids parking a waiter
 /// behind a single wedged leader. If the replacement also stalls, its waiters
-/// keep waiting in timeout chunks with no overall deadline until either fetch
-/// settles; callers needing a hard bound must add their own.
+/// park until a result or abandonment; callers needing a hard deadline must
+/// bound their fetches.
 pub const SINGLEFLIGHT_WAIT_TIMEOUT_MS: u64 = 5_000;
 
 /// Singleflight key for a segment fetch: the NZB segment message-id,
@@ -55,6 +55,7 @@ pub fn flight_key(segment_id: &str) -> String {
 
 struct FlightState<T, E> {
     done: bool,
+    abandoned: bool,
     result: Option<Result<T, E>>,
     successor: Option<Arc<Flight<T, E>>>,
 }
@@ -74,6 +75,7 @@ impl<T, E> Flight<T, E> {
         Self {
             state: Mutex::new(FlightState {
                 done: false,
+                abandoned: false,
                 result: None,
                 successor: None,
             }),
@@ -140,12 +142,11 @@ where
     /// the air.
     pub fn call(&self, key: &str, fetch: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
         let mut fetch = Some(fetch);
-        // A flight a timed-out waiter was told to join, if any.
+        // A flight a re-electing waiter was told to join, if any.
         let mut joined: Option<Arc<Flight<T, E>>> = None;
-        // Whether this caller has already timed out once. A flight it goes on
-        // to lead is then a replacement, even when elected fresh after a
-        // leader panic.
-        let mut has_timed_out = false;
+        // After a timeout or abandonment, a new claim by this caller is
+        // already a replacement, even if the registry slot was cleared.
+        let mut re_electing = false;
         loop {
             let flight = match joined.take() {
                 Some(flight) => flight,
@@ -158,7 +159,7 @@ where
                     if let Some(flight) = slot.current.clone() {
                         flight
                     } else {
-                        let is_replacement = has_timed_out || slot.outstanding > 0;
+                        let is_replacement = re_electing || slot.outstanding > 0;
                         let flight = Arc::new(Flight::new(is_replacement));
                         slot.current = Some(Arc::clone(&flight));
                         slot.outstanding += 1;
@@ -173,9 +174,9 @@ where
                 return result;
             }
 
-            // Timed out on `flight`. Checks run under the registry lock, so a
-            // leader that settles in the gap is seen as completed here.
-            has_timed_out = true;
+            // The wait ended on timeout or abandonment. Check under the
+            // registry lock so a leader settling in the gap is seen here.
+            re_electing = true;
             let mut registry = self.registry();
             if let Some(result) = Self::completed(&flight) {
                 return result;
@@ -187,10 +188,7 @@ where
             let current = registry.get(key).and_then(|slot| slot.current.clone());
             match current {
                 Some(current) if Arc::ptr_eq(&current, &flight) => {
-                    if flight.is_replacement {
-                        joined = Some(flight);
-                        continue;
-                    }
+                    debug_assert!(!flight.is_replacement);
                     let replacement = Arc::new(Flight::new(true));
                     flight
                         .state
@@ -216,7 +214,7 @@ where
     /// Run `fetch` as the leader of `flight`, then settle: the outcome goes to
     /// the flight and to the replacement it was superseded by (if still
     /// pending), and the leader's slot is released. A panicking `fetch`
-    /// releases the slot without a result; its waiters recover via timeout.
+    /// releases the slot without a result and wakes its waiters to re-elect.
     fn lead(
         &self,
         key: &str,
@@ -230,7 +228,6 @@ where
             armed: true,
         };
         let result = fetch();
-        unsettled.armed = false;
         let mut registry = self.registry();
         Self::publish(&flight, result.clone());
         if let (Some(successor), Ok(_)) = (Self::successor(&flight), &result) {
@@ -239,6 +236,7 @@ where
             Self::publish(&successor, result.clone());
         }
         release(&mut registry, key, &flight);
+        unsettled.armed = false;
         result
     }
 
@@ -257,14 +255,23 @@ where
         }
     }
 
-    /// Wait for the leader's outcome; `None` on timeout signals that the
-    /// caller should re-run leader election.
+    /// Wait for the leader's outcome; `None` after timeout or abandonment
+    /// signals that the caller should re-run leader election.
     fn wait(flight: &Flight<T, E>, timeout: Duration) -> Option<Result<T, E>> {
         let state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (state, _) = flight
-            .ready
-            .wait_timeout_while(state, timeout, |s| !s.done)
-            .unwrap_or_else(|e| e.into_inner());
+        let pending = |s: &mut FlightState<T, E>| !s.done && !s.abandoned;
+        let state = if flight.is_replacement {
+            flight
+                .ready
+                .wait_while(state, pending)
+                .unwrap_or_else(|e| e.into_inner())
+        } else {
+            flight
+                .ready
+                .wait_timeout_while(state, timeout, pending)
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+        };
         state.done.then(|| {
             state
                 .result
@@ -305,8 +312,8 @@ where
     }
 }
 
-/// Unregisters a leader's slot when its `fetch` panics. Disarmed on the
-/// normal path, where `lead` settles the flight under the same lock.
+/// Unregisters a leader's slot if fetching or publishing panics. Disarmed
+/// after `lead` settles the flight under the same lock.
 struct Unsettled<'a, T, E> {
     registry: &'a Mutex<Registry<T, E>>,
     key: &'a str,
@@ -319,6 +326,9 @@ impl<T, E> Drop for Unsettled<'_, T, E> {
         if self.armed {
             let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
             release(&mut registry, self.key, self.flight);
+            let mut state = self.flight.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.abandoned = true;
+            self.flight.ready.notify_all();
         }
     }
 }
@@ -1060,6 +1070,57 @@ mod tests {
 
         let result = group.call(&key, || Ok::<_, String>(b"recovered".to_vec()));
         assert_eq!(result.unwrap(), b"recovered");
+    }
+
+    #[test]
+    fn panicking_result_clone_releases_the_leaders_claim() {
+        struct PanicOnClone;
+
+        impl Clone for PanicOnClone {
+            fn clone(&self) -> Self {
+                panic!("simulated panic while publishing a fetch result")
+            }
+        }
+
+        let group = Singleflight::<PanicOnClone, &str>::new();
+        let key = "segment";
+        let panic = std::panic::catch_unwind(|| group.call(key, || Ok(PanicOnClone)));
+        assert!(panic.is_err());
+        assert!(group.registry().is_empty());
+        assert!(matches!(
+            group.call(key, || Err("next fetch")),
+            Err("next fetch")
+        ));
+        assert!(group.registry().is_empty());
+    }
+
+    #[test]
+    fn abandoned_replacement_releases_only_its_own_claim() {
+        let group = Singleflight::<(), ()>::with_timeout(Duration::ZERO);
+        let key = "segment";
+        group
+            .call(key, || {
+                let mut replacement = None;
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    group.call(key, || {
+                        replacement = group.registry().get(key).unwrap().current.clone();
+                        panic!("simulated replacement panic")
+                    })
+                }));
+                assert!(panic.is_err());
+                let replacement = replacement.unwrap();
+                assert!(replacement.state.lock().unwrap().abandoned);
+                assert_eq!(Singleflight::wait(&replacement, Duration::MAX), None);
+                let mut registry = group.registry();
+                let slot = registry.get_mut(key).unwrap();
+                assert_eq!(slot.outstanding, 1);
+                assert!(slot.current.is_none());
+                drop(registry);
+                assert_eq!(group.call(key, || Ok(())), Ok(()));
+                Ok(())
+            })
+            .unwrap();
+        assert!(group.registry().is_empty());
     }
 
     #[test]
