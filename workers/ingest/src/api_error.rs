@@ -5,7 +5,8 @@
 //! the registry HTTP status. Validation messages are user-facing by
 //! construction; 5xx messages never carry binding or upstream detail.
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
+use std::ops::Deref;
 
 use crate::nzb_intake::IntakeRejection;
 
@@ -97,13 +98,30 @@ fn message_for_server_error(code: &str) -> &'static str {
 
 /// A user-facing error ready for the HTTP layer: `status` is the response
 /// status, the serialized body is exactly `{code, message, retryable}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
-    pub code: &'static str,
+    spec: CodeSpec,
     pub message: String,
-    pub retryable: bool,
-    #[serde(skip)]
-    pub status: u16,
+}
+
+impl Deref for ApiError {
+    type Target = CodeSpec;
+
+    fn deref(&self) -> &CodeSpec {
+        &self.spec
+    }
+}
+
+impl Serialize for ApiError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let message = if self.status >= 500 {
+            message_for_server_error(self.code)
+        } else {
+            &self.message
+        };
+        serde_json::json!({"code": self.code, "message": message, "retryable": self.retryable})
+            .serialize(serializer)
+    }
 }
 
 impl ApiError {
@@ -112,19 +130,12 @@ impl ApiError {
     /// registered codes keep the caller's message.
     pub fn by_code(code: &str, message: impl Into<String>) -> Self {
         let spec = spec(code);
-        let message = if spec.code != code {
-            "unexpected error".to_string()
-        } else if spec.status >= 500 {
+        let message = if spec.status >= 500 {
             message_for_server_error(spec.code).to_string()
         } else {
             message.into()
         };
-        Self {
-            code: spec.code,
-            message,
-            retryable: spec.retryable,
-            status: spec.status,
-        }
+        Self { spec, message }
     }
 
     pub fn unauthorized(message: impl Into<String>) -> Self {

@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::dispatch::{content_sha256_hex, PAYLOAD_KEY_PREFIX};
 use crate::jobs::{JobSource, JobState};
 
 /// Ordered Workflow steps; `repair` runs only when verify asks for it.
@@ -85,6 +86,14 @@ pub struct QueueMsg {
     /// clobber a checkpoint that already carries an id.
     #[serde(default)]
     pub provider_id: Option<String>,
+}
+
+impl QueueMsg {
+    /// Check bytes read from the content-addressed upload store.
+    pub(crate) fn matches_upload_payload(&self, payload: &[u8]) -> bool {
+        let digest = content_sha256_hex(payload);
+        self.payload_ref.as_deref() == Some(&format!("{PAYLOAD_KEY_PREFIX}{digest}"))
+    }
 }
 
 /// Native par2 repair dispatched to the Container batch job via the

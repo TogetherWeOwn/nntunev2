@@ -20,7 +20,8 @@
 //! writers-wiring follow-up; this module pins the statements, the
 //! parameter orders, and the zero-row classification that wiring uses.
 
-use crate::jobs::validate_job_id;
+use crate::dispatch::make_job_id;
+use crate::jobs::derive_idempotency_key;
 
 /// Latest bindable `accepted_at`: mirrors the migration `CHECK`
 /// (`accepted_at <= 253402300799`), so a caller clock fault fails here
@@ -101,24 +102,27 @@ pub fn validate_transition_status(raw: &str) -> bool {
 
 /// Check admission values before they touch the database. Bounds mirror
 /// migration 0021 (`CHECK`s on `id`, `idempotency_key`, `accepted_at`);
-/// the key shape mirrors the ingest key (`ingest:` prefix).
+/// the key and deterministic job id must bind the same owner and source.
 pub fn validate_admit_params(
     job_id: &str,
     user_id: &str,
     idempotency_key: &str,
     accepted_at: i64,
 ) -> Result<(), &'static str> {
-    if !validate_job_id(job_id) {
-        return Err("job id must be 1..=64 url-safe chars");
+    let invalid_key = "invalid ingest idempotency key";
+    if idempotency_key.len() > MAX_ADMIT_KEY_BYTES {
+        return Err(invalid_key);
     }
-    if user_id.is_empty() || user_id.len() > 128 {
-        return Err("user id must be 1..=128 chars");
+    let (key_user, rest) = idempotency_key
+        .strip_prefix("ingest:")
+        .and_then(|key| key.split_once(':'))
+        .ok_or(invalid_key)?;
+    let (sha, source_ref) = rest.split_once(':').ok_or(invalid_key)?;
+    if key_user != user_id || derive_idempotency_key(user_id, sha, source_ref)? != idempotency_key {
+        return Err(invalid_key);
     }
-    if idempotency_key.len() > MAX_ADMIT_KEY_BYTES
-        || !idempotency_key.starts_with("ingest:")
-        || idempotency_key.bytes().filter(|b| *b == b':').count() < 2
-    {
-        return Err("idempotency key must be an ingest key of 1..=768 chars");
+    if job_id != make_job_id(user_id, sha, source_ref) {
+        return Err("job id does not match ingest idempotency key");
     }
     if !(0..=MAX_ACCEPTED_AT_SECS).contains(&accepted_at) {
         return Err("accepted_at must be 0..=253402300799 unix seconds");
@@ -234,17 +238,19 @@ mod tests {
 
     #[test]
     fn admission_params_are_validated_before_they_touch_the_database() {
-        let key = format!("ingest:user_01:{}:upload", "a".repeat(64));
-        assert!(validate_admit_params("job_0123456789abcdef", "user_01", &key, 1700000000).is_ok());
+        let sha = "a".repeat(64);
+        let key = format!("ingest:user_01:{sha}:upload");
+        let id = make_job_id("user_01", &sha, "upload");
+        assert!(validate_admit_params(&id, "user_01", &key, 1700000000).is_ok());
         assert!(validate_admit_params("", "user_01", &key, 1700000000).is_err());
         assert!(validate_admit_params("job_1", "", &key, 1700000000).is_err());
         assert!(validate_admit_params("job_1", &"u".repeat(129), &key, 1700000000).is_err());
         assert!(validate_admit_params("job_1", "user_01", "not-our-key", 1700000000).is_err());
         assert!(validate_admit_params("job_1", "user_01", "ingest:abc", 1700000000).is_err());
         assert!(validate_admit_params("job_1", "user_01", &"k".repeat(769), 1700000000).is_err());
-        assert!(validate_admit_params("job_1", "user_01", &key, -1).is_err());
-        assert!(validate_admit_params("job_1", "user_01", &key, 253402300800).is_err());
-        assert!(validate_admit_params("job_1", "user_01", &key, 0).is_ok());
-        assert!(validate_admit_params("job_1", "user_01", &key, MAX_ACCEPTED_AT_SECS).is_ok());
+        assert!(validate_admit_params(&id, "user_01", &key, -1).is_err());
+        assert!(validate_admit_params(&id, "user_01", &key, 253402300800).is_err());
+        assert!(validate_admit_params(&id, "user_01", &key, 0).is_ok());
+        assert!(validate_admit_params(&id, "user_01", &key, MAX_ACCEPTED_AT_SECS).is_ok());
     }
 }

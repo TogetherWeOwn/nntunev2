@@ -1115,22 +1115,14 @@ impl MbFetchFailure {
     }
 }
 
-/// Load the upload payload for match-query derivation only (it was
-/// digest-checked and parsed in `Parsing`). Absence is distinguished
-/// from failure: a genuinely missing payload (its 30-day TTL expired
-/// before the job reached `Matching`) yields `Ok(None)` and the job is
-/// written unmatched, while a binding/read failure is a transient
-/// `ERR_MATCH_FAILED` — a KV blip must not bake a permanent unmatched
-/// `Done` into the library.
-async fn load_payload_for_match(env: &Env, msg: &QueueMsg) -> Result<Option<String>, JobError> {
-    let transient = |detail: &'static str| JobError::transient(ERR_MATCH_FAILED, detail);
-    let Some(payload_ref) = msg.payload_ref.as_deref() else {
-        return Ok(None);
-    };
-    let store = env
-        .kv(PAYLOAD_KV_BINDING)
-        .map_err(|_| transient("upload payload unavailable"))?;
-    store
+/// Recheck the upload digest before deriving a match query. Missing bytes
+/// retry within the job budget, since a KV miss cannot establish that the
+/// upload has no catalogue match.
+async fn load_payload_for_match(env: &Env, msg: &QueueMsg) -> Result<String, JobError> {
+    let unavailable = || JobError::transient(ERR_MATCH_FAILED, "upload payload unavailable");
+    let payload_ref = msg.payload_ref.as_deref().ok_or_else(unavailable)?;
+    let store = env.kv(PAYLOAD_KV_BINDING).map_err(|_| unavailable())?;
+    let payload = store
         .get(payload_ref)
         .cache_ttl(PAYLOAD_CACHE_TTL_SECS)
         .text()
@@ -1142,8 +1134,22 @@ async fn load_payload_for_match(env: &Env, msg: &QueueMsg) -> Result<Option<Stri
                 "ingest.match_payload.read_failed",
                 serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
             );
-            transient("upload payload unavailable")
-        })
+            unavailable()
+        })?;
+    validate_match_payload(msg, payload)
+}
+
+/// Classify the upload bytes read from KV before matching.
+pub fn validate_match_payload(msg: &QueueMsg, payload: Option<String>) -> Result<String, JobError> {
+    let payload = payload
+        .ok_or_else(|| JobError::transient(ERR_MATCH_FAILED, "upload payload unavailable"))?;
+    if !msg.matches_upload_payload(payload.as_bytes()) {
+        return Err(JobError::permanent(
+            ERR_MATCH_FAILED,
+            "upload payload digest mismatch",
+        ));
+    }
+    Ok(payload)
 }
 
 /// The query the MB lookup runs for this job: the search text for
@@ -1156,9 +1162,7 @@ async fn match_query(env: &Env, msg: &QueueMsg) -> Result<Option<String>, JobErr
             msg.query.as_deref().unwrap_or(""),
         )),
         JobSource::NzbUpload => {
-            let Some(payload) = load_payload_for_match(env, msg).await? else {
-                return Ok(None);
-            };
+            let payload = load_payload_for_match(env, msg).await?;
             let subjects: Vec<String> = match nntune_core::nzb::parse(payload.as_bytes()) {
                 Ok(document) => document
                     .files
@@ -1944,11 +1948,6 @@ async fn persist(env: &Env, cp: &JobCheckpoint, trace_id: &str) -> bool {
 }
 
 async fn process_message(env: &Env, msg: &QueueMsg) -> Settlement {
-    if validate_queue_msg(msg).is_err() {
-        // Poison shape: no trustworthy job identity to checkpoint against.
-        // Native Queue retries move it to the dead-letter queue.
-        return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
-    }
     let mut cp = match crate::checkpoint::get(env, &msg.job_id).await {
         Ok(Some(cp)) => {
             if !checkpoint_matches(msg, &cp) {
@@ -2092,6 +2091,10 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
             return;
         }
     };
+    if validate_queue_msg(&msg).is_err() {
+        retry_raw(&raw, UNPERSISTED_RETRY_SECS);
+        return;
+    }
     // The route stamped this job's trace on the message; keep a valid ID so
     // the consumer's line correlates with the intake lines, and hand a valid
     // ID to any continuation this delivery enqueues. An invalid value is
