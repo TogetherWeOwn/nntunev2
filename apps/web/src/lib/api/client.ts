@@ -807,21 +807,14 @@ export class ApiClient {
 			const aborted = new Promise<never>((_, reject) => {
 				signal.addEventListener('abort', () => reject(signal.reason), { once: true });
 			});
-			const dispatch = async () => {
-				const response = await this.fetchFn(url, {
-					...init,
-					...(session && { cache: 'no-store' } as const),
-					redirect: 'error',
-					signal,
-					headers,
-					credentials: 'include'
-				});
-				if (signal.aborted) {
-					void response.body?.cancel().catch(() => undefined);
-					signal.throwIfAborted();
-				}
-				return response;
-			};
+			const dispatch = async () => this.fetchFn(url, {
+				...init,
+				...(session && { cache: 'no-store' } as const),
+				redirect: 'error',
+				signal,
+				headers,
+				credentials: 'include'
+			});
 			const intent = route === REVOKE_ALL ? { stale: staleSession(), revocation: { generation: expected } }
 				: route === LOGOUT ? { stale: staleSession() } : undefined;
 			// The caller can time out while the mutation fence still holds until dispatch settles.

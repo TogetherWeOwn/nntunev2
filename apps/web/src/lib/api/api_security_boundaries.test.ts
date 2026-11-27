@@ -99,6 +99,18 @@ it.each([true, false])('checks the origin of the document base (same origin: %s)
 	}
 });
 
+it('discards a late response without touching its body after the caller leaves', async () => {
+	const scope = new AbortController();
+	const transport = Promise.withResolvers<Response>();
+	const client = new ApiClient({ baseUrl: '', fetchFn: () => transport.promise, signal: scope.signal });
+	const result = client.get('/health');
+	scope.abort();
+	const late = new Response('{}');
+	transport.resolve(late);
+	await expect(result).rejects.toBe(scope.signal.reason);
+	expect(late.bodyUsed).toBe(false);
+});
+
 it.each(['fetch', 'body'])('times out when an ordinary GET stalls during %s', async (phase) => {
 	vi.useFakeTimers();
 	try {
