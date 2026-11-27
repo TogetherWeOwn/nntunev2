@@ -7,10 +7,11 @@ import http.client
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import tomllib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.error
 
 import alerts_staging as guard
@@ -197,6 +198,11 @@ def page_info(page, count, total_count, **extra):
 
 
 class PaginationAndTransportTests(unittest.TestCase):
+    def stub_response(self, opener):
+        response = opener.return_value.open.return_value.__enter__.return_value
+        response.headers = http.client.HTTPMessage()
+        return response
+
     def test_live_single_page_shape_without_total_pages_is_verified(self):
         requested = []
         batch = unrelated(10) + fixtures()[1]
@@ -310,7 +316,7 @@ class PaginationAndTransportTests(unittest.TestCase):
                               ({"success": True}, "API_RESULT_MISSING"),
                               ([], "API_UNSUCCESSFUL")):
             with patch.object(guard.urllib.request, "build_opener") as opener:
-                response = opener.return_value.open.return_value.__enter__.return_value
+                response = self.stub_response(opener)
                 response.read.return_value = json.dumps(payload).encode()
                 with self.assertRaisesRegex(guard.GuardError, code) as raised:
                     guard.api_get(f"scripts/{guard.WORKER}/settings", ACCOUNT, "test-token")
@@ -325,22 +331,47 @@ class PaginationAndTransportTests(unittest.TestCase):
 
     def test_transport_rejects_oversized_responses(self):
         with patch.object(guard.urllib.request, "build_opener") as opener:
-            response = opener.return_value.open.return_value.__enter__.return_value
+            response = self.stub_response(opener)
             response.read.return_value = b"x" * (8 * 1024 * 1024 + 1)
             with self.assertRaisesRegex(guard.GuardError, "API_RESPONSE_TOO_LARGE"):
                 guard.api_get("unused", ACCOUNT, "test-token")
             response.read.assert_called_once_with(8 * 1024 * 1024 + 1)
 
+    def test_transport_requires_complete_unambiguous_http_body(self):
+        body = b'{"success":true,"result":{}}'
+        length = f"Content-Length: {len(body)}\r\n"
+        transfer = "Transfer-Encoding: chunked\r\n"
+        chunked_body = f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n"
+        for headers, wire_body, valid in (
+            (length, body, True), ("", body, True), (transfer, chunked_body, True),
+            (length + length, body, False), (f"Content-Length: {len(body) + 1}\r\n", body, False),
+            (length + transfer, chunked_body, False), ("Transfer-Encoding: invalid\r\n", body, False),
+        ):
+            with self.subTest(headers=headers), patch.object(guard.urllib.request, "build_opener") as opener:
+                wire = f"HTTP/1.1 200 OK\r\n{headers}\r\n".encode() + wire_body
+                response = http.client.HTTPResponse(Mock(makefile=Mock(return_value=io.BytesIO(wire))))
+                response.begin()
+                opener.return_value.open.return_value = response
+                if valid:
+                    self.assertEqual(guard.api_get("unused", ACCOUNT, "test-token")["result"], {})
+                else:
+                    with self.assertRaisesRegex(guard.GuardError, "^API_GET_FAILED$"):
+                        guard.api_get("unused", ACCOUNT, "test-token")
+
     def test_transport_errors_and_invalid_json_are_redacted(self):
-        for error in (urllib.error.URLError("private-canary"), TimeoutError("private-canary"),
-                      http.client.IncompleteRead(b"private-canary")):
+        for error in (urllib.error.URLError("private-canary"), TimeoutError("private-canary")):
             with patch.object(guard.urllib.request, "build_opener") as opener:
                 opener.return_value.open.side_effect = error
                 with self.assertRaisesRegex(guard.GuardError, "API_GET_FAILED") as raised:
                     guard.api_get("unused", ACCOUNT, "test-token")
                 self.assertNotIn("private-canary", str(raised.exception))
         with patch.object(guard.urllib.request, "build_opener") as opener:
-            opener.return_value.open.return_value.__enter__.return_value.read.return_value = b"private-canary"
+            read = self.stub_response(opener).read
+            read.side_effect = http.client.IncompleteRead(b"private-canary")
+            with self.assertRaisesRegex(guard.GuardError, "^API_GET_FAILED$"):
+                guard.api_get("unused", ACCOUNT, "test-token")
+            read.side_effect = None
+            read.return_value = b"private-canary"
             with self.assertRaisesRegex(guard.GuardError, "API_JSON_INVALID"):
                 guard.api_get("unused", ACCOUNT, "test-token")
 
@@ -350,12 +381,19 @@ class PaginationAndTransportTests(unittest.TestCase):
                      b'{"success":true,"result":NaN}',
                      b'{"success":true,"result":' + b"[" * 10_000 + b"0" + b"]" * 10_000 + b"}"):
             with self.subTest(body=body[:64]), patch.object(guard.urllib.request, "build_opener") as opener:
-                opener.return_value.open.return_value.__enter__.return_value.read.return_value = body
+                self.stub_response(opener).read.return_value = body
                 with self.assertRaisesRegex(guard.GuardError, "^API_JSON_INVALID$"):
                     guard.api_get("unused", ACCOUNT, "test-token")
 
 
 class ConfigAndFreezeTests(unittest.TestCase):
+    def test_alert_cli_runs_without_other_scripts_in_the_checkout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / "alerts_staging.py"
+            script.write_bytes(Path(guard.__file__).read_bytes())
+            result = subprocess.run([guard.sys.executable, "-I", str(script), "--help"], capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
     def test_logs_url_rejections(self):
         guard.validate_logs_url(LOGS)
         for url in ("", None, "https://dash.cloudflare.com/" + "x" * 1024,

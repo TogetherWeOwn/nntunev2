@@ -3,6 +3,7 @@
 
 import argparse
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 import hashlib
 import http.client
 import json
@@ -15,8 +16,6 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-
-from staging_api_identity import UUID, Unavailable, decode, valid
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULES = tuple(
@@ -34,6 +33,8 @@ PRODUCER = "nntune-api-staging"
 COMPATIBILITY_DATE = "2026-10-01"
 REQUIRED_BINDINGS = {"PRODUCER_SCRIPT_NAME", "LOGS_URL", "ALERT_WINDOWS"}
 WEBHOOK = "OPS_ALERT_WEBHOOK_URL"
+VERSION_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 class GuardError(ValueError):
@@ -130,6 +131,17 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def unique_fields(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError
+    return result
+
+
+def reject_constant(_):
+    raise ValueError
+
+
 def api_get(path, account_id, token):
     logs_url(account_id)
     require(bool(token), "API_TOKEN_MISSING")
@@ -139,14 +151,25 @@ def api_get(path, account_id, token):
     )
     try:
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=20) as response:
-            raw = response.read(8 * 1024 * 1024 + 1)
-        require(len(raw) <= 8 * 1024 * 1024, "API_RESPONSE_TOO_LARGE")
-        payload = decode(raw, "API_JSON_INVALID")
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+            require(len(raw) <= MAX_RESPONSE_BYTES, "API_RESPONSE_TOO_LARGE")
+            lengths = response.headers.get_all("Content-Length", [])
+            transfers = response.headers.get_all("Transfer-Encoding", [])
+            require(not transfers or (not lengths and [value.lower() for value in transfers] == ["chunked"]),
+                    "API_GET_FAILED")
+            # A bounded HTTPResponse.read can return short without raising.
+            require(not lengths or (
+                len(lengths) == 1
+                and re.fullmatch(r"[0-9]{1,10}", lengths[0])
+                and int(lengths[0]) == len(raw)
+            ), "API_GET_FAILED")
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields,
+                             parse_constant=reject_constant, parse_float=Decimal)
     except GuardError:
         raise
     except (OSError, http.client.HTTPException):
         raise GuardError("API_GET_FAILED") from None
-    except (ValueError, Unavailable):
+    except (ValueError, RecursionError, InvalidOperation):
         raise GuardError("API_JSON_INVALID") from None
     require(isinstance(payload, dict) and payload.get("success") is True, "API_UNSUCCESSFUL")
     require("result" in payload, "API_RESULT_MISSING")
@@ -242,7 +265,8 @@ def verify(settings, namespaces, subdomain, versions, expected_logs):
     require(isinstance(items, list) and bool(items) and isinstance(items[0], dict),
             "VERSION_EVIDENCE_MISSING")
     version_id = items[0].get("id")
-    require(valid(UUID, version_id), "VERSION_EVIDENCE_MISSING")
+    require(isinstance(version_id, str) and VERSION_ID.fullmatch(version_id),
+            "VERSION_EVIDENCE_MISSING")
     return {"worker": WORKER, "version_id": version_id,
             "do_namespace_id": mine[0]["id"], "bindings": sorted(by_name)}
 
