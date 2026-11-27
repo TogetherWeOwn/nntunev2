@@ -435,9 +435,9 @@ async fn parse_rejects_traversal_uuid_and_binding_bounds_and_isolates_cross_buck
         );
     }
 
-    // Verify cross-bucket and cross-object locators fail closed at both
-    // S3MediaMetadata::from_trusted_context and production read_s3_range_chunk
-    // with zero body reads while keeping stored metadata intact.
+    // Metadata construction checks the object key against the trusted context.
+    // The range reader rejects both bucket and object mismatches before reading
+    // the body, leaving the stored metadata intact.
     let trusted = context();
     let versioned = locator(S3Binding::VersionId(VERSION.into()));
     let stored = S3MediaMetadata::from_trusted_context(versioned.clone(), &trusted).unwrap();
