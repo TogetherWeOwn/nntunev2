@@ -4,6 +4,7 @@
 // Selectors and receipt JSON are untrusted. No deploy, credential fallback or
 // unchecked publication is available here; exhausted discovery fails closed.
 const { execFileSync } = require("node:child_process");
+const { createHash } = require("node:crypto");
 const path = require("node:path");
 
 const WORKFLOW = ".github/workflows/deploy-production.yml";
@@ -33,7 +34,7 @@ function requireProof(condition, reason) {
 
 function id(value) {
   return (Number.isSafeInteger(value) && value > 0) ||
-    (typeof value === "string" && /^[1-9][0-9]{0,15}$/.test(value))
+    (typeof value === "string" && /^[1-9][0-9]{0,15}$/.test(value) && Number.isSafeInteger(Number(value)))
     ? String(value)
     : null;
 }
@@ -223,11 +224,21 @@ function productionEvidence(repo) {
 }
 
 function verifyPromotion({ repo, sha }) {
+  const hint = process.env.PROMOTION_RUN_ID || "";
+  const attemptHint = process.env.PROMOTION_RUN_ATTEMPT || "";
+  if (hint || attemptHint) {
+    requireProof(
+      id(hint) && id(attemptHint),
+      "both run and attempt selectors must be positive decimal IDs",
+    );
+  }
   const { command, list, source, artifactFor, validateRun, workflow, requirePublishedJob } = productionEvidence(repo);
   function fromRun(runId, attempt) {
     const { run, job } = source(runId, attempt);
     requirePublishedJob(job);
     const { artifact, archive } = artifactFor(run, artifactName(sha, runId, attempt));
+    const digest = `sha256:${createHash("sha256").update(archive).digest("hex")}`;
+    requireProof(digest === artifact.digest, "artifact archive digest mismatch");
     // Read a fixed bounded member in memory; never gh run download/unzip or
     // filesystem extraction of untrusted paths. Python's stdlib checks CRC too.
     const bytes = command(
@@ -250,15 +261,7 @@ function verifyPromotion({ repo, sha }) {
     };
   }
 
-  const hint = process.env.PROMOTION_RUN_ID || "";
-  const attemptHint = process.env.PROMOTION_RUN_ATTEMPT || "";
-  if (hint || attemptHint) {
-    requireProof(
-      id(hint) && id(attemptHint),
-      "both run and attempt selectors must be positive decimal IDs",
-    );
-    return fromRun(hint, attemptHint);
-  }
+  if (hint) return fromRun(hint, attemptHint);
   // Do not filter by head_sha: preflight may select an older deployed SHA than
   // github.sha. No global-success filter: downstream publication may have failed.
   const runs = list(`workflows/${id(workflow.id)}/runs?branch=main`, "workflow_runs");

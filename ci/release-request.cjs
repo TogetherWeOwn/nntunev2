@@ -25,9 +25,19 @@ const WORKFLOW = ".github/workflows/deploy-production.yml";
 const JOBS = ["deploy-production"];
 
 function loadSections(file) {
-  const sections = JSON.parse(fs.readFileSync(file, "utf8")).packages["."]["changelog-sections"];
+  const sections = JSON.parse(fs.readFileSync(file, "utf8"))?.packages?.["."]?.["changelog-sections"];
   if (!Array.isArray(sections) || !sections.length)
     throw new Error(`${file} has no changelog-sections`);
+  const types = new Set();
+  for (const section of sections) {
+    const { type, section: label, hidden } = section ?? {};
+    if (typeof type !== "string" || !type.trim() || types.has(type) ||
+        typeof label !== "string" || !label.trim() ||
+        (hidden !== undefined && typeof hidden !== "boolean")) {
+      throw new Error(`${file} has invalid changelog-sections`);
+    }
+    types.add(type);
+  }
   return sections.map(({ type, section, hidden }) =>
     hidden ? { type, section, hidden: true } : { type, section },
   );

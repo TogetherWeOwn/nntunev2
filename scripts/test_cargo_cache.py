@@ -62,6 +62,23 @@ class CacheTests(unittest.TestCase):
     def save_policy(self):
         (self.pool / 'policy.json').write_text(json.dumps(self.policy))
 
+    def test_malformed_policy_is_refused(self):
+        policy = self.pool / 'policy.json'
+        valid = json.dumps(self.policy)
+        for raw in ('[]', valid.replace('"version": 1', '"version": true'),
+                    '{"version": 2,' + valid[1:], '{"extra": NaN,' + valid[1:]):
+            with self.subTest(raw=raw):
+                policy.write_text(raw)
+                with self.assertRaises(cache.Refusal):
+                    cache.load_policy(self.pool)
+
+    def test_policy_symlink_is_refused(self):
+        policy = self.pool / 'policy.json'
+        external = policy.rename(self.root / 'outside-policy.json')
+        policy.symlink_to(external)
+        with self.assertRaises(cache.Refusal):
+            cache.load_policy(self.pool)
+
     def start_fake(self, workspace=None):
         driver = ('import cargo_cache as c; from pathlib import Path; '
                   'c.run_cargo(Path(__import__("sys").argv[1]), ["check"], '
@@ -486,6 +503,19 @@ class CacheTests(unittest.TestCase):
             (slot / 'lease.json').write_text('{"wrapper_pid": 99999999}')
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
             cache.acquire(self.pool, self.policy, self.root)
+
+    def test_malformed_lease_is_preserved_and_next_slot_is_usable(self):
+        lease = self.pool / 'slot-0' / 'lease.json'
+        for raw in (f'{{"cargo_pgid": 1, "cargo_pgid": {self.dead_pgid()}}}',
+                    '{"cargo_pgid": 1099511627776}'):
+            with self.subTest(raw=raw):
+                lease.write_text(raw)
+                got, _, fd = cache.acquire(self.pool, self.policy, self.root)
+                try:
+                    self.assertEqual(got.name, 'slot-1')
+                    self.assertEqual(lease.read_text(), raw)
+                finally:
+                    os.close(fd)
 
     def dead_pgid(self):
         terminated = subprocess.Popen(['true'])
@@ -1320,6 +1350,33 @@ class SharedPoolRetainTests(unittest.TestCase):
         kwargs.setdefault('proc_root', self.proc)
         kwargs.setdefault('now', self.now)
         return cache.shared_pool_retain(self.pool, self.inventory, **kwargs)
+
+    def test_malformed_inventory_is_refused_before_mutation(self):
+        valid = self.inventory
+        for inventory in ([], {**valid, 'version': True},
+                          {**valid, 'captured_at_unix': 10 ** 400},
+                          {**valid, 'slots': [None]},
+                          {**valid, 'slots': [{**valid['slots'][0], 'status': []}]},
+                          {**valid, 'slots': [{**valid['slots'][0], 'issue_id': ['fixture']}]}):
+            with self.subTest(inventory=inventory):
+                self.inventory = inventory
+                with self.assertRaises(cache.Refusal):
+                    self.retain()
+                self.assertTrue((self.pool / 'slot-0' / 'target' / 'debug' / 'fixture').exists())
+
+    def test_inventory_commands_refuse_duplicate_json_fields(self):
+        inventory = self.root / 'inventory.json'
+        inventory.write_text('{"version":2,' + json.dumps({**self.inventory, 'workspaces': []})[1:])
+        for args in (['audit', '--worktrees', str(self.root)],
+                     ['retain', '--pool', str(self.pool), '--proc-root', str(self.proc)]):
+            argv = [str(SCRIPT), *args, '--inventory', str(inventory)]
+            err = io.StringIO()
+            with (self.subTest(command=args[0]), patch.object(sys, 'argv', argv),
+                  patch.object(cache, 'process_references', return_value=([], [])),
+                  contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO())):
+                self.assertEqual(cache.main(), 75)
+                self.assertEqual(json.loads(err.getvalue())['finding'], 'refused')
+        self.assertTrue((self.pool / 'slot-0' / 'target' / 'debug' / 'fixture').exists())
 
     def by_slot(self, receipt):
         return {row['slot']: row for row in receipt['slots']}

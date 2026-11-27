@@ -14,7 +14,7 @@
 // JSON over TOML, searching parent directories), so an unreviewed JSON
 // production config can never slip past the TOML shape check.
 // Tested by ci/test-check-production-secrets-shape.mjs (node --test, no install).
-import { existsSync, readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -170,6 +170,7 @@ function stripTomlComment(line, state) {
     if (ch === '"' || ch === "'") {
       const triple = ch.repeat(3);
       if (line.startsWith(triple, i)) {
+        out += '""'; // Preserve the value's string type without its contents.
         const closer = findTripleCloser(line, triple, i + 3);
         if (closer === -1) {
           state.long = triple;
@@ -233,12 +234,13 @@ function joinTomlStatements(text) {
     const code = stripTomlComment(line, stripState);
     buf += (buf ? " " : "") + code;
     scan(code);
-    if (depth === 0 && !quote && !stripState.long) {
+    if (quote) throw new Error("unfinished TOML statement");
+    if (depth === 0 && !stripState.long) {
       statements.push(buf);
       buf = "";
     }
   }
-  if (buf.trim()) statements.push(buf);
+  if (depth || stripState.long) throw new Error("unfinished TOML statement");
   return statements;
 }
 
@@ -246,18 +248,22 @@ function assignTomlPath(root, segments, value) {
   let node = root;
   for (let i = 0; i < segments.length - 1; i += 1) {
     const key = segments[i];
-    if (!node[key] || typeof node[key] !== "object" || Array.isArray(node[key])) node[key] = {};
+    if (typeof node[key] !== "object") node[key] = Object.create(null);
     node = node[key];
   }
   node[segments[segments.length - 1]] = value;
 }
 
 // Structural value parse: inline tables become key objects (recursively,
-// honouring dotted keys); everything else is opaque. Only key names are
-// ever inspected; values are never read or printed.
+// honouring dotted keys). Keep string types for the name field and treat
+// all scalar contents as opaque.
+const TOML_STRING = Symbol("string");
+const TOML_OTHER = Symbol("other");
+
 function parseTomlValue(text) {
   const trimmed = text.trim();
-  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return { scalar: true };
+  if (/^(?:"(?:[^"\\]|\\.)*"|'[^']*')$/.test(trimmed)) return TOML_STRING;
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return TOML_OTHER;
   const inner = trimmed.slice(1, -1);
   const entries = [];
   let quote = null;
@@ -279,26 +285,24 @@ function parseTomlValue(text) {
     }
   }
   entries.push(inner.slice(start));
-  const table = {};
+  const table = Object.create(null);
   for (const entry of entries) {
     if (!entry.trim()) continue;
     const assignment = splitTomlAssignment(entry);
     if (!assignment) continue;
-    const segments = splitTomlKey(assignment[0]).filter((s) => s !== "");
-    if (segments.length === 0) continue;
+    const segments = splitTomlKey(assignment[0]);
     assignTomlPath(table, segments, parseTomlValue(assignment[1]));
   }
   return table;
 }
 
 function productionBeyondName(root) {
-  const production = root?.env?.production;
-  if (!production || typeof production !== "object") return null;
-  const nodes = Array.isArray(production) ? production : [production];
-  for (const node of nodes) {
-    if (!node || typeof node !== "object" || Array.isArray(node)) return "env.production";
-    const extra = Object.keys(node).filter((key) => key !== "name");
-    if (extra.length > 0) return `env.production.${extra[0]}`;
+  if (typeof root.env !== "object") return root.env === undefined ? null : "env";
+  const production = root.env.production;
+  if (production === undefined) return null;
+  if (typeof production !== "object") return "env.production";
+  for (const key of Object.keys(production)) {
+    if (key !== "name" || production[key] !== TOML_STRING) return `env.production.${key}`;
   }
   return null;
 }
@@ -310,30 +314,27 @@ function refuseProductionTable(label) {
 }
 
 export function assertProductionSecretsShape(configText) {
-  const root = {};
+  const root = Object.create(null);
   let current = [];
   for (const statement of joinTomlStatements(configText)) {
     const trimmed = statement.trim();
     if (!trimmed) continue;
-    const header = /^\s*\[{1,2}\s*(.+?)\s*\]{1,2}\s*$/.exec(trimmed);
+    const arrayHeader = /^\[\[\s*(.+?)\s*\]\]$/.exec(trimmed);
+    const header = arrayHeader ?? /^\[\s*(.+?)\s*\]$/.exec(trimmed);
     if (header) {
-      const segments = splitTomlKey(header[1]).filter((s) => s !== "");
-      if (segments.length === 0) continue;
-      if (
-        segments.length > 2 &&
-        segments[0] === "env" &&
-        segments[1] === "production"
-      ) {
+      const segments = splitTomlKey(header[1]);
+      if (segments[0] === "env" &&
+          ((arrayHeader && segments.length === 1) ||
+           (segments[1] === "production" && (arrayHeader || segments.length > 2)))) {
         refuseProductionTable(segments.join("."));
       }
       current = segments;
-      assignTomlPath(root, segments, {});
+      assignTomlPath(root, segments, Object.create(null));
       continue;
     }
     const assignment = splitTomlAssignment(trimmed);
     if (!assignment) continue;
-    const segments = splitTomlKey(assignment[0]).filter((s) => s !== "");
-    if (segments.length === 0) continue;
+    const segments = splitTomlKey(assignment[0]);
     const full = [...current, ...segments];
     // The `name` leaf itself (e.g. `name = "..."` under [env.production])
     // is the allowed production name; anything else beyond env.production
@@ -351,11 +352,11 @@ export function assertProductionSecretsShape(configText) {
 // Config names wrangler prefers over wrangler.toml, in wrangler's own
 // resolution order (wrangler.json, then wrangler.jsonc, then wrangler.toml,
 // searching parent directories from the invocation cwd).
-const SHADOW_CONFIG_NAMES = ["wrangler.json", "wrangler.jsonc"];
+const SHADOW_CONFIG_NAMES = ["wrangler.json", "wrangler.jsonc", ".wrangler/deploy/config.json"];
 
 // Mirror wrangler's upward config search (deploy-production.yml runs
-// wrangler without --config from apps/web): any JSON config in appDir or
-// an ancestor up to and including stopDir shadows the TOML shape check.
+// wrangler without --config from apps/web): refuse config files and
+// generated-config redirects in appDir or its repo ancestors.
 // Returns the shadowing path, or null when the TOML is authoritative.
 // Paths only; file bodies are never read here.
 export function findShadowWranglerConfig(appDir, stopDir) {
@@ -364,7 +365,7 @@ export function findShadowWranglerConfig(appDir, stopDir) {
   while (dir === stop || dir.startsWith(stop + sep)) {
     for (const name of SHADOW_CONFIG_NAMES) {
       const candidate = join(dir, name);
-      if (existsSync(candidate)) return candidate;
+      if (lstatSync(candidate, { throwIfNoEntry: false })) return candidate;
     }
     if (dir === stop) return null;
     dir = dirname(dir);
@@ -394,14 +395,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const shadow = findShadowWranglerConfig(appDir, repoRoot);
     if (shadow) {
       throw new Error(
-        `${shadow} shadows apps/web/wrangler.toml: wrangler prefers wrangler.json/jsonc over wrangler.toml, so review JSON production config support in ci/check-production-secrets-shape.mjs before promoting`,
+        `${shadow} shadows apps/web/wrangler.toml: review Wrangler config selection in ci/check-production-secrets-shape.mjs before promoting`,
       );
     }
     assertProductionSecretsShape(readFileSync(join(appDir, "wrangler.toml"), "utf8"));
     console.log("Production Worker secret shape ok: no production vars or secret tables");
   } catch (error) {
     // Names only: never print values or file bodies on a failed check.
-    console.error(`::error::${error.message}`);
+    const message = error.message.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A");
+    console.error(`::error::${message}`);
     process.exitCode = 1;
   }
 }

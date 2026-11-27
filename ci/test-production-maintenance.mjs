@@ -163,6 +163,36 @@ test('missing, stale, mismatched or nonempty route proof refuses before Cloudfla
   assert.deepEqual(calls, []);
 });
 
+test('non-string credentials or route proof and invalid clocks refuse before Cloudflare access', async (t) => {
+  for (const [label, input, reason] of [
+    ['account type', { account: [account] }, /invalid production account/],
+    ['blank token', { token: '   ' }, /invalid production account/],
+    ['proof type', { routeProof: [routeProof] }, /malformed custodian route proof/],
+    ['invalid clock', { now: () => NaN }, /route proof must be fresh/],
+  ]) {
+    await t.test(label, async () => {
+      const { calls, run } = cloudflareFixture();
+      await assert.rejects(run(input), reason);
+      assert.deepEqual(calls, []);
+    });
+  }
+});
+
+test('a malformed final Worker deployment timestamp fails readback', async () => {
+  const { calls, request } = seedTransport({ account, checkedAt, sha, version, workerId });
+  await assert.rejects(seedMaintenance({
+    account, token: 'fixture-only', worker: workerId, sha, routeProof, now,
+    request: async (url, options) => {
+      const response = await request(url, options);
+      if (calls.length !== 9) return response;
+      const body = await response.json();
+      body.result.deployed_on = [checkedAt];
+      return Response.json(body);
+    },
+  }), /not confirmed deployed and unexposed/);
+  assert.equal(calls.filter(([method]) => method === 'POST').length, 1);
+});
+
 test('wrong deployment ID, allocation or page count fails readback without retry or deletion', async () => {
   for (const [id, version_id, percentage, total_pages] of [
     ['malformed', version, 100, 1],

@@ -5,7 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -137,6 +137,41 @@ describe("assertProductionSecretsShape", () => {
     assertProductionSecretsShape("[env.staging.vars]\n[other]\n");
   });
 
+  it("refuses malformed production shapes and unfinished statements", async (t) => {
+    for (const [label, config] of Object.entries({
+      productionArray: '[[env.production]]\nname = "x"\n',
+      envArray: '[[env]]\nproduction = { name = "x" }\n',
+      nameTable: '[env.production]\nname = { nested = "x" }\n',
+      nameArray: '[env.production]\nname = ["x"]\n',
+      trailingText: '[env.production]\nname = "x" unexpected\n',
+      splitQuote: 'env = { production = { name = "first\nsecond" } }\n',
+      emptyKey: 'env = { production = { "" = "x" } }\n',
+      unfinishedArray: 'metadata = [\n[env.production.vars]\n',
+    })) {
+      await t.test(label, () => {
+        assert.throws(() => assertProductionSecretsShape(config), /production secret requirements|unfinished TOML/);
+      });
+    }
+    assertProductionSecretsShape('[env.production]\nname = """x\n"""\n');
+  });
+
+  it("treats prototype names as ordinary TOML keys", (t) => {
+    const key = "secretsShapeTestField";
+    t.after(() => { delete Object.prototype[key]; });
+    assertProductionSecretsShape(`[__proto__.${key}]\n`);
+    assert.equal(Object.hasOwn(Object.prototype, key), false);
+  });
+
+  it("keeps decoded key characters on one workflow annotation line", () => {
+    const config = '[env.production."row\\u000anext%0A"]\n';
+    withTempRoot({ "apps/web/wrangler.toml": config }, (root) => {
+      const result = runChecker(root);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /row%0Anext%250A/);
+      assert.equal(result.stderr.trimEnd().split("\n").length, 1);
+    });
+  });
+
   it("CLI exits 1 on a temp tree whose toml declares production vars", () => {
     // Pins the entrypoint's refusal exit code: deleting
     // `process.exitCode = 1` prints ::error:: but exits 0, going red here.
@@ -181,6 +216,25 @@ describe("assertProductionSecretsShape", () => {
         assert.equal(runChecker(root).status, 0);
       },
     );
+  });
+
+  it("refuses a generated Wrangler config redirect without reading its target", () => {
+    withTempRoot({
+      "apps/web/wrangler.toml": CLEAN_TOML,
+      "apps/web/.wrangler/deploy/config.json": '{"configPath":"../../generated.toml"}',
+      "apps/web/generated.toml": BAD_TOML,
+    }, (root) => {
+      const result = runChecker(root);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /\.wrangler\/deploy\/config\.json shadows/);
+    });
+  });
+
+  it("refuses a dangling shadow file", () => {
+    withTempRoot({ "apps/web/wrangler.toml": CLEAN_TOML }, (root) => {
+      symlinkSync("missing.json", join(root, "apps/web/wrangler.json"));
+      assert.match(runChecker(root).stderr, /wrangler\.json shadows/);
+    });
   });
 
   it("shadow search stops at the repo root", () => {

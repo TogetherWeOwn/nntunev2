@@ -15,7 +15,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const { validateReceipt, artifactName, verifyPromotion } = require("./release-promotion-proof.cjs");
-const { buildRequest } = require("./release-request.cjs");
+const { buildRequest, loadSections } = require("./release-request.cjs");
 
 const REPO = "TogetherWeOwn/nntunev2";
 const SHA = "ab".repeat(20);
@@ -130,6 +130,22 @@ describe("buildRequest", () => {
     const second = buildRequest({ sha: SHA, receipt: goodReceipt(), artifact, sections });
     assert.equal(second.input.operation, first.input.operation);
   });
+});
+
+it("refuses malformed or ambiguous changelog section records", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "release-sections-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "config.json");
+  const valid = { type: "fix", section: "Fixed", hidden: false };
+  const write = (sections) => fs.writeFileSync(file, JSON.stringify({
+    packages: { ".": { "changelog-sections": sections } },
+  }));
+  for (const sections of [[{ ...valid, hidden: "false" }], [valid, valid], [null], [{ type: "fix" }]]) {
+    write(sections);
+    assert.throws(() => loadSections(file), /invalid changelog-sections/);
+  }
+  write([valid]);
+  assert.deepEqual(loadSections(file), [{ type: "fix", section: "Fixed" }]);
 });
 
 describe("release retry and repair wiring", () => {
@@ -270,13 +286,14 @@ describe("verifyPromotion", () => {
     "        if scenario == \"no-artifact\":",
     "            return respond({\"total_count\": 0, \"artifacts\": []})",
     "        data = build_zip()",
+    '        digest = "b" * 64 if scenario == "archive-digest-mismatch" else hashlib.sha256(data).hexdigest()',
     '        producer_sha = sha if scenario == "wrong-artifact-producer-sha" else head_sha',
     "        return respond({\"total_count\": 1, \"artifacts\": [{",
     "            \"id\": 555001,",
     "            \"name\": \"production-promotion-\" + sha + \"-\" + run_id + \"-\" + attempt,",
     "            \"expired\": False, \"size_in_bytes\": len(data),",
     '            \"expires_at\": \"2030-01-01T00:00:00Z\",',
-    '            "digest": "sha256:" + hashlib.sha256(data).hexdigest(),',
+    '            "digest": "sha256:" + digest,',
     "            \"workflow_run\": {\"id\": int(run_id), \"repository_id\": repo_id,",
     "                \"head_repository_id\": repo_id,",
     '                \"head_branch\": \"main\", \"head_sha\": producer_sha},',
@@ -353,6 +370,20 @@ describe("verifyPromotion", () => {
       () => withFakeGithub("wrong-artifact-producer-sha", () => verifyPromotion({ repo: REPO, sha: SHA })),
       { message: "production promotion proof refused: expired, oversized or mismatched artifact producer metadata" },
     );
+  });
+
+  it("refuses receipt bytes that disagree with the GitHub artifact digest", () => {
+    assert.throws(
+      () => withFakeGithub("archive-digest-mismatch", () => verifyPromotion({ repo: REPO, sha: SHA })),
+      /artifact archive digest mismatch/,
+    );
+  });
+
+  it("refuses a run selector that the release request cannot represent exactly", () => {
+    withFakeGithub("ok", () => {
+      process.env.PROMOTION_RUN_ID = "9007199254740993";
+      assert.throws(() => verifyPromotion({ repo: REPO, sha: SHA }), /selectors must be positive decimal IDs/);
+    });
   });
 
   it("refuses when no attempt-bound artifact exists", () => {

@@ -5,11 +5,14 @@ const name = 'nntune-web';
 const hexId = /^[0-9a-f]{32}$/;
 const shaPattern = /^[0-9a-f]{40}$/;
 const versionId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const timestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const matches = (pattern, value) => typeof value === 'string' && pattern.test(value);
 const empty = (value) => Array.isArray(value) && value.length === 0;
 const page = '?page=1&per_page=2';
 
 function requireRouteProof(raw, worker, sha, now) {
   let proof;
+  if (typeof raw !== 'string') throw new Error('Missing or malformed custodian route proof');
   try {
     proof = JSON.parse(raw);
   } catch {
@@ -19,7 +22,7 @@ function requireRouteProof(raw, worker, sha, now) {
   const checkedAt = typeof stamp === 'string' ? Date.parse(stamp) : NaN;
   if (proof?.worker_id !== worker || proof.sha !== sha || proof.route_count !== 0 ||
       !Number.isFinite(checkedAt) || stamp !== new Date(checkedAt).toISOString().slice(0, 19) + 'Z' ||
-      checkedAt > now || now - checkedAt > 30 * 60 * 1000) {
+      !Number.isFinite(now) || checkedAt > now || now - checkedAt > 30 * 60 * 1000) {
     throw new Error('Custodian route proof must be fresh, empty and bound to this Worker and SHA');
   }
 }
@@ -57,7 +60,8 @@ export function cloudflare(account, token, request) {
 }
 
 export async function seedMaintenance({ account, token, worker, sha, routeProof, request = fetch, now = Date.now }) {
-  if (!hexId.test(account ?? '') || !hexId.test(worker ?? '') || !token || !shaPattern.test(sha ?? '')) {
+  if (!matches(hexId, account) || !matches(hexId, worker) || !matches(shaPattern, sha) ||
+      !matches(/^[A-Za-z0-9._~+/-]+=*$/, token)) {
     throw new Error('Missing or invalid production account, immutable Worker ID, token or SHA');
   }
   const pinned = `/workers/${worker}`;
@@ -66,10 +70,14 @@ export async function seedMaintenance({ account, token, worker, sha, routeProof,
 
   async function workerState(deployed) {
     const { result } = await api(pinned, 'Worker identity');
+    const deployedOn = result.deployed_on;
+    const hasExpectedState = deployed
+      ? matches(timestamp, deployedOn) && Number.isFinite(Date.parse(deployedOn))
+      : deployedOn === null;
     if (result.id !== worker || result.name !== name ||
         !empty(result.references?.domains) || !Object.values(result.references).every(empty) ||
         result.subdomain?.enabled !== false || result.subdomain.previews_enabled !== false ||
-        (deployed ? !Number.isFinite(Date.parse(result.deployed_on)) : result.deployed_on !== null)) {
+        !hasExpectedState) {
       throw new Error(`Pinned Worker is not confirmed ${deployed ? 'deployed and' : 'undeployed and'} unexposed`);
     }
   }

@@ -27,6 +27,7 @@ import time
 GIB = 1024 ** 3
 DEFAULT_POOL = Path('/paperclip/.cache/nntunev2-bounded')
 TERMINAL = {'done', 'cancelled'}
+INVENTORY_STATUSES = TERMINAL | {'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}
 # Shipped placeholder prefix in scripts/cargo_pool_policy.json. load_policy
 # refuses it: a verbatim copy without Operator quota evidence must never
 # admit builds claiming the attested hard limit.
@@ -89,9 +90,33 @@ def available(path):
     return fs.f_bavail * fs.f_frsize
 
 
+def read_json_object(path):
+    def unique_keys(pairs):
+        record = dict(pairs)
+        if len(record) != len(pairs):
+            raise ValueError('duplicate JSON field')
+        return record
+
+    def refuse_constant(_value):
+        raise ValueError('non-JSON constant')
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, encoding='utf-8') as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise Refusal(f'not a regular JSON file: {path.name}')
+            record = json.load(source, object_pairs_hook=unique_keys,
+                               parse_constant=refuse_constant)
+    except (OSError, ValueError, RecursionError) as error:
+        raise Refusal(f'unreadable or malformed JSON file: {path.name}') from error
+    if not isinstance(record, dict):
+        raise Refusal(f'expected a JSON object: {path.name}')
+    return record
+
+
 def load_policy(pool):
-    policy = json.loads((pool / 'policy.json').read_text())
-    if policy.get('version') != 1:
+    policy = read_json_object(pool / 'policy.json')
+    if type(policy.get('version')) is not int or policy['version'] != 1:
         raise Refusal('unsupported pool policy')
     for field in ('slots', 'slot_budget_bytes', 'min_available_bytes', 'hard_limit_bytes'):
         if type(policy.get(field)) is not int or policy[field] <= 0:
@@ -250,15 +275,14 @@ def acquire(pool, policy, workspace):
                 # lease whose recorded Cargo process group is also dead is
                 # recovered here; anything else still needs the Operator.
                 try:
-                    lease = json.loads((slot / 'lease.json').read_text())
-                except (OSError, ValueError):
-                    lease = None
-                pgid = lease.get('cargo_pgid') if isinstance(lease, dict) else None
-                if (isinstance(pgid, int) and not isinstance(pgid, bool) and pgid > 0
+                    pgid = read_json_object(slot / 'lease.json').get('cargo_pgid')
+                except Refusal:
+                    pgid = None
+                if (type(pgid) is int and 0 < pgid < (1 << 31)
                         and measured < policy['slot_budget_bytes']
                         and not group_alive(pgid)):
                     print(json.dumps({'finding': 'stale_lease_recovered',
-                                      'slot': slot.name, **lease}, sort_keys=True),
+                                      'slot': slot.name, 'cargo_pgid': pgid}, sort_keys=True),
                           file=sys.stderr)
                     (slot / 'lease.json').unlink()
                 else:
@@ -885,6 +909,31 @@ def slot_output_inodes(target, scratch):
     return None, nodes
 
 
+def inventory_timestamp(inventory, now, max_age):
+    if (not isinstance(inventory, dict) or type(inventory.get('version')) is not int
+            or inventory['version'] != 1 or inventory.get('complete') is not True
+            or inventory.get('process_scope') != 'host'):
+        raise Refusal('need complete host-scope control-plane inventory')
+    captured = inventory.get('captured_at_unix')
+    if type(captured) not in (int, float) or not now - max_age <= captured <= now:
+        raise Refusal('control-plane inventory is stale or from the future')
+    return captured
+
+
+def attributed_path(row, label):
+    if not isinstance(row, dict):
+        raise Refusal(f'ambiguous {label} attribution')
+    raw = row.get('path')
+    if (not isinstance(raw, str) or not os.path.isabs(raw) or '\0' in raw
+            or type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool):
+        raise Refusal(f'ambiguous {label} attribution')
+    issue, status = row.get('issue_id'), row.get('status')
+    if (not isinstance(issue, str) or not issue.strip()
+            or not isinstance(status, str) or status not in INVENTORY_STATUSES):
+        raise Refusal(f'missing {label} attribution/status')
+    return raw
+
+
 def validate_shared_pool_inventory(pool, policy, inventory, now, max_age):
     """Validate a shared-pool retain inventory; refuse the whole run on ambiguity.
 
@@ -897,12 +946,7 @@ def validate_shared_pool_inventory(pool, policy, inventory, now, max_age):
     live_run covers running/queued/retry runs; referenced covers all
     execution/project/shared workspace refs. Returns (indexed, captured).
     """
-    if (inventory.get('version') != 1 or inventory.get('complete') is not True
-            or inventory.get('process_scope') != 'host'):
-        raise Refusal('need complete host-scope control-plane inventory')
-    captured = inventory.get('captured_at_unix')
-    if type(captured) not in (int, float) or not 0 <= now - captured <= max_age:
-        raise Refusal('control-plane inventory is stale or from the future')
+    captured = inventory_timestamp(inventory, now, max_age)
     rows = inventory.get('slots')
     if not isinstance(rows, list):
         raise Refusal('inventory slots must be a list')
@@ -910,17 +954,10 @@ def validate_shared_pool_inventory(pool, policy, inventory, now, max_age):
     identities = {}
     target_identities = {}
     for row in rows:
-        raw = row['path']
-        if not isinstance(raw, str) or not os.path.isabs(raw):
-            raise Refusal('ambiguous slot attribution')
+        raw = attributed_path(row, 'slot')
         canonical = os.path.normpath(raw)
         if raw != canonical or canonical in indexed:
             raise Refusal('ambiguous slot attribution')
-        if type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool:
-            raise Refusal('ambiguous slot attribution')
-        if not row.get('issue_id') or row.get('status') not in TERMINAL | {
-                'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}:
-            raise Refusal('missing slot attribution/status')
         try:
             resolved = os.path.realpath(canonical)
         except OSError:
@@ -1238,12 +1275,7 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
     worktrees = real_directory(worktrees)
     started = time.monotonic()
     now = time.time() if now is None else now
-    if (inventory.get('version') != 1 or inventory.get('complete') is not True
-            or inventory.get('process_scope') != 'host'):
-        raise Refusal('need complete host-scope control-plane inventory')
-    captured = inventory.get('captured_at_unix')
-    if type(captured) not in (int, float) or not 0 <= now - captured <= max_age:
-        raise Refusal('control-plane inventory is stale or from the future')
+    captured = inventory_timestamp(inventory, now, max_age)
     rows = inventory.get('workspaces')
     if not isinstance(rows, list):
         raise Refusal('inventory workspaces must be a list')
@@ -1251,22 +1283,15 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
     identities = {}
     target_identities = {}
     for row in rows:
-        raw = row['path']
+        raw = attributed_path(row, 'workspace')
         # Inventory paths must be absolute strings. Lexical canonicalization
         # alone cannot catch symlink/bind-mount aliases, so resolve symlink
         # spellings and reconcile (st_dev, st_ino) identities for existing
         # workspaces before indexing; any conflicting live row must refuse
         # the whole audit, not be ignored.
-        if not isinstance(raw, str) or not os.path.isabs(raw):
-            raise Refusal('ambiguous workspace attribution')
         canonical = os.path.normpath(raw)
         if raw != canonical or canonical in indexed:
             raise Refusal('ambiguous workspace attribution')
-        if type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool:
-            raise Refusal('ambiguous workspace attribution')
-        if not row.get('issue_id') or row.get('status') not in TERMINAL | {
-                'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}:
-            raise Refusal('missing issue attribution/status')
         try:
             resolved = os.path.realpath(canonical)
         except OSError:
@@ -1469,9 +1494,9 @@ def main():
                 cargo_args = cargo_args[1:]
             return run_cargo(args.pool, cargo_args)
         if args.command == 'audit':
-            result = retention_audit(args.worktrees, json.loads(args.inventory.read_text()))
+            result = retention_audit(args.worktrees, read_json_object(args.inventory))
         elif args.command == 'retain':
-            result = shared_pool_retain(args.pool, json.loads(args.inventory.read_text()),
+            result = shared_pool_retain(args.pool, read_json_object(args.inventory),
                                         proc_root=args.proc_root)
             if args.evidence is not None:
                 args.evidence.write_text(json.dumps(result, sort_keys=True))
