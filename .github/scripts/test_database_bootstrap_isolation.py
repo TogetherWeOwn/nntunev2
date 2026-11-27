@@ -523,11 +523,16 @@ def prove_setup_caller(cluster, *, interrupt, reader):
                    f"GRANT {STAGING} TO {CREATOR} WITH INHERIT FALSE, SET TRUE;")
         run(env, "refused", 1)
         cluster.ok("restore the exact setup membership", f"REVOKE {STAGING} FROM {CREATOR};")
-        _, create, admit = setup.statements(setup.setup_plan(raw), cluster.expiry)
+        plan = setup.setup_plan(raw)
+        _, create, admit = setup.statements(plan, cluster.expiry)
+        _, expired_create, expired_admit = setup.statements(plan, int(time.time()) - 1)
         cluster.denied("refuse creation in a separately connected wrong session", create,
                        "22012", role=DECOY)
+        cluster.denied("refuse creation after authorization expires", expired_create, "22012", role=CREATOR)
         cluster.ok("create a fenced target for admission checks", create, role=CREATOR)
         try:
+            cluster.denied("refuse admission after authorization expires", expired_admit,
+                           "database admission refused", role=CREATOR)
             cluster.ok("observe a target that lost its connection fence",
                        f"ALTER DATABASE {LAUNCH} ALLOW_CONNECTIONS true;")
             cluster.denied("refuse to admit a target whose fence changed", admit,
@@ -1112,6 +1117,13 @@ def prove_reader_lifecycle(cluster, pending, *, scenario, database_oid, publish=
     cluster.ok("model a wider PUBLIC column grant", "GRANT UPDATE (id) ON reader_scope.leaf TO PUBLIC;", database=LAUNCH)
     cluster.denied("refuse the wider PUBLIC column grant", activate, "reader scope refused", **launch)
     cluster.ok("remove the synthetic wider grant", "REVOKE UPDATE (id) ON reader_scope.leaf FROM PUBLIC;", database=LAUNCH)
+    cluster.ok("grant PUBLIC access to a large-object data column",
+               "GRANT SELECT (data) ON pg_catalog.pg_largeobject TO PUBLIC;", database=LAUNCH)
+    try:
+        cluster.denied("refuse activation with a large-object column grant", activate, "reader scope refused", **launch)
+    finally:
+        cluster.ok("remove the PUBLIC large-object data column grant",
+                   "REVOKE SELECT (data) ON pg_catalog.pg_largeobject FROM PUBLIC;", database=LAUNCH)
     cluster.denied("roll back partial grants if a required grant option is missing", activate,
                    "ERROR:  42501:", **launch)
     cluster.ok("verify refusal preserved both credential and CONNECT fences", f"""
