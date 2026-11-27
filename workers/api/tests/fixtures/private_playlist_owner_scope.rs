@@ -223,7 +223,10 @@ async fn owner_scope_and_fences_via_route() {
     for (label, denied_track) in [
         ("foreign-only library track", foreign_track),
         ("owner fenced library track", fenced_track),
-        ("catalogue track without library membership", unlisted_track),
+        (
+            "catalogue track without library membership",
+            unlisted_track.clone(),
+        ),
         (
             "missing track uuid",
             "00000000-0000-0000-0000-000000000000".into(),
@@ -289,18 +292,35 @@ async fn owner_scope_and_fences_via_route() {
         "append shared",
     );
     let shared_id = shared["id"].as_str().unwrap();
+    let add_member = "INSERT INTO public.library_tracks (library_id, track_id) VALUES ($1::text::uuid, $2::text::uuid)";
+    db.execute(add_member, &[&owner_lib, &unlisted_track])
+        .await
+        .unwrap();
+    let third = json_body(
+        route(
+            &ctx,
+            &owner_req,
+            &mut db,
+            Append(id, unlisted_track.clone()),
+        )
+        .await,
+        201,
+        "append third",
+    );
+    let third_id = third["id"].as_str().unwrap();
     let cap = crate::library::MAX_ITEMS;
     assert_eq!(
         db.execute(
             "UPDATE public.playlist_tracks SET position = $2 WHERE id = $1::text::uuid",
-            &[&shared_id, &((cap - 1) as i32)],
+            &[&third_id, &((cap - 1) as i32)],
         )
         .await
         .unwrap(),
         1
     );
     let original = playlist_entry_snapshot(&db, id).await;
-    let reversed = || Reorder(id, vec![shared_id.into(), entry_id.into()]);
+    let order = |ids: &[&str]| Reorder(id, ids.iter().map(|id| (*id).to_owned()).collect());
+    let rotated = || order(&[shared_id, third_id, entry_id]);
     let remove = || Remove(id, shared_id.into());
 
     for (req, expected, label) in [
@@ -329,7 +349,7 @@ async fn owner_scope_and_fences_via_route() {
             "authorization header",
         ),
     ] {
-        for cmd in [reversed(), remove()] {
+        for cmd in [rotated(), remove()] {
             let got = route(&ctx, req, &mut db, cmd).await;
             assert_eq!(
                 (got.status, got.body),
@@ -358,26 +378,17 @@ async fn owner_scope_and_fences_via_route() {
     let other_entry = other_entry["id"].as_str().unwrap();
     let other_snapshot = playlist_entry_snapshot(&db, other_id).await;
     for (cmd, expected) in [
-        (
-            Reorder(id, vec![entry_id.into(), other_entry.into()]),
-            not_found(),
-        ),
+        (order(&[entry_id, third_id, other_entry]), not_found()),
         (Remove(id, other_entry.into()), not_found()),
-        (
-            Reorder(id, vec![entry_id.into(), legacy_id.clone()]),
-            not_found(),
-        ),
+        (order(&[entry_id, third_id, &legacy_id]), not_found()),
         (Remove(id, legacy_id.clone()), not_found()),
         (
-            Reorder(id, vec![entry_id.into(), entry_id.to_uppercase()]),
+            order(&[entry_id, third_id, &entry_id.to_uppercase()]),
             not_found(),
         ),
-        (Reorder(id, vec![entry_id.into()]), not_found()),
+        (order(&[entry_id, shared_id]), not_found()),
         (
-            Reorder(
-                id,
-                vec![entry_id.into(), shared_id.into(), other_entry.into()],
-            ),
+            order(&[entry_id, shared_id, third_id, other_entry]),
             not_found(),
         ),
         (Reorder(id, vec![]), invalid_request()),
@@ -405,7 +416,7 @@ async fn owner_scope_and_fences_via_route() {
         ),
     ] {
         assert_eq!(db.execute(fence, &[&id]).await.unwrap(), 1);
-        for cmd in [reversed(), remove()] {
+        for cmd in [rotated(), remove()] {
             check(
                 route(&ctx, &owner_req, &mut db, cmd).await,
                 not_found(),
@@ -416,7 +427,7 @@ async fn owner_scope_and_fences_via_route() {
     }
     let fence_library = "UPDATE public.libraries SET deleting_at = now() WHERE id = $1::text::uuid";
     assert_eq!(db.execute(fence_library, &[&owner_lib]).await.unwrap(), 1);
-    for cmd in [reversed(), remove()] {
+    for cmd in [rotated(), remove()] {
         check(
             route(&ctx, &owner_req, &mut db, cmd).await,
             not_found(),
@@ -430,7 +441,7 @@ async fn owner_scope_and_fences_via_route() {
 
     for _ in 0..2 {
         check(
-            route(&ctx, &owner_req, &mut db, reversed()).await,
+            route(&ctx, &owner_req, &mut db, rotated()).await,
             json_response(200, json!({"reordered": true})),
             "owner reorder and retry",
         );
@@ -449,9 +460,31 @@ async fn owner_scope_and_fences_via_route() {
         json!([
             {"id": legacy_id, "position": 0, "track_id": owned_track},
             {"id": shared_id, "position": 2, "track_id": shared_track},
+            {"id": third_id, "position": 3, "track_id": unlisted_track},
             {"id": entry_id, "position": cap - 1, "track_id": owned_track},
         ])
     );
+    // Losing one membership blocks edits to that entry. Removing a different
+    // entry must preserve the dormant tombstone and all surviving positions.
+    let drop_member = "DELETE FROM public.library_tracks WHERE library_id = $1::text::uuid AND track_id = $2::text::uuid";
+    assert_eq!(
+        db.execute(drop_member, &[&owner_lib, &unlisted_track])
+            .await
+            .unwrap(),
+        1
+    );
+    let before_dormant_edit = playlist_entry_snapshot(&db, id).await;
+    for cmd in [
+        order(&[entry_id, shared_id, third_id]),
+        Remove(id, third_id.into()),
+    ] {
+        check(
+            route(&ctx, &owner_req, &mut db, cmd).await,
+            not_found(),
+            "dormant entry edit",
+        );
+    }
+    assert_eq!(playlist_entry_snapshot(&db, id).await, before_dormant_edit);
     check(
         route(&ctx, &owner_req, &mut db, remove()).await,
         json_response(200, json!({"id": shared_id})),
@@ -463,18 +496,10 @@ async fn owner_scope_and_fences_via_route() {
         "removal retry",
     );
     check(
-        route(&ctx, &owner_req, &mut db, reversed()).await,
+        route(&ctx, &owner_req, &mut db, rotated()).await,
         not_found(),
         "stale reorder",
     );
-    let appended_again = json_body(
-        route(&ctx, &owner_req, &mut db, Append(id, shared_track.clone())).await,
-        201,
-        "append after removal at cap",
-    );
-    let new_entry = appended_again["id"].as_str().unwrap();
-    assert_ne!(new_entry, shared_id);
-    assert_eq!(appended_again["position"], cap - 1);
     let remaining = json_body(
         route(&ctx, &owner_req, &mut db, Read(id)).await,
         200,
@@ -485,8 +510,40 @@ async fn owner_scope_and_fences_via_route() {
         remaining["entries"],
         json!([
             reordered["entries"][0],
-            {"id": entry_id, "position": cap - 2, "track_id": owned_track},
-            {"id": new_entry, "position": cap - 1, "track_id": shared_track},
+            {"id": third_id, "position": 3, "dormant": true},
+            reordered["entries"][3],
+        ])
+    );
+    check(
+        route(&ctx, &owner_req, &mut db, Append(id, shared_track.clone())).await,
+        not_found(),
+        "interior removal leaves append cap in place",
+    );
+    check(
+        route(&ctx, &owner_req, &mut db, Remove(id, entry_id.into())).await,
+        json_response(200, json!({"id": entry_id})),
+        "remove tail occurrence",
+    );
+    db.execute(add_member, &[&owner_lib, &unlisted_track])
+        .await
+        .unwrap();
+    let appended_again = json_body(
+        route(&ctx, &owner_req, &mut db, Append(id, shared_track.clone())).await,
+        201,
+        "append after tail removal",
+    );
+    let new_entry = appended_again["id"].as_str().unwrap();
+    assert_ne!(new_entry, shared_id);
+    assert_eq!(appended_again["position"], 4);
+    let detail = json_body(
+        route(&ctx, &owner_req, &mut db, Read(id)).await,
+        200,
+        "tail removal read",
+    );
+    assert_eq!(
+        detail["entries"],
+        json!([reordered["entries"][0], reordered["entries"][2],
+            {"id": new_entry, "position": 4, "track_id": shared_track},
         ])
     );
     let edited = playlist_entry_snapshot(&db, id).await;
@@ -520,10 +577,7 @@ async fn owner_scope_and_fences_via_route() {
         ("fenced read", Read(id)),
         ("fenced rename", Rename(id, "Blocked".into())),
         ("fenced append", Append(id, shared_track)),
-        (
-            "fenced reorder",
-            Reorder(id, vec![new_entry.into(), entry_id.into()]),
-        ),
+        ("fenced reorder", order(&[new_entry, third_id])),
         ("fenced remove", Remove(id, new_entry.into())),
         ("fenced delete", Delete(id)),
     ] {

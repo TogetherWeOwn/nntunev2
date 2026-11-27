@@ -97,23 +97,17 @@ WITH entries AS (
 SELECT '{\"reordered\":true}' FROM valid"
 );
 
-// Close the removed slot so a playlist at the append cap can accept another
-// entry. The deletion and the shift affect disjoint sets of rows.
+// Leave the other positions stable, including dormant tombstones. Append
+// keeps using the next tail position, so deleting an interior row leaves a gap.
 const REMOVE: &str = concat!(
     "
-WITH removed AS (
-  DELETE FROM playlist_tracks e USING playlists p
-  WHERE p.id = $2 AND e.playlist_id = p.id AND e.id = $3::text::uuid AND NOT e.is_legacy
-    AND e.position >= jsonb_array_length(p.items) AND e.position < $4
-    AND EXISTS (",
+DELETE FROM playlist_tracks e USING playlists p
+WHERE p.id = $2 AND e.playlist_id = p.id AND e.id = $3::text::uuid AND NOT e.is_legacy
+  AND e.position >= jsonb_array_length(p.items) AND e.position < $4
+  AND EXISTS (",
     owned_membership!(),
     " AND lt.track_id = e.track_id LIMIT 1 FOR SHARE OF l, lt)
-  RETURNING e.id, e.position
-), shifted AS (
-  UPDATE playlist_tracks e SET position = e.position - 1 FROM removed r
-  WHERE e.playlist_id = $2 AND NOT e.is_legacy AND e.position > r.position AND e.position < $4
-)
-SELECT jsonb_build_object('id', id)::text FROM removed"
+RETURNING jsonb_build_object('id', e.id)::text"
 );
 
 const DELETE_REQUEST: &str = "
