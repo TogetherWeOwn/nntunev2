@@ -26,7 +26,9 @@ pub fn candidate_hashes<'a>(
     intent: &CandidateIntent,
     manifest: &'a OriginManifest,
 ) -> Result<&'a [[u8; 32]], CandidateError> {
-    if intent.reservation_generation <= 0 {
+    // storage_object_intents requires the sealing generation to differ from
+    // the object ID. The origin codec accepts UUIDs with either relationship.
+    if intent.reservation_generation <= 0 || intent.identities[2] == intent.identities[3] {
         return Err(CandidateError::Identity);
     }
     manifest

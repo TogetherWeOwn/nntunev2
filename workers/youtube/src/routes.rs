@@ -266,7 +266,7 @@ mod tests {
             "Durable Object fetch handler must not carry cfg/other attributes"
         );
         let expected_durable_object_fetch = syn::parse_str::<syn::ImplItemFn>(
-            "async fn fetch(&self, req: Request) -> Result<Response> {\n                let decision = routes::decide_extract(req.method().as_ref(), &req.path());\n                match decision {\n                    ExtractDecision::NotFound => Response::error(ExtractDecision::NotFound.body(), ExtractDecision::NotFound.status(),),\n                    ExtractDecision::ExtractionUnavailable => respond_unavailable(),\n                }\n            }",
+            "async fn fetch(&self, req: Request) -> Result<Response> {\n                let url = req.url().ok();\n                let path = url.as_ref().filter(|url| url.query().or(url.fragment()).is_none()).map_or(\"\", |url| url.path());\n                let decision = routes::decide_extract(req.method().as_ref(), path);\n                match decision {\n                    ExtractDecision::NotFound => Response::error(ExtractDecision::NotFound.body(), ExtractDecision::NotFound.status(),),\n                    ExtractDecision::ExtractionUnavailable => respond_unavailable(),\n                }\n            }",
         )
         .expect("parse expected Durable Object handler");
         assert_eq!(

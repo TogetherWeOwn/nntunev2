@@ -6,7 +6,8 @@
 //! An empty measurement (zero fetches) fails closed: no data, no GO.
 
 /// Maximum tolerable byte-fetch failure rate: 5%.
-pub const GATE_FAILURE_THRESHOLD: f64 = 0.05;
+pub const GATE_FAILURE_THRESHOLD: f64 = 1.0 / GATE_FAILURE_DENOMINATOR as f64;
+const GATE_FAILURE_DENOMINATOR: u64 = 20;
 
 /// The gate verdict over one measurement run.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -15,7 +16,7 @@ pub struct GateVerdict {
     pub failures: u64,
     /// Total byte fetches attempted.
     pub total: u64,
-    /// `failures / total` (1.0 when `total == 0`: fail closed).
+    /// `failures / total` (1.0 for empty or inconsistent counts).
     pub failure_rate: f64,
     /// True when `failure_rate <= 0.05` with at least one fetch.
     pub go: bool,
@@ -23,7 +24,7 @@ pub struct GateVerdict {
 
 /// Evaluate the gate over `failures` failed fetches out of `total`.
 pub fn evaluate_gate(failures: u64, total: u64) -> GateVerdict {
-    if total == 0 {
+    if total == 0 || failures > total {
         return GateVerdict {
             failures,
             total,
@@ -36,7 +37,7 @@ pub fn evaluate_gate(failures: u64, total: u64) -> GateVerdict {
         failures,
         total,
         failure_rate,
-        go: failure_rate <= GATE_FAILURE_THRESHOLD,
+        go: failures <= total / GATE_FAILURE_DENOMINATOR,
     }
 }
 

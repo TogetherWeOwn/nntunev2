@@ -7,6 +7,7 @@
 //! path. This seam grants no membership, catalogue or playback authority.
 
 use crate::audio_classifications::ClassificationCheckpoint;
+use crate::audio_manifest::{valid_identity, MAX_AUDIO_ENTRIES, MAX_MANIFEST_BYTES};
 
 pub const FREEZE_SQL: &str = include_str!("audio_classifications_store.sql");
 
@@ -34,11 +35,53 @@ fn validate_candidate(
     user_id: &str,
     original_hash: &str,
 ) -> Result<(), StoreError> {
-    if !checkpoint.is_for(job_id, user_id) || checkpoint.original_content_sha256() != original_hash
+    if !valid_identity(job_id, user_id, original_hash)
+        || !checkpoint.is_for(job_id, user_id)
+        || checkpoint.original_content_sha256() != original_hash
     {
         return Err(StoreError::Identity);
     }
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct CheckpointVersion {
+    version: u8,
+}
+
+fn supported_encoding(raw: &str) -> bool {
+    // The checkpoint column has the same byte cap as the manifest column.
+    raw.len() <= MAX_MANIFEST_BYTES
+        && serde_json::from_str::<CheckpointVersion>(raw).is_ok_and(|root| root.version == 1)
+}
+
+fn valid_entries(checkpoint: &ClassificationCheckpoint) -> bool {
+    let entries = checkpoint.entries();
+    let mut survivors = std::collections::HashSet::new();
+    !entries.is_empty()
+        && entries.len() <= MAX_AUDIO_ENTRIES
+        && entries.iter().enumerate().all(|(index, entry)| {
+            let ordinal = (index + 1) as u32;
+            entry.audio_ordinal == ordinal
+                && entry.medium_no > 0
+                && entry.track_no > 0
+                && (1..=ordinal).contains(&entry.release_group_ref)
+                && (entry.duplicate_of.is_some()
+                    || survivors.insert((entry.release_group_ref, entry.medium_no, entry.track_no)))
+                && {
+                    let anchor = &entries[(entry.release_group_ref - 1) as usize];
+                    anchor.release_group_ref == entry.release_group_ref && anchor.kind == entry.kind
+                }
+                && entry.duplicate_of.is_none_or(|winner| {
+                    (1..ordinal).contains(&winner) && {
+                        let winner = &entries[(winner - 1) as usize];
+                        winner.duplicate_of.is_none()
+                            && winner.release_group_ref == entry.release_group_ref
+                            && winner.medium_no == entry.medium_no
+                            && winner.track_no == entry.track_no
+                    }
+                })
+        })
 }
 
 fn accept_stored(
@@ -47,10 +90,26 @@ fn accept_stored(
     user_id: &str,
     original_hash: &str,
 ) -> Result<ClassificationCheckpoint, StoreError> {
+    if !supported_encoding(raw) {
+        return Err(StoreError::InvalidStored);
+    }
     let stored = ClassificationCheckpoint::parse(raw).map_err(|_| StoreError::InvalidStored)?;
     validate_candidate(&stored, job_id, user_id, original_hash)
         .map_err(|_| StoreError::InvalidStored)?;
+    if !valid_entries(&stored) {
+        return Err(StoreError::InvalidStored);
+    }
     Ok(stored)
+}
+
+fn encode_candidate(checkpoint: &ClassificationCheckpoint) -> Result<String, StoreError> {
+    if !valid_entries(checkpoint) {
+        return Err(StoreError::Permanent);
+    }
+    let raw = serde_json::to_string(checkpoint).map_err(|_| StoreError::Permanent)?;
+    supported_encoding(&raw)
+        .then_some(raw)
+        .ok_or(StoreError::Permanent)
 }
 
 /// Only a present, owner/digest-bound original whose checkpoint is SQL NULL
@@ -63,7 +122,7 @@ pub async fn load(
     user_id: &str,
     original_hash: &str,
 ) -> Result<Option<ClassificationCheckpoint>, StoreError> {
-    if !crate::audio_manifest::valid_identity(job_id, user_id, original_hash) {
+    if !valid_identity(job_id, user_id, original_hash) {
         return Err(StoreError::Identity);
     }
     crate::library::with_db_deadline(
@@ -109,7 +168,7 @@ pub async fn freeze(
     original_hash: &str,
 ) -> Result<ClassificationCheckpoint, StoreError> {
     validate_candidate(checkpoint, job_id, user_id, original_hash)?;
-    let raw = serde_json::to_string(checkpoint).map_err(|_| StoreError::Permanent)?;
+    let raw = encode_candidate(checkpoint)?;
     crate::library::with_db_deadline(
         async move {
             let row = client
@@ -206,13 +265,12 @@ mod tests {
     #[test]
     fn persisted_winner_must_parse_and_match_every_binding() {
         let checkpoint = test_checkpoint();
-        let raw = serde_json::to_string(&checkpoint).unwrap();
+        let raw = encode_candidate(&checkpoint).unwrap();
         let hash = checkpoint.original_content_sha256().to_string();
-        for raw in ["null", "{}", "not json"] {
-            assert_eq!(
-                accept_stored(raw, "class_store_job", "class_store_owner", &hash),
-                Err(StoreError::InvalidStored)
-            );
+        let accept = |raw: &str| accept_stored(raw, "class_store_job", "class_store_owner", &hash);
+        let oversized = format!("{raw}{}", " ".repeat(MAX_MANIFEST_BYTES));
+        for raw in ["null", "{}", "not json", &oversized] {
+            assert_eq!(accept(raw), Err(StoreError::InvalidStored));
         }
         for (job, owner, digest) in [
             ("other_job", "class_store_owner", hash.clone()),
@@ -222,6 +280,29 @@ mod tests {
             assert_eq!(
                 accept_stored(&raw, job, owner, &digest),
                 Err(StoreError::InvalidStored)
+            );
+        }
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let first = &value["entries"][0];
+        let mut second = first.clone();
+        second["audio_ordinal"] = 2.into();
+        for (pointer, replacement) in [
+            ("/version", 2.into()),
+            ("/entries", serde_json::json!([])),
+            ("/entries/0/track_no", 0.into()),
+            ("/entries/0/audio_ordinal", 2.into()),
+            ("/entries/0/release_group_ref", 0.into()),
+            ("/entries/0/duplicate_of", 1.into()),
+            ("/entries", serde_json::json!([first, second])),
+        ] {
+            let mut bad = value.clone();
+            *bad.pointer_mut(pointer).unwrap() = replacement;
+            let raw = bad.to_string();
+            assert_eq!(accept(&raw), Err(StoreError::InvalidStored), "{pointer}");
+            assert_eq!(
+                encode_candidate(&ClassificationCheckpoint::parse(&raw).unwrap()),
+                Err(StoreError::Permanent),
+                "{pointer}"
             );
         }
     }

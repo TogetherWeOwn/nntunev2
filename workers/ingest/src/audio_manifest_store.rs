@@ -51,6 +51,15 @@ fn accept_stored(
     Ok(stored)
 }
 
+fn encode_candidate(manifest: &AcceptedAudioManifest) -> Result<String, FreezeError> {
+    // Legacy winners remain readable, but a new first acceptance must
+    // carry frozen disc geometry for classification and publication.
+    if manifest.effective_discs().is_none() {
+        return Err(FreezeError::Permanent);
+    }
+    serde_json::to_string(manifest).map_err(|_| FreezeError::Permanent)
+}
+
 /// Only a present, owner/digest-bound original whose manifest is SQL NULL
 /// returns None. Missing originals, deletion fences and invalid records refuse
 /// rather than authorizing regeneration. The returned selection is immutable;
@@ -107,7 +116,7 @@ pub async fn freeze(
     original_hash: &str,
 ) -> Result<AcceptedAudioManifest, FreezeError> {
     validate_candidate(manifest, job_id, user_id, original_hash)?;
-    let raw = serde_json::to_string(manifest).map_err(|_| FreezeError::Permanent)?;
+    let raw = encode_candidate(manifest)?;
     crate::library::with_db_deadline(
         async move {
             let row = client
@@ -208,6 +217,20 @@ mod tests {
                 Err(FreezeError::InvalidStored)
             );
         }
+    }
+
+    #[test]
+    fn first_acceptance_requires_frozen_disc_geometry() {
+        let legacy = candidate("Legacy title");
+        assert_eq!(encode_candidate(&legacy), Err(FreezeError::Permanent));
+        let mut frozen = serde_json::to_value(&legacy).unwrap();
+        frozen["effective_discs"] = json!([1]);
+        let frozen = AcceptedAudioManifest::parse(&frozen.to_string()).unwrap();
+        assert!(encode_candidate(&frozen).is_ok());
+        assert!(include_str!("audio_manifest_store.rs").contains(concat!(
+            "let raw = encode_candidate(manifest)?;\n",
+            "    crate::library::with_db_deadline("
+        )));
     }
 
     #[test]
