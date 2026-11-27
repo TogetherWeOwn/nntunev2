@@ -199,18 +199,12 @@ fn host_shape_ok(host: &str) -> bool {
     if host.parse::<IpAddr>().is_ok() {
         return true;
     }
-    // Require DNS labels only after strict IPv4 parsing. A transport may
-    // interpret alternate numeric spellings as IP literals instead of
-    // consulting the resolver that approved this name.
-    host.split('.').all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    }) && matches!(url::Host::parse(host), Ok(url::Host::Domain(_)))
+    if !host.split('.').all(valid_dns_label) {
+        return false;
+    }
+
+    // Reject alternate IPv4 spellings a transport may read as a literal.
+    matches!(url::Host::parse(host), Ok(url::Host::Domain(_)))
 }
 
 // Address guard is single-owned by `nntune_ssrf_guard::ip_is_forbidden`
@@ -462,6 +456,16 @@ impl IndexerConfig {
         let port = parsed.port_or_known_default().unwrap_or(443);
         resolve_public_target(bare, port, dns)
     }
+}
+
+fn valid_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 // --- `test connection` rate limit + timeouts -----------------------------------------

@@ -347,17 +347,6 @@ fn verify_client_data(
     {
         return Err(WebAuthnError::Invalid);
     }
-    // Deserializing directly rejects duplicate security fields, while
-    // allowing new WebAuthn fields the RP does not use.
-    #[derive(serde::Deserialize)]
-    struct ClientData {
-        #[serde(rename = "type")]
-        ceremony_type: String,
-        challenge: String,
-        origin: String,
-        #[serde(default, rename = "crossOrigin")]
-        cross_origin: bool,
-    }
     let data: ClientData =
         serde_json::from_slice(client_data_json).map_err(|_| WebAuthnError::Invalid)?;
     if data.cross_origin
@@ -373,20 +362,6 @@ fn verify_client_data(
 struct AuthData {
     sign_count: u32,
     attested: Option<RegisteredCredential>,
-}
-
-fn verify_extension_data(flags: u8, bytes: &[u8]) -> Result<(), WebAuthnError> {
-    if flags & FLAG_EXTENSION_DATA == 0 {
-        return if bytes.is_empty() {
-            Ok(())
-        } else {
-            Err(WebAuthnError::Invalid)
-        };
-    }
-    match cbor_parse(bytes)? {
-        Cbor::Map(entries) if entries.iter().all(|(key, _)| key.as_text().is_some()) => Ok(()),
-        _ => Err(WebAuthnError::Invalid),
-    }
 }
 
 fn parse_auth_data(
@@ -553,6 +528,31 @@ pub fn verify_assertion(
         return Err(WebAuthnError::Invalid);
     }
     Ok(parsed.sign_count)
+}
+
+// Typed decoding rejects duplicate security fields and accepts unknown fields.
+#[derive(serde::Deserialize)]
+struct ClientData {
+    #[serde(rename = "type")]
+    ceremony_type: String,
+    challenge: String,
+    origin: String,
+    #[serde(default, rename = "crossOrigin")]
+    cross_origin: bool,
+}
+
+fn verify_extension_data(flags: u8, bytes: &[u8]) -> Result<(), WebAuthnError> {
+    if flags & FLAG_EXTENSION_DATA == 0 {
+        return if bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(WebAuthnError::Invalid)
+        };
+    }
+    match cbor_parse(bytes)? {
+        Cbor::Map(entries) if entries.iter().all(|(key, _)| key.as_text().is_some()) => Ok(()),
+        _ => Err(WebAuthnError::Invalid),
+    }
 }
 
 #[cfg(test)]
@@ -747,10 +747,7 @@ mod tests {
     #[test]
     fn client_data_requires_a_json_object() {
         let list = format!(r#"["webauthn.get","{CHALLENGE}","{ORIGIN}",false]"#);
-        assert_eq!(
-            verify_client_data(list.as_bytes(), "webauthn.get", &expect()),
-            Err(WebAuthnError::Invalid)
-        );
+        assert!(verify_client_data(list.as_bytes(), "webauthn.get", &expect()).is_err());
     }
 
     #[test]
