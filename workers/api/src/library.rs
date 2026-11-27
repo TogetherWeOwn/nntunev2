@@ -153,7 +153,7 @@ fn require_caller(caller: Option<&str>) -> Result<&str, LibraryError> {
 
 pub(crate) fn check_name(name: &str) -> Result<String, LibraryError> {
     let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > MAX_NAME_LEN {
+    if trimmed.is_empty() || trimmed.contains('\0') || trimmed.chars().count() > MAX_NAME_LEN {
         return Err(LibraryError::Invalid);
     }
     Ok(trimmed.to_string())
@@ -167,7 +167,10 @@ fn check_items(items: Vec<String>) -> Result<Vec<String>, LibraryError> {
         .into_iter()
         .map(|item| {
             let trimmed = item.trim();
-            if trimmed.is_empty() || trimmed.chars().count() > MAX_ITEM_LEN {
+            if trimmed.is_empty()
+                || trimmed.contains('\0')
+                || trimmed.chars().count() > MAX_ITEM_LEN
+            {
                 return Err(LibraryError::Invalid);
             }
             Ok(trimmed.to_string())
@@ -288,13 +291,7 @@ pub fn parse_page_cursor(cursor: &str) -> Result<String, LibraryError> {
     }
     let bytes = crate::b64::decode(cursor).map_err(|_| LibraryError::Invalid)?;
     let id = std::str::from_utf8(&bytes).map_err(|_| LibraryError::Invalid)?;
-    if id.is_empty() || id.len() > MAX_CURSOR_PUBLIC_ID_LEN {
-        return Err(LibraryError::Invalid);
-    }
-    if !id
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
+    if !crate::ledger::is_valid_key_field(id, MAX_CURSOR_PUBLIC_ID_LEN) {
         return Err(LibraryError::Invalid);
     }
     Ok(id.to_string())
@@ -502,10 +499,11 @@ pub fn prepare_genre_insert(
     now: u64,
 ) -> Result<NewGenre, LibraryError> {
     let caller = require_caller(caller)?;
+    let name = check_name(name)?;
     Ok(NewGenre {
         public_id: new_public_id()?,
         owner_user_id: caller.to_string(),
-        name: check_name(name)?,
+        name,
         is_public,
         created_at: now,
     })
@@ -519,11 +517,13 @@ pub fn prepare_playlist_insert(
     now: u64,
 ) -> Result<NewPlaylist, LibraryError> {
     let caller = require_caller(caller)?;
+    let name = check_name(name)?;
+    let items = check_items(items)?;
     Ok(NewPlaylist {
         public_id: new_public_id()?,
         owner_user_id: caller.to_string(),
-        name: check_name(name)?,
-        items: check_items(items)?,
+        name,
+        items,
         is_public,
         created_at: now,
     })

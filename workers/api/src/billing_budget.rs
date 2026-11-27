@@ -25,6 +25,7 @@ enum Phase {
     Bootstrap,
     Work,
     Running,
+    Failed,
     Finished,
 }
 
@@ -136,10 +137,15 @@ impl BillingBudget {
         operation: impl FnOnce() -> F,
     ) -> Result<T, PhaseFailure> {
         if self.phase.replace(Phase::Running) != expected {
+            self.phase.set(Phase::Failed);
             return Err(PhaseFailure::Operation);
         }
         // A cancelled or failed phase remains Running and cannot be restarted.
         let result = phase_deadline(operation, duration_ms).await?;
+        // An invalid overlapping call may have poisoned this phase while it ran.
+        if self.phase.get() != Phase::Running {
+            return Err(PhaseFailure::Operation);
+        }
         self.phase.set(next);
         Ok(result)
     }
@@ -547,6 +553,22 @@ where
         operation.as_mut().poll(cx)
     })
     .await
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn overlapping_phase_cannot_restore_a_failed_budget() {
+    let budget = BillingBudget {
+        phase: Cell::new(Phase::Connect),
+    };
+    let result = budget
+        .connect(|| async {
+            assert!(budget.bootstrap(|| async { Ok(()) }).await.is_err());
+            Ok(())
+        })
+        .await;
+    assert!(result.is_err());
+    assert!(budget.bootstrap(|| async { Ok(()) }).await.is_err());
 }
 
 #[cfg(feature = "billing-owned-wasm-test")]
