@@ -72,7 +72,7 @@ impl SyntheticCatalogue {
     }
 
     fn preflight(self, budget: &mut ConstructionBudget) -> Result<(), BudgetExceeded> {
-        if self.tracks > MAX_ROWS {
+        if self.releases == 0 || self.tracks > MAX_ROWS {
             return Err(BudgetExceeded);
         }
         let mut aggregate = 0usize;
@@ -111,7 +111,7 @@ impl SyntheticCatalogue {
     }
 
     pub(super) fn rows(self, budget: &mut ConstructionBudget) -> Result<Rows, BudgetExceeded> {
-        if self.releases == 0 {
+        if self.releases == 0 && self.tracks == 0 && self.padded_title_bytes.is_none() {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
         self.preflight(budget)?;
@@ -209,4 +209,17 @@ fn empty_needs_no_charge_and_small_carries_prior_charge() {
     let (a, r, t) = fixture("small").rows(&mut budget).unwrap();
     assert_eq!((a.capacity(), r.capacity(), t.capacity()), (1, 1, 1));
     assert!(budget.charged() > carried);
+}
+
+#[cfg(test)]
+#[test]
+fn tracks_without_releases_are_not_an_empty_fixture() {
+    let mut budget = ConstructionBudget::new(4096);
+    let fixture = SyntheticCatalogue {
+        releases: 0,
+        tracks: 1,
+        padded_title_bytes: None,
+    };
+    assert!(fixture.rows(&mut budget).is_err());
+    assert_eq!(budget.charged(), 0);
 }

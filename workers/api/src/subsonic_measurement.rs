@@ -2,14 +2,13 @@
 
 use nntune_subsonic::staging_rejection::{RejectionFormat, StagingRejection, StagingRejection::*};
 use subtle::ConstantTimeEq;
-use worker::js_sys::{Function, JsString};
-use worker::wasm_bindgen::{JsCast, JsValue};
+use worker::js_sys::JsString;
 use worker::{web_sys, Env, Response, Result as WorkerResult};
 use zeroize::Zeroizing;
 
 use crate::subsonic_experiment_gate::{Deployment, Lease};
 use crate::subsonic_request_metadata::{is_ascii_literal, property, request_url};
-use crate::subsonic_staging::respond_fixed_rejection;
+use crate::subsonic_staging::{request_header, respond_fixed_rejection};
 use crate::worker_entry::with_deadline;
 
 use self::schedule::Schedule;
@@ -83,8 +82,7 @@ fn authorized_runner(request: &web_sys::Request, env: &Env, now: u64) -> Option<
         .then_some(binding.strip_prefix("v1:")?)?
         .splitn(3, ':');
     let timestamp = |raw: &str| {
-        raw.bytes()
-            .all(|byte| byte.is_ascii_digit())
+        (raw.len() <= 20 && raw.bytes().all(|byte| byte.is_ascii_digit()))
             .then(|| raw.parse::<u64>().ok())
             .flatten()
     };
@@ -102,22 +100,13 @@ fn authorized_runner(request: &web_sys::Request, env: &Env, now: u64) -> Option<
     }
     // Cap the normalized JS header before copying into Rust. Compare only
     // the fixed-length bearer bytes in constant time.
-    let value = header(request, "authorization")?;
+    let value = request_header(request, "authorization")?;
     if value.length() as usize != "Bearer ".len() + RUNNER_BEARER_LEN {
         return None;
     }
     let value = Zeroizing::new(String::from(value));
     let candidate = value.strip_prefix("Bearer ")?;
     bool::from(candidate.as_bytes().ct_eq(token.as_bytes())).then_some(())
-}
-
-fn header(request: &web_sys::Request, name: &str) -> Option<JsString> {
-    let headers = request.headers();
-    let get: Function = property(headers.as_ref(), "get").ok()?;
-    get.call1(headers.as_ref(), &JsValue::from_str(name))
-        .ok()?
-        .dyn_into()
-        .ok()
 }
 
 fn runner_case(
@@ -128,7 +117,7 @@ fn runner_case(
 ) -> Option<schedule::Case> {
     authorized_runner(request, env, now)?;
     // Match only a scheduled literal in JS; do not copy selector values into Rust.
-    schedule.resolve(&header(request, "x-subsonic-measurement-case")?)
+    schedule.resolve(&request_header(request, "x-subsonic-measurement-case")?)
 }
 
 async fn within_request(

@@ -145,17 +145,14 @@ fn record(
 async fn compat_table_present(client: &mut impl PgConnect) -> Result<bool, StoreError> {
     // Unqualified like the queries below: the probe must resolve the same
     // table the compat queries reach through the active search_path.
-    let rows = client
-        .query_typed(
+    let row = client
+        .query_typed_one(
             "SELECT to_regclass('subsonic_credentials') IS NOT NULL",
             &[],
         )
         .await
         .map_err(|_| StoreError)?;
-    Ok(rows
-        .first()
-        .map(|row| row.get::<_, bool>(0))
-        .unwrap_or(false))
+    row.try_get::<_, bool>(0).map_err(|_| StoreError)
 }
 
 async fn transaction(client: &mut impl PgConnect) -> Result<PgTransaction<'_>, StoreError> {
@@ -622,10 +619,17 @@ pub(super) async fn insert(
     if sessions.len() != 1 {
         return Ok(false);
     }
-    let count: i64 = tx.query_typed(
-        "SELECT count(*)::bigint FROM subsonic_credentials WHERE user_id = $1 AND revoked_at IS NULL",
-        &[(&s.user_id, Type::TEXT)],
-    ).await.map_err(|_| StoreError)?[0].try_get(0).map_err(|_| StoreError)?;
+    let row = tx
+        .query_typed_one(
+            "SELECT count(*)::bigint FROM subsonic_credentials WHERE user_id = $1 AND revoked_at IS NULL",
+            &[(&s.user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let count: i64 = row.try_get(0).map_err(|_| StoreError)?;
+    if count < 0 {
+        return Err(StoreError);
+    }
     if count >= MAX_ACTIVE_CREDENTIALS {
         return Ok(false);
     }

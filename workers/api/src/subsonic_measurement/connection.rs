@@ -126,6 +126,7 @@ pub(crate) async fn test_connect_deadline() -> Result<(), &'static str> {
     use crate::billing_owned_socket::stalled_startup_fixture;
     use tokio_postgres::config::SslMode;
     use worker::js_sys::Reflect;
+    use worker::wasm_bindgen::{JsCast, JsValue};
 
     let mut config = tokio_postgres::Config::new();
     config.user("fixture").ssl_mode(SslMode::Disable);

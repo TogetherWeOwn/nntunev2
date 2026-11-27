@@ -60,11 +60,11 @@ pub enum StagingApp<'a, K> {
 }
 
 impl<K> StagingApp<'_, K> {
-    fn postgres(&mut self) -> &mut PgClient {
+    fn postgres(&mut self) -> Result<&mut PgClient, StagingRejection> {
         match self {
-            Self::Postgres { client, .. } => client,
+            Self::Postgres { client, .. } => Ok(client),
             #[cfg(feature = "staging-body-wasm-test")]
-            Self::VerifiedFixture => panic!("unexpected staging data load"),
+            Self::VerifiedFixture => Err(StagingRejection::Unavailable),
         }
     }
 }
@@ -233,9 +233,10 @@ impl StagingConstruction {
                     fixture.rows(budget).map_err(|_| reject(BusyOrCapacity))?
                 }
                 CatalogueSource::IsolatedMirror(connect_isolated) => {
-                    let member = load_staging_membership(budget, app.postgres(), principal)
-                        .await
-                        .map_err(reject)?;
+                    let member =
+                        load_staging_membership(budget, app.postgres().map_err(reject)?, principal)
+                            .await
+                            .map_err(reject)?;
                     let selection = MirrorSelection {
                         releases: &member.releases,
                         pairs: &member.pairs,
@@ -266,7 +267,7 @@ impl StagingConstruction {
                 ProductionStore::resolve_song_occurrence(&tracks, &songs, id)
             })
         } else if name == "getLicense" {
-            let (identity, _) = load_staging_account(budget, app.postgres(), principal)
+            let (identity, _) = load_staging_account(budget, app.postgres().map_err(reject)?, principal)
                 .await
                 .map_err(reject)?;
             basic_document(budget, name, &identity.email)

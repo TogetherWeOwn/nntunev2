@@ -21,10 +21,23 @@ pub use dispatch::{respond_staging, CatalogueSource, StagingApp, StagingDispatch
 #[cfg(target_arch = "wasm32")]
 pub use fixture::SyntheticCatalogue;
 #[cfg(target_arch = "wasm32")]
+pub(crate) use request::request_header;
+#[cfg(target_arch = "wasm32")]
 pub use request::InputError;
 
 #[cfg(target_arch = "wasm32")]
 const CONSTRUCTION_BYTES: usize = 8 * 1024 * 1024;
+
+fn admits_form_media_type(mut units: impl Iterator<Item = u16>) -> bool {
+    b"application/x-www-form-urlencoded"
+        .iter()
+        .all(|&byte| units.next() == Some(u16::from(byte)))
+        && match units.find(|&unit| unit != u16::from(b' ') && unit != u16::from(b'\t')) {
+            None => true,
+            Some(unit) if unit == u16::from(b';') => !units.any(|unit| unit == u16::from(b',')),
+            _ => false,
+        }
+}
 
 /// Validated input and the ledger that paid for its backing storage.
 pub struct StagingInput {
@@ -77,6 +90,23 @@ mod tests {
     use super::*;
     use crate::subsonic_http::{StagingBody, STAGING_SOURCE_BYTES};
     use crate::worker_entry::with_production_snapshot;
+
+    #[test]
+    fn form_admission_requires_one_exact_media_type() {
+        let form = "application/x-www-form-urlencoded";
+        for header in [form.to_owned(), format!("{form} \t; charset=utf-8")] {
+            assert!(admits_form_media_type(header.encode_utf16()));
+        }
+        for header in [
+            format!("text/plain; hint={form}"),
+            format!("{form}-extra"),
+            format!("{form}, text/plain"),
+            format!("{form}; charset=utf-8, text/plain"),
+            format!("{form}\u{a0}; charset=utf-8"),
+        ] {
+            assert!(!admits_form_media_type(header.encode_utf16()), "{header}");
+        }
+    }
 
     fn empty_input(limit: usize) -> StagingInput {
         StagingInput {

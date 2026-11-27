@@ -1,13 +1,24 @@
 //! Bounded collection from the raw Worker request. This does not take a permit.
 
+use worker::js_sys::{Function, JsString};
+use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::web_sys;
 
-use super::{ConstructionBudget, StagingInput, CONSTRUCTION_BYTES};
+use super::{admits_form_media_type, ConstructionBudget, StagingInput, CONSTRUCTION_BYTES};
 use crate::subsonic_http::{StagingBody, StagingBodyError};
 pub use crate::subsonic_request_metadata::InputError;
 use crate::subsonic_request_metadata::{
-    admit_metadata, BodyPlan, RequestMetadata, CAPACITY, TOO_LARGE,
+    admit_metadata, property, BodyPlan, RequestMetadata, CAPACITY, TOO_LARGE,
 };
+
+pub(crate) fn request_header(request: &web_sys::Request, name: &str) -> Option<JsString> {
+    let headers = request.headers();
+    let get: Function = property(headers.as_ref(), "get").ok()?;
+    get.call1(headers.as_ref(), &JsValue::from_str(name))
+        .ok()?
+        .dyn_into()
+        .ok()
+}
 
 impl From<StagingBodyError> for InputError {
     fn from(error: StagingBodyError) -> Self {
@@ -40,6 +51,13 @@ impl StagingInput {
         let (form, budget) = match body {
             BodyPlan::Skip => (String::new(), budget),
             BodyPlan::Form { declared } => {
+                // Metadata identifies candidates by substring. Check the full
+                // media type before interpreting any bytes as credentials.
+                let value = request_header(request, "content-type").ok_or(InputError::Unreadable)?;
+                let units = (0..value.length()).map(|i| value.char_code_at(i) as u16);
+                if !admits_form_media_type(units) {
+                    return Err(InputError::Unreadable);
+                }
                 StagingBody::new(declared, budget)?
                     .collect_worker(request, Some(&query))
                     .await?
