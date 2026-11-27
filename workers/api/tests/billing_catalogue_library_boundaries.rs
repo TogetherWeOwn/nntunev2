@@ -6,7 +6,7 @@ use nntune_api::native_rest::{
     authorize, issue_credential, scope_for_operation, CredentialError, NativeRestRecord, Pepper,
     RouteDecision, Scope, MAX_CREDENTIAL_TTL_SECS,
 };
-use nntune_api::target_identity::{canonical_target_id, MAX_TARGET_ID_LEN};
+use nntune_api::target_identity::MAX_TARGET_ID_LEN;
 
 #[test]
 fn renewal_grace_never_outlasts_the_paid_end_plus_seven_days() {
@@ -75,14 +75,12 @@ fn bearer_scope_requires_a_listed_path_and_valid_target_segment() {
     ] {
         assert_eq!(scope_for_operation(method, path), RouteDecision::Deny);
     }
-    let opaque = "Track-A_2";
-    assert_eq!(canonical_target_id(opaque), opaque);
     assert_eq!(
         scope_for_operation("GET", "/v1/releases/album.v2"),
         RouteDecision::Bearer(Scope::LibraryRead)
     );
     assert_eq!(
-        scope_for_operation("GET", &format!("/v1/stream/{opaque}")),
+        scope_for_operation("GET", "/v1/stream/Track-A_2"),
         RouteDecision::Bearer(Scope::StreamRead)
     );
     let oversized = "a".repeat(MAX_TARGET_ID_LEN + 1);

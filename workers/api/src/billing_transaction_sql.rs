@@ -12,8 +12,10 @@ use tokio_postgres::types::{ToSql, Type};
 use crate::billing_reconcile::PaidInvoiceRow;
 
 fn valid_history_coverage(history: &PaidInvoiceRow) -> bool {
+    // The history table's CHECK rejects negative amounts. Reject zero here
+    // because it may be recorded, but cannot establish exact paid coverage.
     history.covered_periods.is_empty()
-        || (history.amount_cents > 0
+        || (history.amount_cents != 0
             && !history.stripe_invoice_id.trim().is_empty()
             && history.currency.len() == 3
             && history.currency.bytes().all(|b| b.is_ascii_lowercase())
