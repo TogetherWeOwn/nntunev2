@@ -95,3 +95,45 @@ test.each(['wrong tab', 'server error', 'short expiry', 'TTL expiry'] as const)(
 	expect(queue.snapshot).toBe(snapshot);
 	expect([fetchFn.mock.calls.length, src()]).toEqual([2, incumbent]);
 });
+
+test('existing track stays closed without synthetic fallback until verified grant arrives, then reopens cleanly', async () => {
+	const { player, media, fetchFn, src, play, requests } = setup();
+	const syntheticTracks = initial.tracks.map((track) => ({ ...track, streamUrl: '/api/demo/audio' }));
+	expect(player.reconcileLibrary(syntheticTracks, () => true)).toBe(true);
+	expect(player.replaceQueue({ tracks: syntheticTracks, currentIndex: 0 })).toBe(true);
+	expect([src(), media.audio]).toEqual(['', undefined]);
+
+	let sessionTab = '';
+	fetchFn.mockImplementationOnce(async (_path, init) => {
+		sessionTab = JSON.parse(String(init?.body)).session_id;
+		return new Response(null, { status: 404 });
+	});
+	await play(0);
+	expect([src(), media.audio, player.queueAnnouncement.text]).toEqual(['', undefined, 'Could not start playback.']);
+	expect(sessionTab).toBeTruthy();
+
+	const valid = { sessionBinding: 'A'.repeat(43), playbackSessionId: sessionTab, trackId: 'first', playId: 'play-1', durationMs: 120_000 };
+	for (const reply of [
+		new Response(null, { status: 503 }),
+		new Response('not-json', { status: 200 }),
+		Response.json({ play_id: 'legacy-1', grant: 'synthetic' }),
+		Response.json({ sessionBinding: valid.sessionBinding, playbackSessionId: sessionTab, trackId: 'first', playId: 'play-1' }),
+		Response.json({ ...valid, durationMs: 0 }),
+		Response.json({ ...valid, playId: '' }),
+		Response.json({ ...valid, trackId: 'second' }),
+		Response.json({ ...valid, playbackSessionId: 'other-tab' }),
+		Response.json({ ...valid, sessionBinding: 'B'.repeat(43) }),
+		Response.json({ ...valid, extra: 'unexpected' }),
+	]) {
+		fetchFn.mockResolvedValueOnce(reply);
+		await play(0);
+		expect([src(), media.audio]).toEqual(['', undefined]);
+	}
+
+	await play(0);
+	const expectedSrc = `/v1/plays/media/first/${sessionTab}/play-1`;
+	expect([src(), media.audio?.getAttribute('src')]).toEqual([expectedSrc, expectedSrc]);
+	expect(media.audio?.play).toHaveBeenCalledTimes(1);
+	expect(media.audio?.paused).toBe(false);
+	expect(requests().every((body) => body.track_id === 'first' && body.session_id === sessionTab)).toBe(true);
+});

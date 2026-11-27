@@ -459,3 +459,76 @@ fn browser_grants_and_media_refuse_a_removed_cohort_member() {
     assert_eq!(h.store.browser_playback_opens.get(), 2);
     assert_eq!(h.store.playback_leases.borrow()["member"], lease);
 }
+
+#[test]
+fn operator_source_stays_closed_without_a_bound_browser_receipt_and_reopens_cleanly() {
+    use crate::worker_entry::{handle_with_transport_headers, relay_media, CollectedBody};
+    use serde_json::{json, Value};
+
+    let (h, mut media, headers) = media_relay_fixture();
+    h.store.browser_playback_armed.set(true);
+    h.store.catalogue_library.borrow_mut().insert("member".into(), vec![unmatched_library_row("track")]);
+    let (lease, verified_bearer) = install_browser_play(&h, &mut media, 7, MEDIA_EPOCH);
+    // The store supplies a prebuilt receipt. This test exercises the HTTP
+    // boundary; the committed catalogue fixture exercises publication lookup.
+    let verified_receipt = h.store.browser_receipt.take().unwrap();
+    let ctx = media_relay_context(&h);
+    let bind = session_binding(&block_on(ctx.authenticate(&media, false)).unwrap().0);
+    let issue = |body: Value| {
+        let req = Request { method: "POST".into(), path: "/v1/plays".into(), origin: Some(ORIGIN.into()), body: body.to_string().into_bytes(), ..media.clone() };
+        let hdrs = HashMap::from([("x-nntune-browser-playback".into(), "1".into()), (SESSION_BINDING_HEADER.into(), bind.clone())]);
+        block_on(handle_with_transport_headers(&ctx, req, &hdrs))
+    };
+    let relay_refused = || {
+        let res: Option<Result<(), Response>> = block_on(relay_media(&ctx, &media, &CollectedBody::Complete(Vec::new()), &headers, async |_| panic!("reached Stream")));
+        assert_eq!(res.unwrap().unwrap_err().status, 404);
+    };
+
+    let start = json!({"track_id": "track", "session_id": "tab-1"});
+    let closed = issue(start.clone());
+    assert_eq!(closed.status, 404);
+    assert!(serde_json::from_str::<Value>(&closed.body).ok().and_then(|v| v.get("grant").cloned()).is_none());
+    relay_refused();
+
+    let legacy_v2 = crate::play_grant::issue_v2_at("member", "track", &lease.play_id, lease.epoch, ctx.now, lease.expires_at - ctx.now, h.config.play_grant_secret.as_deref()).unwrap().token;
+    let mutate = |f: fn(&mut browser_playback_relay::BrowserReceipt)| {
+        let mut r = verified_receipt.clone();
+        f(&mut r);
+        r
+    };
+    for broken in [
+        mutate(|r| r.lease.track_id = "other-track".into()),
+        mutate(|r| r.lease.session_id = "other-tab".into()),
+        mutate(|r| r.session_binding = "B".repeat(43)),
+    ] {
+        h.store.browser_receipt.replace(Some(broken));
+        assert_eq!(issue(start.clone()).status, 404);
+        relay_refused();
+    }
+    let mut with_v2 = verified_receipt.clone();
+    with_v2.grant.token = legacy_v2;
+    for broken in [
+        with_v2,
+        mutate(|r| r.lease.play_id = "legacy-play-1".into()),
+        mutate(|r| r.artifact_sha256 = r.artifact_sha256.to_ascii_uppercase()),
+        mutate(|r| r.artifact_sha256 = "abcd".into()),
+        mutate(|r| { let c = if r.grant.token.pop() == Some('A') { 'B' } else { 'A' }; r.grant.token.push(c); }),
+    ] {
+        h.store.browser_receipt.replace(Some(broken));
+        relay_refused();
+    }
+
+    h.store.browser_receipt.replace(Some(verified_receipt));
+    let reopened = issue(start);
+    assert_eq!(reopened.status, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&reopened.body).unwrap(),
+        json!({"sessionBinding": bind, "playbackSessionId": "tab-1", "trackId": "track", "playId": lease.play_id, "durationMs": 60000})
+    );
+    let relayed = block_on(relay_media(&ctx, &media, &CollectedBody::Complete(Vec::new()), &headers, async |get| {
+        assert_eq!(get.path, "/play/track");
+        assert!(get.headers().eq([("authorization", verified_bearer.as_str()), ("range", MEDIA_RANGE)]));
+        206
+    }));
+    assert_eq!(relayed.unwrap().ok(), Some(206));
+}
