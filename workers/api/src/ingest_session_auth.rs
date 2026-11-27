@@ -197,4 +197,108 @@ mod tests {
         let wrong_owner = check(Action::Status, "test", "library", "job", &other_job);
         assert_eq!(wrong_owner, forbidden);
     }
+
+    #[test]
+    fn reuse_action_requires_explicit_grant_matching_owner_and_scope() {
+        let mut record = record();
+        let peppers = [Pepper {
+            version: 1,
+            bytes: PEPPER,
+        }];
+        let grant = Grant {
+            credential_id: "credential".into(),
+            environment: "test".into(),
+            library_id: "library".into(),
+            actions: vec![Action::Upload, Action::Reuse],
+        };
+        let upload_only = Grant {
+            actions: vec![Action::Upload],
+            ..grant.clone()
+        };
+        let wrong_cred = Grant {
+            credential_id: "other-credential".into(),
+            ..grant.clone()
+        };
+        let job = Job {
+            id: "session-1",
+            owner_id: "owner",
+            environment: "test",
+            library_id: "library",
+        };
+        let check = |rec: &NativeRestRecord, secret, now, g, scope, target| {
+            authorize(
+                (Some(rec), secret),
+                &peppers,
+                now,
+                Some(g),
+                scope,
+                Action::Reuse,
+                target,
+            )
+        };
+        let (unauth, forbidden) = (
+            Err(CredentialError::Unauthenticated),
+            Err(CredentialError::Forbidden),
+        );
+        let (scope, target) = (("test", "library"), Some(("session-1", &job)));
+
+        assert_eq!(
+            check(&record, Some(SECRET), 1, &grant, scope, target),
+            Ok(())
+        );
+        // Upload permission alone never authorizes reuse.
+        for g in [&upload_only, &wrong_cred] {
+            assert_eq!(check(&record, Some(SECRET), 1, g, scope, target), forbidden);
+        }
+        assert_eq!(
+            check(&record, Some(SECRET), 1, &grant, scope, None),
+            forbidden
+        );
+        for (env, lib, id) in [
+            ("other", "library", "session-1"),
+            ("test", "other", "session-1"),
+            ("test", "library", "other-session"),
+            ("test", "library", ""),
+        ] {
+            assert_eq!(
+                check(
+                    &record,
+                    Some(SECRET),
+                    1,
+                    &grant,
+                    (env, lib),
+                    Some((id, &job))
+                ),
+                forbidden
+            );
+        }
+        let cross_owner = Job {
+            owner_id: "other-owner",
+            ..job
+        };
+        assert_eq!(
+            check(
+                &record,
+                Some(SECRET),
+                1,
+                &grant,
+                scope,
+                Some(("session-1", &cross_owner))
+            ),
+            forbidden
+        );
+        assert_eq!(
+            check(&record, Some("wrong"), 1, &grant, scope, target),
+            unauth
+        );
+        assert_eq!(
+            check(&record, Some(SECRET), 10, &grant, scope, target),
+            unauth
+        );
+        record.revoked_at = Some(1);
+        assert_eq!(
+            check(&record, Some(SECRET), 1, &grant, scope, target),
+            unauth
+        );
+    }
 }
