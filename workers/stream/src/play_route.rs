@@ -38,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::task::{ready, Poll};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,7 @@ use crate::delivered::{DeliveredInterval, DeliveredSink};
 use crate::grant;
 use crate::meter::Meter;
 use crate::play::{self, PlayError, PlayInput, PlayStream, StreamPool};
+use crate::r2_play::Delivery;
 
 /// R2 object suffix for a track's segment manifest:
 /// `track/<track_id>/manifest.json`, next to the `track/<track_id>`
@@ -347,7 +349,6 @@ pub fn serve_play(
             };
             let mut headers = vec![
                 ("content-type".to_string(), PLAY_CONTENT_TYPE.to_string()),
-                ("cache-control".to_string(), "private, no-store".to_string()),
                 ("accept-ranges".to_string(), "bytes".to_string()),
                 ("content-length".to_string(), response.body_len.to_string()),
             ];
@@ -377,6 +378,45 @@ pub fn serve_play(
             }
             PlayRouteOutcome::Refuse(PlayRouteRefusal::from(&error))
         }
+    }
+}
+
+/// Enforce fixed-length framing before recording any delivered bytes.
+pub struct MeteredBody<S, F: FnOnce(u64)> {
+    reader: Option<S>,
+    remaining: u64,
+    delivery: Delivery<F>,
+}
+
+impl<S, F: FnOnce(u64)> MeteredBody<S, F> {
+    pub fn new(reader: S, expected: u64, report: F) -> Self {
+        Self {
+            reader: Some(reader),
+            remaining: expected,
+            delivery: Delivery::new(expected, report),
+        }
+    }
+
+    pub fn poll_chunk<E>(
+        &mut self,
+        poll: impl FnOnce(&mut S) -> Poll<Option<Result<Vec<u8>, E>>>,
+        length_error: impl FnOnce() -> E,
+    ) -> Poll<Option<Result<Vec<u8>, E>>> {
+        let Some(reader) = self.reader.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let outcome = match ready!(poll(reader)) {
+            Some(Ok(chunk)) if chunk.len() as u64 <= self.remaining => {
+                self.remaining -= chunk.len() as u64;
+                self.delivery.record(chunk.len());
+                return Poll::Ready(Some(Ok(chunk)));
+            }
+            Some(Err(error)) => Some(Err(error)),
+            None if self.remaining == 0 => None,
+            _ => Some(Err(length_error())),
+        };
+        self.reader = None;
+        Poll::Ready(outcome)
     }
 }
 

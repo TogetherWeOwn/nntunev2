@@ -208,7 +208,6 @@ impl OriginalAuthorization {
         };
         let mut headers = vec![
             ("content-type".into(), PLAY_CONTENT_TYPE.into()),
-            ("cache-control".into(), "private, no-store".into()),
             ("accept-ranges".into(), "bytes".into()),
             ("content-length".into(), selected.len().to_string()),
         ];

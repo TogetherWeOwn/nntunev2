@@ -32,11 +32,11 @@
 //! warm provider connection parked in the pool is reused by later requests.
 
 use std::cell::{OnceCell, RefCell};
-use std::pin::{pin, Pin};
-use std::task::{ready, Context as PollContext, Poll};
+use std::pin::Pin;
+use std::task::{Context as PollContext, Poll};
 use std::time::Duration;
 
-use futures_util::{future::select, future::Either, Stream, StreamExt};
+use futures_util::{Stream, StreamExt};
 use nntune_core::nntp::NntpClient;
 use nntune_core::transports::WorkerTransport;
 use worker::wasm_bindgen::JsValue;
@@ -49,7 +49,7 @@ use crate::api_error::ApiError;
 use crate::body::{parse_body_request, run_body, BodyReply, MAX_BODY_REQUEST_BYTES};
 use crate::delivered::{parse_delivered_report, DeliveredInterval, MAX_DELIVERED_REQUEST_BYTES};
 use crate::meter_sink::{self, MeterBook};
-use crate::play_route::{self, TRACK_MANIFEST_SUFFIX};
+use crate::play_route::{self, MeteredBody, TRACK_MANIFEST_SUFFIX};
 use crate::pool::Pool;
 use crate::probe::{
     parse_request, run_probe, PoolProvider, ProbeError, ProbeReply, WallClock, MAX_PROBE_BODY_BYTES,
@@ -116,13 +116,10 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
     let authorization = req.headers().get("authorization").ok().flatten();
     let token = play_route::bearer_token(authorization.as_deref()).unwrap_or("");
     if token.starts_with("v4.") {
-        let Ok(range) = req.headers().get("range") else {
-            return api_error_response(&ApiError::invalid_request(), None);
-        };
         let request = play_route::PlayRouteRequest {
             track_id: track_id.into(),
             token: Some(token.into()),
-            range,
+            range: req.headers().get("range")?,
             trace_id: None,
         };
         return crate::enrolled_playback::route::worker::serve(req, env, ctx, request, secret)
@@ -232,9 +229,6 @@ async fn serve_blob(
                 .execute()
                 .await
                 .ok()??;
-            if object.size() != blob_len {
-                return None;
-            }
             object.body()?.stream().ok()
         })
         .await
@@ -250,53 +244,31 @@ async fn serve_blob(
         end: start,
         file_bytes: Some(blob_len),
     };
-    let metered = MeteredStream {
-        inner: Some(Box::pin(stream)),
-        remaining: expected,
-        delivery: r2_play::Delivery::new(expected, move |written| {
-            let mut interval = interval;
-            interval.end += written;
-            ctx.wait_until(report_delivered(env, interval));
-        }),
-    };
+    let metered = MeteredBody::new(Box::pin(stream), expected, move |written| {
+        let mut interval = interval;
+        interval.end += written;
+        ctx.wait_until(report_delivered(env, interval));
+    });
     Response::builder()
         .with_headers(headers)
         .with_status(status)
-        .from_stream(metered)
+        .from_stream(MeteredStream(metered))
 }
 
 /// Response-stream wrapper that counts bytes actually pulled toward the
 /// client and, when the stream settles (completed, errored, or dropped
 /// on client abort), reports the written interval exactly once. The
 /// report rides `wait_until`, so it survives the response finishing.
-struct MeteredStream<F: FnOnce(u64)> {
-    inner: Option<Pin<Box<ByteStream>>>,
-    remaining: u64,
-    delivery: r2_play::Delivery<F>,
-}
+struct MeteredStream<F: FnOnce(u64)>(MeteredBody<Pin<Box<ByteStream>>, F>);
 
 impl<F: FnOnce(u64) + Unpin> Stream for MeteredStream<F> {
     type Item = Result<Vec<u8>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>) -> Poll<Option<Self::Item>> {
-        let Some(inner) = self.inner.as_mut() else {
-            return Poll::Ready(None);
-        };
-        let outcome = match ready!(inner.as_mut().poll_next(cx)) {
-            Some(Ok(chunk))
-                if routes::consume_body_bytes(&mut self.remaining, Some(chunk.len())) =>
-            {
-                self.delivery.record(chunk.len());
-                return Poll::Ready(Some(Ok(chunk)));
-            }
-            Some(Err(error)) => Some(Err(error)),
-            None if routes::consume_body_bytes(&mut self.remaining, None) => None,
-            _ => Some(Err(worker::Error::RustError(
-                "playback body length mismatch".into(),
-            ))),
-        };
-        self.inner = None;
-        Poll::Ready(outcome)
+        self.0.poll_chunk(
+            |reader| reader.as_mut().poll_next(cx),
+            || worker::Error::RustError("playback body length mismatch".into()),
+        )
     }
 }
 
@@ -692,9 +664,11 @@ impl NntpPool {
         }
         // The ack names at most the batch's play ids; cap the read so
         // a hostile or broken endpoint cannot balloon the DO.
-        let stream = response.stream().map_err(|_| ())?;
-        let bytes = collect_capped(stream, 64 * 1024).await.map_err(|_| ())?;
-        meter_sink::parse_ack(&bytes).ok_or(())
+        let text = response.text().await.map_err(|_| ())?;
+        if text.len() > 64 * 1024 {
+            return Err(());
+        }
+        meter_sink::parse_ack(text.as_bytes()).ok_or(())
     }
 
     /// The user's provider settings and connection cap.
@@ -729,11 +703,7 @@ impl NntpPool {
 async fn dial_with_deadline<T>(
     dial: impl std::future::Future<Output = nntune_core::Result<T>>,
 ) -> nntune_core::Result<T> {
-    let deadline = pin!(Delay::from(Duration::from_secs(20)));
-    match select(deadline, pin!(dial)).await {
-        Either::Left(_) => Err(nntune_core::Error::Io(std::io::ErrorKind::TimedOut.into())),
-        Either::Right((result, _)) => result,
-    }
+    routes::dial_before_deadline(Delay::from(Duration::from_secs(20)), dial).await
 }
 
 /// Convert the portable routing decision into the reply rendered by the adapter.
@@ -747,23 +717,12 @@ fn route_reply(decision: ProbeDecision) -> ProbeReply {
 
 /// Read the body without ever buffering more than `cap` bytes.
 async fn read_capped(req: &mut Request, cap: usize) -> core::result::Result<Vec<u8>, ProbeError> {
-    let stream = req
-        .stream()
-        .map_err(|_| ProbeError::BadRequest("unreadable body"))?;
-    collect_capped(stream, cap).await
-}
-
-async fn collect_capped(
-    stream: ByteStream,
-    cap: usize,
-) -> core::result::Result<Vec<u8>, ProbeError> {
     let unreadable = ProbeError::BadRequest("unreadable body");
-    let mut stream = pin!(stream);
+    let mut stream = Box::pin(req.stream().map_err(|_| unreadable)?);
     let mut buf = Vec::new();
-    let mut remaining = cap as u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| unreadable)?;
-        if !routes::consume_body_bytes(&mut remaining, Some(chunk.len())) {
+        if buf.len().saturating_add(chunk.len()) > cap {
             return Err(ProbeError::TooLarge);
         }
         buf.extend_from_slice(&chunk);

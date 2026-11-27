@@ -10,6 +10,12 @@
 //! change here (including the `503` → `200` mutant) turns the native suite
 //! red long before deploy.
 
+use std::{
+    future::{poll_fn, Future},
+    pin::pin,
+    task::Poll,
+};
+
 /// Durable Object class name. Must match `class_name` in
 /// `workers/stream/wrangler.toml` and the `pub struct` in `src/runtime.rs`
 /// (pinned by `do_class_name_matches_wrangler_and_runtime`).
@@ -201,17 +207,21 @@ pub fn decide_public_route(method: &str, path: &str) -> PublicRoute {
     }
 }
 
-/// Charge an entire chunk against a body budget before copying or sending it.
-/// For a fixed-length response, accept EOF only after the budget is exhausted.
-pub fn consume_body_bytes(remaining: &mut u64, chunk_len: Option<usize>) -> bool {
-    let Some(len) = chunk_len else {
-        return *remaining == 0;
-    };
-    let Some(next) = remaining.checked_sub(len as u64) else {
-        return false;
-    };
-    *remaining = next;
-    true
+/// Race a provider handshake against its operation deadline.
+pub async fn dial_before_deadline<T>(
+    deadline: impl Future<Output = ()>,
+    dial: impl Future<Output = nntune_core::Result<T>>,
+) -> nntune_core::Result<T> {
+    let (mut deadline, mut dial) = (pin!(deadline), pin!(dial));
+    poll_fn(|cx| {
+        if deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(nntune_core::Error::Io(
+                std::io::ErrorKind::TimedOut.into(),
+            )));
+        }
+        dial.as_mut().poll(cx)
+    })
+    .await
 }
 
 #[cfg(test)]

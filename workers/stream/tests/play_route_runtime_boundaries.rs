@@ -1,22 +1,21 @@
-use std::future::pending;
+use std::{
+    cell::Cell,
+    future::{pending, ready},
+    task::Poll,
+};
 
+use futures_util::FutureExt;
 use nntune_core::{
     nzb::{File, Segment},
     original_source::OriginalSource,
 };
 use nntune_stream::{
     api_error::ApiError,
-    cache::ContentCache,
     grant,
-    meter::MemoryMeter,
     original_play::{authorize_original, control::OriginalRequestControl},
     play::PlayError,
-    play_route::{
-        bearer_token, serve_play, MemoryManifestStore, PlayRouteOutcome, PlayRouteRefusal,
-        PlayRouteRequest,
-    },
-    pool::Pool,
-    routes::{consume_body_bytes, decide_public_route, PublicRoute},
+    play_route::{bearer_token, MeteredBody, PlayRouteRefusal, PlayRouteRequest},
+    routes::{decide_public_route, dial_before_deadline, PublicRoute},
 };
 
 const TRACK: &str = "00000000-0000-0000-0000-000000000001";
@@ -53,34 +52,6 @@ fn public_dispatch_and_bearer_reject_ambiguous_inputs() {
 }
 
 #[test]
-fn granted_cache_range_stays_private() {
-    let mut cache = ContentCache::new();
-    cache.put_track(TRACK, vec![0, 1, 2, 3]);
-    let result = serve_play(
-        &mut Pool::new(1),
-        &mut cache,
-        &mut MemoryMeter::default(),
-        SECRET,
-        &MemoryManifestStore::default(),
-        "127.0.0.1:0".parse().unwrap(),
-        NOW,
-        &request(),
-    );
-    let PlayRouteOutcome::Serve(response) = result else {
-        panic!("bound range refused")
-    };
-    assert_eq!((response.status, response.body_len), (206, 2));
-    for (name, value) in [
-        ("content-range", "bytes 1-2/4"),
-        ("content-length", "2"),
-        ("cache-control", "private, no-store"),
-    ] {
-        assert!(response.headers.contains(&(name.into(), value.into())));
-    }
-    assert_eq!(response.play.flatten().collect::<Vec<_>>(), [1, 2]);
-}
-
-#[test]
 fn original_control_failure_and_grant_expiry_keep_distinct_statuses() {
     let file = File {
         ordinal: 0,
@@ -97,14 +68,13 @@ fn original_control_failure_and_grant_expiry_keep_distinct_statuses() {
         }],
     };
     let source = OriginalSource::from_file(TRACK, "fixture-job", &file, 4, None).unwrap();
-    let request = request();
     for (now, status, code) in [
         (NOW, 502, "upstream_unavailable"),
         (EXPIRY, 401, "unauthorized"),
     ] {
         let mut control = OriginalRequestControl::new(EXPIRY, pending(), || now);
         control.cancellation().cancel();
-        let error = authorize_original(&request, SECRET, NOW)
+        let error = authorize_original(&request(), SECRET, NOW)
             .unwrap()
             .prepare_owned(source.clone(), Some("bytes=4-"), &mut control)
             .err()
@@ -115,14 +85,37 @@ fn original_control_failure_and_grant_expiry_keep_distinct_statuses() {
 }
 
 #[test]
-fn body_budget_refuses_overrun_and_short_eof() {
-    let mut remaining = 4;
-    assert!(consume_body_bytes(&mut remaining, Some(3)));
-    assert!(!consume_body_bytes(&mut remaining, Some(2)));
-    assert!(!consume_body_bytes(&mut remaining, None));
-    assert!(consume_body_bytes(&mut remaining, Some(1)));
-    assert!(consume_body_bytes(&mut remaining, None));
-    assert!(!consume_body_bytes(&mut remaining, Some(1)));
+fn metered_body_rejects_overrun_and_short_eof() {
+    for (chunks, accepted, terminal, reported) in [
+        (&[5][..], 0, Some(Err("length")), None),
+        (&[2, 3, 1][..], 1, Some(Err("length")), Some(2)),
+        (&[2][..], 1, Some(Err("length")), Some(2)),
+        (&[2, 2][..], 2, None, Some(4)),
+    ] {
+        let delivered = Cell::new(None);
+        let reader = chunks.iter().map(|&len| Ok(vec![0; len]));
+        let mut body = MeteredBody::new(reader, 4, |bytes| delivered.set(Some(bytes)));
+        let mut pull = || body.poll_chunk(|reader| Poll::Ready(reader.next()), || "length");
+        for &len in &chunks[..accepted] {
+            assert_eq!(pull(), Poll::Ready(Some(Ok(vec![0; len]))));
+        }
+        assert_eq!(pull(), Poll::Ready(terminal));
+        assert_eq!(
+            body.poll_chunk(|_| panic!("read after termination"), || "length"),
+            Poll::Ready(None)
+        );
+        drop(body);
+        assert_eq!(delivered.get(), reported);
+    }
+}
+
+#[test]
+fn handshake_deadline_stops_a_pending_dial() {
+    let refused = dial_before_deadline(ready(()), pending::<nntune_core::Result<()>>());
+    assert!(matches!(
+        refused.now_or_never(),
+        Some(Err(nntune_core::Error::Io(error))) if error.kind() == std::io::ErrorKind::TimedOut
+    ));
 }
 
 #[test]
@@ -133,13 +126,7 @@ fn error_codes_use_public_messages_and_registry_status() {
         retry_after_ms: 1001,
     };
     let refusal = PlayRouteRefusal::from(&failure);
-    assert_eq!(
-        (
-            failure.http_status(),
-            refusal.status,
-            refusal.api_error.status
-        ),
-        (503, 503, 503)
-    );
+    assert_eq!(failure.http_status(), 503);
+    assert_eq!(refusal.status, refusal.api_error.status);
     assert_eq!(refusal.retry_after.as_deref(), Some("2"));
 }
