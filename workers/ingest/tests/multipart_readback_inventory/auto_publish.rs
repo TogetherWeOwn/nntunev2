@@ -365,18 +365,17 @@ pub(super) async fn exercise(
     assert_counter(&replay, json!({"outcome": "staged"}));
     tx.commit().await.unwrap();
 
-    let publication = async || {
-        db.query_one(
-            "SELECT jsonb_agg(jsonb_build_array(t, s, l) ORDER BY t.medium_no, t.track_no)::text
+    const PUBLICATION: &str =
+        "SELECT jsonb_agg(jsonb_build_array(t, s, l) ORDER BY t.medium_no, t.track_no)::text
              FROM public.tracks t
              LEFT JOIN public.catalogue_s3_sources s ON t.id = s.track_id
              LEFT JOIN public.storage_s3_locator_intents l USING (object_id)
-             WHERE t.release_id = $1::text::uuid",
-            &[&RELEASE],
-        )
-        .await
-        .unwrap()
-        .get::<_, String>(0)
+             WHERE t.release_id = $1::text::uuid";
+    let publication = async || {
+        db.query_one(PUBLICATION, &[&RELEASE])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
     };
     let before = publication().await;
 
@@ -384,13 +383,17 @@ pub(super) async fn exercise(
     // upload outcome that is indeterminate or disagrees with its receipt must
     // stop before the catalogue transaction can move either pointer.
     let mut tx = writer.transaction().await.unwrap();
-    for evidence in [Indeterminate(&uploads), Conflicting(&uploads, 5)] {
-        let result = apply(&mut tx, evidence, false, 2).await;
-        assert!(matches!(
-            result,
-            Err(PublicationError::Indeterminate | PublicationError::Refused)
-        ));
-        assert_eq!(publication().await, before);
+    for (evidence, error) in [
+        (Indeterminate(&uploads), PublicationError::Indeterminate),
+        (Conflicting(&uploads, 5), PublicationError::Refused),
+    ] {
+        assert_eq!(apply(&mut tx, evidence, false, 2).await, Err(error));
+        let staged = tx
+            .query_one(PUBLICATION, &[&RELEASE])
+            .await
+            .unwrap()
+            .get::<_, String>(0);
+        assert_eq!(staged, before);
     }
     tx.rollback().await.unwrap();
     assert_eq!(publication().await, before);
