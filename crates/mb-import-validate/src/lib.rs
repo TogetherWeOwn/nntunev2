@@ -411,7 +411,7 @@ fn decode_copy_field(value: &str) -> Result<String, &'static str> {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\r' {
+        if matches!(bytes[i], b'\r' | b'\n') {
             return Err(reason::BAD_ESCAPE);
         }
         if bytes[i] != b'\\' {
@@ -599,7 +599,14 @@ fn split_zone(value: &str) -> Option<String> {
 
 fn is_date(date: &str) -> bool {
     let p: Vec<&str> = date.split('-').collect();
-    if p.len() != 3 || p[0].len() != 4 || p[1].len() != 2 || p[2].len() != 2 {
+    if p.len() != 3
+        || p[0].len() != 4
+        || p[1].len() != 2
+        || p[2].len() != 2
+        || !p
+            .iter()
+            .all(|part| part.bytes().all(|b| b.is_ascii_digit()))
+    {
         return false;
     }
     let (Ok(y), Ok(m), Ok(d)) = (
@@ -626,6 +633,12 @@ fn is_time(time: &str) -> bool {
     // Canonical dump shape requires seconds (`HH:MM:SS[.ffffff]`); a bare
     // `HH:MM` is valid Postgres but not a shape the dumps emit, so it goes
     // to the dead-letter table for operator review instead.
+    if !time
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b':' | b'.'))
+    {
+        return false;
+    }
     let p: Vec<&str> = time.split(':').collect();
     if p.len() != 3 {
         return false;

@@ -154,6 +154,8 @@ fn optional<T>(
 }
 
 fn timestamp(token: &str) -> Result<(), &'static str> {
+    // Report poison escapes before enforcing the producer's literal timestamp.
+    required_text(token)?;
     token
         .strip_suffix('Z')
         .is_some_and(|utc| {
