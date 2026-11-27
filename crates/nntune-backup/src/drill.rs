@@ -446,12 +446,10 @@ fn crypto(e: nntune_core::Error) -> DrillError {
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     let source = src.canonicalize().map_err(|e| e.to_string())?;
-    let parent = dst.parent().ok_or("invalid restore directory")?;
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
+    let parent = dst
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let destination = parent
         .canonicalize()
         .map_err(|e| e.to_string())?
@@ -722,6 +720,7 @@ mod tests {
             err,
             DrillError::KeyringMissingVersion(DRILL_KEK_VERSION)
         ));
+        assert!(!restore_dir.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

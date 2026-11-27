@@ -140,7 +140,7 @@ pub fn verify_rows(rows_jsonl: &str, keyring: &Keyring, tool: &str) -> VerifyRep
     .unwrap()
 }
 
-// Hex ciphertext plus the other columns and framing of the operator export.
+// Hex ciphertext plus room for the other columns and the line terminator.
 const MAX_ROW_BYTES: usize = 2 * MAX_CIPHERTEXT_BYTES + 16 * 1024;
 
 /// Verify an export one bounded row at a time. An I/O error, oversized row

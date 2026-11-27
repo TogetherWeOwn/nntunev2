@@ -47,7 +47,7 @@ fn cli_verify_refuses_oversized_invalid_or_symlinked_exports() {
     let scratch = Scratch::new("invalid-rows");
     let rows = scratch.0.join("rows.jsonl");
     let file = fs::File::create(&rows).unwrap();
-    file.set_len(2 * MAX_CIPHERTEXT_BYTES as u64 + 32 * 1024)
+    file.set_len(2 * MAX_CIPHERTEXT_BYTES as u64 + 16 * 1024 + 1)
         .unwrap();
     let error = b"error: invalid or unreadable rows export";
     assert_denied(verify_cli(&rows).output().unwrap(), error);
