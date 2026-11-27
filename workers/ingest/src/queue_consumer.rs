@@ -77,10 +77,7 @@
 use futures_util::{Stream, StreamExt};
 use worker::{Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
 
-use crate::dispatch::{
-    content_sha256_hex, make_job_id, validate_user_id, INGEST_QUEUE_BINDING, PAYLOAD_KEY_PREFIX,
-    PAYLOAD_KV_BINDING,
-};
+use crate::dispatch::{make_job_id, validate_user_id, INGEST_QUEUE_BINDING, PAYLOAD_KV_BINDING};
 use crate::jobs::{
     advance_checkpoint, validate_job_id, JobCheckpoint, JobSource, JobState, MAX_ATTEMPTS,
     MAX_REPAIR_ROUNDS,
@@ -161,7 +158,8 @@ enum Settlement {
     Quarantine(Box<DlqEntry>),
 }
 
-fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
+/// Validate the original queue envelope before logging or accessing job state.
+pub fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
     if !validate_job_id(&msg.job_id) || !validate_user_id(&msg.user_id) {
         return Err("invalid job or user id");
     }
@@ -212,14 +210,8 @@ fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
             }
         }
         JobSource::NzbUpload => {
-            let payload_ref = msg.payload_ref.as_deref().ok_or("missing payload handle")?;
-            let sha = payload_ref
-                .strip_prefix(PAYLOAD_KEY_PREFIX)
-                .ok_or("invalid payload handle")?;
-            if sha.len() != 64
-                || !sha.bytes().all(|b| b.is_ascii_hexdigit())
-                || sha != sha.to_ascii_lowercase()
-                || msg.query.is_some()
+            let sha = msg.upload_digest().ok_or("invalid payload handle")?;
+            if msg.query.is_some()
                 || msg.indexer_ref.is_some()
                 || !msg.categories.is_empty()
                 || msg.limit.is_some()
@@ -526,12 +518,7 @@ async fn load_upload_parse(
             return Err(unavailable());
         }
     };
-    if payload_ref
-        != format!(
-            "{PAYLOAD_KEY_PREFIX}{}",
-            content_sha256_hex(payload.as_bytes())
-        )
-    {
+    if !msg.matches_upload_payload(payload.as_bytes()) {
         return Err(JobError::permanent(
             ERR_PARSE_FAILED,
             "upload payload digest mismatch",
@@ -1115,22 +1102,21 @@ impl MbFetchFailure {
     }
 }
 
-/// Load the upload payload for match-query derivation only (it was
-/// digest-checked and parsed in `Parsing`). Absence is distinguished
-/// from failure: a genuinely missing payload (its 30-day TTL expired
-/// before the job reached `Matching`) yields `Ok(None)` and the job is
-/// written unmatched, while a binding/read failure is a transient
-/// `ERR_MATCH_FAILED` — a KV blip must not bake a permanent unmatched
-/// `Done` into the library.
-async fn load_payload_for_match(env: &Env, msg: &QueueMsg) -> Result<Option<String>, JobError> {
+/// Recheck the upload digest before deriving a match query. Missing bytes
+/// retry within the job budget, since a KV miss cannot establish that the
+/// upload has no catalogue match.
+async fn load_payload_for_match(env: &Env, msg: &QueueMsg) -> Result<String, JobError> {
     let transient = |detail: &'static str| JobError::transient(ERR_MATCH_FAILED, detail);
     let Some(payload_ref) = msg.payload_ref.as_deref() else {
-        return Ok(None);
+        return Err(JobError::permanent(
+            ERR_MATCH_FAILED,
+            "upload payload handle missing",
+        ));
     };
     let store = env
         .kv(PAYLOAD_KV_BINDING)
         .map_err(|_| transient("upload payload unavailable"))?;
-    store
+    let payload = store
         .get(payload_ref)
         .cache_ttl(PAYLOAD_CACHE_TTL_SECS)
         .text()
@@ -1143,7 +1129,15 @@ async fn load_payload_for_match(env: &Env, msg: &QueueMsg) -> Result<Option<Stri
                 serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
             );
             transient("upload payload unavailable")
-        })
+        })?
+        .ok_or_else(|| transient("upload payload unavailable"))?;
+    if !msg.matches_upload_payload(payload.as_bytes()) {
+        return Err(JobError::permanent(
+            ERR_MATCH_FAILED,
+            "upload payload digest mismatch",
+        ));
+    }
+    Ok(payload)
 }
 
 /// The query the MB lookup runs for this job: the search text for
@@ -1156,9 +1150,7 @@ async fn match_query(env: &Env, msg: &QueueMsg) -> Result<Option<String>, JobErr
             msg.query.as_deref().unwrap_or(""),
         )),
         JobSource::NzbUpload => {
-            let Some(payload) = load_payload_for_match(env, msg).await? else {
-                return Ok(None);
-            };
+            let payload = load_payload_for_match(env, msg).await?;
             let subjects: Vec<String> = match nntune_core::nzb::parse(payload.as_bytes()) {
                 Ok(document) => document
                     .files
@@ -1944,11 +1936,6 @@ async fn persist(env: &Env, cp: &JobCheckpoint, trace_id: &str) -> bool {
 }
 
 async fn process_message(env: &Env, msg: &QueueMsg) -> Settlement {
-    if validate_queue_msg(msg).is_err() {
-        // Poison shape: no trustworthy job identity to checkpoint against.
-        // Native Queue retries move it to the dead-letter queue.
-        return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
-    }
     let mut cp = match crate::checkpoint::get(env, &msg.job_id).await {
         Ok(Some(cp)) => {
             if !checkpoint_matches(msg, &cp) {
@@ -2092,6 +2079,11 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
             return;
         }
     };
+    if validate_queue_msg(&msg).is_err() {
+        // Native retries move an invalid envelope to the dead-letter queue.
+        retry_raw(&raw, UNPERSISTED_RETRY_SECS);
+        return;
+    }
     // The route stamped this job's trace on the message; keep a valid ID so
     // the consumer's line correlates with the intake lines, and hand a valid
     // ID to any continuation this delivery enqueues. An invalid value is

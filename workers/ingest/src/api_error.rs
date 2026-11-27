@@ -5,7 +5,7 @@
 //! the registry HTTP status. Validation messages are user-facing by
 //! construction; 5xx messages never carry binding or upstream detail.
 
-use serde::Serialize;
+use serde::{ser::SerializeStruct, Serialize, Serializer};
 
 use crate::nzb_intake::IntakeRejection;
 
@@ -97,13 +97,33 @@ fn message_for_server_error(code: &str) -> &'static str {
 
 /// A user-facing error ready for the HTTP layer: `status` is the response
 /// status, the serialized body is exactly `{code, message, retryable}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
     pub code: &'static str,
     pub message: String,
     pub retryable: bool,
-    #[serde(skip)]
     pub status: u16,
+}
+
+impl Serialize for ApiError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let declared = spec(self.code);
+        let spec = if declared.status == self.status {
+            declared
+        } else {
+            FALLBACK
+        };
+        let message = if spec.status >= 500 {
+            message_for_server_error(spec.code)
+        } else {
+            &self.message
+        };
+        let mut body = serializer.serialize_struct("ApiError", 3)?;
+        body.serialize_field("code", spec.code)?;
+        body.serialize_field("message", message)?;
+        body.serialize_field("retryable", &spec.retryable)?;
+        body.end()
+    }
 }
 
 impl ApiError {
@@ -112,9 +132,7 @@ impl ApiError {
     /// registered codes keep the caller's message.
     pub fn by_code(code: &str, message: impl Into<String>) -> Self {
         let spec = spec(code);
-        let message = if spec.code != code {
-            "unexpected error".to_string()
-        } else if spec.status >= 500 {
+        let message = if spec.status >= 500 {
             message_for_server_error(spec.code).to_string()
         } else {
             message.into()

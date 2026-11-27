@@ -510,6 +510,39 @@ impl Spend {
     }
 }
 
+fn spool_matches(
+    segments: &[StagedSpoolSegment],
+    job_id: &str,
+    round: u32,
+    index: usize,
+    segment_count: usize,
+) -> bool {
+    segments.len() <= segment_count
+        && segments
+            .iter()
+            .enumerate()
+            .all(|(n, segment)| segment.key == VerifyProgress::spool_key(job_id, round, index, n))
+}
+
+fn scratch_progress_matches(job_id: &str, files: &[ParsedFile], progress: &VerifyProgress) -> bool {
+    let round = progress.round;
+    progress.staged.iter().all(|(&index, staged)| {
+        files.get(index).is_some_and(|file| {
+            if staged.spool.is_empty() {
+                staged.key == VerifyProgress::file_key(job_id, round, index, &file.name)
+            } else {
+                staged.key == VerifyProgress::spool_meta_key(job_id, round, index)
+                    && staged.spool.len() == file.segment_ids.len()
+                    && spool_matches(&staged.spool, job_id, round, index, file.segment_ids.len())
+            }
+        })
+    }) && progress.spool.iter().all(|(&index, segments)| {
+        files.get(index).is_some_and(|file| {
+            spool_matches(segments, job_id, round, index, file.segment_ids.len())
+        })
+    })
+}
+
 /// Run one Verifying step. See the module docs for the order, caps and
 /// resume contract. `deadline_exceeded` is polled before each file and
 /// segment (the consumer passes a wall-clock budget).
@@ -527,6 +560,16 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
     }
     if files.is_empty() || files.len() > MAX_VERIFY_FILES {
         return Err(VerifyError::Permanent("file count out of bounds".into()));
+    }
+    if files.iter().any(|file| {
+        file.segment_ids.is_empty() || file.segment_ids.len() != file.segment_bytes.len()
+    }) {
+        return Err(VerifyError::Permanent(
+            "invalid file segment inventory".into(),
+        ));
+    }
+    if !scratch_progress_matches(job_id, files, progress) {
+        return Err(VerifyError::Permanent("invalid scratch progress".into()));
     }
     let round = progress.round;
     let mut spend = Spend {
@@ -609,7 +652,7 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
             // judgement in its metadata — adopt it instead of refetching.
             let key = VerifyProgress::file_key(job_id, round, idx, &file.name);
             if let Some(meta) = scratch.head(&key).await? {
-                if meta.key == key {
+                if meta.key == key && meta.spool.is_empty() {
                     progress.staged.insert(idx, meta);
                     if !file.is_par2 {
                         claim_staged(&sets, files, progress, &mut claimed);
@@ -630,6 +673,14 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                             if adopted.key == meta_key
                                 && adopted.sha256 == meta.sha256
                                 && adopted.size == meta.size
+                                && adopted.spool.len() == file.segment_ids.len()
+                                && spool_matches(
+                                    &adopted.spool,
+                                    job_id,
+                                    round,
+                                    idx,
+                                    file.segment_ids.len(),
+                                )
                             {
                                 // Same guard as resume trust: adopt the
                                 // staged judgement only while every
@@ -687,19 +738,20 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                         break;
                     }
                     let key = VerifyProgress::spool_key(job_id, round, idx, n);
-                    match scratch.head(&key).await? {
-                        Some(meta) => adopted.push(StagedSpoolSegment {
-                            key: meta.key,
-                            size: meta.size,
-                            crc32: meta.crc32,
-                            missing: meta.missing,
-                            // Refused segments stage no object, so a
-                            // rebuilt cursor never adopts one: any
-                            // object found here held real bytes.
-                            size_refused: false,
-                        }),
-                        None => break,
-                    }
+                    let Some(meta) = scratch
+                        .head(&key)
+                        .await?
+                        .filter(|m| m.key == key && !m.missing)
+                    else {
+                        break;
+                    };
+                    adopted.push(StagedSpoolSegment {
+                        key,
+                        size: meta.size,
+                        crc32: meta.crc32,
+                        missing: false,
+                        size_refused: false,
+                    });
                 }
                 if !adopted.is_empty() {
                     progress.spool.insert(idx, adopted);
