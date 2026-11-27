@@ -1293,7 +1293,7 @@ impl PgStore {
             budget
                 .bootstrap(|| billing_budget::bootstrap_transaction(&mut client))
                 .await?;
-            budget.work(|| work(&mut client)).await
+            budget.work(|| Box::pin(work(&mut client))).await
         })
         .await;
         result.map_err(|_| self.statement_failed("api.db.statement_failed.store_reconcile_outcome"))

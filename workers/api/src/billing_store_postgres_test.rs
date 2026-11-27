@@ -476,10 +476,7 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
     assert_eq!(snapshot(&observer).await, committed);
 
     check_legacy_mixed_plan_history(&observer, seed).await;
-    Box::pin(scheduled_reconciliation_preserves_later_plan_update(
-        &observer,
-    ))
-    .await;
+    scheduled_reconciliation_preserves_later_plan_update(&observer).await;
     drop(observer);
     driver.await.unwrap().unwrap();
 }
