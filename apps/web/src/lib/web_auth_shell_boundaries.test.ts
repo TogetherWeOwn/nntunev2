@@ -82,7 +82,6 @@ it('skips listeners retired and resubscribed during an auth transition', () => {
 		[offFirst, offSecond, offReplacement].forEach((off) => off());
 	}
 });
-
 it.each(['_x', 'YQ==', 'YQ  ', '+w'])('rejects noncanonical base64url %j', (value) => {
 	expect(() => decodeBase64Url(value)).toThrow();
 });
@@ -90,7 +89,6 @@ it.each(['_x', 'YQ==', 'YQ  ', '+w'])('rejects noncanonical base64url %j', (valu
 const creation = { challenge: 'AQ', rp: { name: 'Example' },
 	user: { id: 'AQ', name: 'example', displayName: 'Example' }, pubKeyCredParams: [] };
 const bytesAsBase64 = (size: number) => encodeBase64Url(new Uint8Array(size));
-
 it.each(['', 'A'.repeat(44), 'YQ='])('rejects an invalid challenge %j', (challenge) => {
 	expect(() => toRequestOptions({ challenge })).toThrow();
 	expect(() => toCreationOptions({ ...creation, challenge })).toThrow();
@@ -102,7 +100,6 @@ it('accepts padded challenges and fields at their size limits', () => {
 		.allowCredentials).toHaveLength(64);
 	expect(toCreationOptions({ ...creation, user: { ...creation.user, id: bytesAsBase64(64) } }).user.id)
 		.toEqual(new Uint8Array(64));
-	expect(serialize(assertion, { id: bytesAsBase64(1024) }).id).toBe(bytesAsBase64(1024));
 });
 
 it.each(['', 'YQ==', bytesAsBase64(65)])('rejects an invalid registration handle %j', (id) => {
@@ -111,6 +108,7 @@ it.each(['', 'YQ==', bytesAsBase64(65)])('rejects an invalid registration handle
 
 it.each([
 	['empty id', [{ id: '' }]],
+	['oversized id', [{ id: bytesAsBase64(1025) }]],
 	['wrong type', [{ id: 'AQ', type: 'password' as PublicKeyCredentialType }]],
 	['too many entries', Array(65).fill({ id: 'AQ' })],
 	['sparse list', new Array(1)]
@@ -125,16 +123,17 @@ const serialize = (response: Record<string, ArrayBuffer | null>, fields: Record<
 	serializePublicKeyCredential({ id: 'AQ', type: 'public-key', rawId: buffer, ...fields,
 		response: { clientDataJSON: buffer, ...response }, getClientExtensionResults: () => ({})
 	} as unknown as PublicKeyCredential);
-
 it.each([
 	['rawId', 1024], ['authenticatorData', 16_384], ['signature', 1024],
 	['userHandle', 64], ['clientDataJSON', 16_384], ['attestationObject', 16_384]
 ] as const)('bounds the browser credential %s buffer', (field, limit) => {
-	const atSize = (size: number) => field === 'rawId' ? serialize(assertion, { rawId: new ArrayBuffer(size) })
+	const atSize = (size: number, id = 'AQ') => field === 'rawId' ? serialize(assertion, { id, rawId: new ArrayBuffer(size) })
 		: serialize({ ...(field === 'attestationObject' ? {} : assertion), [field]: new ArrayBuffer(size) });
 	expect(() => atSize(0)).toThrow();
 	expect(() => atSize(limit + 1)).toThrow();
-	expect(atSize(limit).id).toBe('AQ');
+	const encoded = bytesAsBase64(limit);
+	const result = atSize(limit, encoded);
+	expect(field === 'rawId' ? result.rawId : (result.response as Record<string, unknown>)[field]).toBe(encoded);
 });
 
 it.each([{ type: 'password' }, { id: '' }, { id: '+' }, { id: bytesAsBase64(1025) }])('rejects malformed browser credential metadata %#', (fields) => {
@@ -147,14 +146,14 @@ it('bounds attribution entry counts, evidence lists and field lengths', () => {
 	expect(validate(new Array(129))).toHaveLength(1);
 	expect(validate([{ ...entry, evidence: Array(33).fill('LICENSE') }])).toHaveLength(1);
 	expect(validate([{ ...entry, notice: 'a'.repeat(4097) }])).toHaveLength(1);
+	expect(validate([entry])).toEqual([]);
 });
 
 it('withholds both attribution lists when inventory validation fails', async () => {
 	vi.resetModules();
 	vi.doMock('./attributions/contract.js', () => ({ validateAttributionInventory: () => ['invalid'] }));
 	const { activeAttributions, plannedAttributions } = await import('./attributions/index.js');
-	expect(activeAttributions).toEqual([]);
-	expect(plannedAttributions).toEqual([]);
+	expect([activeAttributions, plannedAttributions]).toEqual([[], []]);
 });
 
 it('falls back to finite menu coordinates for invalid geometry', () => {
@@ -218,6 +217,7 @@ it('keeps mini-player hints isolated and clears invalid hints', () => {
 });
 
 it('refuses malformed panel content', () => {
+	setRightPanel((() => {}) as unknown as Parameters<typeof setRightPanel>[0]);
 	setRightPanel('invalid snippet' as unknown as Parameters<typeof setRightPanel>[0]);
 	expect(readRightPanel()).toBeNull();
 });
