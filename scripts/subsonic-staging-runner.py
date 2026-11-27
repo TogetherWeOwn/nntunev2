@@ -492,6 +492,9 @@ def pressure(model, limits):
 
 
 def validate(model, slot, sample, elapsed, limits):
+    require(type(sample) is dict and type(sample.get("oracle")) is str
+            and type(sample.get("http_status", 0)) is int
+            and type(sample.get("body_bytes", 0)) is int, "response-mismatch")
     require(0 <= sample.get("body_bytes", 0) <= limits["body_bytes"], "body-limit")
     if "pair" not in slot:
         require(sample == slot["expected"], "response-mismatch")

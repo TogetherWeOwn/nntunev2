@@ -754,6 +754,16 @@ class InvalidInputTests(unittest.TestCase):
         self.assertRejected(with_section("genres", SubSection("collected", ())))
         self.assertRejected(with_section("genres", Section("collected", (SubOwned(OWNER, Genre("g", "n", True, T0)),))))
 
+    def test_coverage_status_cannot_spoof_a_valid_string(self):
+        class SpoofedStatus(str):
+            def __eq__(self, other):
+                return other == "collected"
+
+        status = SpoofedStatus(SENTINEL)
+        self.assertRejected(with_section("genres", sec(status=status)))
+        library = Library("name", T0, sec(status=status))
+        self.assertRejected(with_section("libraries", sec(own(library))))
+
     def test_malformed_ownership_identities_fail(self):
         for owner in (0, True, "", object()):
             self.assertRejected(with_section("genres", sec(Owned(owner, Genre("g", "n", True, T0)))))

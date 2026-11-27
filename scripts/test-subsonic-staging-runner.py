@@ -7,8 +7,10 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from io import StringIO
 from pathlib import Path
 from threading import Event, Thread, Timer
 from unittest.mock import patch
@@ -496,6 +498,23 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(model.readback(), BASELINE)
                 self.assertEqual(model.starts, [])
 
+    def test_noninteger_receipt_values_do_not_count_as_accepted(self):
+        for field in ("http_status", "body_bytes"):
+            with self.subTest(field=field):
+                class MalformedReceipt(RecordingModel):
+                    def result(self, slot):
+                        sample = super().result(slot)
+                        if sample is not None and field in sample:
+                            sample[field] = float(sample[field])
+                        return sample
+
+                report = rehearse(matrix, MalformedReceipt())
+                self.assertEqual(report["stop"], "response-mismatch")
+                self.assertEqual(report["cleanup"], "simulated-off-and-drained")
+                last = report["slots"][report["starts"]]
+                self.assertEqual(last["state"], "rejected")
+                self.assertNotIn(field, last)
+
     def test_telemetry_loss_and_pressure_stop_before_next_start(self):
         for starts, observation, reason in ((0, (-1, True, 0), "telemetry-stale-or-unsafe"),
                                             (1, (50, True, 3), "backend-pressure"),
@@ -659,6 +678,66 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(report["cleanup"], "unverified")
         self.assertTrue(model.state.verified_off())
         self.assertEqual(model.state.version, BASELINE.version)
+
+
+class FixtureCheckerTests(unittest.TestCase):
+    def test_rejects_malformed_or_linked_golden_fixtures(self):
+        checker = runpy.run_path(str(Path(__file__).with_name("check-subsonic-fixtures.py")))
+        source, check = checker["FIX"], checker["main"]
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp).resolve()
+            root = parent / "fixtures"
+            root.mkdir()
+            for name in ("README.md", "ping.xml", "ping.json", "ping-jsonp.txt",
+                         "error-auth-required.xml", "routes-table.json"):
+                (root / name).write_bytes((source / name).read_bytes())
+            with patch.dict(check.__globals__, FIX=root), redirect_stdout(StringIO()):
+                self.assertEqual(check(), 0)
+                cases = (
+                    ("ping.json", b'["subsonic-response"]'),
+                    ("ping.json", b'{"subsonic-response":null}'),
+                    ("ping.json", b'{"subsonic-response":{"status":"ok","version":"1.16.1","n":NaN}}'),
+                    ("ping.json", b'{"subsonic-response":{},"subsonic-response":' +
+                     (source / "ping.json").read_bytes().split(b":", 1)[1]),
+                    ("ping.xml", b'<?xml version="1.0" encoding="UTF-8"?>'
+                     b'<other><subsonic-response status="ok" version="1.16.1"/></other/>'),
+                    ("ping.xml", b'<?xml version="1.0" encoding="UTF-8"?>'
+                     b'<!-- <subsonic-response --> <other status="ok" version="1.16.1"/>'),
+                    ("ping.xml", (source / "ping.xml").read_bytes() + b"<!-- trailing -->"),
+                    ("ping.xml", (source / "ping.xml").read_bytes() + b"<?trailing instruction?>"),
+                    ("ping.xml", b'<?xml version="1.0" encoding="UTF-8"?>'
+                     b'<!DOCTYPE subsonic-response><subsonic-response status="ok" version="1.16.1"/>'),
+                    ("ping-jsonp.txt", b'/* subsonic-response */'),
+                    ("routes-table.json", b'{"supported":"' + b"x" * 49 +
+                     b'","unsupported":"123456789"}'),
+                    ("routes-table.json", (source / "routes-table.json").read_bytes().replace(
+                        b'"getLicense"', b'"ping"')),
+                    ("routes-table.json", (source / "routes-table.json").read_bytes().replace(
+                        b'"jukeboxControl"', b'"ping"')),
+                )
+                for name, raw in cases:
+                    with self.subTest(name=name, raw=raw[:54]):
+                        path = root / name
+                        path.write_bytes(raw)
+                        self.assertEqual(check(), 1)
+                        path.write_bytes((source / name).read_bytes())
+                        self.assertEqual(check(), 0)
+                jsonp = root / "ping-jsonp.txt"
+                jsonp.unlink()
+                self.assertEqual(check(), 1)
+                jsonp.write_bytes((source / jsonp.name).read_bytes())
+                self.assertEqual(check(), 0)
+                path = root / "ping.json"
+                outside = parent / "outside.json"
+                path.rename(outside)
+                path.symlink_to(outside)
+                self.assertEqual(check(), 1)
+                path.unlink()
+                outside.rename(path)
+                outside_root = parent / "outside"
+                root.rename(outside_root)
+                root.symlink_to(outside_root, target_is_directory=True)
+                self.assertEqual(check(), 1)
 
 
 if __name__ == "__main__":

@@ -10,8 +10,10 @@ import argparse
 from decimal import Decimal, localcontext
 from fractions import Fraction
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import sys
 
 MAX_INPUT_BYTES = 32 * 1024 * 1024
@@ -111,7 +113,11 @@ def _invalid_constant(value: str) -> None:
 
 
 def load(path: Path) -> object:
-    with path.open("rb") as source:
+    # A FIFO must not block before we can check the opened file's type.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise InputError("input must be a regular file")
         raw = source.read(MAX_INPUT_BYTES + 1)
     if len(raw) > MAX_INPUT_BYTES:
         raise InputError("input exceeds the 32 MiB limit; export a bounded input")
