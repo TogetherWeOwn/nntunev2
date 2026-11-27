@@ -10,11 +10,10 @@
 //! link-local (incl. the cloud metadata endpoint), private, carrier-grade
 //! NAT, multicast, broadcast, documentation, `0.0.0.0/8`, IETF protocol
 //! assignments, deprecated 6to4 relay, benchmarking and reserved space.
-//! For v6 it rejects anything outside native global unicast and transition or
-//! special-use space inside it
-//! (mapped, translated, compatible, NAT64, 6to4, Teredo/ORCHID,
-//! site-local, discard, documentation). Resolve-ALL callers reject when
-//! ANY answer is forbidden; IP literals are checked directly with no DNS.
+//! IPv6 is limited to native global unicast, excluding transition and
+//! special-use addresses such as 6to4, Teredo and documentation ranges.
+//! Resolve-ALL callers reject when any answer is forbidden. IP literals
+//! are checked directly without DNS.
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -29,8 +28,7 @@ pub fn v4_is_forbidden(o: &[u8; 4]) -> bool {
         || v4.is_documentation() // 192.0.2/24, 198.51.100/24, 203.0.113/24
         || o[0] == 0 // 0.0.0.0/8 ("this network")
         || (o[0] == 100 && (o[1] & 0xC0) == 64) // 100.64/10 carrier-grade NAT
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 (IETF protocol assignments)
-        || o[..3] == [192, 88, 99] // 192.88.99.0/24 (deprecated 6to4 relay)
+        || matches!(o[..3], [192, 0, 0] | [192, 88, 99]) // IETF assignments and deprecated 6to4 relay
         || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmarking
         || o[0] >= 240 // 240.0.0.0/4 reserved + 255.255.255.255 broadcast
 }
