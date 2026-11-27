@@ -154,9 +154,10 @@ pub fn render_jsonp(doc: &Value, callback: Option<&str>) -> (Vec<u8>, &'static s
 /// (a superset for letters, so exotic-but-valid identifiers still pass;
 /// non-ASCII marks/digits outside those classes are rejected), and callbacks
 /// over 128 bytes are rejected as a DoS guard (Symfony has no cap, but real
-/// clients send short names).
+/// clients send short names). Raw CR and LF are rejected even in quoted
+/// indexers so a malformed callback cannot produce an invalid script.
 pub fn is_valid_jsonp_callback(cb: &str) -> bool {
-    if cb.is_empty() || cb.len() > 128 {
+    if cb.is_empty() || cb.len() > 128 || cb.contains(['\r', '\n']) {
         return false;
     }
     cb.split('.').all(is_valid_jsonp_part) && !cb.split('.').any(is_reserved_word)

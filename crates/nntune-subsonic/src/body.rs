@@ -32,11 +32,17 @@ mod tests {
 }
 
 /// Accumulates body chunks under a byte cap and a declared `Content-Length`.
-#[derive(Debug)]
 pub struct FormBody {
     declared: Option<usize>,
     cap: usize,
     bytes: Vec<u8>,
+    oversized: bool,
+}
+
+impl std::fmt::Debug for FormBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FormBody").finish_non_exhaustive()
+    }
 }
 
 impl FormBody {
@@ -51,6 +57,7 @@ impl FormBody {
             declared,
             cap,
             bytes: Vec::new(),
+            oversized: false,
         }
     }
 
@@ -62,9 +69,11 @@ impl FormBody {
         }
     }
 
-    /// Append one chunk, refusing as soon as the cap would be crossed.
+    /// Append one chunk. An oversized body remains rejected through `finish`.
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), BodyFault> {
-        if exceeds_cap(self.bytes.len(), chunk.len(), self.cap) {
+        self.check_declared()?;
+        if self.oversized || exceeds_cap(self.bytes.len(), chunk.len(), self.cap) {
+            self.oversized = true;
             return Err(BodyFault::Oversized);
         }
         self.bytes.extend_from_slice(chunk);
@@ -75,6 +84,10 @@ impl FormBody {
     /// length is a client abort the runtime reports as a normal end, so it is
     /// unreadable, never a smaller valid body.
     pub fn finish(self) -> Result<String, BodyFault> {
+        self.check_declared()?;
+        if self.oversized {
+            return Err(BodyFault::Oversized);
+        }
         if self
             .declared
             .is_some_and(|declared| self.bytes.len() < declared)

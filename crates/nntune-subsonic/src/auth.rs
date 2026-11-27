@@ -1,13 +1,12 @@
 //! Credential handling, ported from v1 `AuthenticateSubsonicRequests` +
 //! `SubsonicCredentials` (spec section 5.3 behaviour).
 //!
-//! Accepted, in order: per-client `apiKey`; legacy `u` with `p` (including
-//! `p=enc:<hex>`); token `u` with `t` and `s`. Raw values decide presence
-//! (v1 deliberately passes them through uncoerced so `?apiKey[]=x`-style
-//! smuggling cannot look absent). Codes match v1 exactly: 43 when `apiKey`
-//! is mixed with any of `u`/`p`/`t`/`s`, 44 for an invalid API key, 10 for
-//! token auth without `s`, 40 for any other credential failure (including
-//! malformed `enc:` hex). The `v` (client protocol version) parameter is
+//! `apiKey` selects API-key auth, including when supplied with an empty
+//! value. Otherwise, a nonempty `t` selects token auth and `p` selects
+//! legacy password auth (including `p=enc:<hex>`). A supplied `apiKey`
+//! together with any supplied `u`/`p`/`t`/`s` is error 43, an invalid API
+//! key is 44, token auth without `s` is 10, and other credential failures
+//! (including malformed `enc:` hex) are 40. The `v` parameter is
 //! accepted and ignored: v1 authenticates before any version gate, and
 //! clients in the wild send a spread of values.
 
@@ -88,22 +87,23 @@ pub fn authenticate<S: AuthStore>(
     store: &S,
     creds: &Credentials,
 ) -> Result<Identity, (i64, String)> {
-    let api_key_present = Credentials::present(&creds.api_key);
-    let legacy_present = Credentials::present(&creds.username)
-        || Credentials::present(&creds.password)
-        || Credentials::present(&creds.token)
-        || Credentials::present(&creds.salt);
-    if api_key_present && legacy_present {
-        return Err((
-            code::CONFLICTING_AUTH,
-            "Conflicting authentication parameters.".to_string(),
-        ));
-    }
-    if api_key_present {
-        let key = creds.api_key.clone().unwrap_or_default();
-        return store
-            .verify_api_key(&key)
-            .ok_or((code::INVALID_API_KEY, "Invalid API key.".to_string()));
+    if let Some(key) = creds.api_key.as_deref() {
+        if creds.username.is_some()
+            || creds.password.is_some()
+            || creds.token.is_some()
+            || creds.salt.is_some()
+        {
+            return Err((
+                code::CONFLICTING_AUTH,
+                "Conflicting authentication parameters.".to_string(),
+            ));
+        }
+        let identity = if key.is_empty() {
+            None
+        } else {
+            store.verify_api_key(key)
+        };
+        return identity.ok_or_else(|| (code::INVALID_API_KEY, "Invalid API key.".to_string()));
     }
     if !Credentials::present(&creds.username) {
         return Err((code::WRONG_CREDENTIALS, wrong_creds()));
