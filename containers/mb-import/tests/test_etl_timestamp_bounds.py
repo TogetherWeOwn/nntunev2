@@ -14,10 +14,13 @@ ETL = TEST_DIR.parent / "etl.sh"
 
 
 class TimestampBoundsTests(unittest.TestCase):
-    def test_utc_overflow_is_cleanly_refused_before_publication(self):
-        for timestamp in (
-            "0001-01-01T00:00:00+15:00",
-            "9999-12-31T23:59:59-15:00",
+    def test_invalid_timestamps_are_cleanly_refused_before_publication(self):
+        for timestamp, error in (
+            ("0001-01-01T00:00:00+15:00", "representable as a UTC timestamp"),
+            ("9999-12-31T23:59:59-15:00", "representable as a UTC timestamp"),
+            ("2026-10-18\n12:00:00Z", "an ISO-8601 timestamp"),
+            ("2026-10-18T12:00:00.1234567Z", "an ISO-8601 timestamp"),
+            ("2026-10-18T12:00:00+00:00:00.5", "an ISO-8601 timestamp"),
         ):
             with self.subTest(timestamp=timestamp), tempfile.TemporaryDirectory() as work:
                 raw = Path(work) / "mbdump"
@@ -44,7 +47,7 @@ class TimestampBoundsTests(unittest.TestCase):
                     before = state()
                     result = run(timestamp)
                     self.assertEqual(result.returncode, 1, result.stderr)
-                    self.assertIn("DUMP_TS must be representable as a UTC timestamp", result.stderr)
+                    self.assertIn(f"DUMP_TS must be {error}", result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
                     self.assertEqual(state(), before)
 

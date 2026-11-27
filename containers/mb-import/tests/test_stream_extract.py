@@ -10,6 +10,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 EXTRACT = ROOT / "stream_extract.py"
@@ -37,7 +39,7 @@ def load(name, path, env=None):
 
 def tar_bytes(members):
     buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w") as archive:
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.GNU_FORMAT) as archive:
         for name, data in members.items():
             info = tarfile.TarInfo(name)
             info.size = len(data)
@@ -61,13 +63,13 @@ class StreamExtractTest(unittest.TestCase):
         extract = load("stream_extract", EXTRACT)
         members = {f"mbdump/{t}": f"{t}\trow\n".encode() for t in extract.REQUIRED_TABLES}
         members["mbdump/tag"] = b"never kept\n"
-        members["TIMESTAMP"] = b"2026-11-04 00:22:22+00\n"
+        members.update(TIMESTAMP=b"2026-11-04 00:22:22+00\n", REPLICATION_SEQUENCE=b"")
         result, out = self.run_extract(members)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((out / "tag.gz").exists())
         self.assertEqual(gzip.decompress((out / "artist.gz").read_bytes()), b"artist\trow\n")
         meta = json.loads((out / "dump-meta.json").read_text())
-        self.assertEqual(meta["meta"]["TIMESTAMP"], "2026-11-04 00:22:22+00")
+        self.assertEqual(meta["meta"], {"TIMESTAMP": "2026-11-04 00:22:22+00", "REPLICATION_SEQUENCE": ""})
         self.assertEqual(meta["skipped_members"], 1)
         self.assertEqual(meta["missing"], [])
 
@@ -81,17 +83,17 @@ class StreamExtractTest(unittest.TestCase):
             result = subprocess.run([sys.executable, str(EXTRACT), str(out)],
                                     input=tar_bytes(members), capture_output=True, check=False)
             self.assertEqual(result.returncode, 1, result.stderr)
-            meta = json.loads((out / "dump-meta.json").read_text())
-            self.assertEqual(meta["missing"], ["label_alias"])
-            self.assertEqual(meta["skipped_members"], 2)
-            self.assertFalse((out / "label_alias.gz").exists())
-            self.assertFalse((out / "label_alias_type.gz").exists())
+            self.assertIn(b"missing required tables: label_alias", result.stderr)
+            self.assertEqual(list(out.iterdir()), [])
+            members["mbdump/label_alias"] = b""
+            corrected = subprocess.run([sys.executable, str(EXTRACT), str(out)],
+                                       input=tar_bytes(members), capture_output=True, check=False)
+            self.assertEqual(corrected.returncode, 0, corrected.stderr)
 
     def test_missing_required_table_fails(self):
         result, out = self.run_extract({"mbdump/artist": b"x\n"})
         self.assertEqual(result.returncode, 1)
-        self.assertIn("missing required tables", result.stderr.decode())
-        missing = json.loads((out / "dump-meta.json").read_text())["missing"]
+        missing = result.stderr.decode().split("missing required tables: ", 1)[1].strip().split(", ")
         self.assertIn("track", missing)
         self.assertIn("artist_alias", missing)
         self.assertIn("recording_alias", missing)
@@ -117,7 +119,7 @@ class DuplicateMemberTest(unittest.TestCase):
                                 capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"duplicate", result.stderr)
-        self.assertEqual(gzip.decompress((out / "artist.gz").read_bytes()), b"first\n")
+        self.assertFalse((out / "artist.gz").exists())
 
 
 class EtlDiskBoundedModeTest(unittest.TestCase):
@@ -158,6 +160,114 @@ class EtlDiskBoundedModeTest(unittest.TestCase):
             outputs.append(path.read_bytes())
         self.assertEqual(outputs[0], outputs[1])
         self.assertEqual(gzip.decompress(outputs[0]), b"row\n")
+
+
+class OfflineBoundaryTest(unittest.TestCase):
+    def setUp(self):
+        self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def test_copy_rows_reject_invalid_framing_and_oversize(self):
+        etl = load("etl", ROOT / "etl.py", {"MB_ETL_CONSUME_INPUTS": "1"})
+        for packed in (False, True):
+            path = self.scratch / ("input.gz" if packed else "input")
+            for data in (b"1\tmissing newline", b"1\tbare CR\r", b"1\t\0\n",
+                         b"1\t" + b"x" * (1 << 20) + b"\n"):
+                with self.subTest(packed=packed, prefix=data[:20]):
+                    path.write_bytes(gzip.compress(data) if packed else data)
+                    with self.assertRaises(ValueError):
+                        list(etl.rows(self.scratch / "input", 2))
+                    self.assertTrue(path.exists())
+            path.unlink(missing_ok=True)
+
+    def test_integer_fields_refuse_non_decimal_or_out_of_range_input(self):
+        etl = load("etl", ROOT / "etl.py")
+        for field in (" 1", "1_0", "１", "2147483648", "-2147483649"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                etl.required_int(field, "test field")
+        self.assertEqual(etl.required_int("-2147483648", "test field"), -2147483648)
+
+    def test_archive_refuses_malformed_members_and_tail(self):
+        extract = load("stream_extract", EXTRACT)
+        complete = tar_bytes({f"mbdump/{table}": b"" for table in extract.REQUIRED_TABLES})
+        block = tarfile.BLOCKSIZE
+        body = complete[:len(extract.REQUIRED_TABLES) * block]
+        oversized = tarfile.TarInfo("mbdump/artist")
+        oversized.size = 1 << 48
+        link = tarfile.TarInfo("TIMESTAMP")
+        link.type = tarfile.SYMTYPE
+        for malformed, reason in (
+            (tar_bytes({"../artist": b""}), b"unsafe path"),
+            (link.tobuf() + complete, b"unsupported member type"),
+            (oversized.tobuf(tarfile.GNU_FORMAT), b"archive size limit"),
+            (tar_bytes({"TIMESTAMP": b"x" * 4097}), b"metadata size limit"),
+            (tar_bytes({"TIMESTAMP": b"\xff"}), b"invalid metadata"),
+            (tarfile.TarInfo("TIMESTAMP").tobuf() + complete, b"TIMESTAMP: invalid metadata"),
+            (tar_bytes({"TIMESTAMP": b"first", "./TIMESTAMP": b"second"}), b"duplicate member"),
+            (body + b"\0" * block, b"truncated archive"),
+            (body + b"x" * block + complete[len(body):], b"invalid header"),
+            (complete + b"extra", b"archive trailer"),
+        ):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as out:
+                result = subprocess.run([sys.executable, str(EXTRACT), out], input=malformed,
+                                        capture_output=True, check=False)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assertEqual(list(Path(out).iterdir()), [])
+
+    def test_extract_refuses_to_overwrite_preexisting_table(self):
+        outside = self.scratch / "outside"
+        outside.write_bytes(b"keep me")
+        (self.scratch / "artist.gz").symlink_to(outside)
+        result = subprocess.run([sys.executable, str(EXTRACT), str(self.scratch)],
+                                input=tar_bytes({"mbdump/artist": b"new"}), capture_output=True, check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(outside.read_bytes(), b"keep me")
+
+    def test_readiness_requires_bounded_successful_typed_snapshot(self):
+        readiness = load("readiness", ROOT / "check-readiness.py")
+        mbid = "11111111-1111-4111-8111-111111111111"
+        tracks = [[1, 1, mbid]]
+        evidence = self.scratch / "evidence.json"
+        evidence.write_text(json.dumps({
+            "tables": {table: {"sha256": "0" * 64, "lines": 1, "rows": 1} for table in readiness.TABLES},
+            "probes": [{"query": "example", "release_mbid": mbid, "artist_mbid": mbid, "tracks": tracks}],
+        }))
+        payload = self.scratch / "payload"
+        psql = self.scratch / "psql"
+        psql.write_text(f"#!{sys.executable}\nimport os, select, sys\nfrom pathlib import Path\n"
+                        "if os.environ['TEST_STATUS'] == 'wait': select.select([], [], [], 2)\n"
+                        "sys.stdout.buffer.write(Path(os.environ['TEST_SNAPSHOT']).read_bytes())\n"
+                        "sys.exit(os.environ['TEST_STATUS'] == '1')\n")
+        psql.chmod(0o700)
+        counts = b"[1,1,0]\n" * len(readiness.TABLES)
+        hits = json.dumps([[mbid, mbid, True]]).encode() + b"\n"
+        recordings = json.dumps(tracks).encode() + b"\n"
+        good = counts + hits + recordings
+        for raw, status, deadline, expected in (
+            (good, 0, 10, 0),
+            (good, 1, 10, 2),
+            (good, "wait", 0.5, 2),
+            (good.replace(b"[1,1,0]", b"[true,1,0]", 1), 0, 10, 2),
+            (good.replace(b"true", b"1"), 0, 10, 2),
+            (good.replace(b"[[1", b"[[true"), 0, 10, 2),
+            (counts + hits + b" " * (512 * 1024) + recordings, 0, 10, 2),
+            (good + b"[]\n", 0, 10, 2),
+        ):
+            with self.subTest(size=len(raw), prefix=raw[:12], status=status, deadline=deadline):
+                payload.write_bytes(raw)
+                with patch.dict(os.environ, PATH=f"{self.scratch}:{os.environ['PATH']}",
+                                TEST_SNAPSHOT=str(payload), TEST_STATUS=str(status)), \
+                        patch.object(subprocess.Popen, "kill", autospec=True, side_effect=subprocess.Popen.kill) as kill, \
+                        patch.object(readiness, "PSQL_TIMEOUT", deadline, create=True), \
+                        patch.object(sys, "argv", ["check-readiness.py", str(evidence)]), \
+                        patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO):
+                    try:
+                        result = readiness.main()
+                    except SystemExit as exc:
+                        result = exc.code
+                    self.assertEqual(result, expected)
+                    if status == "wait":
+                        self.assertEqual(kill.call_args.args[0].returncode, -signal.SIGKILL)
 
 
 class ProjectionTestCase(unittest.TestCase):
