@@ -115,7 +115,7 @@ class Graph(unittest.TestCase):
         if before is not None:
             payload["before"] = before
         event_file = self.root / "event.json"
-        event_file.write_text(json.dumps(payload))
+        event_file.write_text(env.pop("EVENT_JSON", json.dumps(payload)))
         clean.update(GITHUB_EVENT_PATH=str(event_file))
         clean.update({k: v for k, v in env.items() if v is not None})
         return run(["python3", str(BASE), "--root", str(self.root)], REPO_ROOT, clean)
@@ -312,10 +312,18 @@ class OtherEventBaselineTests(Graph):
             with self.subTest(label):
                 self.assert_closed(self.helper(**self.push_env(before)))
 
-    def test_fallback_to_main_when_before_zero_or_empty(self):
-        for label, before in (("zero", ZERO), ("empty", ""), ("unset", None)):
+    def test_fallback_to_main_only_for_explicit_branch_creation(self):
+        self.assert_base(self.helper(**self.push_env(ZERO)), self.main_tip)
+        for label, before in (("empty", ""), ("unset", None)):
             with self.subTest(label):
-                self.assert_base(self.helper(**self.push_env(before)), self.main_tip)
+                self.assert_closed(self.helper(**self.push_env(before)))
+
+    def test_unrecognized_event_cannot_infer_main_baseline(self):
+        self.assert_closed(self.helper(GITHUB_EVENT_NAME="unknown", GITHUB_SHA=self.merge))
+
+    def test_push_rejects_duplicate_before(self):
+        event = f'{{"before":"{self.old}","before":"{ZERO}"}}'
+        self.assert_closed(self.helper(**self.push_env(ZERO), EVENT_JSON=event))
 
     def test_other_events_use_main(self):
         for event in ("workflow_dispatch", "workflow_call", "schedule"):

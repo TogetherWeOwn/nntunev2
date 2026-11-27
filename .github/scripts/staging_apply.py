@@ -32,7 +32,7 @@ from pathlib import Path
 
 import migration_history
 
-FILE_RE = re.compile(r"^\d{4}_[A-Za-z0-9_]+\.sql$")
+FILE_RE = migration_history.FILE_RE
 SECRET_ENV = "PLANETSCALE_MIGRATOR_URL_STAGING"
 TRUSTED_DIRNAME = ".github/scripts"
 # Names a trusted-code child is allowed to inherit. DATABASE_URL is
@@ -58,14 +58,18 @@ def normalize_url(raw, expected_database):
     """
     if not raw:
         raise StagingApplyError("staging migrator secret is missing")
-    url = urllib.parse.urlsplit(raw)
+    try:
+        url = urllib.parse.urlsplit(raw)
+        url.port  # raises on a malformed port
+        query = urllib.parse.parse_qs(url.query, strict_parsing=True, keep_blank_values=True)
+    except ValueError:
+        raise StagingApplyError("staging migrator URL is malformed") from None
     database = urllib.parse.unquote(url.path.removeprefix("/"))
     if (url.scheme not in ("postgres", "postgresql") or not url.hostname
             or not url.username or not database or url.fragment):
         raise StagingApplyError("staging migrator URL is malformed")
     if database != expected_database:
         raise StagingApplyError("staging migrator URL does not target the expected database")
-    query = urllib.parse.parse_qs(url.query, strict_parsing=True)
     if (set(query) - {"sslmode", "sslrootcert"}
             or len(query.get("sslmode", [])) > 1
             or query.get("sslrootcert", ["system"]) != ["system"]):
@@ -87,7 +91,12 @@ def allowlisted_child_env(database_url, environ=None):
 
 def load_entries(data_root):
     manifest_path = Path(data_root) / "migrations/manifest.toml"
-    return migration_history.parse_manifest(migration_history.read_input(str(manifest_path)))
+    if manifest_path.parent.is_symlink():
+        raise StagingApplyError("migrations directory must not be a symlink")
+    try:
+        return migration_history.parse_manifest(migration_history.read_input(manifest_path))
+    except migration_history.HistoryError as exc:
+        raise StagingApplyError(f"invalid migration manifest: {exc}") from None
 
 
 def entry_names(entry):
@@ -239,7 +248,7 @@ def quote_literal(name):
     return "'" + name.replace("'", "''") + "'"
 
 
-def read_row(child, entry, filename, preserve=False):
+def read_row(child, entry):
     """Return the recorded row for an entry under any of its names
     (current name or a renamed_from alias), mirroring entry identity."""
     names = entry_names(entry)
@@ -250,13 +259,20 @@ def read_row(child, entry, filename, preserve=False):
         ["psql", "--no-psqlrc", "--no-password", "--quiet",
          "--tuples-only", "--no-align", "--field-separator", "\t",
          "--set", "ON_ERROR_STOP=1"],
-        input=sql.encode("utf-8") if preserve else sql, text=not preserve,
+        input=sql.encode("utf-8"),
         capture_output=True, timeout=60, env=child)
     if result.returncode != 0:
         raise StagingApplyError("evidence read failed; connection details redacted")
-    if preserve:
-        return result.stdout.decode("utf-8").removesuffix("\n")
-    return result.stdout.strip()
+    return result.stdout.decode("utf-8").removesuffix("\n")
+
+
+def verified_row_fields(row, entry):
+    fields = row.split("\t")
+    if (len(fields) != 4 or fields[0] not in entry_names(entry) or fields[1] != entry["sha256"]
+            or not fields[2] or not fields[3]
+            or any(any(ord(ch) < 32 or ord(ch) == 127 for ch in field) for field in fields)):
+        raise StagingApplyError("ledger row missing, ambiguous or mismatched")
+    return fields
 
 
 def run_evidence(data_root, migration_file, applied_files, apply_outcome,
@@ -291,10 +307,11 @@ def run_evidence(data_root, migration_file, applied_files, apply_outcome,
             entry = find_entry(entries, filename)
             if entry is None:
                 raise StagingApplyError("file is not listed in the pinned manifest")
-            row = read_row(child, entry, filename)
+            row = read_row(child, entry)
             if not row:
                 missing.append(filename)
                 continue
+            verified_row_fields(row, entry)
             handle.write(f"- `{row}`\n")
     if apply_outcome == "success" and missing:
         raise StagingApplyError(
@@ -405,8 +422,8 @@ def run_ledger_audit(trusted_root, data_root, filename, expected_sha, expected_d
     if result.returncode != 0 or len(result.stdout) > 2_000_000:
         raise StagingApplyError("ledger audit read failed; details redacted")
     try:
-        payload = json.loads(result.stdout)
-    except (ValueError, TypeError) as exc:
+        payload = migration_history.decode_json(result.stdout)
+    except migration_history.HistoryError as exc:
         raise StagingApplyError("invalid ledger audit evidence") from exc
     if (not isinstance(payload, dict) or set(payload) != {"database", "plain_table", "rows"}
             or payload["database"] != expected_database or payload["plain_table"] is not True):
@@ -437,15 +454,10 @@ def run_readback(data_root, filename, expected_sha, expected_database, environ=N
             or matches[0].get("renamed_from")):
         raise StagingApplyError("readback manifest identity mismatch")
     path = Path(data_root) / "migrations" / filename
-    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha:
+    if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha:
         raise StagingApplyError("readback migration bytes mismatch")
     child = evidence_child_env(source.get(SECRET_ENV, ""), expected_database)
-    row = read_row(child, matches[0], filename, preserve=True)
-    fields = row.split("\t")
-    if (len(fields) != 4 or fields[0] != filename or fields[1] != expected_sha
-            or not fields[2] or not fields[3]
-            or any(any(ord(ch) < 32 or ord(ch) == 127 for ch in field) for field in fields)):
-        raise StagingApplyError("readback row missing, ambiguous or mismatched")
+    fields = verified_row_fields(read_row(child, matches[0]), matches[0])
     receipt = dict(zip(("file", "sha256", "applied_at", "applied_by"), fields))
     receipt.update({"kind": "staging-ledger-readback", "trusted_revision": source["TRUSTED_REVISION"],
                     "data_revision": source["DATA_REVISION"], "run_id": source["GITHUB_RUN_ID"],

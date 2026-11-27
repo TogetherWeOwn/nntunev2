@@ -235,8 +235,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     sql = render(args.target)
     if args.check:
-        existing = pathlib.Path(args.check).read_text(encoding="utf-8")
-        if existing != sql:
+        try:
+            with pathlib.Path(args.check).open("rb") as stream:
+                rendered = sql.encode("utf-8")
+                existing = stream.read(len(rendered) + 1)
+        except OSError:
+            print("schema-migrations-backfill: cannot read SQL artifact", file=sys.stderr)
+            return 1
+        if existing != rendered:
             print(f"schema-migrations-backfill: {args.check} is stale; regenerate it",
                   file=sys.stderr)
             return 1

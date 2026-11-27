@@ -42,6 +42,12 @@ def version(*bindings, sha=SHA):
 
 
 class IdentityTests(unittest.TestCase):
+    def test_deploy_output_requires_ascii_jsonl_record_boundaries(self):
+        session = b'{"type":"wrangler-session"}'
+        with self.assertRaisesRegex(identity.Unavailable, "deploy-output-unavailable"):
+            identity.deployed_version(session + b"\r" + output())
+        self.assertEqual(identity.deployed_version(session + b"\r\n" + output()), VERSION)
+
     def test_stream_receipt_requires_its_own_deployed_version_and_build(self):
         output_stream = output(worker_name=identity.STREAM)
         mode = {"name": "PRIVATE_PLAYBACK_ENABLED", "type": "plain_text"}

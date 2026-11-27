@@ -100,6 +100,8 @@ def has_search_path_header(data):
 def load_manifest(root):
     path = root / MANIFEST
     try:
+        if path.parent.is_symlink() or path.is_symlink() or not path.is_file():
+            raise GateError(f"cannot read {MANIFEST}: expected a regular file in the migrations directory")
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
         raise GateError(f"cannot read {MANIFEST}: {exc}") from exc

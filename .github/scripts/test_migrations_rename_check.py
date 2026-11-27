@@ -1454,6 +1454,23 @@ class GitFixture(unittest.TestCase):
             self.assertEqual(migrations_rename_check.main(args), 1)
         self.assertIn("API metadata does not match pinned event commits", err.getvalue())
 
+    def test_manifest_path_must_stay_in_checkout(self):
+        args, _ = self.legacy_cli(self.chain())
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = pathlib.Path(tmp) / "manifest.toml"
+            manifest_path.write_bytes((self.root / "migrations/manifest.toml").read_bytes())
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(migrations_rename_check.main(args + ["--manifest", str(manifest_path)]), 1)
+        self.assertIn("manifest must stay inside the checkout", err.getvalue())
+
+    def test_rename_refuses_symlinked_evidence_inside_checkout(self):
+        args, _ = self.legacy_cli(self.chain())
+        metadata = self.root / "metadata.json"
+        metadata.symlink_to(metadata.rename(self.root / "other.json"))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(migrations_rename_check.main(args), 1)
+        self.assertIn("expected a regular file", err.getvalue())
+
 
 class WorkflowBoundary(unittest.TestCase):
     def test_separate_immutable_code_and_data_pins(self):

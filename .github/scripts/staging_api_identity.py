@@ -58,7 +58,7 @@ def deployed_version(body, script=SCRIPT):
     # The action has no version-ID output; use Wrangler 4.162.0's session and deploy v1 JSONL.
     reason = "deploy-output-unavailable"
     require(len(body) <= MAX_DEPLOY_OUTPUT and body.endswith(b"\n"), reason)
-    records = [decode(line, reason) for line in body.splitlines()]
+    records = [decode(line, reason) for line in body[:-1].split(b"\n")]
     require(all(field(record, "type") in ("wrangler-session", "deploy") for record in records), reason)
     deploys = [record for record in records if record["type"] == "deploy"]
     require(len(deploys) == 1, reason)

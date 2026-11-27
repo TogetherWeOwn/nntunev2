@@ -13,7 +13,7 @@ import tomllib
 FILE_RE = re.compile(r"[0-9]{4}_[A-Za-z0-9_]+\.sql\Z")
 PATH_RE = re.compile(r"migrations/[0-9]{4}_[A-Za-z0-9_]+\.sql\Z")
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
-COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
+COMMIT_RE = re.compile(r"(?!0{40})[0-9a-f]{40}\Z")
 EDGE_KEYS = ("parent", "commit", "old_path", "new_path", "old_sha256", "new_sha256")
 MAX_COMMITS = 512
 MAX_EVENTS = 2048
@@ -102,6 +102,7 @@ def parse_manifest(text):
 def validate_entries(entries):
     validate_history(entries)
     names, aliases = set(), set()
+    previous_number = -1
     for entry in entries:
         if (not isinstance(entry.get("file"), str) or not FILE_RE.fullmatch(entry["file"])
                 or not isinstance(entry.get("sha256"), str) or not SHA_RE.fullmatch(entry["sha256"])
@@ -109,6 +110,10 @@ def validate_entries(entries):
             raise HistoryError("migration manifest entry is malformed")
         if entry["file"] in names:
             raise HistoryError("duplicate migration entry")
+        number = int(entry["file"][:4])
+        if number <= previous_number:
+            raise HistoryError("migration numbers must be strictly increasing")
+        previous_number = number
         names.add(entry["file"])
         renamed = entry.get("renamed_from", [])
         if not isinstance(renamed, list):
@@ -209,7 +214,10 @@ def validate_fresh_import(source, candidate, baseline, sql_bytes):
 
 def read_input(path):
     try:
-        with pathlib.Path(path).open("rb") as stream:
+        path = pathlib.Path(path)
+        if path.is_symlink() or not path.is_file():
+            raise HistoryError("cannot read history input: expected a regular file")
+        with path.open("rb") as stream:
             raw = stream.read(MAX_INPUT + 1)
         if len(raw) > MAX_INPUT:
             raise HistoryError("input byte bound exceeded")
@@ -227,15 +235,25 @@ def unique_object(pairs):
     return result
 
 
+def reject_json_constant(_value):
+    raise HistoryError("invalid JSON numeric constant")
+
+
+def decode_json(text):
+    try:
+        return json.loads(text, object_pairs_hook=unique_object, parse_constant=reject_json_constant)
+    except HistoryError:
+        raise
+    except (ValueError, RecursionError) as exc:
+        raise HistoryError("invalid API JSON") from exc
+
+
 def api_coverage(files_text, metadata_text, base, head):
     """Require complete paginated input pinned to the event's base and head."""
     if max(len(files_text.encode()), len(metadata_text.encode())) > MAX_INPUT:
         raise HistoryError("API input byte bound exceeded")
-    try:
-        pages = json.loads(files_text, object_pairs_hook=unique_object)
-        metadata = json.loads(metadata_text, object_pairs_hook=unique_object)
-    except (ValueError, RecursionError) as exc:
-        raise HistoryError("invalid API JSON") from exc
+    pages = decode_json(files_text)
+    metadata = decode_json(metadata_text)
     if (not isinstance(metadata, dict) or not isinstance(metadata.get("base"), dict)
             or not isinstance(metadata.get("head"), dict)
             or metadata["base"].get("sha") != base or metadata["head"].get("sha") != head):
