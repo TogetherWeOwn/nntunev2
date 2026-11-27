@@ -577,6 +577,7 @@ mod tests {
             "https://nzb.example:+443/x.nzb",
             "https://[nzb.example]/x.nzb",
             "https://nzb..example/x.nzb",
+            &format!("https://nzb.example/{}", "a".repeat(MAX_FETCH_URL_BYTES)),
         ] {
             let result = validate_fetch_url(url, &cfg, &PublicDns);
             assert_eq!(result, Err(FetchRejection::MalformedUrl));

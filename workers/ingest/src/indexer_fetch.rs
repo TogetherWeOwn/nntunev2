@@ -50,7 +50,6 @@ pub const DIAL_TIMEOUT_MS: u64 = 5_000;
 pub const FETCH_TIMEOUT_MS: u64 = 15_000;
 /// Maximum redirect hops followed after the initial fetch.
 pub const MAX_REDIRECTS: u32 = 3;
-/// Maximum returned search response size in the buffered fetch model.
 pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// DNS resolution as a trait so tests use a fake and the Worker uses real
@@ -199,12 +198,6 @@ pub struct BodyChunk {
 impl fmt::Debug for RawResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "RawResponse {{ status: {:?}, .. }}", &self.status)
-    }
-}
-
-impl fmt::Debug for BodyChunk {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "BodyChunk {{ len: {:?}, .. }}", &self.bytes.len())
     }
 }
 
@@ -633,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn host_shape_is_checked_before_dns() {
+    fn malformed_urls_are_rejected_before_dns() {
         // Even a (wildcard) DNS answer that is public must not rescue a
         // non-LDH host: a WHATWG parser would read `\`/`%` differently.
         for host in [
@@ -647,6 +640,7 @@ mod tests {
             "indexer_example",
             ".indexer.example",
             "indexer..example",
+            &format!("indexer.example/{}", "a".repeat(8192)),
         ] {
             let dns = FakeDns::with(host, &[IpAddr::V4(PUBLIC_V4)]);
             let url = format!("https://{host}/api");
@@ -663,8 +657,10 @@ mod tests {
     fn backslash_redirect_location_is_blocked_and_never_dialed() {
         let start = "https://indexer.example/api";
         let dns = FakeDns::with("indexer.example", &[IpAddr::V4(PUBLIC_V4)]);
-        let mut transport = FakeTransport::default()
-            .serve(start, redirect(r"https://127.0.0.1\x.evil.example/", 5));
+        for location in [r"/a\b", "/a\0b", &"/a".repeat(4097)] {
+            assert!(resolve_location("indexer.example", location).is_err());
+        }
+        let mut transport = FakeTransport::default().serve(start, redirect(r"/a\b", 5));
         assert_eq!(
             fetch_indexer(start, &FetchConfig::default(), &dns, &mut transport),
             Err(FetchRejection::MalformedUrl)
@@ -697,10 +693,8 @@ mod tests {
         let url = "https://indexer.example/api";
         let dns = FakeDns::with("indexer.example", &[IpAddr::V4(PUBLIC_V4)]);
         let mut response = ok(1, 1);
-        response.chunks.push(BodyChunk {
-            delay_ms: 1,
-            bytes: vec![0; MAX_RESPONSE_BYTES],
-        });
+        response.chunks.push(response.chunks[0].clone());
+        response.chunks[0].bytes.resize(MAX_RESPONSE_BYTES, 0);
         let mut transport = FakeTransport::default().serve(url, response);
         assert_eq!(
             fetch_indexer(url, &FetchConfig::default(), &dns, &mut transport),

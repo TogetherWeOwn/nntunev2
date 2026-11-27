@@ -88,7 +88,10 @@ fn overflow_preserves_spent_buckets_until_refill() {
     let overflow = key_for(CAP);
     assert!(!is_allow(&store.check(&overflow, &cfg, NOW)));
     for probe in [0, 1, CAP - 1] {
-        assert!(!is_allow(&store.check(&key_for(probe), &cfg, NOW)));
+        assert!(
+            !is_allow(&store.check(&key_for(probe), &cfg, NOW)),
+            "key {probe} must retain its spent balance"
+        );
     }
     let refilled = NOW + cfg.window_secs;
     assert!(is_allow(&store.check(&overflow, &cfg, refilled)));
