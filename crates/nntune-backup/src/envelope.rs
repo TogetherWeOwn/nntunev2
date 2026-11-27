@@ -350,7 +350,8 @@ mod tests {
     #[test]
     fn authenticated_unknown_versions_are_refused() {
         let (kek, dek, nonce) = (test_kek(0x11), test_kek(0x22), [0; NONCE_LEN]);
-        for (version, format) in [(3, 1), (2, 2)] {
+        let refused = Err(EnvelopeError::Crypto);
+        for (version, format, expected) in [(2, 1, Ok(true)), (3, 1, refused), (2, 2, refused)] {
             let seal = |key: &[u8], purpose, kek_version, msg: &[u8]| {
                 let aad = aad_v2(purpose, "u", "u:t", version, format, kek_version);
                 Aes256Gcm::new_from_slice(key)
@@ -365,7 +366,7 @@ mod tests {
                 ciphertext: seal(&dek, PURPOSE_PAYLOAD, None, b"synthetic"),
             };
             let opened = open_media_key(&kek, "u", "u:t", version, format, 7, &env);
-            assert_eq!(opened, Err(EnvelopeError::Crypto));
+            assert_eq!(opened.map(|bytes| bytes == b"synthetic"), expected);
         }
     }
 
@@ -405,7 +406,6 @@ mod tests {
             open_media_key(&kek, "u", &identity, 2, 1, 7, &env),
             Err(EnvelopeError::CorruptStoredData)
         );
-        assert_eq!(open(&env, 7), Ok(b"synthetic".to_vec()));
     }
 
     /// Pins the framing against the documented production

@@ -438,6 +438,8 @@ mod tests {
         for bad in [
             format!("../{PRIVATE}"),
             format!("data/./{PRIVATE}"),
+            format!("/{PRIVATE}"),
+            format!("data//{PRIVATE}"),
             "manifest.json".into(),
         ] {
             manifest.files[0].path = bad;
@@ -465,13 +467,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nntune-backup-test-{}-8", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut manifest = writer_in(&dir).finish().unwrap();
+        assert_eq!(verify_bundle(&dir), Ok(manifest.clone()));
         manifest.format_version = BUNDLE_FORMAT_VERSION + 1;
         let path = dir.join(MANIFEST_FILE);
         fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert_eq!(
-            read_manifest(&dir),
-            Err(BundleError::UnsupportedFormat(manifest.format_version))
-        );
+        let err = read_manifest(&dir).unwrap_err();
+        assert_eq!(err, BundleError::UnsupportedFormat(manifest.format_version));
         let file = File::create(path).unwrap();
         file.set_len(MAX_MANIFEST_BYTES + 1).unwrap();
         assert_eq!(read_manifest(&dir), Err(BundleError::ManifestTooLarge));
