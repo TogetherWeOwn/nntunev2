@@ -225,17 +225,18 @@ mod tests {
             environment: "test",
             library_id: "library",
         };
-        let check = |rec: &NativeRestRecord, secret, now, g, scope, target| {
-            authorize(
-                (Some(rec), secret),
-                &peppers,
-                now,
-                Some(g),
-                scope,
-                Action::Reuse,
-                target,
-            )
-        };
+        let check =
+            |rec: &NativeRestRecord, secret, now, g, scope, target: Option<(&str, &Job<'_>)>| {
+                authorize(
+                    (Some(rec), secret),
+                    &peppers,
+                    now,
+                    Some(g),
+                    scope,
+                    Action::Reuse,
+                    target,
+                )
+            };
         let (unauth, forbidden) = (
             Err(CredentialError::Unauthenticated),
             Err(CredentialError::Forbidden),
@@ -272,21 +273,32 @@ mod tests {
                 forbidden
             );
         }
-        let cross_owner = Job {
-            owner_id: "other-owner",
-            ..job
-        };
-        assert_eq!(
-            check(
-                &record,
-                Some(SECRET),
-                1,
-                &grant,
-                scope,
-                Some(("session-1", &cross_owner))
-            ),
-            forbidden
-        );
+        for mismatched_job in [
+            Job {
+                owner_id: "other-owner",
+                ..job
+            },
+            Job {
+                environment: "other",
+                ..job
+            },
+            Job {
+                library_id: "other",
+                ..job
+            },
+        ] {
+            assert_eq!(
+                check(
+                    &record,
+                    Some(SECRET),
+                    1,
+                    &grant,
+                    scope,
+                    Some(("session-1", &mismatched_job))
+                ),
+                forbidden
+            );
+        }
         assert_eq!(
             check(&record, Some("wrong"), 1, &grant, scope, target),
             unauth

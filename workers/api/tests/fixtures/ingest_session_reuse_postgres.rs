@@ -150,6 +150,20 @@ pub(super) async fn protect_completed(
         session: &dup_sid,
         ..scope
     };
+    let dup_prepared = PreparedUpload {
+        scope: CompletionScope {
+            session: &dup_sid,
+            ..prepared.scope
+        },
+        job: &dup_job,
+        ..prepared
+    };
+    // Prove `outcome_lock.sql` accepts `dup_scope` (returning `Ok(None)` while
+    // uncompleted), isolating the `reuse` refusal to `reuse_lock.sql`.
+    assert!(read(writer, auth, dup_prepared, reload)
+        .await
+        .unwrap()
+        .is_none());
     let res = reuse(writer, auth, &dup_scope, &dup_job, async |_, _| {
         panic!("uncompleted duplicate-digest session claimed another session's winner")
     })
