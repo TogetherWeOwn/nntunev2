@@ -57,17 +57,6 @@ async fn typed_probe_refuses_bad_batches_and_never_redials_a_timeout() {
     let mut req: ProbeRequest = serde_json::from_str(
         r#"{"job_id":"job","user_id":"user","idempotency_key":"key","batch_index":0,"segment_ids":[]}"#,
     ).unwrap();
-    let dial = || async { panic!("this probe must not dial") };
-    let oversized = vec!["id@example.test".into(); MAX_PROBE_SEGMENTS + 1];
-    for batch in [vec![], oversized, vec!["bad id".into()]] {
-        req.segment_ids = batch;
-        assert!(matches!(
-            run_probe(&pool, dial, |_| {}, &req).await,
-            Err(ProbeError::BadRequest(_))
-        ));
-        assert_eq!(pool.borrow().in_use(), 0);
-    }
-    req.segment_ids = vec!["id@example.test".into(); 2];
     let handshake = b"200 ready\r\n200 reader mode\r\n".as_slice();
     let partial = b"200 ready\r\n200 reader mode\r\n430 missing\r\n".as_slice();
     for (replies, kind, retries) in [
@@ -81,6 +70,17 @@ async fn typed_probe_refuses_bad_batches_and_never_redials_a_timeout() {
             .unwrap();
         let lease = pool.borrow_mut().try_acquire(Lane::Ingest).unwrap();
         pool.borrow_mut().release(lease, Some(client));
+        let dial = || async { panic!("this probe must not dial") };
+        let oversized = vec!["id@example.test".into(); MAX_PROBE_SEGMENTS + 1];
+        for batch in [vec![], oversized, vec!["bad id".into()]] {
+            req.segment_ids = batch;
+            assert!(matches!(
+                run_probe(&pool, dial, |_| {}, &req).await,
+                Err(ProbeError::BadRequest(_))
+            ));
+            assert_eq!((pool.borrow().idle(), pool.borrow().in_use()), (1, 0));
+        }
+        req.segment_ids = vec!["id@example.test".into(); 2];
         let mut dials = 0;
         let dial = || {
             dials += 1;
