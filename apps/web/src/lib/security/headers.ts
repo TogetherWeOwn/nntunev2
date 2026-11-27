@@ -25,10 +25,13 @@ export function parseApiBaseUrl(value: string, allowHttpLoopback = false): URL |
 	if (base === '') return null;
 
 	const authority = /^https?:\/\/([^/]+)/i.exec(base)?.[1];
-	if (!authority || authority.includes('@') || /[\u0000-\u0020\u007f\\?#]/.test(base) || !URL.canParse(base)) {
+	if (!authority || authority.includes('@') || /[\u0000-\u0020\u007f\\?#]/.test(base)) throw new Error('Invalid API base URL');
+	let url: URL;
+	try {
+		url = new URL(base);
+	} catch {
 		throw new Error('Invalid API base URL');
 	}
-	const url = new URL(base);
 	// URL host parsing alone allows punctuation that delimits CSP directives and policies.
 	const host = url.hostname;
 	if (!/^(?:[a-z0-9.-]+|\[[a-f0-9:]+\])$/i.test(host)) throw new Error('Invalid API base URL host');

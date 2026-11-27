@@ -103,17 +103,11 @@ export async function readCappedJson(response: Response, signal?: AbortSignal): 
 	let inString = false;
 	for (let index = 0; index < text.length; index++) {
 		const char = text[index];
-		if (inString && char === '\\') {
-			index++;
-		} else if (char === '"') {
-			inString = !inString;
-		} else if (!inString) {
-			if (char === '{' || char === '[') {
-				if (++depth > MAX_JSON_DEPTH) throw new SyntaxError('JSON body nesting limit exceeded');
-			} else if (char === '}' || char === ']') {
-				depth--;
-			}
-		}
+		if (inString && char === '\\') index++;
+		else if (char === '"') inString = !inString;
+		else if (!inString && (char === '{' || char === '[')) {
+			if (++depth > MAX_JSON_DEPTH) throw new SyntaxError('JSON body nesting limit exceeded');
+		} else if (!inString && (char === '}' || char === ']')) depth--;
 	}
 	return JSON.parse(text);
 }

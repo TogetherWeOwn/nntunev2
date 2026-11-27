@@ -368,7 +368,8 @@ const COOKIE_MUTATIONS = new Set([
 	'/v1/session/reauthenticate/finish', '/v1/session/refresh', LOGOUT, REVOKE_ALL
 ]);
 
-function requiresSessionBinding(route: string, method?: string): boolean {
+function requiresSessionBinding(path: string, method?: string): boolean {
+	const route = path.split('?', 1)[0];
 	return (route === '/v1/me/taste/session' && ['GET', 'PUT', 'DELETE'].includes(method ?? '')) ||
 		((method === 'PUT' || method === 'DELETE') && /^\/v1\/me\/likes\/track\/[^/]+$/.test(route));
 }
@@ -769,7 +770,7 @@ export class ApiClient {
 		if (session && Object.keys(headers).some((name) => name.toLowerCase() === 'authorization')) {
 			throw new Error('Account requests use the browser session');
 		}
-		const bound = requiresSessionBinding(route, init.method);
+		const bound = requiresSessionBinding(path, init.method);
 		if (bound) {
 			if (!session?.binding) throw new Error('Missing verified session binding');
 			headers[SESSION_BINDING_HEADER] = session.binding;

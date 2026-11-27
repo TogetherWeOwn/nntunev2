@@ -2,7 +2,7 @@ import { expect, it, vi } from 'vitest';
 import { JsonBodyTooLargeError, MAX_JSON_BODY_BYTES, readCappedJson } from './cappedJson.js';
 import { API_REQUEST_TIMEOUT_MS, ApiClient, ApiError } from './client.js';
 import { parseErrorBody } from './errors.js';
-import * as authFence from '../auth-fence.js';
+import { AUTH_LOCK } from '../auth-fence.js';
 import { cspSources } from '../security/headers.js';
 import { bindVerifiedLocalLyrics, createLyricsResolver, type ExactLyricsProvider } from '../server/lyrics.js';
 
@@ -59,17 +59,27 @@ it.each(['//other.example/health', '/\\other.example/health', '/\t/other.example
 	}
 );
 
-it('fences auth mutations under a configured API prefix and refuses redirects', async () => {
-	const mutation = vi.spyOn(authFence, 'runAuthMutation');
+it('holds the prefixed auth mutation lock past timeout until fetch settles', async () => {
+	const response = Promise.withResolvers<Response>();
+	const started = Promise.withResolvers<void>();
+	vi.useFakeTimers();
+	vi.stubGlobal('window', { localStorage: { setItem: vi.fn() } });
 	try {
-		const fetchFn = vi.fn(async () => Response.json({ ok: true }));
+		const fetchFn = vi.fn(() => { started.resolve(); return response.promise; });
 		const client = new ApiClient({ baseUrl: 'https://api.example:443/prefix/', fetchFn });
-		await expect(client.post('/v1/auth/magic/finish?next=%2Fhome', {})).resolves.toEqual({ ok: true });
-		expect(mutation).toHaveBeenCalledOnce();
+		const failure = vi.fn();
+		void client.post('/v1/auth/magic/finish?next=%2Fhome', {}).catch(failure);
+		await started.promise;
+		await vi.advanceTimersByTimeAsync(API_REQUEST_TIMEOUT_MS);
+		expect(failure).toHaveBeenCalledWith(expect.objectContaining({ code: 'request_timeout' }));
+		expect((await navigator.locks.query()).held).toContainEqual(expect.objectContaining({ name: AUTH_LOCK }));
 		expect(fetchFn).toHaveBeenCalledWith('https://api.example/prefix/v1/auth/magic/finish?next=%2Fhome',
 			expect.objectContaining({ redirect: 'error' }));
 	} finally {
-		mutation.mockRestore();
+		response.resolve(Response.json({ ok: true }));
+		await navigator.locks.request(AUTH_LOCK, () => {});
+		vi.unstubAllGlobals();
+		vi.useRealTimers();
 	}
 });
 
@@ -85,19 +95,6 @@ it.each([true, false])('checks the origin of the document base (same origin: %s)
 		expect(fetchFn).toHaveBeenCalledTimes(sameOrigin ? 1 : 0);
 	} finally {
 		vi.unstubAllGlobals();
-	}
-});
-
-it('times out even when the transport never settles after abort', async () => {
-	vi.useFakeTimers();
-	try {
-		const client = new ApiClient({ baseUrl: '', fetchFn: () => new Promise(() => {}) });
-		const failure = vi.fn();
-		void client.get('/health').catch(failure);
-		await vi.advanceTimersByTimeAsync(API_REQUEST_TIMEOUT_MS);
-		expect(failure).toHaveBeenCalledWith(expect.objectContaining({ code: 'request_timeout' }));
-	} finally {
-		vi.useRealTimers();
 	}
 });
 
@@ -133,6 +130,16 @@ it.each(['https://api.example;invalid', 'https://api.example,invalid', 'https://
 		expect(() => new ApiClient({ baseUrl })).toThrow();
 	}
 );
+
+it('accepts a valid API base when URL.canParse is unavailable', () => {
+	vi.stubGlobal('URL', Object.assign(class extends URL {}, { canParse: undefined }));
+	try {
+		expect(cspSources('https://api.example')).toEqual(["'self'", 'https://api.example']);
+		expect(() => new ApiClient({ baseUrl: 'https://api.example' })).not.toThrow();
+	} finally {
+		vi.unstubAllGlobals();
+	}
+});
 
 const track = { trackName: 'Track', artistName: 'Artist', albumName: 'Album', durationSeconds: 120 };
 const lrc = '[00:01]Fixture cue';
