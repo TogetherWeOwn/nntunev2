@@ -514,6 +514,7 @@ test('breach without named rules fails closed', () => {
     ['numeric entry', { overall, breached_rules: ['overall', 42] }],
     ['empty-string entry', { overall, breached_rules: ['overall', ''] }],
     ['null entry', { overall, breached_rules: ['overall', null] }],
+    ['free-form rule', { overall, breached_rules: ['overall', 'unregistered_rule'] }],
     ['130 rules', { overall, breached_rules: Array(130).fill('overall') }],
   ]) {
     assert.equal(render(breachVerdict({ thresholds }), contextFixture()), null, `${name} must not render`);
@@ -590,7 +591,7 @@ test('adversarial long rule names, breakdown keys, and SHAs fail closed', () => 
 });
 
 test('invalid window labels fail closed', () => {
-  for (const windowLabel of [`window ${LONG}`, CANARIES[1],
+  for (const windowLabel of [`window ${LONG}`, CANARIES[1], 'receive-time local window',
     WINDOW_LABEL.replace('2026-10-22', '2026-02-30'),
     WINDOW_LABEL.replace('12:01:00', '12:00:00')]) {
     assert.equal(render(breachVerdict(), contextFixture({ windowLabel })), null);

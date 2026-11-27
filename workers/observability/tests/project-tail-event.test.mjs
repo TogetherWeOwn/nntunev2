@@ -276,8 +276,7 @@ test('empty allowlists retain the observation but discard grouping', () => {
 });
 test('grouping uses validated allowlist entries only', () => {
   const routes = Object.assign(['GET /healthz'], { indexOf: () => 0 });
-  const policy = policyFixture({ routes });
-  assert.deepEqual(project(withMessages([served({ route: CANARIES[1] })]), policy),
+  assert.deepEqual(project(withMessages([served({ route: CANARIES[1] })]), policyFixture({ routes })),
     expected({ route: 'unknown' }));
   for (const route of ['GET /rest/ping.view%3Ft%3Dsynthetic', `GET /users/${CANARIES[1]}`]) {
     assert.equal(project(withMessages([served({ route })]), policyFixture({ routes: [route] })), null);
