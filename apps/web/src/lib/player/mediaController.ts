@@ -694,19 +694,20 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			const armed = playIntent;
 			let onlineSeen = false, retryStarted = false, listenerArmed = false;
 			const armReconnect = () => {
-				if (listenerArmed || !failureMessage || !listeners || globalThis.navigator?.onLine !== false || !evidence.isCurrent() || !ownsOrigin()) return;
+				if (listenerArmed || !failureMessage || !listeners || globalThis.navigator?.onLine !== false ||
+					playIntent !== armed || !audio.ended || !evidence.isCurrent() || !ownsOrigin()) return;
 				listenerArmed = true;
 				reconnectHandoffAudio = audio;
 				globalThis.addEventListener?.('online', () => {
 					onlineSeen = true;
 					reconnectHandoffAudio = undefined;
-					if (!pendingGrant && playIntent === armed) { retryStarted = true; void handoff(); }
+					if (!pendingGrant && playIntent === armed && audio.ended) { retryStarted = true; void handoff(); }
 				}, { once: true, signal: listeners });
 			};
 			armReconnect();
 			await handoff();
 			armReconnect();
-			if (onlineSeen && !retryStarted && !pendingGrant && playIntent === armed) void handoff();
+			if (onlineSeen && !retryStarted && !pendingGrant && playIntent === armed && audio.ended) void handoff();
 			return;
 		}
 		const streamUrl = streamFor(track);
@@ -797,6 +798,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (mountedAudio.has(audio)) throw new Error('Native observations require a fresh audio element');
 			mountedAudio.add(audio);
 			const previous = current;
+			if (previous?.audio === reconnectHandoffAudio) reconnectHandoffAudio = undefined;
 			if (previous) pendingShare.clear();
 			attachmentVersion += 1;
 			// Node identity is not attachment identity, even for the same source.
