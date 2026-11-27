@@ -2112,6 +2112,56 @@ class SourceBindingTests(Base):
 
                 self.refused(reason, self.run_main, private=True, mode="promote", world_factory=wrong_receipt)
 
+    def test_bootstrap_maintenance_refuses_mismatched_candidate_pins_and_missing_approval(self):
+        _, lines = self.run_main(mode="bootstrap-maintenance")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("not operational acceptance", lines[0])
+
+        saved_policy = self.policy
+        def green_ordinary_world():
+            return World(policy=saved_policy, contract_bytes=self.contract,
+                         xml=make_junit(final_sha=SHA).replace(
+                             b'classname="journey"', b'classname="signup.spec.ts"'))
+
+        self.install_contract(self.contract, dict(saved_policy, approvals=[]))
+        self.refused("approved product contract unavailable", self.run_main,
+                     mode="bootstrap-maintenance", world_factory=green_ordinary_world)
+        self.install_contract(self.contract, saved_policy)
+
+        def make_world(mutate):
+            def factory():
+                world = green_ordinary_world()
+                mutate(world)
+                world.set_archive()
+                return world
+            return factory
+
+        def mutate_receipt_sha(world):
+            world.receipt["sha"] = OTHER_SHA
+
+        def mutate_api_source_sha(world):
+            world.receipt["api"]["source_sha"] = OTHER_SHA
+
+        def mutate_closing_web_sha(world):
+            world.receipt["identities"]["build-identity-final"]["web"] = OTHER_SHA
+
+        def mutate_manifest_hash(world):
+            world.receipt["migration_manifest_sha256"] = "0" * 64
+
+        for label, mutate, reason in (
+            ("receipt sha", mutate_receipt_sha, "receipt source, producer or attempt mismatch"),
+            ("api source_sha", mutate_api_source_sha, "candidate API not actually deployed from the same source"),
+            ("closing live web sha", mutate_closing_web_sha, "opening/closing live identities disagree"),
+            ("migration manifest hash", mutate_manifest_hash, "candidate migration manifest mismatch"),
+        ):
+            with self.subTest(mismatch=label):
+                self.refused(reason, self.run_main, mode="bootstrap-maintenance", world_factory=make_world(mutate))
+
+        for surface in ("Web", "API"):
+            with self.subTest(live_drift=surface):
+                self.refused("current staging identity drift", self.run_main, mode="bootstrap-maintenance",
+                             live_error=sa.CurrentStagingBuildDrift(surface))
+
     def test_main_source_binding_is_independent_of_initial_branch(self):
         for initial_branch in ("main", "master"):
             with self.subTest(initial_branch=initial_branch):

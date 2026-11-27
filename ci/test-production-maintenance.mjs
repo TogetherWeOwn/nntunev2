@@ -599,3 +599,192 @@ test('protected recovery wiring keeps the production lock and contains source an
     assert.doesNotMatch(result.stdout + result.stderr, /fixture-private|Invalid protected/);
   }
 });
+
+test('maintenance-fallback preflight refuses missing, corrupted or mismatched bundle checksums before any write', async (t) => {
+  const { calls, custody, rows, temp, run } = finalSmokeFixture(t, rollbackFixture);
+  const baseline = structuredClone(rows);
+  const validDigest = custody.maintenance.module_sha256;
+  const badCustodies = [
+    ['missing module_sha256', { ...custody, maintenance: { ...custody.maintenance, module_sha256: undefined } }],
+    ['empty module_sha256', { ...custody, maintenance: { ...custody.maintenance, module_sha256: '' } }],
+    ['truncated module_sha256', { ...custody, maintenance: { ...custody.maintenance, module_sha256: validDigest.slice(0, 63) } }],
+    ['uppercase module_sha256', { ...custody, maintenance: { ...custody.maintenance, module_sha256: validDigest.toUpperCase() } }],
+    ['non-hex module_sha256', { ...custody, maintenance: { ...custody.maintenance, module_sha256: 'g'.repeat(64) } }],
+    ['prefixed module_sha256', { ...custody, maintenance: { ...custody.maintenance, module_sha256: `sha256:${validDigest}` } }],
+    ['mismatched module_sha256', { ...custody, maintenance: { ...custody.maintenance, module_sha256: '0'.repeat(64) } }],
+    ['missing evidence_sha256', { ...custody, evidence_sha256: undefined }],
+    ['corrupted evidence_sha256', { ...custody, evidence_sha256: 'not-a-sha256' }],
+  ];
+  for (const command of ['check-seed', 'record']) {
+    for (const [label, badCustody] of badCustodies) {
+      await assert.rejects(
+        run(command, { ROLLBACK_CUSTODY: JSON.stringify(badCustody) }),
+        /Missing or mismatched production rollback custody/,
+        `${command}: ${label}`,
+      );
+      assert.deepEqual(calls, [], `${command}: ${label} must not contact Cloudflare`);
+      assert.equal(existsSync(join(temp, intentFile)), false, `${command}: ${label} must not seal intent`);
+      assert.deepEqual(rows, baseline);
+    }
+  }
+  await run('check-seed');
+  await run('record');
+  assert.equal(existsSync(join(temp, intentFile)), true);
+  assert.ok(calls.length > 0 && calls.every((method) => method === 'GET'));
+  assert.deepEqual(rows, baseline);
+});
+
+test('maintenance-fallback preflight refuses missing or leaked protected-environment approval before any write', async (t) => {
+  const preflight = workflow.match(/id: target\n        env:\n((?: {10}[^\n]*\n)+)        run: \|\n((?: {10}[^\n]*\n)+)/);
+  assert.ok(preflight);
+  assert.match(preflight[1], /^ {10}UNPROTECTED_ACCEPTED_SHA: \$\{\{ vars\.PRODUCTION_ACCEPTED_SHA \}\}$/m);
+  assert.match(preflight[1], /^ {10}UNPROTECTED_WORKER_ID: \$\{\{ vars\.PRODUCTION_WORKER_ID \}\}$/m);
+  assert.match(preflight[1], /^ {10}UNPROTECTED_ROUTE_PROOF: \$\{\{ vars\.PRODUCTION_BOOTSTRAP_ROUTE_PROOF \}\}$/m);
+
+  const workspace = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'maintenance-approval-'));
+  t.after(() => rmSync(workspace, { recursive: true }));
+  const preflightRefusals = [
+    [{ UNPROTECTED_ACCEPTED_SHA: sha }, /PRODUCTION_ACCEPTED_SHA must exist only in the production Environment/],
+    [{ UNPROTECTED_WORKER_ID: workerId }, /Worker ID and route proof must exist only in the production Environment/],
+    [{ UNPROTECTED_ROUTE_PROOF: routeProof }, /Worker ID and route proof must exist only in the production Environment/],
+    [{ GITHUB_REF: 'refs/heads/feature' }, /Dispatch on main/],
+    [{ INPUT_SHA: '' }, /40-char lowercase hex/],
+    [{ PRODUCTION_DOMAIN: 'production-placeholder.example.invalid' }, /Production hostname not decided/],
+  ];
+  for (const [index, [overrides, refusal]] of preflightRefusals.entries()) {
+    const output = join(workspace, `output-${index}`);
+    const result = spawnSync('/bin/bash', ['-c', preflight[2].replace(/^ {10}/gm, '')], {
+      encoding: 'utf8', timeout: 5_000, env: {
+        PATH: process.env.PATH, GITHUB_OUTPUT: output, GITHUB_REF: 'refs/heads/main', GITHUB_SHA: sha,
+        INPUT_SHA: sha, DEPLOY_MODE: 'bootstrap-maintenance', PRODUCTION_DEPLOY_ENABLED: 'true',
+        UNPROTECTED_ACCEPTED_SHA: '', UNPROTECTED_WORKER_ID: '', UNPROTECTED_ROUTE_PROOF: '',
+        GITHUB_RUN_ATTEMPT: '1', PRODUCTION_DOMAIN: 'example.com',
+        PRODUCTION_DOMAIN_DEFAULT: 'production-placeholder.example.invalid',
+        ...overrides,
+      },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, refusal);
+    assert.equal(existsSync(output) ? readFileSync(output, 'utf8') : '', '');
+  }
+
+  const gate = bootstrap.match(/steps:\n      - name: Require the exact Release Manager-accepted SHA\n(.*?)        run: \|\n((?: {10}[^\n]*\n)+)      - uses: actions\/checkout@/s);
+  assert.ok(gate);
+  assert.doesNotMatch(gate[1], /if:|secrets\./);
+  assert.match(gate[1], /ACCEPTED_SHA: \$\{\{ vars\.PRODUCTION_ACCEPTED_SHA \}\}/);
+  assert.match(bootstrap, /uses: actions\/checkout@[0-9a-f]{40}[\s\S]*?ref: \$\{\{ needs\.preflight\.outputs\.sha \}\}[\s\S]*?DEPLOY_SHA: \$\{\{ needs\.preflight\.outputs\.sha \}\}\n        run: node ci\/production-maintenance\/seed\.mjs/);
+  for (const [env, stream, expected] of [
+    [{ DEPLOY_SHA: sha, ACCEPTED_SHA: '', GITHUB_RUN_ATTEMPT: '1' }, 'stdout', /PRODUCTION_ACCEPTED_SHA in the production Environment/],
+    [{ DEPLOY_SHA: sha, GITHUB_RUN_ATTEMPT: '1' }, 'stderr', /ACCEPTED_SHA: unbound variable/],
+  ]) {
+    const result = spawnSync('/bin/bash', ['-c', gate[2].replace(/^ {10}/gm, '')], {
+      encoding: 'utf8', timeout: 5_000, env,
+    });
+    assert.equal(result.status, 1);
+    assert.match(result[stream], expected);
+  }
+
+  const { calls: seedCalls, run: runSeed } = cloudflareFixture();
+  for (const [override, pattern] of [
+    [{ account: '' }, /Missing or invalid production account/],
+    [{ worker: '' }, /Missing or invalid production account/],
+    [{ token: '' }, /Missing or invalid production account/],
+    [{ sha: '' }, /Missing or invalid production account/],
+    [{ routeProof: '{not-json' }, /Missing or malformed custodian route proof/],
+    [{ routeProof: routeProof.replace(workerId, 'c'.repeat(32)) }, /bound to this Worker and SHA/],
+  ]) {
+    await assert.rejects(runSeed(override), pattern);
+  }
+  assert.deepEqual(seedCalls, []);
+
+  const transport = finalSmokeFixture(t, rollbackFixture);
+  await transport.prepare();
+  const { fresh } = recoveryFixture(t, transport, 'success');
+  let evidenceCalls = 0;
+  const countingEvidence = () => {
+    evidenceCalls += 1;
+    assert.fail('admitRecovery must refuse missing approval before reading Actions evidence');
+  };
+  const before = transport.calls.length;
+  for (const accepted of ['', undefined]) {
+    const recovery = { ...fresh('13'), ACCEPTED_SHA: accepted };
+    assert.throws(() => admitRecovery(recovery, countingEvidence), /Invalid protected recovery dispatch/);
+    await assert.rejects(transport.run('prepare-recovery', recovery), /Invalid protected recovery dispatch/);
+    assert.equal(existsSync(join(recovery.RUNNER_TEMP, 'production-final-allocation.sealed')), false);
+  }
+  assert.equal(evidenceCalls, 0);
+  assert.deepEqual(transport.calls.slice(before), []);
+});
+
+test('maintenance-fallback preflight refuses mismatched staging and candidate SHA pins before any write', async (t) => {
+  const { calls, custody, rows, seed, temp, versions, run } = finalSmokeFixture(t, rollbackFixture);
+  const baseline = structuredClone(rows);
+  const otherSha = 'e'.repeat(40);
+
+  for (const command of ['check-seed', 'record']) {
+    await assert.rejects(
+      run(command, { ROLLBACK_CUSTODY: JSON.stringify({ ...custody, sha: otherSha }) }),
+      /Missing or mismatched production rollback custody/,
+    );
+    await assert.rejects(run(command, { GITHUB_SHA: otherSha }), /Invalid protected production rollback context/);
+    await assert.rejects(run(command, { GITHUB_WORKFLOW_SHA: otherSha }), /Invalid protected production rollback context/);
+  }
+  assert.deepEqual(calls, []);
+
+  const originalSeedTag = seed.annotations['workers/tag'];
+  seed.annotations['workers/tag'] = otherSha;
+  await assert.rejects(run('check-seed'), /Maintenance version drifted/);
+  seed.annotations['workers/tag'] = originalSeedTag;
+
+  const originalCandidateTag = versions[1].annotations['workers/tag'];
+  versions[1].annotations['workers/tag'] = `${otherSha}-12-1`;
+  await assert.rejects(run('record'), /Candidate tag did not resolve uniquely/);
+  versions[1].annotations['workers/tag'] = originalCandidateTag;
+
+  assert.equal(existsSync(join(temp, intentFile)), false);
+  assert.ok(calls.length > 0 && calls.every((method) => method === 'GET'));
+  assert.deepEqual(rows, baseline);
+
+  const staging = workflow.split('\n  staging-evidence:\n')[1].split('\n  deploy-production:\n')[0];
+  const inlinePy = staging.match(/python3 - <<'PY'\n([\s\S]*?)^ {10}PY$/m)?.[1]?.replace(/^ {10}/gm, '');
+  assert.ok(inlinePy, 'staging-evidence must retain the maintenance staging prerequisite check');
+  const runPrereq = (responses) => spawnSync('python3', ['-c', `
+import io, json, sys, urllib.request
+responses = json.loads(sys.argv[1])
+script = sys.argv[2]
+class FakeResponse(io.BytesIO):
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+def fake_urlopen(req, timeout=15):
+    url = req.full_url
+    assert url.startswith("https://api.github.com/repos/example/fixture"), url
+    path = url.removeprefix("https://api.github.com/repos/example/fixture")
+    return FakeResponse(json.dumps(responses[path]).encode())
+urllib.request.urlopen = fake_urlopen
+exec(compile(script, "<staging-evidence>", "exec"), {"__name__": "__main__"})
+`, JSON.stringify(responses), inlinePy], {
+    encoding: 'utf8', timeout: 5_000,
+    env: { PATH: process.env.PATH, REPO: 'example/fixture', DEPLOY_SHA: sha, GITHUB_TOKEN: 'fixture-only' },
+  });
+  const runsPath = '/actions/workflows/deploy.yml/runs?branch=main&event=push&per_page=100';
+  const jobsPath = '/actions/runs/501/jobs?per_page=100';
+  const goodRun = { id: 501, head_sha: sha, event: 'push', status: 'completed', conclusion: 'success' };
+  const goodJobs = [
+    { name: 'staging-web', conclusion: 'success' },
+    { name: 'staging-api', conclusion: 'success' },
+    { name: 'post-deploy-e2e / full journey (signup → library → meter → limits)', conclusion: 'success' },
+  ];
+  for (const [label, responses, expected] of [
+    ['mismatched push head_sha', { [runsPath]: { workflow_runs: [{ ...goodRun, head_sha: otherSha }] } }, /No push-triggered deploy run on main/],
+    ['non-success staging-web', { [runsPath]: { workflow_runs: [goodRun] }, [jobsPath]: { jobs: [{ name: 'staging-web', conclusion: 'skipped' }, goodJobs[1], goodJobs[2]] } }, /no staging-web success/],
+    ['non-success full journey', { [runsPath]: { workflow_runs: [goodRun] }, [jobsPath]: { jobs: [goodJobs[0], goodJobs[1], { name: goodJobs[2].name, conclusion: 'failure' }] } }, /post-deploy-e2e jobs are not all success/],
+    ['smoke-only without full journey', { [runsPath]: { workflow_runs: [goodRun] }, [jobsPath]: { jobs: [goodJobs[0], goodJobs[1], { name: 'post-deploy-e2e / smoke', conclusion: 'success' }] } }, /no full journey success/],
+  ]) {
+    const result = runPrereq(responses);
+    assert.equal(result.status, 1, label);
+    assert.match(result.stdout, expected, label);
+  }
+  const ok = runPrereq({ [runsPath]: { workflow_runs: [goodRun] }, [jobsPath]: { jobs: goodJobs } });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, /staging evidence job prerequisites ok/);
+});
