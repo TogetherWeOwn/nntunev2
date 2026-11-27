@@ -211,6 +211,9 @@ pub async fn serve<S: PrivateSource, W: OriginalWriter>(
                 if !source.lease_live(&grant).await {
                     return Err(ApiError::not_found());
                 }
+                if now() >= until {
+                    return Err(unavailable());
+                }
                 Ok(part)
             };
             let part = {
@@ -252,9 +255,14 @@ pub async fn serve<S: PrivateSource, W: OriginalWriter>(
         }
         play.finish().map_err(|_| unavailable())?;
         let writer = writer.as_mut().ok_or_else(ApiError::internal_error)?;
-        poll_fn(|cx| writer.poll_close(cx))
-            .await
-            .map_err(|_| unavailable())
+        poll_fn(|cx| {
+            if now() >= until || writer.poll_cancel(cx).is_ready() {
+                return Poll::Ready(Err(SourceError::Cancelled));
+            }
+            writer.poll_close(cx)
+        })
+        .await
+        .map_err(|_| unavailable())
     }
     .await;
     if let Some(writer) = writer.as_mut().filter(|_| result.is_err()) {
