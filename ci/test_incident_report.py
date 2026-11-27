@@ -552,6 +552,21 @@ class RecentTests(unittest.TestCase):
                 self.assertEqual(ir.recent(api), [action])
                 self.assertEqual([write[:2] for write in api.writes], writes)
 
+    def test_definite_newer_smoke_supersedes_after_ambiguous_smoke(self):
+        def deploy_run(run_id, minutes, updated):
+            return recent_run(run_id, minutes=minutes, updated=updated,
+                              workflow="deploy.yml", event="push")
+
+        runs = [deploy_run(12, 75, 65), deploy_run(11, 80, 70), deploy_run(10, 90, 1)]
+        ambiguous = dict(smoke("success"), name=ir.POST_DEPLOY_JOURNEY)
+        ambiguous["steps"].append(dict(ambiguous["steps"][0], number=4, conclusion="failure"))
+        older_failure = dict(smoke("failure", step="failure"), name=ir.POST_DEPLOY_SMOKE)
+        newer_success = dict(smoke("success"), name=ir.POST_DEPLOY_SMOKE)
+        api = StatefulAPI(runs=runs, jobs={(10, 1): [older_failure],
+                                          (11, 1): [newer_success], (12, 1): [ambiguous]})
+        self.assertEqual(ir.recent(api), ["superseded"])
+        self.assertEqual(api.writes, [])
+
     def incident_state(self, api):
         return [(i["number"], i["state"]) for i in api.issues]
 
