@@ -21,22 +21,18 @@ fn exceeds_cap(current: usize, incoming: usize, cap: usize) -> bool {
     current.checked_add(incoming).is_none_or(|len| len > cap)
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn length_overflow_is_oversized() {
-        assert!(super::exceeds_cap(usize::MAX, 1, usize::MAX));
-        assert!(!super::exceeds_cap(4, 6, 10));
-        assert!(super::exceeds_cap(4, 7, 10));
-    }
-}
-
 /// Accumulates body chunks under a byte cap and a declared `Content-Length`.
-#[derive(Debug)]
 pub struct FormBody {
     declared: Option<usize>,
     cap: usize,
     bytes: Vec<u8>,
+    oversized: bool,
+}
+
+impl std::fmt::Debug for FormBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FormBody").finish_non_exhaustive()
+    }
 }
 
 impl FormBody {
@@ -51,6 +47,7 @@ impl FormBody {
             declared,
             cap,
             bytes: Vec::new(),
+            oversized: false,
         }
     }
 
@@ -62,9 +59,11 @@ impl FormBody {
         }
     }
 
-    /// Append one chunk, refusing as soon as the cap would be crossed.
+    /// Append one chunk. An oversized body remains rejected through `finish`.
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), BodyFault> {
-        if exceeds_cap(self.bytes.len(), chunk.len(), self.cap) {
+        self.check_declared()?;
+        if self.oversized || exceeds_cap(self.bytes.len(), chunk.len(), self.cap) {
+            self.oversized = true;
             return Err(BodyFault::Oversized);
         }
         self.bytes.extend_from_slice(chunk);
@@ -75,6 +74,10 @@ impl FormBody {
     /// length is a client abort the runtime reports as a normal end, so it is
     /// unreadable, never a smaller valid body.
     pub fn finish(self) -> Result<String, BodyFault> {
+        self.check_declared()?;
+        if self.oversized {
+            return Err(BodyFault::Oversized);
+        }
         if self
             .declared
             .is_some_and(|declared| self.bytes.len() < declared)
@@ -82,5 +85,15 @@ impl FormBody {
             return Err(BodyFault::Unreadable);
         }
         String::from_utf8(self.bytes).map_err(|_| BodyFault::Unreadable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn length_overflow_is_oversized() {
+        assert!(super::exceeds_cap(usize::MAX, 1, usize::MAX));
+        assert!(!super::exceeds_cap(4, 6, 10));
+        assert!(super::exceeds_cap(4, 7, 10));
     }
 }
