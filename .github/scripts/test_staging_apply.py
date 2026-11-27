@@ -314,6 +314,17 @@ class StagingApplyTests(unittest.TestCase):
         finally:
             staging_apply.subprocess.run = original
 
+    def test_apply_rejects_del_actor_before_subprocess(self):
+        from unittest.mock import patch
+
+        data, trusted, root = self._roots(manifest_text())
+        env = {staging_apply.SECRET_ENV: URL_REQUIRE, "APPLY_PROGRESS": str(root / "progress")}
+        with patch.object(staging_apply.subprocess, "run") as runner:
+            runner.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with self.assertRaisesRegex(staging_apply.StagingApplyError, "printable text"):
+                staging_apply.apply_files(trusted, data, "0054_first.sql", "operator\x7f", "single", DB, env)
+            runner.assert_not_called()
+
     def test_plan_files_single_unknown_file_refuses(self):
         entries = staging_apply.load_entries(
             str(self._roots(manifest_text())[0]))

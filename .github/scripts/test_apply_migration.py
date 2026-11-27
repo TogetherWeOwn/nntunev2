@@ -41,7 +41,7 @@ class MirrorPinTests(unittest.TestCase):
     def test_mirror_entry_drift_refuses(self):
         for name, sha in runtime_cases.MIRROR_FILES:
             for field, before, after in (
-                    ("file", name, "9998_renamed_mirror.sql"),
+                    ("file", name, f"{name[:5]}renamed_mirror.sql"),
                     ("sha256", sha, "0" * 64),
                     ("target", "mirror", "app")):
                 with self.subTest(file=name, field=field):
@@ -52,12 +52,8 @@ class MirrorPinTests(unittest.TestCase):
                         f'{field} = "{before}"', f'{field} = "{after}"', 1)
                     self.manifest.write_text(
                         "[[migration]]".join(blocks), encoding="utf-8")
-                    if field == "file":
-                        with self.assertRaisesRegex(apply_migration.ApplyError, "strictly increasing"):
-                            apply_migration.load_manifest(self.manifest)
-                    else:
-                        with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
-                            runtime_cases.assert_frozen_mirror(self.manifest)
+                    with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
+                        runtime_cases.assert_frozen_mirror(self.manifest)
 
     def test_mirror_rename_metadata_drift_refuses(self):
         for name, sha in runtime_cases.MIRROR_FILES:

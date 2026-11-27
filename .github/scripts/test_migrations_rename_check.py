@@ -186,8 +186,8 @@ class GitFixture(unittest.TestCase):
         with self.assertRaisesRegex(history.HistoryError, "lacks source_rename_history"):
             history.verify_preserved_source(self.root, self.base, head, digest,
                                             budget=history.EvidenceBudget())
-        with self.assertRaises(history.HistoryError):
-            history.verify_preserved_source(self.root, self.base, "0" * 40, digest,
+        with self.assertRaisesRegex(history.HistoryError, "Git evidence missing or unreadable"):
+            history.verify_preserved_source(self.root, self.base, "1" * 40, digest,
                                             budget=history.EvidenceBudget())
         with self.assertRaisesRegex(history.HistoryError, "ancestor"):
             history.verify_preserved_source(self.root, head, self.base, digest,
@@ -366,7 +366,7 @@ class GitFixture(unittest.TestCase):
         entries = self.chain()
         for field in history.EDGE_KEYS:
             broken = copy.deepcopy(entries)
-            value = ("0" * 40 if field in ("parent", "commit") else "0" * 64
+            value = ("1" * 40 if field in ("parent", "commit") else "0" * 64
                      if field.endswith("sha256") else "migrations/0099_forged.sql")
             broken[0]["source_rename_history"][0][field] = value
             with self.subTest(field=field), self.assertRaises(history.HistoryError):
@@ -645,8 +645,8 @@ class GitFixture(unittest.TestCase):
             with self.subTest(diagnostic=diagnostic), mock.patch.object(h, "git", return_value=raw):
                 with self.assertRaisesRegex(history.HistoryError, diagnostic):
                     h.diff("a" * 40, "b" * 40)
-        with self.assertRaises(history.HistoryError):
-            history.GitHistory(self.root, "0" * 40, self.git("rev-parse", "HEAD"))
+        with self.assertRaisesRegex(history.HistoryError, "Git evidence missing or unreadable"):
+            history.GitHistory(self.root, "1" * 40, self.git("rev-parse", "HEAD"))
         with self.assertRaises(history.HistoryError):
             history.GitHistory(self.root, "main", self.git("rev-parse", "HEAD"))
 
