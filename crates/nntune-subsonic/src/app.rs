@@ -478,12 +478,22 @@ mod tests {
 
     #[test]
     fn production_cover_art_refuses_fixture_bytes_for_every_account() {
-        let fixture = MemStore::seeded();
+        let seed = MemStore::seeded();
+        let mut songs = seed.all_songs();
+        songs[0].cover_art = "coverart:al-1".into();
+        let fixture = MemStore::empty_with_test_auth().with_catalogue(
+            seed.artists(),
+            seed.all_albums(),
+            songs,
+        );
         let app = SubsonicApp::production(fixture.clone());
         let legacy = SubsonicApp::new(fixture);
         let path = "/rest/getCoverArt.view";
-        let served = get(&legacy, path, "apiKey=test-key-1&id=al-1");
-        assert_eq!(served.body, crate::library::PLACEHOLDER_PNG);
+        let known = ["coverart:al-1", "al-1"];
+        for id in known {
+            let served = get(&legacy, path, &format!("apiKey=test-key-1&id={id}"));
+            assert_eq!(served.body, crate::library::PLACEHOLDER_PNG);
+        }
 
         for key in ["test-key-1", "other-key-1", "admin-key-1"] {
             let response = |id| get(&app, path, &format!("apiKey={key}&id={id}&f=json"));
@@ -493,8 +503,9 @@ mod tests {
             assert!(std::str::from_utf8(&unknown.body)
                 .unwrap()
                 .contains("\"code\":70"));
-            assert_eq!(response("al-1"), unknown);
-            assert_eq!(response("coverart:al-1"), unknown);
+            for id in known {
+                assert_eq!(response(id), unknown);
+            }
         }
     }
 
