@@ -7,6 +7,8 @@ import re
 import subprocess
 import sys
 
+# Isolated mode omits the script directory from the import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from migrations_base import BaseError, event_sha, require_commit
 
 WEB = {"web-checks", "web-build", "web-e2e", "web-a11y", "history-fixture"}

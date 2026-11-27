@@ -58,6 +58,7 @@ class AcceptanceTest(unittest.TestCase):
         self.env = ENV.copy()
         self.late_responses = {}
         self.framing = []
+        self.chunk_end = None
         self.connected = []
         self.requests = []
         fixture = self
@@ -74,7 +75,10 @@ class AcceptanceTest(unittest.TestCase):
                 for name, value in fixture.framing:
                     self.send_header(name, value)
                 self.end_headers()
-                self.wfile.write(json.dumps(reply).encode())
+                body = json.dumps(reply).encode()
+                if fixture.chunk_end is not None:
+                    body = f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n" + fixture.chunk_end
+                self.wfile.write(body)
 
             def log_message(self, *_args):
                 pass
@@ -127,6 +131,15 @@ class AcceptanceTest(unittest.TestCase):
         self.evidence = self.admission
         self.routes["/v1/balance"]["extra"] = float("nan")
         self.run_case("invalid_json", "admit")
+
+    def test_admit_requires_the_chunked_body_terminator(self):
+        self.evidence = self.admission
+        self.framing = [("Transfer-Encoding", "chunked")]
+        self.chunk_end = b""
+        self.run_case("invalid_response", "admit")
+        self.assertEqual([path for path, _ in self.requests], ["/api/build"])
+        self.chunk_end = b"\r\n"
+        self.run_case("admitted", "admit")
 
     def test_finish_verifies_payment_and_teardown_with_redacted_output(self):
         self.run_case("accepted")

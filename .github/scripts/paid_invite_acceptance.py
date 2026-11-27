@@ -1,6 +1,7 @@
 """Read-only admission and evidence checks for the protected staging journey."""
 
 import http.client
+from io import BytesIO
 import json
 import os
 import re
@@ -51,6 +52,22 @@ def read_json(source):
                       parse_constant=reject_constant)
 
 
+def read_chunked_json(stream):
+    # Require the final CRLF, which http.client treats as optional at EOF.
+    body = bytearray()
+    while True:
+        size_line = stream.readline(19)
+        require(re.fullmatch(rb"[0-9a-fA-F]{1,16}\r\n", size_line), "invalid_response")
+        size = int(size_line, 16)
+        if size == 0:
+            require(stream.read(2) == b"\r\n", "invalid_response")
+            return read_json(BytesIO(body))
+        require(len(body) + size <= MAX_BYTES, "input_too_large")
+        chunk = stream.read(size)
+        require(len(chunk) == size and stream.read(2) == b"\r\n", "invalid_response")
+        body.extend(chunk)
+
+
 def get_json(host, path, headers):
     # Direct TLS, without redirects, proxy settings or caller-supplied hosts.
     connection = http.client.HTTPSConnection(host, timeout=8)
@@ -66,9 +83,11 @@ def get_json(host, path, headers):
             transfer = response.getheader("Transfer-Encoding")
             if transfer is not None:
                 require(transfer.lower() == "chunked" and length is None, "invalid_response")
-            elif length is not None:
-                require(matches(length, r"[0-9]+"), "invalid_response")
-            payload = read_json(response)
+                payload = read_chunked_json(response.fp)
+            else:
+                if length is not None:
+                    require(matches(length.strip(" \t"), r"[0-9]+"), "invalid_response")
+                payload = read_json(response)
             require(response.length in (None, 0) and isinstance(payload, dict), "invalid_response")
             return payload
     finally:

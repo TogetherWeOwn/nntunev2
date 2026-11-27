@@ -1,5 +1,7 @@
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -81,6 +83,16 @@ class CoverageTests(unittest.TestCase):
             git("commit", "-qm", "Add executable docs path")
             self.assertEqual(plan("pull_request", base, git("rev-parse", "HEAD"), root),
                              (True, {"full"}, []))
+
+            tested = git("rev-parse", "HEAD")
+            cli = Path(__file__).with_name("ci_coverage.py").resolve()
+            output = subprocess.run(
+                [sys.executable, "-I", str(cli), "pull_request", base_tree, tested, tested],
+                cwd=root, env={**os.environ, "GITHUB_STEP_SUMMARY": str(root / "summary")},
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(output.returncode, 0, output.stderr)
+            self.assertEqual(output.stdout, "complete=false\nskip=[]\n")
 
     def test_job_selection_and_dependencies(self):
         workflow = Path(__file__).resolve().parents[1] / "workflows/ci.yml"
