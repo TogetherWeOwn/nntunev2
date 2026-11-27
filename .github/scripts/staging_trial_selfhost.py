@@ -26,7 +26,7 @@ def fingerprint(pem):
 def tls_connection(raw, pins, route, role, ca_file, *, run=subprocess.run):
     # Give libpq a dedicated CA. A separate unauthenticated handshake checks
     # the leaf pin before sending credentials; libpq verifies TLS again.
-    if parse_qs(urlsplit(raw).query, strict_parsing=True) != {"sslmode": ["verify-full"]}:
+    if parse_qs(urlsplit(raw).query, keep_blank_values=True, strict_parsing=True) != {"sslmode": ["verify-full"]}:
         raise ValueError
     env = evidence_child_env(raw, DATABASE)
     host, port = pins["routes"][route]
@@ -54,7 +54,10 @@ def session_guard(pins, role):
         AND EXISTS (SELECT FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()
                     AND ssl AND version = 'TLSv1.3')""")
     if role == "owner":
-        sql += require(f"({CONTROL}) = {pins['system_identifier']}")
+        system_identifier = pins["system_identifier"]
+        if type(system_identifier) is not int or not 0 < system_identifier < 2**64:
+            raise ValueError
+        sql += require(f"({CONTROL}) = {system_identifier}")
     return sql
 
 

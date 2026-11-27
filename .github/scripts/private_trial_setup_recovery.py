@@ -155,32 +155,40 @@ def _check_sql_identity(identity, field):
     _text(identity[0], field)
 
 
+def _check_connection(connection):
+    for field, value in zip(
+        ("account", "request reference", "binding", "origin", "access client", "origin CA"),
+        (connection.account_id, connection.request_ref, connection.binding, connection.origin,
+         connection.access_client_ref, connection.origin_ca_ref), strict=True,
+    ):
+        _text(value, field)
+    _check_sql_identity(connection.database, "database")
+    _check_sql_identity(connection.role, "role")
+    _text(connection.sslmode, "sslmode")
+
+
 def decide_lost_create(intent: ConnectionIntent,
                        readbacks: Iterable[ConnectionReadback]) -> CreateDecision:
     """Resolve a lost connection-create acknowledgement from scoped evidence."""
-    expected = _connection_fields(intent)
-    for field, value in zip(
-        ("account", "request reference", "binding", "origin", "access client", "origin CA"),
-        expected[:3] + expected[5:8], strict=True,
-    ):
-        _text(value, field)
-    _check_sql_identity(intent.database, "database")
-    _check_sql_identity(intent.role, "role")
-    _text(intent.sslmode, "sslmode")
+    _check_connection(intent)
     if intent.sslmode != "verify-full" or intent.caching_disabled is not True:
         return CreateDecision("hold", "connection settings are outside the reviewed contract")
     pending = CreateDecision("hold", "create result is missing, ambiguous or out of scope")
     rows = tuple(readbacks)
+    for row in rows:
+        if not isinstance(row, ConnectionReadback):
+            raise RecoveryInputError("invalid connection readback")
+        _check_connection(row)
+        if not isinstance(row.config_id, str) or not CONFIG_ID.fullmatch(row.config_id):
+            raise RecoveryInputError("invalid config ID")
+    if any(type(row.caching_disabled) is not bool for row in rows):
+        return pending
     candidates = [row for row in rows if row.request_ref == intent.request_ref]
     if len(candidates) != 1:
         return pending
     row, = candidates
-    if _connection_fields(row) != expected or row.caching_disabled is not True:
+    if _connection_fields(row) != _connection_fields(intent) or row.caching_disabled is not True:
         return pending
-    _check_sql_identity(row.database, "database")
-    _check_sql_identity(row.role, "role")
-    if not isinstance(row.config_id, str) or not CONFIG_ID.fullmatch(row.config_id):
-        raise RecoveryInputError("invalid config ID")
     if sum(other.config_id == row.config_id for other in rows) != 1:
         return pending
     return CreateDecision("skip_create", "one scoped result is bound to the original request", row.config_id)

@@ -13,7 +13,7 @@ from staging_apply import StagingApplyError, evidence_child_env, quote_literal a
 from staging_trial_isolated import KIND, ROLES, SHARED_OID
 from staging_trial_role_acl import audit, isolated_extensions, require
 from staging_trial_role_lifecycle import NAMES, baseline, psql, target
-from staging_trial_role_preflight import DATABASE, ROLE_RE, oid
+from staging_trial_role_preflight import DATABASE, ROLE_RE, oid, strict_json
 
 
 DATABASE_OID = 16494
@@ -55,7 +55,7 @@ def verify_branch(branch_id, token):
             body = resp.read(32769)
             if len(body) > 32768:
                 raise ValueError
-            metadata.append(json.loads(body))
+            metadata.append(strict_json(body))
         if not branch_pin(*metadata, branch_id):
             raise StagingApplyError("isolated provider branch identity")
     finally:
@@ -65,32 +65,40 @@ def verify_branch(branch_id, token):
 def plan_config(raw, digest):
     if len(raw) > 32000 or hashlib.sha256(raw.encode()).hexdigest() != digest:
         raise ValueError
-    plan = json.loads(raw)
-    if (plan.keys() != {"branch_id", "direct", "port", "baseline", "consumers"}
-            or not re.fullmatch(r"[a-z0-9]{1,63}", plan["branch_id"])
-            or not re.fullmatch(r"[a-z0-9.-]+\.psdb\.cloud", plan["direct"])
+    plan = strict_json(raw)
+    if (not isinstance(plan, dict) or plan.keys() != {"branch_id", "direct", "port", "baseline", "consumers"}
+            or not isinstance(plan["branch_id"], str) or not re.fullmatch(r"[a-z0-9]{1,63}", plan["branch_id"])
+            or not isinstance(plan["direct"], str) or not re.fullmatch(r"[a-z0-9.-]+\.psdb\.cloud", plan["direct"])
             or type(plan["port"]) is not int or plan["port"] != 5432):
         raise ValueError
     return plan
 
 
 def after_plan(original, consumers, database_oid):
-    if original.keys() != {"databases", "acl"} or len(original["databases"]) > 64:
+    if (not isinstance(original, dict) or original.keys() != {"databases", "acl"}
+            or not oid(database_oid) or database_oid == SHARED_OID):
+        raise ValueError
+    for records, size in ((original["databases"], 4), (original["acl"], 5), (consumers, 4)):
+        if not isinstance(records, list) or any(not isinstance(row, list) or len(row) != size for row in records):
+            raise ValueError
+    if len(original["databases"]) > 64:
         raise ValueError
     dbs = {}
     for dbid, name, owner, template in original["databases"]:
-        if (not oid(dbid) or dbid in dbs or not ROLE_RE.fullmatch(name) or not oid(owner)
+        if (not oid(dbid) or dbid in dbs or not isinstance(name, str) or not ROLE_RE.fullmatch(name) or not oid(owner)
                 or type(template) is not bool):
             raise ValueError
         dbs[dbid] = (name, owner, template)
-    if database_oid == SHARED_OID or dbs.get(database_oid, (None,))[0] != DATABASE:
+    if dbs.get(database_oid, (None,))[0] != DATABASE or len({db[0] for db in dbs.values()}) != len(dbs):
         raise ValueError
     rows = set()
     for dbid, grantee, grantor, priv, option in original["acl"]:
-        if (dbid not in dbs or not oid(grantee, optional=True) or not oid(grantor)
-                or priv not in PRIVILEGES or type(option) is not bool):
+        if (not oid(dbid) or dbid not in dbs or not oid(grantee, optional=True) or not oid(grantor)
+                or not isinstance(priv, str) or priv not in PRIVILEGES or type(option) is not bool):
             raise ValueError
         rows.add((dbid, grantee, grantor, priv, option))
+    if len(rows) != len(original["acl"]):
+        raise ValueError
     public_connect = {d for d, r, _, p, _ in rows if r == 0 and p == "CONNECT"}
     public = {row for row in rows if row[1] == 0 and (
         row[0] == database_oid or row[3] != "TEMPORARY" or row[0] in public_connect
@@ -99,7 +107,8 @@ def after_plan(original, consumers, database_oid):
     added, identities = set(), set()
     direct = {(d, r, p) for d, r, _, p, _ in rows}
     for dbid, grantee, name, priv in consumers:
-        if ((dbid, priv) not in exposed or not oid(grantee) or not ROLE_RE.fullmatch(name)
+        if (not oid(dbid) or not isinstance(priv, str) or (dbid, priv) not in exposed
+                or not oid(grantee) or not isinstance(name, str) or not ROLE_RE.fullmatch(name)
                 or name.lower() == "public" or name in NAMES):
             raise ValueError
         identities.add((grantee, name))
@@ -110,6 +119,8 @@ def after_plan(original, consumers, database_oid):
 
 
 def compose(action, original, consumers, database_oid, login, *, fixture=False, owner_guard="", catalog=CATALOG):
+    if action not in OPERATIONS:
+        raise ValueError
     dbs, after, public, added, identities = after_plan(original, consumers, database_oid)
     owner = dbs[database_oid][1]
     affected = sorted({row[0] for row in public})
@@ -180,7 +191,7 @@ def compose_selfhost(action, raw, digest, pins):
 
     if action not in OPERATIONS or len(raw) > 32000 or hashlib.sha256(raw.encode()).hexdigest() != digest:
         raise ValueError
-    plan = json.loads(raw)
+    plan = strict_json(raw)
     if (not isinstance(plan, dict) or plan.keys() != {"kind", "system_identifier", "database_oid", "baseline", "consumers"}
             or plan["kind"] != KIND or type(plan["system_identifier"]) is not int
             or plan["system_identifier"] != pins["system_identifier"]
@@ -200,9 +211,9 @@ def main():
         login = f"postgres.{plan['branch_id']}"
         if (child["PGHOST"], child["PGPORT"], child["PGUSER"]) != (plan["direct"], str(plan["port"]), login) or not child["PGPASSWORD"]:
             raise ValueError
+        sql = compose(action, plan["baseline"], plan["consumers"], DATABASE_OID, login)
         verify_branch(plan["branch_id"], os.environ["ISOLATED_TRIAL_BRANCH_READ"])
         child.update(PGGSSENCMODE="disable", PGPASSFILE="/dev/null")
-        sql = compose(action, plan["baseline"], plan["consumers"], DATABASE_OID, login)
         psql(child, sql, f"isolated staging {action}")
     except (ApplyError, StagingApplyError, AttributeError, KeyError, TypeError, ValueError, OSError,
             http.client.HTTPException, subprocess.TimeoutExpired):

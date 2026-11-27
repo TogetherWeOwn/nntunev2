@@ -143,6 +143,8 @@ def capture(lane, sha, runner):
                               "private Stream mode was not verified")
         # The existing API receipt validator already binds the fixed API Worker.
         receipt["worker"] = worker
+    admission.require(all(identity.valid(admission.UUID, receipt.get(key))
+                          for key in ("version_id", "deployment_id")), "invalid staging deployment receipt IDs")
     return {**{key: receipt[key] for key in PIN_FIELDS}, **provenance()}
 
 
@@ -163,8 +165,9 @@ def observe(pins, read):
 
 def attach_observations(report, deployments):
     xml = read_bounded(report, admission.MAX_XML)
-    admission.require(b"<!DOCTYPE" not in xml and b"<!ENTITY" not in xml, "unsafe private staging XML")
-    suite = ET.fromstring(xml)
+    admission.require(not any(marker in xml for marker in (b"\x00", b"<!DOCTYPE", b"<!ENTITY")),
+                      "unsafe private staging XML")
+    suite = ET.fromstring(xml, parser=ET.XMLParser(encoding="utf-8"))
     for phase in admission.IDENTITY_PHASES:
         properties = suite.findall(f"./testcase[@classname='private-music'][@name='{phase}']"
                                    "/properties/property[@name='candidate-identity']")

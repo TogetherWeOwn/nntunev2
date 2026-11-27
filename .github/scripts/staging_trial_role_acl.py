@@ -135,8 +135,7 @@ def audit(entries, *, exact, database_preparation=False):
     ambient = ",".join(f"to_regprocedure('public.{sig}')" for sig in AMBIENT)
     missing = "AND NOT EXISTS (SELECT * FROM expected EXCEPT SELECT * FROM direct)" if exact else ""
     return require(f"""
-WITH expected AS (SELECT * FROM ({values}) e(role_id, class_id, obj, sub, priv, opt)
-                  WHERE role_id IN (SELECT oid FROM pg_roles)),
+WITH expected AS (SELECT * FROM ({values}) e(role_id, class_id, obj, sub, priv, opt)),
 schemas AS (SELECT * FROM pg_namespace WHERE nspname !~ '^pg_' AND nspname <> 'information_schema'),
 relations AS (SELECT c.* FROM pg_class c JOIN schemas s ON s.oid = c.relnamespace),
 routines AS (SELECT p.* FROM pg_proc p JOIN schemas s ON s.oid = p.pronamespace),

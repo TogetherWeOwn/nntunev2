@@ -8,7 +8,7 @@ import subprocess
 import sys
 from typing import NamedTuple
 
-from staging_api_identity import SHA, UUID, valid
+from staging_api_identity import SHA, UUID, reject_constant, unique_object, valid
 from staging_apply import SECRET_ENV, StagingApplyError, evidence_child_env, load_entries
 from staging_stream_config import TRIAL_DATABASES
 from staging_trial_schema import BASELINE, ROLE_RE
@@ -117,10 +117,17 @@ def read_binding_identities(*, build_sha, version_id, database_oid, role_pins, q
     }
 
 
+def strict_json(raw):
+    try:
+        return json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
+    except (ValueError, RecursionError):
+        raise ValueError("invalid trial JSON") from None
+
+
 def parse_scope(raw):
     if len(raw) > 1024:
         raise ValueError
-    scope = json.loads(raw)
+    scope = strict_json(raw)
     if not isinstance(scope, dict) or scope.keys() != {"database_oid", "issuer_oid", "reader", "writer"}:
         raise ValueError
     reader, writer = scope["reader"], scope["writer"]

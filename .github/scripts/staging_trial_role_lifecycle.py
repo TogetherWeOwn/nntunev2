@@ -56,6 +56,8 @@ def psql(env, sql, stage):
 
 
 def target(scope, login, fixture):
+    if not oid(scope.get("database_oid")) or not isinstance(login, str) or not LOGIN_RE.fullmatch(login):
+        raise ValueError
     observer = login.partition(".")[0]
     marker = f"AND shobj_description(oid, 'pg_database') = '{FIXTURE}'" if fixture else ""
     return require(f"""

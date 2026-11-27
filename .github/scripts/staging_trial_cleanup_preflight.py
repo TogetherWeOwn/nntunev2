@@ -32,12 +32,29 @@ def preflight(env, read):
     require(identity.valid(SHA256, access_key_sha), "invalid-cleanup-access-key-pin")
     sha = receipt["build_sha"]
     require(identity.valid(identity.SHA, sha), "invalid-disable-build")
-    for lane, worker in (("api", identity.SCRIPT), ("stream", identity.STREAM)):
+    provider = {}
+    for field, setting in {
+        "environment": "ENVIRONMENT", "library": "LIBRARY", "configuration": "S3_CONFIGURATION",
+        "root_version": "ROOT_VERSION", "bucket": "S3_BUCKET", "endpoint": "S3_ENDPOINT", "region": "S3_REGION",
+    }.items():
+        value = env.get("PRIVATE_PLAYBACK_STAGING_" + setting, "")
+        require(0 < len(value) <= 253 and re.fullmatch((API_SETTINGS | PRIVATE_SETTINGS)[setting], value),
+                "invalid-provider-setting")
+        provider[field] = value
+    lanes = (("api", identity.SCRIPT), ("stream", identity.STREAM))
+    for lane, _ in lanes:
         pin = receipt[lane]
         require(isinstance(pin, dict) and set(pin) == {"deployment_id", "version_id"} and
                 all(identity.valid(identity.UUID, value) for value in pin.values()), "invalid-disable-pin")
-        deployment = lambda: identity.current_deployment(read(worker, "deployments"), pin["version_id"])
-        require(deployment() == pin["deployment_id"], "disable-deployment-drift")
+    def check_deployments():
+        for lane, worker in lanes:
+            pin = receipt[lane]
+            deployed = identity.current_deployment(read(worker, "deployments"), pin["version_id"])
+            require(deployed == pin["deployment_id"], "disable-deployment-drift")
+
+    check_deployments()
+    for lane, worker in lanes:
+        pin = receipt[lane]
         bindings = identity.verify_build(read(worker, "versions/" + pin["version_id"]), pin["version_id"], sha)
         mode = bindings.get("PRIVATE_PLAYBACK_ENABLED")
         off = {"type": "plain_text", "text": "false"}
@@ -48,17 +65,8 @@ def preflight(env, read):
             require("PRIVATE_TRIAL_UPLOAD_ENABLED" not in bindings and
                     all(f"PRIVATE_TRIAL_{role}_DB" not in bindings for role in TRIAL_DATABASES),
                     "upload-not-disabled")
-        require(deployment() == pin["deployment_id"], "disable-deployment-drift")
+    check_deployments()
 
-    provider = {}
-    for field, setting in {
-        "environment": "ENVIRONMENT", "library": "LIBRARY", "configuration": "S3_CONFIGURATION",
-        "root_version": "ROOT_VERSION", "bucket": "S3_BUCKET", "endpoint": "S3_ENDPOINT", "region": "S3_REGION",
-    }.items():
-        value = env.get("PRIVATE_PLAYBACK_STAGING_" + setting, "")
-        require(0 < len(value) <= 253 and re.fullmatch((API_SETTINGS | PRIVATE_SETTINGS)[setting], value),
-                "invalid-provider-setting")
-        provider[field] = value
     return {"provider": provider, "scope_sha256": scope_sha, "s3_access_key_sha256": access_key_sha}
 
 

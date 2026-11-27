@@ -1,12 +1,11 @@
 """Target admission and overlay ownership for the isolated staging trial."""
 
-import json
 import re
 
 from apply_migration import transaction_body
 from staging_apply import quote_literal as literal
 from staging_trial_role_acl import LOCK_TABLES, ROUTINES, require
-from staging_trial_role_preflight import DATABASE, LOGIN_RE, oid
+from staging_trial_role_preflight import DATABASE, LOGIN_RE, oid, strict_json
 from staging_trial_schema import LOCATOR_CHECK, TABLES, compose, read_source
 
 CONFIG_ENV = "ISOLATED_TRIAL_TARGET"
@@ -24,7 +23,7 @@ ROLES = {"owner": "nntune_trial_owner", "executor": "nntune_trial_executor",
 def target_config(raw, scope, fixture):
     if len(raw) > 2048:
         raise ValueError
-    config = json.loads(raw)
+    config = strict_json(raw)
     keys = {"database_oid", "executor_oid", "direct", "direct_port", "routed", "routed_port",
             *(key.lower() for key in ROUTES)}
     if (not isinstance(config, dict) or config.keys() != keys
@@ -44,9 +43,10 @@ def target_config(raw, scope, fixture):
         login = config[key.lower()]
         if not isinstance(login, str) or not LOGIN_RE.fullmatch(login):
             raise ValueError
-    if (not fixture and config["owner"].partition(".")[0] != "postgres"
-            or (scope is not None and any(config[key].partition(".")[0] != scope[key][0]
-                                          for key in ("reader", "writer")))):
+    logins = {key.lower(): config[key.lower()].partition(".")[0] for key in ROUTES}
+    if (len(set(logins.values())) != len(logins) or not fixture and logins["owner"] != "postgres"
+            or (scope is not None and (any(logins[key] != scope[key][0] for key in ("reader", "writer"))
+                                       or config["executor_oid"] in (scope["reader"][1], scope["writer"][1])))):
         raise ValueError
     return config
 
@@ -55,7 +55,7 @@ def selfhost_target_config(raw, *, fixture=False):
     """Read separately supplied evidence pins. The PlanetScale parser is separate."""
     if len(raw) > 4096:
         raise ValueError
-    pins = json.loads(raw)
+    pins = strict_json(raw)
     if (not isinstance(pins, dict) or pins.keys() != {
             "kind", "system_identifier", "database_oid", "ca_sha256", "server_sha256", "routes", "role_oids"}
             or pins["kind"] != KIND or not oid(pins["database_oid"]) or pins["database_oid"] in (16494, SHARED_OID)
@@ -116,6 +116,8 @@ def routines(root):
 
 
 def overlay(root, scope, executor_oid, action, *, installed_sql="", absent_sql=""):
+    if action not in ("check", "grant", "verify-overlay", "retire"):
+        raise ValueError
     reader, reader_oid = scope["reader"]
     writer, writer_oid = scope["writer"]
     # Bind retries and revocation to the actual logins, even after reissuance

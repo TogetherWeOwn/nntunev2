@@ -1,5 +1,6 @@
 """Render the internal Stream Worker configuration for staging only."""
 
+from datetime import date
 import json
 import os
 import re
@@ -21,13 +22,18 @@ API_SETTINGS = {"ENVIRONMENT": UUID_V4, "LIBRARY": UUID_V4, **{
     name: PRIVATE_SETTINGS[name] for name in ("S3_CONFIGURATION", "S3_BUCKET", "ROOT_VERSION")
 }}
 TRIAL_DATABASES = ("UPLOAD", "AUTH", "PUBLISH", "ENROLL")
+ROOT = Path(__file__).resolve().parents[2]
+BINDING_MANIFEST = ROOT / ".github/scripts/binding_manifest.toml"
 
 
 def private_vars(env, settings):
     enabled = env.get("PRIVATE_PLAYBACK_STAGING_ENABLED", "")
     if enabled not in ("", "false", "true"):
         raise ValueError("PRIVATE_PLAYBACK_STAGING_ENABLED has an invalid value")
-    if (enabled == "true") != (env.get("PRIVATE_MUSIC_STAGING_JOURNEY", "").lower() == "true"):
+    journey = env.get("PRIVATE_MUSIC_STAGING_JOURNEY", "").lower()
+    if journey not in ("", "false", "true"):
+        raise ValueError("PRIVATE_MUSIC_STAGING_JOURNEY has an invalid value")
+    if (enabled == "true") != (journey == "true"):
         raise ValueError("Arm private playback and the private journey together")
     if enabled != "true":
         return []
@@ -68,7 +74,7 @@ def trial_upload(env):
 def trial_db_bindings(env):
     if not trial_upload(env):
         return []
-    manifest = tomllib.loads(Path(__file__).with_name("binding_manifest.toml").read_text())
+    manifest = tomllib.loads(BINDING_MANIFEST.read_text())
     existing = {
         binding.get(stage) for worker in manifest["worker"] for binding in worker.get("binding", [])
         if binding.get("type") == "hyperdrive" for stage in ("prod", "staging")
@@ -87,14 +93,14 @@ def trial_db_bindings(env):
 def trial_preflight(env):
     armed = bool(api_vars(env))
     trial_db_bindings(env)
-    source = tomllib.loads(Path("workers/stream/wrangler.toml").read_text())
+    source = tomllib.loads((ROOT / "workers/stream/wrangler.toml").read_text())
     render(source, env)
     if armed:
         if (env.get("API_RP_ID_STAGING"), env.get("API_RP_ORIGIN_STAGING")) != (
             "staging.nntune.com", "https://staging.nntune.com",
         ):
             raise ValueError("Private trial requires the staging API RP ID and origin")
-        manifest = tomllib.loads(Path(".github/scripts/binding_manifest.toml").read_text())
+        manifest = tomllib.loads(BINDING_MANIFEST.read_text())
         api = next(worker for worker in manifest["worker"] if worker["name"] == "api")
         database = next(binding for binding in api["binding"] if binding["binding"] == "HYPERDRIVE")
         if env.get("HYPERDRIVE_ID_STAGING") != database["staging"]:
@@ -117,11 +123,15 @@ def render(source, env):
         "tag": "v1", "new_sqlite_classes": ["NntpPool"],
     }]:
         raise ValueError("Stream entrypoint or Durable Object migration changed")
+    compatibility_date = source.get("compatibility_date")
+    if not isinstance(compatibility_date, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", compatibility_date):
+        raise ValueError("Stream compatibility date must use YYYY-MM-DD")
+    compatibility_date = date.fromisoformat(compatibility_date).isoformat()
     playback = private_vars(env, PRIVATE_SETTINGS)
     lines = [
         'name = "nntune-stream-staging"',
         f'main = {json.dumps(source["main"])}',
-        f'compatibility_date = {json.dumps(source["compatibility_date"])}',
+        f'compatibility_date = "{compatibility_date}"',
         "workers_dev = false", "preview_urls = false", "",
         '[[migrations]]', 'tag = "v1"', 'new_sqlite_classes = ["NntpPool"]', "",
         '[env.staging]', 'name = "nntune-stream-staging"',

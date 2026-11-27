@@ -90,6 +90,18 @@ class ApplyRecoveryTests(unittest.TestCase):
 
 
 class LostCreateTests(unittest.TestCase):
+    def test_lost_acknowledgement_refuses_malformed_unrelated_result(self):
+        intent = connection_intent()
+        match = connection_readback(intent)
+        for unrelated in (replace(match, request_ref=""),
+                          replace(match, request_ref="other", config_id=None),
+                          replace(match, request_ref="other", role=("fixture", True))):
+            with self.subTest(unrelated=unrelated), self.assertRaises(RecoveryInputError):
+                decide_lost_create(intent, [match, unrelated])
+
+        unrelated = replace(match, request_ref="other", config_id="d" * 32, caching_disabled=1)
+        self.assertEqual(decide_lost_create(intent, [match, unrelated]).action, "hold")
+
     def test_lost_acknowledgement_binds_one_result_and_skips_create(self):
         intent = connection_intent()
         unrelated = connection_readback(intent, config_id="d" * 32, request_ref="other-request")

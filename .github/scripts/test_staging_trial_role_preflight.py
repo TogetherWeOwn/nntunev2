@@ -1,6 +1,7 @@
 """Check protected trial role preflight and target admission."""
 
 from contextlib import redirect_stderr, redirect_stdout
+from hashlib import sha256
 from io import StringIO
 import json
 import os
@@ -10,9 +11,15 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from apply_migration import ApplyError
 from staging_apply import StagingApplyError
+import staging_trial_ambient_acl as ambient
+import staging_trial_isolated as isolated
+from staging_trial_role_acl import audit
 import staging_trial_role_lifecycle as lifecycle
 import staging_trial_role_preflight as preflight
+from staging_trial_schema import read_source
+from staging_trial_selfhost import session_guard, tls_connection
 from test_apply_migration_postgres import run_psql
 from test_ingest_session_migration_postgres import scratch_database
 
@@ -35,6 +42,80 @@ BINDING_ROLES = {
 def require_disposable_runner():
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
         raise SystemExit("requires the disposable GitHub-hosted PostgreSQL service")
+
+
+class OfflineTrialBoundaryTests(unittest.TestCase):
+    def test_refuses_duplicate_scope_and_target_fields(self):
+        scope = {"database_oid": 42000, "issuer_oid": 0, "reader": ["reader", 42001], "writer": ["writer", 42002]}
+        target = {"database_oid": 42000, "executor_oid": 42003, "owner": "owner", "executor": "executor",
+                  "reader": "reader", "writer": "writer", "direct": "127.0.0.1", "routed": "127.0.0.1",
+                  "direct_port": 15432, "routed_port": 25432}
+        stock = {"kind": isolated.KIND, "database_oid": 42000, "system_identifier": 1,
+                 "ca_sha256": "a" * 64, "server_sha256": "b" * 64,
+                 "routes": {route: [host, 5432] for route, host in isolated.FIXTURE_HOSTS.items()},
+                 "role_oids": dict(zip(isolated.ROLES, range(42001, 42005), strict=True))}
+        for source, parse in ((scope, preflight.parse_scope),
+                              (target, lambda raw: isolated.target_config(raw, scope, True)),
+                              (stock, lambda raw: isolated.selfhost_target_config(raw, fixture=True))):
+            with self.subTest(parse=parse), self.assertRaises(ValueError):
+                parse('{"database_oid": 1, ' + json.dumps(source)[1:])
+        for overrides in ({"executor": "owner.other"}, {"executor_oid": scope["writer"][1]}):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                isolated.target_config(json.dumps(target | overrides), scope, True)
+
+    def test_ambient_acl_refuses_malformed_catalog_rows(self):
+        dbid, owner = 42000, 42001
+        baseline = {"databases": [[dbid, preflight.DATABASE, owner, False]],
+                    "acl": [[dbid, 0, owner, "CONNECT", False]]}
+        for rows in (baseline["acl"] * 2, [[float(dbid), 0, owner, "CONNECT", False]]):
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                ambient.after_plan(baseline | {"acl": rows}, [], dbid)
+        with self.assertRaises(ValueError):
+            ambient.compose("restrict", baseline, [], dbid, "tenant_owner")
+
+    def test_ambient_acl_refuses_duplicate_digest_bound_fields(self):
+        raw = ('{"branch_id":"other","branch_id":"fixture","direct":"direct.example.psdb.cloud",'
+               '"port":5432,"baseline":{},"consumers":[]}')
+        with self.assertRaises(ValueError):
+            ambient.plan_config(raw, sha256(raw.encode()).hexdigest())
+
+    def test_exact_acl_preserves_expected_rows_for_missing_roles(self):
+        entries = [("reader", 42001, "DATABASE", preflight.DATABASE, "CONNECT", "")]
+        sql = audit(entries, exact=True)
+        self.assertNotIn("WHERE role_id IN (SELECT oid FROM pg_roles)", sql)
+        self.assertIn("NOT EXISTS (SELECT * FROM expected EXCEPT SELECT * FROM direct)", sql)
+
+    def test_lifecycle_refuses_invalid_target(self):
+        with self.assertRaises(ValueError):
+            lifecycle.target({"database_oid": "invalid"}, "fixture", False)
+
+    def test_overlay_refuses_unknown_action(self):
+        scope = {"reader": ["reader", 42001], "writer": ["writer", 42002]}
+        with patch.object(isolated, "compose", return_value=("SELECT 1;", DIGEST)) as compose:
+            with self.assertRaises(ValueError):
+                isolated.overlay(Path("."), scope, 42003, "install")
+            compose.assert_not_called()
+
+    def test_schema_source_refuses_absolute_paths(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "checkout"
+            root.mkdir()
+            outside = root.parent / "outside.sql"
+            outside.write_text("SELECT 1;")
+            with self.assertRaises(ApplyError):
+                read_source(root, outside)
+
+    def test_selfhost_refuses_ambiguous_tls_options(self):
+        database = preflight.DATABASE
+        url = f"postgresql://fixture:synthetic@direct.example.invalid/{database}?sslmode=verify-full&sslmode="
+        with patch("staging_trial_selfhost.evidence_child_env") as child:
+            with self.assertRaises(ValueError):
+                tls_connection(url, {}, "direct", "owner", Path("unused"))
+            child.assert_not_called()
+
+    def test_selfhost_refuses_untyped_control_pin(self):
+        with self.assertRaises(ValueError):
+            session_guard({"role_oids": {"owner": 42001}, "system_identifier": "1"}, "owner")
 
 
 class TrialBindingIdentityTests(unittest.TestCase):
