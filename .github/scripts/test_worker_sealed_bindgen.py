@@ -44,11 +44,29 @@ class SealedBindgenProbeTests(unittest.TestCase):
                              "require(process.argv[1]).run_ledger_tests()",
                              str((output / "nntune_api.js").resolve())]))
 
+    def test_existing_output_and_symlink_candidate_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "ledger.wasm"
+            candidate.write_bytes(b"\x00asm\x01\x00\x00\x00")
+            link = root / "link.wasm"
+            link.symlink_to(candidate)
+            for source, output in ((candidate, root), (link, root / "output")):
+                with (self.subTest(source=source),
+                      mock.patch.object(sys, "argv", ["probe", str(source), str(output)]),
+                      mock.patch.object(probe.shutil, "which", side_effect=["/tools/wasm-bindgen", "/tools/node"]),
+                      mock.patch.object(probe.sealed, "consume_sealed") as consume,
+                      mock.patch.object(probe.subprocess, "run") as run):
+                    with self.assertRaises(OSError):
+                        probe.main()
+                    consume.assert_not_called()
+                    run.assert_not_called()
+
     def test_bindgen_failure_prevents_ledger_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             candidate = Path(directory) / "ledger.wasm"
             candidate.write_bytes(b"\x00asm\x01\x00\x00\x00")
-            with (mock.patch.object(sys, "argv", ["probe", str(candidate), directory]),
+            with (mock.patch.object(sys, "argv", ["probe", str(candidate), str(Path(directory) / "output")]),
                   mock.patch.object(probe.shutil, "which", side_effect=["/tools/wasm-bindgen", "/tools/node"]),
                   mock.patch.object(probe.sealed, "consume_sealed", side_effect=subprocess.CalledProcessError(1, "bindgen")),
                   mock.patch.object(probe.subprocess, "run") as run):

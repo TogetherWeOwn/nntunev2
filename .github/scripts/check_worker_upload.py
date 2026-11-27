@@ -229,18 +229,21 @@ def assert_upload_redaction(upload_body, label):
              and part.get_param("name", header="Content-Disposition") == "metadata"]
     check(len(parts) == 1, f"{label}: expected exactly one Wrangler upload metadata part")
     try:
-        metadata = json.loads(parts[0].get_payload(decode=True))
-    except (ValueError, TypeError):
+        metadata = json.loads(
+            parts[0].get_payload(decode=True),
+            object_pairs_hook=lambda pairs: unique_json_object(pairs, label="Wrangler upload metadata"),
+        )
+    except (ValueError, TypeError, RecursionError):
         raise Failure(f"{label}: invalid Wrangler upload metadata JSON") from None
     observability = metadata.get("observability") if isinstance(metadata, dict) else None
     check(isinstance(observability, dict) and observability.get("redact_query_string") is True,
           f"{label}: Wrangler upload metadata must set observability.redact_query_string to true")
 
 
-def unique_json_object(pairs):
+def unique_json_object(pairs, *, label="synthetic invocation record"):
     obj = {}
     for key, value in pairs:
-        check(key not in obj, "synthetic invocation record has duplicate fields")
+        check(key not in obj, f"{label} has duplicate fields")
         obj[key] = value
     return obj
 

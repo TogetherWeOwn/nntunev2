@@ -352,6 +352,18 @@ class PublishTests(unittest.TestCase):
 
 
 class MeasureWorkerErrorTests(unittest.TestCase):
+    def test_report_file_probe_oserror_returns_unreadable(self):
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        import report_worker_wasm_sizes as report
+
+        sentinel = "synthetic stat failure"
+        with TemporaryDirectory() as tmp, patch.object(Path, "is_file", side_effect=OSError(sentinel)):
+            raw, compressed, detail = report.measure_worker(Path(tmp), report.WORKERS[0])
+        self.assertEqual((raw, compressed), (None, None))
+        self.assertIn(sentinel, detail)
+
     def test_directory_artifact_is_unreadable(self):
         import tempfile
         from unittest.mock import patch
@@ -373,31 +385,29 @@ class MeasureWorkerErrorTests(unittest.TestCase):
             self.assertIsNone(compressed)
             self.assertIn("unreadable artifact", detail)
 
-    def test_absolute_path_outside_root_falls_back(self):
+    def test_artifact_outside_root_is_rejected(self):
         import tempfile
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
             root = Path(tmp)
-            spec = {
-                "worker": "api",
-                "target_dir": "/definitely/outside",
-                "wasm": "x.wasm",
-            }
+            spec = WORKERS[0]
+            path = wasm_path(root, spec)
+            path.parent.mkdir(parents=True)
+            external = Path(outside) / "x.wasm"
+            external.write_bytes(b"\x00asm\x01\x00\x00\x00")
+            path.symlink_to(external)
             raw, compressed, detail = measure_worker(root, spec)
             self.assertIsNone(raw)
             self.assertIsNone(compressed)
-            self.assertIn("missing artifact", detail)
-            # relative_to(root) raises ValueError for this absolute path,
-            # so the fallback shows the absolute path itself.
-            self.assertIn("/definitely/outside", detail)
+            self.assertIn("outside", detail)
 
 
 class EvaluateNoneSizeTests(unittest.TestCase):
-    def test_ok_status_with_none_size_passes_current_behavior(self):
-        # Pinned hole: ("ok", None) silently passes today. This test pins
-        # the current verdict without changing it.
-        rows = [{"worker": "api", "raw": None, "compressed": None, "status": "ok"}]
-        self.assertEqual(evaluate(rows, 3_000_000), [])
+    def test_ok_status_requires_positive_integer_sizes(self):
+        for raw, compressed in ((None, 10), (10, None), (10, 0), (True, 10)):
+            with self.subTest(raw=raw, compressed=compressed):
+                rows = [{"worker": "api", "raw": raw, "compressed": compressed, "status": "ok"}]
+                self.assertIn("invalid measurement", evaluate(rows, 3_000_000)[0])
 
 
 class RenderNewlineTests(unittest.TestCase):

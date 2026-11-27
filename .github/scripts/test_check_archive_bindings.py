@@ -508,6 +508,23 @@ def test_manifest_directory_fails_read_closed():
         raise AssertionError("expected directory manifest to fail")
 
 
+def test_tracked_manifest_cannot_disappear_from_scan():
+    path = "workers/stream/wrangler.toml"
+    repo = _repo_with({path: CLEAN_MANIFEST, "apps/web/wrangler.toml": CLEAN_MANIFEST})
+    (repo / path).unlink()
+    _assert_rejected(repo, "tracked config is missing or not a regular file")
+    with tempfile.TemporaryDirectory() as outside:
+        external = Path(outside) / "wrangler.toml"
+        external.write_text(CLEAN_MANIFEST)
+        (repo / path).symlink_to(external)
+        _assert_rejected(repo, "tracked config resolves outside the repository")
+
+
+def test_archive_binding_requires_bucket_name():
+    repo = _repo_with({"workers/stream/wrangler.toml": '[[r2_buckets]]\nbinding = "R2"\nbucket_name = 7\n'})
+    _assert_rejected(repo, "invalid bucket_name")
+
+
 def test_invalid_utf8_manifest_fails_read_closed():
     tmp = Path(tempfile.mkdtemp())
     subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
@@ -578,6 +595,8 @@ if __name__ == "__main__":
     test_git_nonzero_exit_fails_listing_closed()
     test_malformed_tracked_paths_fail_decode_closed()
     test_manifest_directory_fails_read_closed()
+    test_tracked_manifest_cannot_disappear_from_scan()
+    test_archive_binding_requires_bucket_name()
     test_invalid_utf8_manifest_fails_read_closed()
     test_current_repo_manifests_pass()
     print("check_archive_bindings: all tests passed")

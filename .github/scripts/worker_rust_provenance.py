@@ -353,7 +353,15 @@ def load_std(env, rust: dict) -> dict:
 
 
 def parse_vv(text: str) -> dict:
-    return dict(line.split(": ", 1) for line in text.splitlines() if ": " in line)
+    fields = {}
+    for line in text.splitlines():
+        name, separator, value = line.partition(": ")
+        if not separator:
+            continue
+        if name in fields:
+            raise ValueError("duplicate toolchain version field")
+        fields[name] = value
+    return fields
 
 
 def tar_files(archive: bytes, prefix: str, limit: int) -> dict:

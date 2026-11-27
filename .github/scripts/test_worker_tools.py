@@ -38,6 +38,19 @@ def tar_with(name: str, data: bytes, kind=tarfile.REGTYPE, mode="w:gz") -> bytes
 
 
 class ManifestAndLocks(unittest.TestCase):
+    def test_pin_manifest_rejects_duplicate_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pins = Path(directory) / "pins.json"
+            pins.write_text('{"rust":{"version":"first","version":"second"}}')
+            with self.assertRaisesRegex(ValueError, "duplicate tool pin"):
+                wt.load_pins(pins)
+
+    def test_rust_verbose_version_rejects_duplicate_fields(self):
+        from worker_rust_provenance import parse_vv
+
+        with self.assertRaisesRegex(ValueError, "duplicate toolchain version field"):
+            parse_vv("rustc 1.98.1\nrelease: other\nrelease: 1.98.1\n")
+
     def test_manifest_has_single_esbuild_version(self):
         pins = wt.load_pins()
         self.assertEqual(pins["runtime"]["esbuild"], "0.28.2")
@@ -202,6 +215,10 @@ class ManifestAndLocks(unittest.TestCase):
 
 
 class Refusals(unittest.TestCase):
+    def test_runner_temp_must_fit_one_actions_output_line(self):
+        with self.assertRaisesRegex(RuntimeError, "RUNNER_TEMP"):
+            wt.require_actions({**GOOD_ENV, "RUNNER_TEMP": "/tmp/first\nsecond"}, "linux", "x86_64")
+
     def test_accepts_actions_linux(self):
         wt.require_actions(GOOD_ENV, "linux", "x86_64")
 
@@ -512,6 +529,10 @@ class CheckBuild(unittest.TestCase):
         for i in range(3):
             with self.assertRaises(ValueError):
                 self.run_check(self.lines[:i] + self.lines[i + 1 :])
+
+    def test_unrelated_log_lines_cannot_supply_override_evidence(self):
+        with self.assertRaisesRegex(ValueError, "missing or mismatched"):
+            self.run_check(["cargo:warning=" + line for line in self.lines])
 
     def test_wrong_path(self):
         with self.assertRaises(ValueError):

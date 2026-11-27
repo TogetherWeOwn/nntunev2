@@ -137,6 +137,13 @@ _NAME_KEYED_BINDING_TABLES = frozenset(
 )
 
 
+def _binding_array(scope, key, table):
+    entries = scope.get(key, [])
+    if not isinstance(entries, list):
+        raise TypeError(f"{table} must be an array of tables")
+    return entries
+
+
 def extract_bindings(data):
     """Return {(type, binding): entry} for one wrangler table level."""
     if not isinstance(data, dict):
@@ -149,24 +156,24 @@ def extract_bindings(data):
             raise ParityError(f"duplicate binding {item['binding']!r} ({item['type']})")
         out[key] = item
 
-    for item in data.get("r2_buckets", []):
+    for item in _binding_array(data, "r2_buckets", "r2_buckets"):
         add(_entry("r2_buckets", item, "r2", "binding"))
-    for item in data.get("kv_namespaces", []):
+    for item in _binding_array(data, "kv_namespaces", "kv_namespaces"):
         add(_entry("kv_namespaces", item, "kv", "binding"))
-    for item in data.get("hyperdrive", []):
+    for item in _binding_array(data, "hyperdrive", "hyperdrive"):
         add(_entry("hyperdrive", item, "hyperdrive", "binding"))
-    for item in data.get("analytics_engine_datasets", []):
+    for item in _binding_array(data, "analytics_engine_datasets", "analytics_engine_datasets"):
         add(_entry("analytics_engine_datasets", item, "analytics_engine", "binding"))
-    for item in data.get("d1_databases", []):
+    for item in _binding_array(data, "d1_databases", "d1_databases"):
         add(_entry("d1_databases", item, "d1", "binding"))
-    for item in data.get("services", []):
+    for item in _binding_array(data, "services", "services"):
         add(_entry("services", item, "service", "binding"))
     queues = data.get("queues", {})
     if not isinstance(queues, dict):
         raise ParityError("queues: not a table")
-    for item in queues.get("producers", []):
+    for item in _binding_array(queues, "producers", "queues.producers"):
         add(_entry("queues.producers", item, "queue_producer", "binding"))
-    for item in queues.get("consumers", []):
+    for item in _binding_array(queues, "consumers", "queues.consumers"):
         if not isinstance(item, dict):
             raise ParityError("queues.consumers: entry is not a table")
         queue = item.get("queue")
@@ -185,10 +192,12 @@ def extract_bindings(data):
     durable_objects = data.get("durable_objects", {})
     if not isinstance(durable_objects, dict):
         raise ParityError("durable_objects: not a table")
-    for item in durable_objects.get("bindings", []):
+    for item in _binding_array(durable_objects, "bindings", "durable_objects.bindings"):
         add(_entry("durable_objects.bindings", item, "durable_object", "name"))
-    assets = data.get("assets")
-    if isinstance(assets, dict) and "binding" in assets:
+    assets = data.get("assets", {})
+    if not isinstance(assets, dict):
+        raise ParityError("assets must be a table")
+    if "binding" in assets:
         add(_entry("assets", assets, "assets", "binding"))
     # Fail closed on binding-shaped tables this script does not model
     # (a new Cloudflare binding kind): surface them as unknown types so
@@ -669,6 +678,12 @@ def check(root, manifest_path, ops_path):
     for worker in workers:
         name, config_rel = worker["name"], worker["config"]
         config_path = root / config_rel
+        try:
+            contained = config_path.resolve().is_relative_to(root.resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ParityError(f"{name}: cannot resolve mapped config path") from exc
+        if not contained:
+            raise ParityError(f"{name}: mapped config resolves outside the repository")
         if not config_path.is_file():
             drifts.append(_fmt(name, "-", "-", "-", f"mapped config {config_rel} is missing"))
             continue

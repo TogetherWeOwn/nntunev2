@@ -42,8 +42,17 @@ OVERRIDES = (
 )
 
 
+def unique_pin_fields(pairs):
+    fields = {}
+    for key, value in pairs:
+        if key in fields:
+            raise ValueError("duplicate tool pin field")
+        fields[key] = value
+    return fields
+
+
 def load_pins(path: Path = MANIFEST) -> dict:
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_pin_fields)
 
 
 def download(url: str, limit: int) -> bytes:
@@ -82,6 +91,8 @@ def require_actions(env=os.environ, system: str | None = None, machine: str | No
     for key in ("RUNNER_TEMP", "GITHUB_ENV", "GITHUB_PATH"):
         if not env.get(key):
             raise RuntimeError(f"{key} is required")
+    if any(char in env["RUNNER_TEMP"] for char in "\r\n"):
+        raise RuntimeError("RUNNER_TEMP must fit on one Actions output line")
 
 
 def select_profile(pins: dict, profile: str) -> tuple[dict, tuple[str, ...]]:
@@ -277,7 +288,7 @@ def check_build(log_path: str, env=os.environ) -> None:
         path = env.get(var)
         if not path or not os.path.isabs(path):
             raise ValueError(f"{var} is not an absolute path")
-        line = re.compile(rf"Using custom {re.escape(full_name)} from {var}: (.+)$", re.M)
+        line = re.compile(rf"^\[INFO\]: (?:⚙️\. )?Using custom {re.escape(full_name)} from {var}: (.+)$", re.M)
         used = {m.group(1).strip() for m in line.finditer(text)}
         if used != {path}:
             raise ValueError(f"missing or mismatched verified override {var}")

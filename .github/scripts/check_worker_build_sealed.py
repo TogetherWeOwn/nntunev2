@@ -16,8 +16,11 @@ import worker_sealed_candidate as sealed
 
 
 def experiment(output_dir, *, env, build=rust.build_ledger, run=subprocess.run):
-    bindgen = shutil.which("wasm-bindgen", path=env.get("PATH"))
-    node = shutil.which("node", path=env.get("PATH"))
+    path = env.get("PATH")
+    if not path:
+        raise ValueError("PATH is required in the probe environment")
+    bindgen = shutil.which("wasm-bindgen", path=path)
+    node = shutil.which("node", path=path)
     if not bindgen or not node:
         raise ValueError("wasm-bindgen and node must be available on PATH")
 
@@ -32,14 +35,14 @@ def experiment(output_dir, *, env, build=rust.build_ledger, run=subprocess.run):
         if not snapshot.startswith(b"\x00asm\x01\x00\x00\x00"):
             raise ValueError("candidate is not a core WASM module")
 
-    output_dir = output_dir.resolve()
+    output_dir = sealed.fresh_bindgen_output(output_dir)
     sealed.experiment_build_and_consume(
         build_output, verify,
         [os.path.abspath(bindgen), "--target", "nodejs", "--out-dir", str(output_dir),
          "--out-name", "nntune_api"], cwd=str(rust.ROOT), env=env, run=run,
     )
     run([os.path.abspath(node), "-e", "require(process.argv[1]).run_ledger_tests()",
-         str(output_dir / "nntune_api.js")], check=True)
+         str(output_dir / "nntune_api.js")], env=env, check=True)
 
 
 def main():

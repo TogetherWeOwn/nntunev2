@@ -166,9 +166,9 @@ def build_worker(root: Path, spec: dict) -> tuple[bool, str]:
 def measure_worker(root: Path, spec: dict) -> tuple[int | None, int | None, str]:
     """Measure raw + gzip bytes for one worker's ``.wasm`` artifact."""
     path = wasm_path(root, spec)
-    if not path.is_file():
-        return None, None, f"missing artifact: {path.relative_to(root)}"
     try:
+        if not path.is_file():
+            return None, None, f"missing artifact: {path.relative_to(root)}"
         raw = path.stat().st_size
         compressed = gzip_size(path)
     except OSError as exc:

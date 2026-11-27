@@ -34,6 +34,7 @@ class BuildSealedTests(unittest.TestCase):
                 self.assertEqual(Path(command[-1]).read_bytes(), candidate)
             else:
                 events.append("node")
+                self.assertEqual(kwargs["env"], {"PATH": "/tools"})
                 self.assertEqual(command, [
                     "/tools/node", "-e", "require(process.argv[1]).run_ledger_tests()",
                     str((output_dir / "nntune_api.js").resolve()),
@@ -62,8 +63,24 @@ class BuildSealedTests(unittest.TestCase):
                 run = mock.Mock()
                 with mock.patch.object(probe.shutil, "which", side_effect=["/tools/wasm-bindgen", "/tools/node"]):
                     with self.assertRaises(error):
-                        probe.experiment(Path(directory), env={"PATH": "/tools"}, build=build, run=run)
+                        probe.experiment(Path(directory) / "output", env={"PATH": "/tools"}, build=build, run=run)
                 run.assert_not_called()
+
+    def test_existing_output_directory_is_rejected_before_build(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            probe.shutil, "which", side_effect=["/tools/wasm-bindgen", "/tools/node"]
+        ):
+            build, run = mock.Mock(), mock.Mock()
+            with self.assertRaises(FileExistsError):
+                probe.experiment(Path(directory), env={"PATH": "/tools"}, build=build, run=run)
+        build.assert_not_called()
+        run.assert_not_called()
+
+    def test_experiment_requires_its_own_path(self):
+        with mock.patch.object(probe.shutil, "which", return_value=None) as which:
+            with self.assertRaisesRegex(ValueError, "PATH is required"):
+                probe.experiment(Path("unused-output"), env={})
+        which.assert_not_called()
 
     def test_probe_magic_check_does_not_validate_or_authenticate_candidate(self):
         # A truncated section passes the probe's header-only check. A mocked
@@ -79,7 +96,7 @@ class BuildSealedTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             probe.shutil, "which", side_effect=["/tools/wasm-bindgen", "/tools/node"]
         ):
-            probe.experiment(Path(directory), env={"PATH": "/tools"}, build=build, run=run)
+            probe.experiment(Path(directory) / "output", env={"PATH": "/tools"}, build=build, run=run)
         self.assertEqual(run.call_count, 2)
         self.assertIn("pass_fds", run.call_args_list[0].kwargs)
 
@@ -102,6 +119,12 @@ class BuildSealedTests(unittest.TestCase):
             self.assertEqual(marker.read_text().splitlines(), ["wasm-bindgen", "node"])
             self.assertFalse((Path(directory) / "output/nntune_api.js").exists())
 
+    def test_verifier_status_cannot_silently_pass(self):
+        with mock.patch.object(probe.sealed.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "verifier must return None"):
+                probe.sealed.consume_sealed(b"x", lambda _: False, ["/bin/true"], cwd="/", env={}, run=run)
+            run.assert_not_called()
+
     def test_bindgen_failure_prevents_node(self):
         def build(*, env):
             artifact = Path(env["RUNNER_TEMP"]) / "ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
@@ -113,7 +136,7 @@ class BuildSealedTests(unittest.TestCase):
             probe.shutil, "which", side_effect=["/tools/wasm-bindgen", "/tools/node"]
         ):
             with self.assertRaises(subprocess.CalledProcessError):
-                probe.experiment(Path(directory), env={"PATH": "/tools"}, build=build, run=run)
+                probe.experiment(Path(directory) / "output", env={"PATH": "/tools"}, build=build, run=run)
         self.assertEqual(run.call_count, 1)
 
 
