@@ -4,8 +4,8 @@
 //! its type, default, and env-overridability. Workers must read config keys
 //! through [`Config`], never with raw stringly KV lookups on config paths:
 //! [`Config::load`] validates the whole key set at once (defaults applied,
-//! missing required keys rejected, type mismatches rejected, undeclared keys
-//! rejected), and [`Config::apply_env`] layers the documented per-key
+//! missing required and undeclared keys rejected, types and runtime bounds
+//! checked), and [`Config::apply_env`] layers the documented per-key
 //! environment overrides on top for local dev and `wrangler [vars]`.
 //!
 //! Secret values are never config keys: Worker secrets and rotation live
@@ -54,12 +54,11 @@ pub struct KeySpec {
 
 impl KeySpec {
     /// Parse one raw KV text value into the declared type. Numbers and bools
-    /// tolerate surrounding whitespace; strings are kept exact (a hostname
-    /// with a stray space must fail where it is used, not be silently fixed
-    /// here) but empty/whitespace-only strings are rejected, matching the CI
-    /// parity checker (`config_parity_check.py`), which rejects empty
-    /// required strings. Bools accept only `true`/`false`
-    /// (case-insensitive).
+    /// tolerate surrounding whitespace; strings keep their exact spelling
+    /// for field-specific validation. Empty or whitespace-only strings are
+    /// rejected, matching the CI parity checker (`config_parity_check.py`)
+    /// for required strings. Bools accept only `true` and `false`, in any
+    /// ASCII case.
     fn parse(&self, raw: &str) -> Result<Value, ConfigError> {
         let invalid = || ConfigError::InvalidType {
             key: self.name,
@@ -223,8 +222,7 @@ pub enum Value {
     Str(String),
 }
 
-/// Fail-closed load/overlay errors. Key names are reported; values never
-/// are, so error text is safe for CI logs.
+/// Errors emitted by `Config` identify a declared key or redact the unknown name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     MissingRequired(&'static str),
@@ -232,6 +230,7 @@ pub enum ConfigError {
         key: &'static str,
         expected: ConfigType,
     },
+    InvalidValue(&'static str),
     UnknownKey(String),
 }
 
@@ -246,6 +245,7 @@ impl fmt::Display for ConfigError {
                 )
             }
             ConfigError::UnknownKey(key) => write!(f, "undeclared config key: {key}"),
+            ConfigError::InvalidValue(key) => write!(f, "config key {key} has an invalid value"),
         }
     }
 }
@@ -253,58 +253,57 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// Validated, typed view over one environment's KV config.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     values: HashMap<String, Value>,
 }
 
 impl Config {
-    /// Load and validate a full KV key set at once: undeclared keys fail,
-    /// defaults fill unset keys, required keys without a default must be
-    /// present, and every value must parse as its declared type.
+    /// Fill defaults and validate the complete KV set, including runtime
+    /// bounds and RP identity. Missing required and undeclared keys fail.
     pub fn load(kv: &HashMap<String, String>) -> Result<Self, ConfigError> {
         for name in kv.keys() {
             if spec_for(name).is_none() {
-                return Err(ConfigError::UnknownKey(name.clone()));
+                return Err(ConfigError::UnknownKey(REDACTED_KEY.to_owned()));
             }
         }
         let mut values = HashMap::with_capacity(KEYS.len());
         for spec in KEYS {
             match kv.get(spec.name) {
                 Some(raw) => {
-                    values.insert(spec.name.to_owned(), spec.parse(raw)?);
+                    values.insert(spec.name.to_owned(), parse_config_value(spec, raw)?);
                 }
                 None => match spec.default {
                     Some(default) => {
-                        values.insert(spec.name.to_owned(), spec.parse(default)?);
+                        values.insert(spec.name.to_owned(), parse_config_value(spec, default)?);
                     }
                     None if spec.required => return Err(ConfigError::MissingRequired(spec.name)),
                     None => {}
                 },
             }
         }
-        Ok(Config { values })
+        Config { values }.validate_identity()
     }
 
     /// Layer per-key environment overrides on top of KV. Only keys declared
     /// `env_overridable` are consulted, and only through their documented
     /// `env_var` name; every other entry in `env` is ignored. Precedence is
     /// KV first, environment second (local dev and `wrangler [vars]` win).
-    /// The overlay is atomic: every override is parsed first and the config
-    /// is only mutated when all of them are valid, so a failing overlay
-    /// leaves the previous values untouched (fail-closed).
+    /// The overlay is atomic: validate every override and the resulting
+    /// RP identity before committing anything. A failing overlay leaves
+    /// the previous config intact.
     pub fn apply_env(&mut self, env: &HashMap<String, String>) -> Result<(), ConfigError> {
-        let mut staged = Vec::new();
+        let mut candidate = self.clone();
         for spec in KEYS.iter().filter(|spec| spec.env_overridable) {
-            if let Some(var) = spec.env_var {
-                if let Some(raw) = env.get(var) {
-                    staged.push((spec.name.to_owned(), spec.parse(raw)?));
-                }
+            if let Some(raw) = spec.env_var.and_then(|var| env.get(var)) {
+                candidate
+                    .values
+                    .insert(spec.name.to_owned(), parse_config_value(spec, raw)?);
             }
         }
-        for (name, value) in staged {
-            self.values.insert(name, value);
-        }
+        // The RP and origin may both change in the same overlay.
+        let validated = candidate.validate_identity()?;
+        *self = validated;
         Ok(())
     }
 
@@ -330,6 +329,101 @@ impl Config {
             Some(Value::Str(value)) => Some(value),
             _ => None,
         }
+    }
+
+    fn validate_identity(self) -> Result<Self, ConfigError> {
+        let rp_id = self
+            .get_str("auth.rp_id")
+            .ok_or(ConfigError::MissingRequired("auth.rp_id"))?;
+        let origin = self
+            .get_str("auth.rp_origin")
+            .ok_or(ConfigError::MissingRequired("auth.rp_origin"))?;
+        let host = rp_origin_host(rp_id).ok_or(ConfigError::InvalidValue("auth.rp_id"))?;
+        if !valid_rp_origin(origin, host) {
+            return Err(ConfigError::InvalidValue("auth.rp_origin"));
+        }
+        Ok(self)
+    }
+}
+
+// An undeclared name is arbitrary input, including potential secrets or newlines.
+const REDACTED_KEY: &str = "<redacted>";
+
+fn parse_config_value(spec: &KeySpec, raw: &str) -> Result<Value, ConfigError> {
+    let value = spec.parse(raw)?;
+    let Value::U64(number) = value else {
+        return Ok(value);
+    };
+    let bounds = match spec.name {
+        // Match the API's credential lifetimes and invite throttle.
+        "auth.challenge_ttl_secs" => 1..=300,
+        "auth.invite_redemption_max_attempts" => 1..=10,
+        "auth.invite_redemption_window_secs" => 300..=300,
+        "auth.magic_link_ttl_secs" => 1..=900,
+        "session.ttl_secs" => 1..=86_400,
+        "ingest.max_nzb_bytes" => 1..=2 * 1024 * 1024,
+        // Retries match the Queue consumer budget. Payloads survive the
+        // 15-day replay window and expire within the current 30-day retention.
+        "ingest.payload_retry_attempts" => 4..=4,
+        "ingest.payload_ttl_secs" => 15 * 86_400..=30 * 86_400,
+        // KV requires at least 60 seconds. The MB cache interface takes u32.
+        "mb.lookup_cache_ttl_s" | "mb.search_cache_ttl_s" => 60..=u64::from(u32::MAX),
+        "mb.max_query_chars" => 1..=100,
+        "mb.search_limit" => 1..=25,
+        // The streaming buffer flushes one minimum-size R2 part at a time.
+        "stream.r2_min_part_bytes" => 5 * 1024 * 1024..=5 * 1024 * 1024,
+        _ => return Ok(value),
+    };
+    if !bounds.contains(&number) {
+        return Err(ConfigError::InvalidValue(spec.name));
+    }
+    Ok(value)
+}
+
+// This config accepts conventional ASCII DNS names and the API's local-dev
+// loopbacks. A letter-led final label avoids ambiguous numeric IPv4 spellings.
+fn rp_origin_host(rp_id: &str) -> Option<&str> {
+    match rp_id {
+        "::1" => return Some("[::1]"),
+        "localhost" | "127.0.0.1" => return Some(rp_id),
+        _ => {}
+    }
+    let (_, tld) = rp_id.rsplit_once('.')?;
+    (rp_id.len() <= 253
+        && matches!(tld.as_bytes().first(), Some(b'a'..=b'z'))
+        && rp_id.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && !label.starts_with("xn--")
+                && label
+                    .bytes()
+                    .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        }))
+    .then_some(rp_id)
+}
+
+fn valid_rp_origin(origin: &str, host: &str) -> bool {
+    let (authority, default_port) = if let Some(authority) = origin.strip_prefix("https://") {
+        (authority, 443)
+    } else if let (true, Some(authority)) = (
+        matches!(host, "localhost" | "127.0.0.1" | "[::1]"),
+        origin.strip_prefix("http://"),
+    ) {
+        (authority, 80)
+    } else {
+        return false;
+    };
+    match authority.strip_prefix(host) {
+        Some("") => true,
+        Some(suffix) => suffix.strip_prefix(':').is_some_and(|port| {
+            port.len() <= 5
+                && !port.starts_with('0')
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|port| port != default_port)
+        }),
+        None => false,
     }
 }
 
@@ -405,16 +499,14 @@ mod tests {
     }
 
     #[test]
-    fn u64_endpoints_load_and_overflow_shapes_rejected() {
+    fn u64_type_parser_accepts_endpoints_and_rejects_overflow() {
         // Endpoints pin current `trimmed.parse::<u64>()` behavior.
+        let spec = spec_for("session.ttl_secs").unwrap();
         for (raw, expected) in [("0", 0u64), ("18446744073709551615", u64::MAX)] {
-            let mut kv_input = identity();
-            kv_input.insert("session.ttl_secs".to_string(), raw.to_string());
-            let config = Config::load(&kv_input).expect("endpoint loads");
             assert_eq!(
-                config.get_u64("session.ttl_secs"),
-                Some(expected),
-                "endpoint {raw:?} must load"
+                spec.parse(raw),
+                Ok(Value::U64(expected)),
+                "endpoint {raw:?} must parse"
             );
         }
         // Overflow and non-decimal shapes fail as InvalidType.
@@ -441,25 +533,22 @@ mod tests {
     }
 
     #[test]
-    fn nonblank_string_with_surrounding_spaces_round_trips_exact() {
+    fn identity_with_surrounding_spaces_is_rejected() {
         let spaced = "  staging.nntune.com  ";
         let mut raw = identity();
         raw.insert("auth.rp_id".to_string(), spaced.to_string());
-        let config = Config::load(&raw).expect("spaced string loads");
         assert_eq!(
-            config.get_str("auth.rp_id"),
-            Some(spaced),
-            "KV load must preserve surrounding spaces exactly"
+            Config::load(&raw),
+            Err(ConfigError::InvalidValue("auth.rp_id"))
         );
 
         let mut config = Config::load(&identity()).expect("identity loads");
         let env = kv(&[("RP_ID", spaced)]);
-        config.apply_env(&env).expect("env overlay applies");
         assert_eq!(
-            config.get_str("auth.rp_id"),
-            Some(spaced),
-            "env overlay must preserve surrounding spaces exactly"
+            config.apply_env(&env),
+            Err(ConfigError::InvalidValue("auth.rp_id"))
         );
+        assert_eq!(config.get_str("auth.rp_id"), Some("staging.nntune.com"));
     }
 
     #[test]
@@ -468,7 +557,7 @@ mod tests {
         raw.insert("debug.backdoor".to_string(), "true".to_string());
         assert_eq!(
             Config::load(&raw),
-            Err(ConfigError::UnknownKey("debug.backdoor".to_string()))
+            Err(ConfigError::UnknownKey(REDACTED_KEY.to_owned()))
         );
 
         raw.remove("debug.backdoor");
@@ -478,9 +567,7 @@ mod tests {
         );
         assert_eq!(
             Config::load(&raw),
-            Err(ConfigError::UnknownKey(
-                "vault.indexer_allow_redirects".to_string()
-            ))
+            Err(ConfigError::UnknownKey(REDACTED_KEY.to_owned()))
         );
     }
 
@@ -519,7 +606,11 @@ mod tests {
         // One good override plus one bad override: the whole overlay fails
         // and NONE of the values change (no partial application).
         let mut config = Config::load(&identity()).expect("identity loads");
-        let env = kv(&[("RP_ID", "evil"), ("SESSION_TTL_SECS", "soon")]);
+        let env = kv(&[
+            ("RP_ID", "other.example"),
+            ("RP_ORIGIN", "https://other.example"),
+            ("SESSION_TTL_SECS", "soon"),
+        ]);
         assert_eq!(
             config.apply_env(&env),
             Err(ConfigError::InvalidType {
@@ -597,7 +688,7 @@ mod tests {
             })
         );
 
-        let mut config = Config::default();
+        let mut config = Config::load(&identity()).unwrap();
         config
             .values
             .insert(spec.name.to_owned(), spec.parse("true").unwrap());
@@ -843,7 +934,7 @@ mod tests {
             };
             assert_eq!(
                 Config::load(&unknown_key),
-                Err(ConfigError::UnknownKey("debug.backdoor".to_string())),
+                Err(ConfigError::UnknownKey(REDACTED_KEY.to_owned())),
                 "{env} fixture with unknown key must fail"
             );
         }
