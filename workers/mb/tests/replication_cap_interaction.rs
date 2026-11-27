@@ -85,3 +85,32 @@ fn both_caps_fire_preserves_missing_sequence_truncated_marker() {
         report.structured_log.len()
     );
 }
+
+#[test]
+fn future_publication_consumes_missing_cap_without_hiding_valid_pending() {
+    let mut ledger = PacketLedger::default();
+    ledger.record(0, 0, 0);
+    let cap = MAX_MISSING_SEQUENCE_BREACHES as i64;
+    ledger.record_published(cap, i64::MAX);
+    ledger.record_published(cap + 1, i64::MAX);
+    ledger.record_published(cap + 2, 0);
+    // A later applied packet creates another gap, exercising the ordered
+    // pending scan after the first gap uses up the missing report cap.
+    ledger.record(cap + 3, 0, 0);
+    ledger.record_published(cap + 4, 0);
+
+    let probe = ReplicationSloProbe::default();
+    let at_cap = probe.evaluate(&ledger, cap, 0);
+    assert_eq!(at_cap.breach_count, MAX_MISSING_SEQUENCE_BREACHES);
+    assert_eq!(at_cap.pending_count, 0);
+    assert_eq!(at_cap.breaches.last().unwrap().sequence, Some(cap));
+    assert_eq!(at_cap.breaches.last().unwrap().lag_secs, None);
+
+    let over_cap = probe.evaluate(&ledger, cap + 4, 0);
+    assert_eq!(over_cap.breach_count, MAX_MISSING_SEQUENCE_BREACHES + 1);
+    assert_eq!(over_cap.pending_count, 2);
+    assert_eq!(
+        over_cap.breaches.last().unwrap().kind,
+        "missing_sequence_truncated"
+    );
+}

@@ -2,6 +2,8 @@
 //!
 //! The applier persists the same fields in `mb_replication_packet` (migration
 //! 0017); this module keeps the probe deterministic and independently testable.
+use std::collections::BTreeSet;
+
 use serde::Serialize;
 
 /// Replication lag budget promised by ADR 0007.
@@ -49,7 +51,8 @@ pub struct PendingPacket {
 pub struct PacketLedger {
     records: Vec<PacketRecord>,
     pending: Vec<PendingPacket>,
-    conflicts: Vec<i64>,
+    conflicts: BTreeSet<i64>,
+    invalid_records: BTreeSet<i64>,
 }
 
 impl PacketLedger {
@@ -60,19 +63,13 @@ impl PacketLedger {
 
     /// Record a packet with its upstream identifier and sequence number.
     ///
-    /// Callers must satisfy the durable schema's constraints (migration
-    /// 0017): `sequence >= 0`, `applied_at >= published_at`, and `packet_id`
-    /// unique across sequences. This in-memory model does not re-validate
-    /// them; in particular clock skew (`applied_at < published_at`) clamps
-    /// `lag_secs` to 0 here while the applier's insert is rejected by the
-    /// SQL `CHECK`, so pre-validate before recording.
+    /// Reject rows that violate the sequence, lag or packet-ID constraints
+    /// of the durable ledger (migration 0017). Rejections leave applied and
+    /// pending state intact and are sticky breaches for the attempted sequence.
     ///
-    /// A re-record with a different `packet_id` than the one already stored
-    /// for `sequence` is rejected: the original record is left untouched,
-    /// pending state is undisturbed, and the sequence is pinned in
-    /// [`Self::packet_id_conflicts`] for the SLO probe to surface. A
-    /// re-record with the same `packet_id` keeps today's replacement and
-    /// lag recomputation and is never a conflict.
+    /// Changing the ID of a recorded sequence or reusing its ID at another
+    /// sequence pins the attempted sequence in [`Self::packet_id_conflicts`].
+    /// Replaying the same sequence and ID replaces its timestamps and lag.
     pub fn record_packet(
         &mut self,
         packet_id: String,
@@ -80,28 +77,35 @@ impl PacketLedger {
         published_at: i64,
         applied_at: i64,
     ) {
-        if let Some(existing) = self.records.iter_mut().find(|r| r.sequence == sequence) {
-            if existing.packet_id != packet_id {
-                if !self.conflicts.contains(&sequence) {
-                    self.conflicts.push(sequence);
-                }
+        let lag_secs = applied_at.checked_sub(published_at);
+        let Some(lag_secs) = lag_secs.filter(|&lag| lag >= 0) else {
+            self.invalid_records.insert(sequence);
+            return;
+        };
+        if sequence < 0 || packet_id.contains('\0') {
+            self.invalid_records.insert(sequence);
+            return;
+        }
+
+        let record = PacketRecord {
+            packet_id,
+            sequence,
+            published_at,
+            applied_at,
+            lag_secs,
+        };
+        if let Some(existing) = self
+            .records
+            .iter_mut()
+            .find(|r| r.sequence == sequence || r.packet_id == record.packet_id)
+        {
+            if existing.sequence != sequence || existing.packet_id != record.packet_id {
+                self.conflicts.insert(sequence);
                 return;
             }
-            *existing = PacketRecord {
-                packet_id,
-                sequence,
-                published_at,
-                applied_at,
-                lag_secs: applied_at.saturating_sub(published_at),
-            };
+            *existing = record;
         } else {
-            self.records.push(PacketRecord {
-                packet_id,
-                sequence,
-                published_at,
-                applied_at,
-                lag_secs: applied_at.saturating_sub(published_at),
-            });
+            self.records.push(record);
         }
         self.pending.retain(|p| p.sequence != sequence);
     }
@@ -111,6 +115,10 @@ impl PacketLedger {
     /// publication time; applying the packet (via [`Self::record`]) clears
     /// the pending entry.
     pub fn record_published(&mut self, sequence: i64, published_at: i64) {
+        if sequence < 0 {
+            self.invalid_records.insert(sequence);
+            return;
+        }
         let pending = PendingPacket {
             sequence,
             published_at,
@@ -130,13 +138,10 @@ impl PacketLedger {
             .map(|p| p.published_at)
     }
 
-    /// Sequences that have seen a conflicting `packet_id` re-record, in
-    /// packet-sequence order. The conflict is sticky: later re-records
-    /// (even with the original id) do not clear it.
+    /// Sequences of rejected `packet_id` conflicts, in sequence order.
+    /// A later valid write does not clear a pinned conflict.
     pub fn packet_id_conflicts(&self) -> Vec<i64> {
-        let mut conflicts = self.conflicts.clone();
-        conflicts.sort_unstable();
-        conflicts
+        self.conflicts.iter().copied().collect()
     }
 
     /// Return records in packet-sequence order, independent of insertion order.
@@ -182,12 +187,9 @@ pub struct ReplicationSloReport {
 /// signal: no applied packet means no baseline, so a total stall must not
 /// read as SLO-healthy (pass a negative `latest_sequence` when nothing has
 /// been published yet). A missing sequence the ledger knows as pending
-/// (see [`PacketLedger::record_published`]) breaches only once
-/// `now - published_at > slo_secs` (ADR 0007: applied within the budget of
-/// publication); inside the budget it counts toward `pending_count`
-/// instead. A missing sequence with unknown publication time still
-/// breaches as `missing_sequence`: without evidence it is in flight, a gap
-/// must not read as healthy.
+/// (see [`PacketLedger::record_published`]) counts toward `pending_count`
+/// when its age is in `0..=slo_secs` (ADR 0007). Unknown publication times
+/// and future timestamps breach as `missing_sequence` without a lag value.
 /// `slo_secs` is the lag budget a packet must stay within; it defaults to
 /// [`REPLICATION_LAG_SLO_SECS`] and exists as a field so callers (and tests)
 /// can evaluate against a tighter budget without changing the ADR constant.
@@ -212,12 +214,19 @@ impl ReplicationSloProbe {
         now: i64,
     ) -> ReplicationSloReport {
         let records = ledger.records();
-        let pending = ledger.pending();
+        let mut pending = ledger.pending().into_iter().peekable();
         let mut breaches = Vec::new();
         let mut pending_count = 0usize;
         for sequence in ledger.packet_id_conflicts() {
             breaches.push(ReplicationBreach {
                 kind: "packet_id_conflict",
+                sequence: Some(sequence),
+                lag_secs: None,
+            });
+        }
+        for &sequence in &ledger.invalid_records {
+            breaches.push(ReplicationBreach {
+                kind: "invalid_packet_record",
                 sequence: Some(sequence),
                 lag_secs: None,
             });
@@ -234,30 +243,35 @@ impl ReplicationSloProbe {
 
         let mut truncated = false;
         if records.is_empty() {
-            if latest_sequence >= 0 {
+            if latest_sequence >= 0 || pending.peek().is_some() {
                 breaches.push(ReplicationBreach {
                     kind: "empty_ledger",
                     sequence: None,
                     lag_secs: None,
                 });
             }
+        } else if latest_sequence < 0 {
+            breaches.push(ReplicationBreach {
+                kind: "invalid_latest_sequence",
+                sequence: Some(latest_sequence),
+                lag_secs: None,
+            });
         } else {
             // Enumerate gaps arithmetically from the sorted present
             // sequences instead of scanning first..=latest: the work is
-            // bounded by the record + pending counts plus the
-            // reported-breaches cap, never by a caller-supplied cursor span.
+            // bounded by the record + pending counts plus the report cap
+            // once the snapshots are sorted. Consume pending rows once as
+            // each successive gap advances through the sequence space.
             let mut reported_missing = 0usize;
             let mut report_gap = |start: i64,
                                   end: i64,
                                   breaches: &mut Vec<ReplicationBreach>,
                                   pending_count: &mut usize| {
-                // Pending packets inside this gap, in sequence order.
-                let in_gap: Vec<&PendingPacket> = pending
-                    .iter()
-                    .filter(|p| p.sequence >= start && p.sequence <= end)
-                    .collect();
                 let mut cursor = start;
-                for packet in &in_gap {
+                while let Some(packet) = pending.next_if(|p| p.sequence <= end) {
+                    if packet.sequence < start {
+                        continue;
+                    }
                     if packet.sequence > cursor {
                         enumerate_unknown(
                             cursor,
@@ -267,17 +281,18 @@ impl ReplicationSloProbe {
                             &mut truncated,
                         );
                     }
-                    let age = now.saturating_sub(packet.published_at);
-                    if age > self.slo_secs {
+                    let age = i128::from(now) - i128::from(packet.published_at);
+                    if (0..=i128::from(self.slo_secs)).contains(&age) {
+                        *pending_count += 1;
+                    } else {
+                        let lag = (age >= 0).then(|| i64::try_from(age).unwrap_or(i64::MAX));
                         push_missing(
                             packet.sequence,
-                            Some(age),
+                            lag,
                             breaches,
                             &mut reported_missing,
                             &mut truncated,
                         );
-                    } else {
-                        *pending_count += 1;
                     }
                     match packet.sequence.checked_add(1) {
                         Some(next) => cursor = next,
@@ -288,20 +303,20 @@ impl ReplicationSloProbe {
                     enumerate_unknown(cursor, end, breaches, &mut reported_missing, &mut truncated);
                 }
             };
-            let mut expected = records[0].sequence;
+            let mut expected = Some(records[0].sequence);
             for record in &records {
-                if record.sequence > expected {
+                if let Some(start) = expected.filter(|&start| record.sequence > start) {
                     // Clip to latest_sequence: sequences past the reported
                     // latest are not yet missing.
                     let gap_end = (record.sequence - 1).min(latest_sequence);
-                    if gap_end >= expected {
-                        report_gap(expected, gap_end, &mut breaches, &mut pending_count);
+                    if gap_end >= start {
+                        report_gap(start, gap_end, &mut breaches, &mut pending_count);
                     }
                 }
-                expected = record.sequence.saturating_add(1);
+                expected = record.sequence.checked_add(1);
             }
-            if latest_sequence >= expected {
-                report_gap(expected, latest_sequence, &mut breaches, &mut pending_count);
+            if let Some(start) = expected.filter(|&start| latest_sequence >= start) {
+                report_gap(start, latest_sequence, &mut breaches, &mut pending_count);
             }
             if truncated {
                 breaches.push(ReplicationBreach {

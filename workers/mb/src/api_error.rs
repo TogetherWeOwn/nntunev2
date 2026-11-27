@@ -56,33 +56,29 @@ pub fn spec(code: &str) -> CodeSpec {
         .unwrap_or(FALLBACK)
 }
 
-fn message_for_server_error(_code: &str) -> &'static str {
-    "unexpected error"
-}
+const SERVER_ERROR_MESSAGE: &str = "unexpected error";
 
 /// A user-facing error ready for the HTTP layer: `status` is the response
 /// status, the serialized body is exactly `{code, message, retryable}`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ApiError {
-    pub code: &'static str,
-    pub message: String,
-    pub retryable: bool,
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
     #[serde(skip)]
-    pub status: u16,
+    pub(super) status: u16,
 }
 
 impl ApiError {
     /// Build from a registry code; unknown codes become the generic
     /// fallback. Registered 5xx codes use fixed public text; other
-    /// registered codes keep the caller's message.
-    pub fn by_code(code: &str, message: impl Into<String>) -> Self {
+    /// registered codes accept static public text from the caller.
+    pub fn by_code(code: &str, message: &'static str) -> Self {
         let spec = spec(code);
-        let message = if spec.code != code {
-            "unexpected error".to_string()
-        } else if spec.status >= 500 {
-            message_for_server_error(spec.code).to_string()
+        let message = if spec.code != code || spec.status >= 500 {
+            SERVER_ERROR_MESSAGE
         } else {
-            message.into()
+            message
         };
         Self {
             code: spec.code,
@@ -92,14 +88,14 @@ impl ApiError {
         }
     }
 
-    pub fn invalid_request(message: impl Into<String>) -> Self {
+    pub fn invalid_request(message: &'static str) -> Self {
         Self::by_code("invalid_request", message)
     }
-    pub fn not_found(message: impl Into<String>) -> Self {
+    pub fn not_found(message: &'static str) -> Self {
         Self::by_code("not_found", message)
     }
     pub fn internal_error() -> Self {
-        Self::by_code("internal_error", "unexpected error")
+        Self::by_code("internal_error", SERVER_ERROR_MESSAGE)
     }
 
     /// Serialized envelope body. Infallible: the shape is three scalars.
