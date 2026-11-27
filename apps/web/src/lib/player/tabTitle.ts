@@ -38,7 +38,6 @@ export function createDemoTabTitle(target: { title: string }): DemoTabTitle {
 		originalTitle,
 		update(track, playing) {
 			if (titleOwners.get(target) !== owner) return;
-			restored = false;
 			target.title = resolveDemoTabTitle(originalTitle, track, playing);
 		},
 		restore() {

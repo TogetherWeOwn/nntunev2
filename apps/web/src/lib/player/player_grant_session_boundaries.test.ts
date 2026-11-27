@@ -49,10 +49,12 @@ it('refuses a failed grant dispatch or inherited receipt and can open again', as
 	await expect(open()).resolves.toBe(true);
 });
 
-it('binds retries to the published receipt and requires a complete privacy acknowledgement', async () => {
+it.each(['malformed', 'timeout'])('binds retries to the published receipt through a %s privacy reply', async (failure) => {
+	let refuse = true;
 	const fetchFn = vi.fn<typeof fetch>().mockImplementation(async (_path, init) => {
 		const body = JSON.parse(String(init?.body));
-		if ('enabled' in body) return Response.json({ session_id: body.session_id, private_until: null, extra: true });
+		if ('enabled' in body) return refuse && failure === 'timeout' ? new Response(null, { status: 408 })
+			: Response.json({ session_id: body.session_id, private_until: null, ...(refuse && { extra: true }) });
 		return Response.json({
 			sessionBinding: binding, playbackSessionId: body.session_id, trackId: body.track_id,
 			playId: body.play_id ?? 'issued', durationMs: 1000
@@ -70,6 +72,9 @@ it('binds retries to the published receipt and requires a complete privacy ackno
 	expect(await session.open('other', always, publish, 'issued')).toBe(false);
 	expect(await session.open(track.id, always, publish, 'issued')).toBe(true);
 	expect(fetchFn).toHaveBeenCalledTimes(3);
+	refuse = false;
+	await session.setPrivate(false);
+	expect(await session.open(track.id, always, publish)).toBe(true);
 });
 
 it.each(['0', '901', 'invalid'])('refuses a grant with an invalid explicit TTL (%s)', async (ttl) => {
@@ -105,6 +110,14 @@ it('keeps the latest Library source evidence across reentrant reconciliation', (
 		expect(player.reconcileLibrary([{ id: track.id, streamUrl: '/current' }], always)).toBe(true);
 	})).toBe(false);
 	expect(player.queue.sourceForQueuedPlay(track.id)?.streamUrl).toBe('/current');
+});
+
+it('preserves a queue edit made during Library reconciliation', () => {
+	const next = { ...track, id: 'next' };
+	const player = createPlayerController(createQueue([track, next]), { flush: async () => {} });
+	onTestFinished(player.destroy);
+	expect(player.reconcileLibrary([track], always, () => { player.removeQueuedTrack(0); })).toBe(false);
+	expect(player.queue.snapshot.tracks).toEqual([next]);
 });
 
 it.each(['context', 'start'] as const)('refuses a history %s response with extra fields', async (phase) => {
@@ -205,4 +218,7 @@ it('ignores title writes and teardown from a superseded controller', () => {
 	expect(target.title).toBe('Song — Artist');
 	current.restore();
 	expect(target.title).toBe('Original');
+	current.update(track, false);
+	current.restore();
+	expect(target.title).toBe('Song — Artist (paused)');
 });
