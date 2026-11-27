@@ -24,7 +24,10 @@ def unique_fields(pairs):
 def consistent_readback(raw, *, baseline_handoff=False):
     if len(raw) > MAX_RECORD_BYTES:
         return False
-    record = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
+    try:
+        record = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
+    except (ValueError, RecursionError):
+        return False
     fields = {"review", "snapshot", "baseline_branch_id"} if baseline_handoff else {"review", "snapshot"}
     if not isinstance(record, dict) or record.keys() != fields:
         return False
@@ -72,7 +75,7 @@ if __name__ == "__main__":
         consistent = args in ([], ["--baseline-handoff"]) and consistent_readback(
             sys.stdin.buffer.read(MAX_RECORD_BYTES + 1), baseline_handoff=bool(args),
         )
-    except (OSError, ValueError, RecursionError):
+    except OSError:
         consistent = False
     if not consistent:
         sys.exit("database-bootstrap-snapshot: refused")

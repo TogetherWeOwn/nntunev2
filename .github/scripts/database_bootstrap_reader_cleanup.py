@@ -27,7 +27,10 @@ def valid_pins(pins):
 def consistent_readback(raw):
     if len(raw) > MAX_RECORD_BYTES:
         return False
-    record = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
+    try:
+        record = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
+    except (ValueError, RecursionError):
+        return False
     if not isinstance(record, dict) or record.keys() != {"reviewed", "receipt"}:
         return False
     reviewed, receipt = record["reviewed"], record["receipt"]
@@ -44,7 +47,7 @@ if __name__ == "__main__":
         consistent = len(sys.argv) == 1 and consistent_readback(
             sys.stdin.buffer.read(MAX_RECORD_BYTES + 1),
         )
-    except (OSError, ValueError, RecursionError):
+    except OSError:
         consistent = False
     if not consistent:
         sys.exit("database-bootstrap-reader-cleanup: pending")

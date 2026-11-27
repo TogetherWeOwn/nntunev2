@@ -184,6 +184,14 @@ class EnvironmentReadbackTests(unittest.TestCase):
                 path.write_bytes(raw)
                 self.assert_blocked(BOOTSTRAP, "unresolved: missing or invalid Environment response")
 
+    def test_response_symlink_outside_evidence_directory_refuses(self):
+        path = self.directory / f"{BOOTSTRAP}.environment.json"
+        with TemporaryDirectory() as outside:
+            response = Path(outside) / "response.json"
+            path.rename(response)
+            path.symlink_to(response)
+            self.assert_blocked(BOOTSTRAP, "unresolved: missing or invalid Environment response")
+
 
 if __name__ == "__main__":
     unittest.main()

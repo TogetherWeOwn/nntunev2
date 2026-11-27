@@ -21,7 +21,10 @@ def unique_fields(pairs):
 def consistent_inventory(raw):
     if len(raw) > MAX_RECORD_BYTES:
         return False
-    record = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
+    try:
+        record = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
+    except (ValueError, RecursionError):
+        return False
     if not isinstance(record, dict) or record.keys() != {"migration", "inventory"}:
         return False
     migration, inventory = record["migration"], record["inventory"]
@@ -53,7 +56,7 @@ def consistent_inventory(raw):
 if __name__ == "__main__":
     try:
         consistent = len(sys.argv) == 1 and consistent_inventory(sys.stdin.buffer.read(MAX_RECORD_BYTES + 1))
-    except (OSError, ValueError, RecursionError):
+    except OSError:
         consistent = False
     if not consistent:
         sys.exit("database-bootstrap-inventory: refused")

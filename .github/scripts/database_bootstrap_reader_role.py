@@ -112,6 +112,7 @@ class ReaderRoleLifecycle(RoleLifecycle):
            WHERE a.grantee = 0
        ) OR NOT has_table_privilege(target, 'pg_largeobject_metadata', 'SELECT')
        OR has_table_privilege(target, 'pg_largeobject', 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+       OR has_any_column_privilege(target, 'pg_largeobject', 'SELECT,INSERT,UPDATE,REFERENCES')
        OR EXISTS (
            SELECT FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
            WHERE {USER_SCHEMA} AND CASE
@@ -153,11 +154,8 @@ class ReaderRoleLifecycle(RoleLifecycle):
     def fence(self, oid):
         # The role is cluster-wide. Fence it even if the launch database is unavailable.
         receipt = role_oid(oid)
-        return self._run(f"""
+        return self._run(self._receipt_guard(receipt) + f"""
     IF target IS NOT NULL THEN
-        IF target <> {receipt} THEN
-            RAISE EXCEPTION 'reader fence refused';
-        END IF;
         ALTER ROLE {self.role} NOLOGIN PASSWORD NULL VALID UNTIL 'epoch';
     END IF;
 """)
@@ -185,9 +183,9 @@ SELECT 'retired' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE oid = {receipt} OR
         END LOOP;
         EXECUTE format('REVOKE CONNECT ON DATABASE %I FROM %I', current_database(), '{self.name}');
 """ if plan else ""
-        return self._run(f"""
+        return self._run(self._receipt_guard(receipt) + f"""
     IF target IS NOT NULL THEN
-        IF target <> {receipt} OR NOT EXISTS (
+        IF NOT EXISTS (
             SELECT FROM pg_roles WHERE oid = target AND NOT rolcanlogin AND rolvaliduntil = 'epoch'::timestamptz
         ) THEN
             RAISE EXCEPTION 'reader retirement refused';

@@ -3,15 +3,27 @@
 import base64
 import hashlib
 import json
+import os
 import secrets
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import TestCase, TextTestRunner, defaultTestLoader
+from unittest.mock import patch
 
 import database_bootstrap_admission as admission
+import database_bootstrap_inventory as inventory
+import database_bootstrap_reader_cleanup as cleanup
+import database_bootstrap_reader_evidence as reader_evidence
+import database_bootstrap_setup as setup
+import database_bootstrap_snapshot as snapshot
 from database_bootstrap_baseline import WORKFLOW as BASELINE_WORKFLOW
+from database_bootstrap_baseline import baseline_plan, baseline_sql
+from database_bootstrap_preflight import BootstrapPreflightError, catalog_probe_sql, require_absent_catalog_result
+from database_bootstrap_reader_role import ReaderRoleLifecycle
+from database_bootstrap_role import SetupRoleLifecycle
 from test_ci_pnpm_retry import job_level_field, job_needs, split_jobs
 
 
@@ -51,6 +63,107 @@ def synthetic_authorization(plan, sha, run, expiry, *, workflow=admission.WORKFL
         "BOOTSTRAP_PLAN_B64": base64.b64encode(plan).decode("ascii"),
         "BOOTSTRAP_PLAN_DIGEST": hashlib.sha256(plan).hexdigest(),
     }
+
+
+class OfflineBoundaryTests(TestCase):
+    route = {"version": 2, "host": "fixture.example", "port": 5432, "ca_pem": "fixture",
+             "branch_id": "fixture001", "launch": "fixture_launch", "reader_role": "fixture_reader"}
+    setup_record = route | {"maintenance": "postgres", "setup_login": "fixture_setup.fixture001",
+                            "setup_role": "fixture_setup", "owner_role": "fixture_owner",
+                            "migrator_role": "fixture_migrator"}
+    baseline_record = route | {"database_oid": 41001, "reader_oid": 42001}
+
+    def test_event_requires_regular_file_and_strict_utf8_json(self):
+        now = int(time.time())
+        env = synthetic_authorization(b"fixture plan", "a" * 40, "101", now + 60)
+        with tempfile.TemporaryDirectory() as private, patch.object(sys, "argv", ["fixture"]):
+            event = Path(private) / "event.json"
+            env["GITHUB_EVENT_PATH"] = str(event)
+            event.write_bytes(b"{}")
+            self.assertEqual(admission.read_authorized_plan(env), b"fixture plan")
+            for malformed in (b'{"inputs": null, "inputs": {}}', b'{"other": NaN}', "{}".encode("utf-16")):
+                with self.subTest(malformed=malformed):
+                    event.write_bytes(malformed)
+                    self.assertIsNone(admission.read_authorized_plan(env))
+            event.write_bytes(b"{}")
+            link = event.with_name("link.json")
+            link.symlink_to(event)
+            pipe = event.with_name("pipe")
+            os.mkfifo(pipe)
+            for path in (link, pipe):
+                with self.subTest(path=path.name):
+                    result = subprocess.run([sys.executable, "-IB", admission.__file__],
+                                            env=env | {"GITHUB_EVENT_PATH": str(path)},
+                                            capture_output=True, timeout=2, check=False)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                     (1, b"", b"database-bootstrap-admission: refused\n"))
+
+    def test_plan_parsers_enforce_size_and_shared_route_constraints(self):
+        with patch.object(setup, "validate_ca"), patch("database_bootstrap_baseline.validate_ca"):
+            for parse, record in ((setup.setup_plan, self.setup_record), (baseline_plan, self.baseline_record)):
+                with self.subTest(parser=parse.__name__):
+                    raw = json.dumps(record).encode().ljust(admission.MAX_PLAN_BYTES)
+                    self.assertEqual(parse(raw).reader_role, record["reader_role"])
+                    with self.assertRaises(ValueError):
+                        parse(raw + b" ")
+            for changes in ({"reader_role": "fixture.reader"}, {"launch": "postgres"},
+                            {"maintenance": "fixture maintenance"}):
+                with self.subTest(changes=changes), self.assertRaises(ValueError):
+                    setup.setup_plan(json.dumps(self.setup_record | changes).encode())
+
+    def test_preflight_rejects_malformed_pins_and_status(self):
+        for pins in ((None, "fixture_launch", "fixture_setup"), ("postgres", "fixture_launch", [])):
+            with self.subTest(pins=pins), self.assertRaises(BootstrapPreflightError):
+                catalog_probe_sql(*pins)
+        for status, output in ((False, "name-absent\n"), (0.0, "name-absent\n"), (0, [])):
+            with self.subTest(status=status, output=output), self.assertRaises(BootstrapPreflightError):
+                require_absent_catalog_result(status, output)
+
+    def test_malformed_records_return_closed_verdicts(self):
+        for check, refused in ((inventory.consistent_inventory, False), (snapshot.consistent_readback, False),
+                               (cleanup.consistent_readback, False), (reader_evidence.reader_evidence_verdict, "pending")):
+            for raw in (b'{"duplicate": 1, "duplicate": 2}', b"\xff", b"[" * 1500 + b"0" + b"]" * 1500):
+                with self.subTest(check=check.__module__, raw=raw[:32]):
+                    self.assertEqual(check(raw), refused)
+
+    def test_setup_mutations_recheck_session_and_target_fence(self):
+        with patch.object(setup, "validate_ca"):
+            plan = setup.setup_plan(json.dumps(self.setup_record).encode())
+        probe, create, admit = setup.statements(plan, 1800000000)
+        with self.assertRaises(ValueError):
+            setup.statements(plan, "1800000000")
+        for sql in (create, admit):
+            with self.subTest(statement=sql.splitlines()[1]):
+                for clause in ("current_database() = 'postgres'", "session_user = 'fixture_setup'",
+                               "current_user = 'fixture_setup'", "NOT pg_is_in_recovery()",
+                               "clock_timestamp() < to_timestamp(1800000000)"):
+                    self.assertIn(clause, sql)
+        self.assertLess(create.index("\\if :bootstrap_write"), create.index("CREATE DATABASE"))
+        self.assertLess(admit.index("NOT datallowconn AND datacl IS NULL"), admit.index("REVOKE ALL"))
+        self.assertIn("r.rolname = current_user", admit)
+        self.assertIn("m.set_option AND NOT (m.inherit_option OR m.admin_option)", probe)
+        self.assertIn("SELECT count(*) FROM pg_auth_members WHERE member = r.oid", probe)
+
+    def test_lifecycle_mutations_refuse_renamed_issuance(self):
+        raw = json.dumps(self.setup_record).encode()
+        with patch.object(setup, "validate_ca"):
+            setup_role = SetupRoleLifecycle(raw)
+            reader = ReaderRoleLifecycle(raw, "fixture_issuer")
+        for sql in (setup_role.fence(42001), setup_role.retire(42001), reader.fence(42001), reader.retire(None, 42001)):
+            with self.subTest(operation=sql.splitlines()[1]):
+                self.assertIn("target IS DISTINCT FROM 42001::oid", sql)
+                self.assertIn("target IS NOT NULL OR EXISTS (SELECT FROM pg_roles WHERE oid = 42001::oid)", sql)
+
+    def test_baseline_and_activation_check_large_object_catalog_access(self):
+        raw = json.dumps(self.baseline_record).encode()
+        with patch.object(setup, "validate_ca"), patch("database_bootstrap_baseline.validate_ca"):
+            plan = baseline_plan(raw)
+            role = ReaderRoleLifecycle(json.dumps(self.setup_record).encode(), "fixture_issuer")
+            activation = role.activate(raw, plan.reader_oid, 1800000000, "a" * 48)
+        for sql in (baseline_sql(plan).decode(), activation):
+            with self.subTest(statement=sql.splitlines()[1]):
+                self.assertRegex(sql, r"has_any_column_privilege\((?:target, )?'pg_largeobject', 'SELECT,")
+        self.assertIn("OR a.grantee IN (0, role_id)\n", baseline_sql(plan).decode())
 
 
 def check_aborted_baseline_run_binding():
@@ -461,6 +574,8 @@ def check_snapshot_label_retry():
 
 
 if __name__ == "__main__":
+    if not TextTestRunner().run(defaultTestLoader.loadTestsFromTestCase(OfflineBoundaryTests)).wasSuccessful():
+        sys.exit("database-bootstrap-admission-fixture: failed")
     try:
         check_baseline_workflow()
         check_aborted_baseline_run_binding()

@@ -1,6 +1,5 @@
 """Read a bounded launch database baseline through the distinct reader lane."""
 
-import json
 import os
 import re
 import signal
@@ -11,7 +10,7 @@ from types import SimpleNamespace
 
 from database_bootstrap_admission import read_authorized_plan
 from database_bootstrap_setup import (
-    MAX_SECONDS, PORT, remember_signal, run_sql, tls_environment, unique_fields, valid_host, validate_ca,
+    MAX_SECONDS, PORT, load_plan, remember_signal, run_sql, tls_environment, valid_host, validate_ca,
 )
 
 WORKFLOW = ".github/workflows/deploy-database-baseline.yml"
@@ -22,7 +21,7 @@ MAX_SQL_BYTES = 8192
 
 
 def baseline_plan(raw):
-    data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
+    data = load_plan(raw)
     if (
         not isinstance(data, dict) or data.keys() != FIELDS
         or type(data["version"]) is not int or data["version"] != 2
@@ -69,11 +68,13 @@ BEGIN
         OR EXISTS (SELECT FROM pg_auth_members WHERE member = role_id)
         OR has_database_privilege(current_database(), 'CREATE,TEMP,CONNECT WITH GRANT OPTION')
         OR NOT has_table_privilege('pg_largeobject_metadata', 'SELECT')
+        OR has_table_privilege('pg_largeobject', 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+        OR has_any_column_privilege('pg_largeobject', 'SELECT,INSERT,UPDATE,REFERENCES')
         OR EXISTS (
             SELECT FROM pg_largeobject_metadata l
             LEFT JOIN LATERAL aclexplode(l.lomacl) a ON true
             WHERE l.lomowner = role_id
-              OR (a.grantee IN (0, role_id) AND (a.privilege_type = 'UPDATE' OR a.is_grantable))
+              OR a.grantee IN (0, role_id)
         )
         OR EXISTS (
             SELECT FROM pg_namespace

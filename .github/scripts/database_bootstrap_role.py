@@ -7,7 +7,6 @@ import re
 import secrets
 from datetime import datetime, timezone
 
-from database_bootstrap_preflight import catalog_probe_sql
 from database_bootstrap_setup import setup_plan
 
 
@@ -45,6 +44,14 @@ DRAIN_SESSIONS = """
 
 
 class RoleLifecycle:
+    def _receipt_guard(self, receipt):
+        return f"""
+    IF target IS DISTINCT FROM {receipt}
+       AND (target IS NOT NULL OR EXISTS (SELECT FROM pg_roles WHERE oid = {receipt})) THEN
+        RAISE EXCEPTION 'role receipt mismatch';
+    END IF;
+"""
+
     def _transaction(self, body, result="", *, database=None, guard=""):
         return f"""BEGIN;
 SET LOCAL search_path = pg_catalog;
@@ -80,7 +87,6 @@ class SetupRoleLifecycle(RoleLifecycle):
 
     def __init__(self, raw_plan):
         plan = setup_plan(raw_plan)
-        catalog_probe_sql(plan.maintenance, plan.launch, plan.setup_role)
         self.maintenance = plan.maintenance
         self.name = plan.setup_role
         self.role = f'"{self.name}"'
@@ -128,12 +134,14 @@ class SetupRoleLifecycle(RoleLifecycle):
 
     def _cleanup(self, oid, action, *, require_fence=True, result=""):
         receipt = role_oid(oid)
-        fence_check = f"OR NOT EXISTS (SELECT FROM pg_roles WHERE oid = target AND {self.fenced})"
-        return self._transaction(f"""
-    IF target IS NOT NULL THEN
-        IF target <> {receipt} {fence_check if require_fence else ''} THEN
+        fence_check = f"""
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE oid = target AND {self.fenced}) THEN
             RAISE EXCEPTION 'cleanup refused';
         END IF;
+""" if require_fence else ""
+        return self._transaction(self._receipt_guard(receipt) + f"""
+    IF target IS NOT NULL THEN
+        {fence_check}
         {action}
     END IF;
 """, result)

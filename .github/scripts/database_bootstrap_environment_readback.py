@@ -2,7 +2,9 @@
 
 import argparse
 import json
+import os
 import re
+import stat
 from pathlib import Path
 
 REPOSITORY = "togetherweown/nntunev2"
@@ -24,14 +26,17 @@ def reject_constant(_):
 
 def read_object(path):
     try:
-        if path.is_file():
-            with path.open("rb") as source:
-                raw = source.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw) <= MAX_RESPONSE_BYTES:
-                data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields,
-                                  parse_constant=reject_constant)
-                if isinstance(data, dict):
-                    return data
+        with open(path, "rb", opener=lambda path, flags: os.open(
+            path, flags | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )) as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                return None
+            raw = source.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) <= MAX_RESPONSE_BYTES:
+            data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields,
+                              parse_constant=reject_constant)
+            if isinstance(data, dict):
+                return data
     except (OSError, ValueError, RecursionError):
         pass
     return None

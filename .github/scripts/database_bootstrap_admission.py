@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 
@@ -14,6 +15,17 @@ MAIN = "refs/heads/main"
 MAX_EVENT_BYTES = 256 * 1024
 MAX_PLAN_BYTES = 4096
 MAX_WINDOW_SECONDS = 7200
+
+
+def unique_fields(pairs):
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ValueError
+    return fields
+
+
+def reject_constant(_):
+    raise ValueError
 
 
 def authorized_plan(env, event, now, *, workflow=WORKFLOW):
@@ -60,11 +72,19 @@ def authorized_plan(env, event, now, *, workflow=WORKFLOW):
 def read_authorized_plan(env, *, workflow=WORKFLOW):
     if len(sys.argv) != 1:
         return None
-    with open(env["GITHUB_EVENT_PATH"], "rb") as source:
-        raw = source.read(MAX_EVENT_BYTES + 1)
-    if len(raw) <= MAX_EVENT_BYTES:
-        return authorized_plan(env, json.loads(raw), time.time(), workflow=workflow)
-    return None
+    try:
+        with open(env["GITHUB_EVENT_PATH"], "rb", opener=lambda path, flags: os.open(
+            path, flags | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )) as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                return None
+            raw = source.read(MAX_EVENT_BYTES + 1)
+        if len(raw) > MAX_EVENT_BYTES:
+            return None
+        event = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields, parse_constant=reject_constant)
+    except (KeyError, OSError, ValueError, RecursionError):
+        return None
+    return authorized_plan(env, event, time.time(), workflow=workflow)
 
 
 if __name__ == "__main__":

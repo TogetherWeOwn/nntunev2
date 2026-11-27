@@ -14,8 +14,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from database_bootstrap_admission import read_authorized_plan
-from database_bootstrap_preflight import catalog_probe_sql, require_absent_catalog_result
+from database_bootstrap_admission import MAX_PLAN_BYTES, read_authorized_plan, reject_constant, unique_fields
+from database_bootstrap_preflight import catalog_probe_sql, require_absent_catalog_result, validate_catalog_pins
 
 MAX_SECONDS = 60
 MAX_SQL_BYTES = 4096
@@ -33,11 +33,13 @@ def remember_signal(_signum, _frame):
     interrupted = True
 
 
-def unique_fields(pairs):
-    fields = dict(pairs)
-    if len(fields) != len(pairs):
-        raise ValueError
-    return fields
+def load_plan(raw):
+    if not 0 < len(raw) <= MAX_PLAN_BYTES:
+        raise ValueError("invalid bootstrap plan size")
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields, parse_constant=reject_constant)
+    except (ValueError, RecursionError):
+        raise ValueError("invalid bootstrap plan JSON") from None
 
 
 def valid_host(host):
@@ -57,7 +59,7 @@ def validate_ca(ca):
 
 
 def setup_plan(raw):
-    data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
+    data = load_plan(raw)
     if (not isinstance(data, dict) or data.keys() != FIELDS
             or type(data["version"]) is not int or data["version"] != 2
             or type(data["port"]) is not int or data["port"] != PORT
@@ -72,27 +74,37 @@ def setup_plan(raw):
     ):
         raise ValueError
     setup_role, branch_id = data["setup_role"], data["branch_id"]
-    if ("." in setup_role or not re.fullmatch(r"(?:[a-z0-9]{10}|[a-z0-9]{12})", branch_id)
+    if ("." in setup_role or "." in data["reader_role"]
+            or not re.fullmatch(r"(?:[a-z0-9]{10}|[a-z0-9]{12})", branch_id)
             or data["setup_login"] != f"{setup_role}.{branch_id}"):
         raise ValueError
+    validate_catalog_pins(data["maintenance"], data["launch"], setup_role)
     validate_ca(data["ca_pem"])
     return SimpleNamespace(**data)
 
 
 def statements(plan, expiry):
+    if type(expiry) is not int or not 0 < expiry <= 9999999999:
+        raise ValueError("invalid setup expiry")
     probe = catalog_probe_sql(plan.maintenance, plan.launch, plan.setup_role)
     probe += f"""
 SELECT 'roles-ready'
 WHERE NOT pg_is_in_recovery()
 AND EXISTS (
-    SELECT FROM pg_roles WHERE rolname = current_user
-      AND NOT (rolsuper OR rolcreaterole OR rolreplication OR rolbypassrls)
+    SELECT FROM pg_roles r WHERE rolname = current_user
+      AND rolconnlimit = 1 AND NOT (rolinherit OR rolsuper OR rolcreaterole OR rolreplication OR rolbypassrls)
       AND rolvaliduntil > clock_timestamp() AND rolvaliduntil <= to_timestamp({expiry})
+      AND (SELECT count(*) FROM pg_auth_members WHERE member = r.oid) = 1
 )
 AND EXISTS (
-    SELECT FROM pg_roles WHERE rolname = '{plan.owner_role}'
+    SELECT FROM pg_roles r WHERE rolname = '{plan.owner_role}'
       AND NOT (rolcanlogin OR rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)
-      AND pg_has_role(current_user, oid, 'SET') AND NOT pg_has_role(current_user, oid, 'USAGE')
+      AND NOT EXISTS (SELECT FROM pg_auth_members WHERE member = r.oid)
+      AND EXISTS (
+          SELECT FROM pg_auth_members m JOIN pg_roles member ON member.oid = m.member
+          WHERE m.roleid = r.oid AND member.rolname = current_user
+            AND m.set_option AND NOT (m.inherit_option OR m.admin_option)
+      )
 )
 AND EXISTS (
     SELECT FROM pg_roles WHERE rolname = '{plan.migrator_role}'
@@ -107,9 +119,31 @@ AND EXISTS (
 );
 """
     database = f'"{plan.launch}"'
-    create = f"CREATE DATABASE {database} TEMPLATE template0 ALLOW_CONNECTIONS false;"
+    scope = f"""current_database() = '{plan.maintenance}' AND session_user = '{plan.setup_role}'
+    AND current_user = '{plan.setup_role}' AND NOT pg_is_in_recovery()
+    AND clock_timestamp() < to_timestamp({expiry})"""
+    create = f"""
+SELECT ({scope}) AS bootstrap_write
+\\gset
+\\if :bootstrap_write
+CREATE DATABASE {database} TEMPLATE template0 ALLOW_CONNECTIONS false;
+\\else
+SELECT 1/0;
+\\endif
+"""
     admit = f"""
 BEGIN;
+DO $bootstrap$
+BEGIN
+    IF NOT ({scope}) OR NOT EXISTS (
+        SELECT FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba
+        WHERE d.datname = '{plan.launch}' AND r.rolname = current_user
+          AND NOT datistemplate AND NOT datallowconn AND datacl IS NULL
+    ) THEN
+        RAISE EXCEPTION 'database admission refused';
+    END IF;
+END
+$bootstrap$;
 REVOKE ALL ON DATABASE {database} FROM PUBLIC;
 GRANT CONNECT, CREATE ON DATABASE {database} TO "{plan.migrator_role}";
 ALTER DATABASE {database} ALLOW_CONNECTIONS true;

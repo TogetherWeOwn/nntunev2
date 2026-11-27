@@ -276,6 +276,12 @@ def prove_issuance(cluster, lifecycle):
                        lifecycle.issue(expiry, cluster.passwords[CREATOR]),
                        "ERROR:  P0001:", role=ISSUER)
     oid = issue_role(cluster, lifecycle, cluster.expiry)
+    cluster.ok("rename the issued setup role under the same OID", f"ALTER ROLE {CREATOR} RENAME TO fixture_renamed;")
+    try:
+        cluster.denied("refuse to report a fence for a renamed setup role", lifecycle.fence(oid),
+                       "role receipt mismatch", role=ISSUER)
+    finally:
+        cluster.ok("restore the setup role name", f"ALTER ROLE fixture_renamed RENAME TO {CREATOR};")
     cluster.denied("refuse repeated issuance without rotating the credential", issue,
                    "ERROR:  P0001:", role=ISSUER)
     cluster.ok("read back both setup SQL identities, attributes, membership and expiry", f"""
@@ -511,8 +517,23 @@ def prove_setup_caller(cluster, *, interrupt, reader):
         cluster.ok("restore the canonical role's database creation privilege", f"ALTER ROLE {CREATOR} CREATEDB;")
         run(env | {"PATH": routed_client(cluster, "wrong-role"),
                    "BOOTSTRAP_SETUP_PASSWORD": cluster.passwords[DECOY]}, "refused", 1)
-        require((cluster.directory / "probe-result").read_bytes() == b"wrong-session\nroles-ready\n",
+        require((cluster.directory / "probe-result").read_bytes() == b"wrong-session\n",
                 "observe a different eligible SQL identity on the approved route")
+        cluster.ok("grant the setup role an unrelated SET-only membership",
+                   f"GRANT {STAGING} TO {CREATOR} WITH INHERIT FALSE, SET TRUE;")
+        run(env, "refused", 1)
+        cluster.ok("restore the exact setup membership", f"REVOKE {STAGING} FROM {CREATOR};")
+        _, create, admit = setup.statements(setup.setup_plan(raw), cluster.expiry)
+        cluster.denied("refuse creation in a separately connected wrong session", create,
+                       "22012", role=DECOY)
+        cluster.ok("create a fenced target for admission checks", create, role=CREATOR)
+        try:
+            cluster.ok("observe a target that lost its connection fence",
+                       f"ALTER DATABASE {LAUNCH} ALLOW_CONNECTIONS true;")
+            cluster.denied("refuse to admit a target whose fence changed", admit,
+                           "database admission refused", role=CREATOR)
+        finally:
+            cluster.ok("remove the disposable admission target", f"DROP DATABASE {LAUNCH};")
         run(env | {"PATH": routed_client(cluster, "standby")}, "refused", 1)
         require((cluster.directory / "standby-result").read_bytes() == b"",
                 "refuse the recovery-state probe without a SQL error")
@@ -655,6 +676,13 @@ def prove_baseline(cluster):
     require(calls.stat().st_size == before, "refuse disabled, cross-workflow and invalid plans before SQL")
     run("refused", database_oid=plan["database_oid"] + 1)
     run("empty")
+    cluster.ok("grant access to a large-object data column",
+               f'GRANT SELECT (data) ON pg_catalog.pg_largeobject TO "{reader}";', database=LAUNCH)
+    try:
+        run("refused")
+    finally:
+        cluster.ok("revoke access to the large-object data column",
+                   f'REVOKE SELECT (data) ON pg_catalog.pg_largeobject FROM "{reader}";', database=LAUNCH)
     prove_baseline_partial_read(cluster, env | plan_binding(json.dumps(plan).encode()), reader)
     with tempfile.TemporaryDirectory(dir=cluster.directory, prefix="handoff-environment-") as evidence:
         directory = Path(evidence)
@@ -877,7 +905,9 @@ def prove_ineffective_baseline_grant(cluster, plan):
             ("over-privileged column grant", f"REVOKE UPDATE ON grant_tracks.tracks FROM {READER};"
              f" GRANT UPDATE (id) ON grant_tracks.tracks TO {READER};",
              "baseline table privilege refused", "UPDATE (id) ON grant_tracks.tracks"),
-            ("over-privileged large-object grant", f"REVOKE UPDATE (id) ON grant_tracks.tracks FROM {READER};"
+            ("large-object read grant", f"REVOKE UPDATE (id) ON grant_tracks.tracks FROM {READER};"
+             f" GRANT SELECT ON LARGE OBJECT 900001 TO {READER};", "baseline scope refused", None),
+            ("over-privileged large-object grant", f"REVOKE SELECT ON LARGE OBJECT 900001 FROM {READER};"
              f" GRANT UPDATE ON LARGE OBJECT 900001 TO {READER};",
              "baseline scope refused", "UPDATE ON LARGE OBJECT 900001"),
             ("ineffective grants", f"REVOKE UPDATE ON LARGE OBJECT 900001 FROM {READER};"

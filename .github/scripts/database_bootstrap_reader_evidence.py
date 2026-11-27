@@ -51,7 +51,10 @@ def matches_pins(observed, expected):
 def reader_evidence_verdict(raw):
     if len(raw) > MAX_RECORD_BYTES:
         return "pending"
-    record = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
+    try:
+        record = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
+    except (ValueError, RecursionError):
+        return "pending"
     if not isinstance(record, dict) or record.keys() - {"review", "inventory", "reader_privileges"}:
         return "pending"
     review = record.get("review")
@@ -103,7 +106,7 @@ if __name__ == "__main__":
     try:
         if len(sys.argv) == 1:
             verdict = reader_evidence_verdict(sys.stdin.buffer.read(MAX_RECORD_BYTES + 1))
-    except (OSError, ValueError, RecursionError):
+    except OSError:
         pass
     message = f"database-bootstrap-reader-evidence: {verdict}"
     if verdict != "consistent":
