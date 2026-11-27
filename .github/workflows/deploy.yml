@@ -102,10 +102,10 @@ jobs:
       - name: Install locked local Worker runtime
         working-directory: apps/web
         run: pnpm install --frozen-lockfile --ignore-scripts --config.minimumReleaseAge=4320
+      - name: Install pinned Worker Rust
+        run: python3 -I .github/scripts/worker_rust_provenance.py rust
       - name: Install pinned Worker tools
-        run: |
-          python3 -I .github/scripts/worker_rust_provenance.py rust
-          python3 -I .github/scripts/worker_tools.py install
+        run: python3 -I .github/scripts/worker_tools.py install
       - name: Build the isolated cleanup Worker
         working-directory: workers/api
         run: |

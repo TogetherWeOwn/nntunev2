@@ -22,6 +22,11 @@ CONFIG_SPEC = importlib.util.spec_from_file_location(
 )
 STREAM_CONFIG = importlib.util.module_from_spec(CONFIG_SPEC)
 CONFIG_SPEC.loader.exec_module(STREAM_CONFIG)
+WORKFLOW_SPEC = importlib.util.spec_from_file_location(
+    "workflow_structure", Path(__file__).with_name("test_ci_pnpm_retry.py"),
+)
+WORKFLOW = importlib.util.module_from_spec(WORKFLOW_SPEC)
+WORKFLOW_SPEC.loader.exec_module(WORKFLOW)
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = "worker-build --release -- --locked"
@@ -39,6 +44,30 @@ def steps(section):
 
 
 class WorkerBuildWorkflowTests(unittest.TestCase):
+    def test_worker_tool_installs_use_rust_from_an_earlier_step(self):
+        rust = re.compile(r"\bworker_rust_provenance\.py[ \t]+rust\b")
+        install = re.compile(r"\bworker_tools\.py[ \t]+install\b(?![ \t]+repair\b)")
+        run = re.compile(r"^ {6}(?:- |  )run:.*(?:\n(?: {10}.*|[ \t]*(?=\n|$)))*", re.M)
+        installations = 0
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            for name, section in WORKFLOW.split_jobs(path.read_text()).items():
+                rust_idx = None
+                for index, step in enumerate(WORKFLOW.split_steps(section)):
+                    match = run.search(step)
+                    if match is None:
+                        continue
+                    script = re.sub(r"(?m)^[ \t]*#.*$", "", match.group())
+                    if rust.search(script):
+                        rust_idx = index
+                    if install.search(script):
+                        installations += 1
+                        with self.subTest(job=f"{path.name}:{name}", step=index + 1):
+                            self.assertTrue(
+                                rust_idx is not None and rust_idx < index,
+                                "Worker tool install requires Rust setup in an earlier, separate step",
+                            )
+        self.assertGreater(installations, 0, "no canonical Worker tool installs found")
+
     def test_api_wrangler_example_requires_query_redaction(self):
         example = (ROOT / "workers/api/wrangler.toml.example").read_text()
         _, _, block = example.partition("# [env.staging.observability]\n")

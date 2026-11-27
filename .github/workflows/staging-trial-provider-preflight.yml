@@ -47,11 +47,10 @@ jobs:
         with:
           node-version: "24.22.3"
           package-manager-cache: false
+      - name: Install pinned Worker Rust
+        run: python3 -I .github/scripts/worker_rust_provenance.py rust
       - name: Install pinned Worker tools
-        run: |
-          set -euo pipefail
-          python3 -I .github/scripts/worker_rust_provenance.py rust
-          python3 -I .github/scripts/worker_tools.py install
+        run: python3 -I .github/scripts/worker_tools.py install
       - name: Build the standalone probe
         run: |
           set -euo pipefail
