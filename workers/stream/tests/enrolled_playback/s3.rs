@@ -82,6 +82,70 @@ async fn bounded_range_delivers_in_order_across_two_full_chunks() {
 }
 
 #[tokio::test]
+async fn s3_open_requires_exact_range_total_length_and_version_metadata() {
+    use S3RangeResponseError::{ContentRange, Length, ObjectIdentity, Status};
+
+    let f = Fixture::new();
+    let exact_range = Some("bytes 65600-65616/65617");
+    let version = Some("media-v1");
+    for (status, range, length, observed_version, error) in [
+        (200, exact_range, Some(17), version, Status),
+        (206, None, Some(17), version, ContentRange),
+        (
+            206,
+            Some("bytes 65599-65615/65617"),
+            Some(17),
+            version,
+            ContentRange,
+        ),
+        (
+            206,
+            Some("bytes 65600-65616/65618"),
+            Some(17),
+            version,
+            ContentRange,
+        ),
+        (
+            206,
+            Some("bytes 65600-65616/*"),
+            Some(17),
+            version,
+            ContentRange,
+        ),
+        (206, exact_range, None, version, Length),
+        (206, exact_range, Some(16), version, Length),
+        (206, exact_range, Some(18), version, Length),
+        (206, exact_range, Some(17), None, ObjectIdentity),
+        (
+            206,
+            exact_range,
+            Some(17),
+            Some("media-v1, media-v1"),
+            ObjectIdentity,
+        ),
+    ] {
+        let (_, play) =
+            EnrolledPlayback::start(Some("bytes=-1"), f.pins(), f.media_input(), now()).unwrap();
+        let opened = play
+            .unwrap()
+            .open_s3(now, async |get| {
+                assert_eq!(get.range, 65_600..65_617);
+                assert_eq!(get.sealed_len, 65_617);
+                Ok(S3GetReply {
+                    status,
+                    version: observed_version.map(str::to_owned),
+                    content_range: range.map(str::to_owned),
+                    content_length: length,
+                    has_content_encoding: false,
+                    body: Body(&f.last),
+                })
+            })
+            .await;
+        assert_eq!(opened.err(), Some(PlaybackError::Response(error)));
+    }
+}
+
+#[tokio::test]
 async fn pinned_media_play_seek_and_refusals_preserve_written_prefix() {
     use PlaybackError::{Binding, Expired, Response, Stopped};
     use S3RangeResponseError::{Length, ObjectIdentity};
@@ -210,12 +274,28 @@ async fn pinned_media_play_seek_and_refusals_preserve_written_prefix() {
 
 #[tokio::test]
 async fn sequential_playback_waits_for_one_eof_at_the_short_final_frame() {
+    sequential_playback_at_eof(false).await;
+}
+
+#[tokio::test]
+async fn dropping_pending_final_eof_preserves_only_acknowledged_plaintext() {
+    sequential_playback_at_eof(true).await;
+}
+
+async fn sequential_playback_at_eof(cancel: bool) {
     use std::{future::poll_fn, task::Poll};
 
     struct EofBody<'a> {
         bytes: Body<'a>,
         eof_ready: &'a Cell<bool>,
         eof_reads: &'a Cell<usize>,
+        dropped: &'a Cell<bool>,
+    }
+
+    impl Drop for EofBody<'_> {
+        fn drop(&mut self) {
+            self.dropped.set(true);
+        }
     }
 
     impl ReadbackBody for EofBody<'_> {
@@ -242,6 +322,7 @@ async fn sequential_playback_waits_for_one_eof_at_the_short_final_frame() {
     let sealed = [&f.context.header[..], &f.first, &f.last].concat();
     let eof_ready = Cell::new(false);
     let eof_reads = Cell::new(0);
+    let dropped = Cell::new(false);
 
     let (outcome, play) = EnrolledPlayback::start(None, f.pins(), f.media_input(), now()).unwrap();
     assert_eq!(outcome, RangeOutcome::Full);
@@ -260,6 +341,7 @@ async fn sequential_playback_waits_for_one_eof_at_the_short_final_frame() {
                     bytes: Body(&sealed),
                     eof_ready: &eof_ready,
                     eof_reads: &eof_reads,
+                    dropped: &dropped,
                 },
             })
         })
@@ -272,19 +354,33 @@ async fn sequential_playback_waits_for_one_eof_at_the_short_final_frame() {
     let first = first.unwrap().unwrap();
     assert_eq!(first.as_slice(), &plaintext[..65_536]);
     assert_eq!(eof_reads.get(), 0);
-    play.written(first.as_slice().len()).unwrap();
+    assert_eq!(play.served_bytes(), 0);
+    play.written(1).unwrap();
+    assert_eq!(play.served_bytes(), 1);
+    assert_eq!(play.next_page(now()), Err(PlaybackError::Delivery));
+    play.written(first.as_slice().len() - 1).unwrap();
 
-    let last = {
-        // Drive the pending EOF read explicitly, without a timer or socket.
-        let mut next = std::pin::pin!(play.next(f.page(), now));
-        assert!(futures_util::poll!(&mut next).is_pending());
-        assert_eq!(eof_reads.get(), 1);
-        eof_ready.set(true);
-        let Poll::Ready(part) = futures_util::poll!(&mut next) else {
-            panic!("the final frame must be ready once the body confirms EOF");
-        };
-        part.unwrap().unwrap()
+    // Drive the pending EOF read explicitly, without a timer or socket.
+    let mut next = Box::pin(play.next(f.page(), now));
+    assert!(futures_util::poll!(&mut next).is_pending());
+    assert_eq!(eof_reads.get(), 1);
+    assert!(!dropped.get());
+    if cancel {
+        drop(next);
+        assert!(dropped.get());
+        assert_eq!(play.next_page(now()), Err(PlaybackError::Stopped));
+        assert_eq!(play.written(1), Err(PlaybackError::Delivery));
+        assert_eq!(play.served_bytes(), 65_536);
+        assert_eq!(play.finish(), Err(PlaybackError::Delivery));
+        return;
+    }
+    eof_ready.set(true);
+    let Poll::Ready(part) = futures_util::poll!(&mut next) else {
+        panic!("the final frame must be ready once the body confirms EOF");
     };
+    let last = part.unwrap().unwrap();
+    drop(next);
+    assert!(dropped.get());
     assert_eq!(last.as_slice(), &plaintext[65_536..]);
     assert_eq!(play.served_bytes(), 65_536);
     play.written(last.as_slice().len()).unwrap();

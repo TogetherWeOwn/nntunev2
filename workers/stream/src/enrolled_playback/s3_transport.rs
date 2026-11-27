@@ -27,6 +27,7 @@ use worker::{
 use zeroize::Zeroizing;
 
 use super::{read_observation::ReadObservation, S3Get, S3GetReply};
+pub(super) use crate::s3_range_response::valid_version;
 use crate::{
     grant::{hmac_sha256, sha256},
     s3_range_response::{read_exact, require_eof, validate_s3_range_metadata, S3RangeResponse},
@@ -297,14 +298,6 @@ pub(super) fn hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
-}
-
-pub(super) fn valid_version(version: &str) -> bool {
-    !matches!(version, "" | "null")
-        && version.len() <= 1024
-        && version
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && byte != b',')
 }
 
 fn length(headers: &Headers) -> io::Result<Option<u64>> {
