@@ -1,6 +1,10 @@
+function validMediaTime(seconds: number): boolean {
+	return Number.isFinite(seconds) && seconds >= 0 && seconds <= Number.MAX_SAFE_INTEGER;
+}
+
 /** Format seconds as `m:ss`, or `h:mm:ss` once an hour or more. */
 export function formatDuration(totalSeconds: number): string {
-	const whole = Math.max(0, Math.floor(totalSeconds));
+	const whole = validMediaTime(totalSeconds) ? Math.floor(totalSeconds) : 0;
 	const hours = Math.floor(whole / 3600);
 	const minutes = Math.floor((whole % 3600) / 60);
 	const seconds = whole % 60;
@@ -18,15 +22,15 @@ export interface TrackTime {
 
 /**
  * Derive elapsed/remaining/total display strings from media seconds. An
- * unknown duration (non-finite or negative) yields null coordinates, never
+ * unknown duration (outside the safe nonnegative range) yields null coordinates, never
  * zero; a finite zero duration is known. Unknown elapsed normalizes to zero,
  * finite elapsed clamps to `[0, duration]` when known, and fractions floor
  * after clamping/subtraction.
  */
 export function deriveTrackTime(currentTime: number, duration: number): TrackTime {
-	const elapsedRaw = Number.isFinite(currentTime) ? currentTime : 0;
-	const known = Number.isFinite(duration) && duration >= 0;
-	const clamped = known ? Math.min(Math.max(0, elapsedRaw), duration) : elapsedRaw;
+	const elapsedRaw = validMediaTime(currentTime) ? currentTime : 0;
+	const known = validMediaTime(duration);
+	const clamped = known ? Math.min(elapsedRaw, duration) : elapsedRaw;
 	return {
 		elapsed: formatDuration(clamped),
 		remaining: known ? formatDuration(duration - clamped) : null,

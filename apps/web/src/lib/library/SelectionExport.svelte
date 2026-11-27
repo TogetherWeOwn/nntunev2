@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
+	import { createM3UDownload, m3uDownloadFailure } from '#lib/player/m3uDownload.js';
 	import { createQueue, formatQueueM3U, formatQueueText } from '#lib/player/queue.js';
 	import type { LibraryItem } from './cache.js';
 	import { appendSelection } from './selection.js';
@@ -21,29 +22,30 @@
 	let fallback = $state<string | null>(null);
 	let generation = 0;
 	let alive = true;
-	let downloadUrl: string | null = null;
-
-	function releaseDownload(): void {
-		if (downloadUrl !== null) URL.revokeObjectURL(downloadUrl);
-		downloadUrl = null;
-	}
+	let actionKey: string | undefined;
+	let downloadKey: string | undefined;
+	const download = createM3UDownload();
 
 	function beginExport(): number {
 		generation += 1;
+		actionKey = selectionKey;
 		status = '';
 		fallback = null;
 		return generation;
 	}
 
 	$effect(() => {
-		selectionKey;
-		beginExport();
+		if (selectionKey !== actionKey) beginExport();
+		if (downloadKey !== undefined && selectionKey !== downloadKey) {
+			download.release();
+			downloadKey = undefined;
+		}
 	});
 
 	onDestroy(() => {
 		alive = false;
 		generation += 1;
-		releaseDownload();
+		download.release();
 	});
 
 	async function copySelectedText(): Promise<void> {
@@ -79,6 +81,7 @@
 	function downloadSelectedM3U(): void {
 		beginExport();
 		if (!alive || snapshot.tracks.length === 0) return;
+		const key = selectionKey;
 		let m3u: string;
 		try {
 			m3u = formatQueueM3U(snapshot);
@@ -86,23 +89,17 @@
 			status = 'Could not export the selection: it contains an unsafe track id.';
 			return;
 		}
-		const link = document.createElement('a');
+		let link: HTMLAnchorElement | undefined;
 		try {
-			// Keep one URL until the next download or teardown, not a timer
-			// that could revoke it while the browser is still saving the file.
-			releaseDownload();
-			downloadUrl = URL.createObjectURL(new Blob([m3u], { type: 'audio/x-mpegurl;charset=utf-8' }));
-			link.href = downloadUrl;
-			link.download = 'selected.m3u';
-			link.hidden = true;
-			document.body.append(link);
-			link.click();
-			status = 'Download started. Check your browser’s downloads for selected.m3u.';
+			link = document.createElement('a');
+			status = download.download(link, () => m3u, 'selected.m3u');
+			downloadKey = key;
 		} catch {
-			releaseDownload();
-			status = 'Could not start the download. Try again or copy the selected tracks as text.';
+			download.release();
+			downloadKey = undefined;
+			status = m3uDownloadFailure('selected tracks');
 		} finally {
-			link.remove();
+			link?.remove();
 		}
 	}
 </script>

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import {
-		MAX_REVISION, PAGE_SIZE, STATUSES, readJob, readQueue, uploadMessage,
+		MAX_REVISION, PAGE_SIZE, STATUSES, readDetail, readJob, readQueue, uploadMessage,
 		type IngestRequests, type ReviewQueue, type ReviewStatus
 	} from './requests.js';
 
@@ -31,6 +31,7 @@
 		event.preventDefault();
 		if (uploading || signal.aborted) return;
 		const files = Array.from(picker.files ?? []);
+		if (files.length === 0) return;
 		picker.value = '';
 		uploads = files.map(({ name }) => ({ name, message: 'Waiting' }));
 		completed = 0;
@@ -87,6 +88,8 @@
 
 	async function openJob(id: string) {
 		if (busy || signal.aborted) return;
+		const listed = queue?.jobs.find((row) => row.job_id === id);
+		if (!listed) return;
 		reviewHeading.focus();
 		busy = true;
 		job = undefined;
@@ -95,9 +98,7 @@
 			const result = await requests.detail(id, signal);
 			if (signal.aborted) return;
 			if (result.status !== 200) return reviewFailure(result.status);
-			const detail = readJob(result.body);
-			if (detail.job_id !== id) throw new Error('Unexpected review job');
-			job = detail;
+			job = readDetail(result.body, listed);
 			await tick();
 			if (!signal.aborted) detailHeading?.focus();
 		} catch {

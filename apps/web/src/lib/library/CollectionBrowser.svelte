@@ -29,24 +29,29 @@
 		const owner = accountSession;
 		const current = () => !request.signal.aborted && run === runIfCurrent && owner === accountSession &&
 			(!owner || owner.isCurrent()) && !requiresSignIn && selected === filter;
-		const started = await run?.(() => {
-			if (!current()) return;
-			const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal, session: owner && { owner } });
-			// Settle the request outside the receipt lock, including early failures.
-			return { result: loadCollections(client, selected).then(
-				(rows) => ({ rows, error: undefined }), (error: unknown) => ({ rows: undefined, error })
-			) };
-		});
-		const result = await started?.result;
-		if (result && await run?.(() => {
-			if (!current()) return;
-			rows = result.rows ?? [];
-			status = result.rows ? 'ready' : result.error instanceof ApiError && result.error.status === 401 ? 'sign-in' : 'error';
-			if (status === 'sign-in') query = '';
-			if (!result.rows) request.abort();
-			return true;
-		})) return;
-		if (current()) status = 'unverified';
+		try {
+			const started = await run?.(() => {
+				if (!current()) return;
+				const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal, session: owner && { owner } });
+				// Settle the request outside the receipt lock, including early failures.
+				return { result: loadCollections(client, selected).then(
+					(rows) => ({ rows, error: undefined }), (error: unknown) => ({ rows: undefined, error })
+				) };
+			});
+			const result = await started?.result;
+			if (result) await run?.(() => {
+				if (!current()) return;
+				rows = result.rows ?? [];
+				status = result.rows ? 'ready' : result.error instanceof ApiError && result.error.status === 401 ? 'sign-in' : 'error';
+				if (status === 'sign-in') query = '';
+			});
+		} catch {
+			// A failed receipt cannot authorize publishing collection data.
+		}
+		if (active === request && !request.signal.aborted && status === 'loading') {
+			query = '';
+			status = 'unverified';
+		}
 	}
 	$effect(() => {
 		if (requiresSignIn) {

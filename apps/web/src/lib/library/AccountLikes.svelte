@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { onMount } from 'svelte';
+	import { onDestroy, untrack } from 'svelte';
 	import { ApiClient, ApiError } from '../api/client.js';
-	import { captureAuthFence, type AccountSession } from '../auth-fence.js';
+	import { observeAccountSession, type AccountSession } from '../auth-fence.js';
 	import { verifiedFavoritesKey, type SnapshotStorage } from './cache.js';
 	import { importDeviceLikes, loadLikes, type LibraryLike } from './likes.js';
 	import { verifyLibrarySession } from './session-verification.js';
@@ -24,6 +24,8 @@
 	let shelfSession: AccountSession | undefined;
 	let importing = $state(false), feedback = $state('');
 	let active: AbortController | undefined;
+	let requestedBinding = $state<string>();
+	const account = observeAccountSession(() => clearShelf('error'));
 	const songs = $derived(likes.filter((like) => like.kind === 'track'));
 	const canImport = $derived(!!shelfBinding && shelfBinding === libraryBinding && !!deviceScope && deviceCount > 0);
 
@@ -38,30 +40,39 @@
 	}
 
 	function sessionChanged() {
-		active?.abort();
+		clearShelf('sign-in');
 		onSessionChanged();
 	}
 
+	function clearShelf(next: 'loading' | 'error' | 'sign-in') {
+		active?.abort();
+		likes = [];
+		shelfSession = shelfBinding = undefined;
+		feedback = '';
+		importing = false;
+		phase = next;
+	}
+
 	async function read(signal: AbortSignal, owner: AccountSession, expected?: string) {
-		const run: AccountSession['run'] = (work) => owner.run(() => signal.aborted ? undefined : work());
+		const run: AccountSession['run'] = (work) => owner.run(() =>
+			!signal.aborted && libraryBinding === expected ? work() : undefined);
 		try {
 			const started = await run(() => ({ response: loadLikes(clientFor(owner, signal)) }));
-			if (!started) return;
+			if (!started) throw new Error('No account receipt');
 			const result = await started.response;
 			const matches = await verify(run, result.binding, signal, owner);
-			if (matches === undefined) return;
-			await run(() => {
+			if (matches === undefined || !await run(() => {
 				if (!matches || (expected && expected !== result.binding)) return sessionChanged();
 				shelfSession = owner;
 				shelfBinding = result.binding;
 				likes = result.items;
 				phase = 'ready';
-			});
+				return true;
+			})) throw new Error('No verified account likes');
 		} catch (error) {
-			await run(() => { phase = error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error'; });
-		} finally {
-			if (!signal.aborted && !owner.isCurrent()) onVerificationSuspended();
-			else if (!signal.aborted && phase === 'loading') phase = 'error';
+			if (signal.aborted || libraryBinding !== expected) return;
+			clearShelf(error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error');
+			if (!owner.isCurrent()) onVerificationSuspended();
 		}
 	}
 
@@ -70,10 +81,12 @@
 		return (await run(() => ({ response: verifyLibrarySession(binding, signal, owner) })))?.response;
 	}
 
-	async function load() {
-		const signal = begin(), expected = libraryBinding;
-		phase = 'loading';
-		const owner = await captureAuthFence();
+	async function load(expected = libraryBinding) {
+		account.prepare();
+		clearShelf('loading');
+		requestedBinding = expected;
+		const signal = begin();
+		const owner = await account.capture();
 		if (signal.aborted) return;
 		if (!owner) { phase = 'error'; return; }
 		await read(signal, owner, expected);
@@ -120,21 +133,23 @@
 		}
 	}
 
-	onMount(() => {
-		void load();
+	$effect(() => {
+		const expected = libraryBinding;
+		untrack(() => { void load(expected); });
 		return () => active?.abort();
 	});
+	onDestroy(account.dispose);
 </script>
 
 <section aria-labelledby="liked-songs-heading">
 	<h2 id="liked-songs-heading">Liked Songs</h2>
-	{#if phase === 'loading'}
+	{#if phase === 'loading' || requestedBinding !== libraryBinding}
 		<p role="status">Loading your liked songs…</p>
 	{:else if phase === 'sign-in'}
 		<p><a href="/login">Sign in</a> to see your liked songs.</p>
 	{:else if phase === 'error'}
 		<p role="alert">Could not load your liked songs.</p>
-		<button class="nt-button nt-button--ghost" type="button" onclick={load}>Retry liked songs</button>
+		<button class="nt-button nt-button--ghost" type="button" onclick={() => void load()}>Retry liked songs</button>
 	{:else}
 		{#if songs.length === 0}
 			<p>No songs saved to this account yet.</p>
@@ -152,5 +167,5 @@
 			</button>
 		{/if}
 	{/if}
-	<p role="status">{feedback}</p>
+	<p role="status">{requestedBinding === libraryBinding ? feedback : ''}</p>
 </section>

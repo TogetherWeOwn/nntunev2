@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { onMount } from 'svelte';
 	import { ApiClient, ApiError } from '../api/client.js';
 	import { observeAccountSession } from '../auth-fence.js';
 	import { subscribeLocalAuthTransition } from '../auth-transition.js';
@@ -51,7 +52,7 @@
 					});
 					if (listed) titles = recentPlayTitles(await listed.items);
 				} catch (error) {
-					if (error instanceof ApiError && error.status === 401) throw error;
+					if (error instanceof ApiError && [401, 403, 412].includes(error.status)) throw error;
 					// A missing catalogue label is not a missing play.
 				}
 			}
@@ -62,13 +63,13 @@
 		}
 	}
 
-	$effect(() => {
+	onMount(() => {
 		function reset(): void {
 			active?.abort();
 			view = { kind: 'sign-in' };
 		}
 		function onStorage(event: StorageEvent): void {
-			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) reset();
+			if (event.key === null || event.key === LIBRARY_AUTH_TRANSITION_KEY) reset();
 		}
 		const unsubscribe = subscribeLocalAuthTransition(reset);
 		window.addEventListener('storage', onStorage);

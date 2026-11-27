@@ -26,8 +26,8 @@ export function findNeedle(query: string): FindNeedle {
 }
 
 /** Title/artist metadata side: lowercased, NFC. Never trimmed. */
-export function canonicalMetadata(value: string): string {
-	return value.toLowerCase().normalize('NFC');
+export function canonicalMetadata(value: unknown): string {
+	return typeof value === 'string' ? value.toLowerCase().normalize('NFC') : '';
 }
 
 /**
@@ -35,6 +35,6 @@ export function canonicalMetadata(value: string): string {
  * Ids are identifiers, not metadata, so canonical equivalence never applies;
  * pair it with `FindNeedle.literal`.
  */
-export function literalId(id: string): string {
-	return id.toLowerCase();
+export function literalId(id: unknown): string {
+	return typeof id === 'string' ? id.toLowerCase() : '';
 }

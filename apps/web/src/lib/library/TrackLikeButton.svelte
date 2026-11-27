@@ -3,17 +3,18 @@
 	import type { TrackLikeControl } from './track-like-controls.js';
 
 	let { title, control }: { title: string; control: TrackLikeControl } = $props();
+	const available = $derived(typeof control.liked === 'boolean' && control.pending === false);
 </script>
 
 <button
 	type="button"
 	class="nt-track-like"
 	aria-label={`Like ${title}`}
-	aria-pressed={control.liked}
-	aria-disabled={control.pending}
-	onclick={() => { if (!control.pending) void control.toggle(); }}
+	aria-pressed={control.liked === true}
+	aria-disabled={!available}
+	onclick={() => { if (available) void control.toggle(); }}
 >
-	<Icon name={control.liked ? 'heart-filled' : 'heart'} />
+	<Icon name={control.liked === true ? 'heart-filled' : 'heart'} />
 </button>
 
 <style>
