@@ -210,7 +210,8 @@ impl DurableObject for TranscodeContainer {
         }
         // Expiry drops local work. Already dispatched I/O can still settle.
         let deadline = Box::pin(Delay::from(Duration::from_millis(DO_TRANSCODE_DEADLINE_MS)));
-        match select(deadline, Box::pin(self.run(&parsed))).await {
+        let outcome = select(deadline, Box::pin(self.run(&parsed))).await;
+        match outcome {
             Either::Right((Ok(body), _)) => json_response(200, body),
             Either::Right((Err(fault), _)) => fault_response(&fault),
             Either::Left(_) => fault_response(&transcode_unavailable_fault()),

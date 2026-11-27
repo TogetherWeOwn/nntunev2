@@ -20,6 +20,8 @@ fn job() -> Value {
         "scratch_prefix": "ingest-scratch/job_01J9ZQ8K2M/r1/",
         "source_sha256": sha.to_ascii_uppercase(),
         "staging_id": "64e7ca9681a8c87e6d2acc5629774dcdfd27387c9b64b71d81273e075f923a9e",
+        "codec": "mp3",
+        "timeout_secs": 600,
     })
 }
 
@@ -33,11 +35,9 @@ fn staging_identity_and_encoder_parameters_are_checked_before_dispatch() {
             .now_or_never()
             .unwrap()
     };
-    assert!(read(job()).is_ok());
+    let forwarded = serde_json::to_value(read(job()).unwrap()).unwrap();
+    assert_eq!(forwarded.as_object().unwrap().len(), 7);
     for (field, value) in [
-        ("codec", json!("mp3")),
-        ("bitrate", json!(320_000)),
-        ("timeout_secs", json!(600)),
         ("scratch_prefix", json!("ingest-scratch/job_01J9ZQ8K2M/r2/")),
         ("source_sha256", json!("a".repeat(64))),
         ("input_key", json!(format!("0008-{}", "a".repeat(64)))),

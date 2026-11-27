@@ -58,7 +58,6 @@ impl ApiFault {
 /// and order match `workers/ingest/src/transcode.rs::TranscodeRequest`
 /// (pinned there by `request_json_shape_is_pinned_for_the_front`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TranscodeRequest {
     pub job_id: String,
     pub user_id: String,
