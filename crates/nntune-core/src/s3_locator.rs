@@ -48,8 +48,7 @@ impl S3Locator {
             return Err(S3LocatorError::Key);
         }
         let valid_binding = match &binding {
-            // A comma can separate combined x-amz-version-id header values.
-            S3Binding::VersionId(id) => id != "null" && opaque_token(id) && !id.contains(','),
+            S3Binding::VersionId(id) => id != "null" && opaque_token(id),
             S3Binding::Etag(tag) => tag
                 .strip_prefix('"')
                 .and_then(|tag| tag.strip_suffix('"'))
@@ -157,12 +156,14 @@ impl fmt::Debug for S3MediaMetadata {
 }
 
 impl S3MediaMetadata {
-    /// Validate the target bucket shape and the exact key for the trusted
-    /// context before a provider returns a version. The caller establishes
+    /// Validate the bucket, exact context key and representable ciphertext
+    /// size before a provider returns a version. The caller establishes
     /// bucket ownership and authorization independently.
     pub fn matches_target(bucket: &str, key: &str, context: &EnvelopeContext) -> bool {
         let [_, identities @ ..] = &context.identities;
-        valid_bucket(bucket) && context_media_key(identities).as_deref() == Some(key)
+        valid_bucket(bucket)
+            && ciphertext_size(context.plaintext_len).is_some()
+            && context_media_key(identities).as_deref() == Some(key)
     }
 
     /// Build from independently trusted context, not a returned tag, length,

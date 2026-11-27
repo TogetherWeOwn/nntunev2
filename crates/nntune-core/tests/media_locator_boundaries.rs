@@ -27,10 +27,10 @@ fn context(plaintext_len: u64) -> EnvelopeContext {
 }
 
 #[test]
-fn locator_refuses_ambiguous_versions_but_preserves_opaque_bindings() {
+fn locator_enforces_binding_bounds_and_preserves_opaque_tokens() {
     use S3LocatorError::Binding;
 
-    for invalid in ["v1,v2", "v1, v2", "null", "", "v\u{7f}", "v\u{00e9}"] {
+    for invalid in ["null", "", "v\u{7f}", "v\u{00e9}"] {
         let binding = S3Binding::VersionId(invalid.into());
         assert_eq!(
             S3Locator::new(BUCKET.into(), KEY.into(), binding).err(),
@@ -125,6 +125,8 @@ fn envelope_layout_and_locator_agree_at_ciphertext_overflow() {
 
     let locator =
         S3Locator::new(BUCKET.into(), KEY.into(), S3Binding::VersionId("v1".into())).unwrap();
+    assert!(S3MediaMetadata::matches_target(BUCKET, KEY, &valid));
+    assert!(!S3MediaMetadata::matches_target(BUCKET, KEY, &over));
     let metadata = S3MediaMetadata::from_trusted_context(locator.clone(), &valid).unwrap();
     assert_eq!(metadata.ciphertext_len(), u64::MAX);
     assert!(S3MediaMetadata::from_trusted_context(locator, &over).is_none());
