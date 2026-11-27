@@ -32,11 +32,12 @@ pub fn plan_range(plaintext_len: u64, start: u64, end: u64) -> Option<RangeSpan>
     let object_len = ciphertext_size(plaintext_len)?;
     let first_chunk = start / PLAIN_CHUNK_SIZE;
     let last_chunk = end / PLAIN_CHUNK_SIZE;
+    let next_chunk = last_chunk.checked_add(1)?;
     let ciphertext_start = chunk_offset(first_chunk)?;
-    let ciphertext_end = if last_chunk.checked_add(1)? == chunk_count(plaintext_len) {
+    let ciphertext_end = if next_chunk == chunk_count(plaintext_len) {
         object_len
     } else {
-        chunk_offset(last_chunk.checked_add(1)?)?
+        chunk_offset(next_chunk)?
     };
     Some(RangeSpan {
         first_chunk,
@@ -61,10 +62,11 @@ pub fn plan_articles(plaintext_len: u64, chunks_per_article: u64) -> Option<Vec<
         return None;
     }
     let total = ciphertext_size(plaintext_len)?;
-    let mut spans = Vec::with_capacity(count as usize);
+    let mut spans = Vec::new();
+    spans.try_reserve_exact(usize::try_from(count).ok()?).ok()?;
     let mut first = 0;
     while first < chunks {
-        let end = first.saturating_add(chunks_per_article).min(chunks);
+        let end = first + chunks_per_article.min(chunks - first);
         let plaintext_start = first.checked_mul(PLAIN_CHUNK_SIZE)?.min(plaintext_len);
         let plaintext_end = if end == chunks {
             plaintext_len

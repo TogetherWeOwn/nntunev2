@@ -7,6 +7,8 @@ use std::fmt::{self, Write};
 
 use crate::{envelope::is_valid_jsonp_callback, value::Value};
 
+const MAX_DEPTH: usize = 64;
+
 #[derive(Clone, Copy)]
 pub enum Format<'a> {
     Json,
@@ -46,7 +48,8 @@ impl Write for Sink<'_> {
 }
 
 /// Count a complete document before the caller charges and allocates its buffer.
-/// Equality with `limit` is allowed; invalid callbacks are never reflected.
+/// Equality with `limit` is allowed, with at most 64 nesting levels below the
+/// root. Invalid callbacks are never reflected.
 pub fn encoded_len(doc: &Value, format: Format<'_>, limit: usize) -> Result<usize, RenderError> {
     if let Format::Jsonp(callback) = format {
         if !is_valid_jsonp_callback(callback) {
@@ -86,7 +89,7 @@ fn document(doc: &Value, format: Format<'_>, out: &mut Sink<'_>) -> fmt::Result 
                 write!(out, "/**/{callback}(")?;
             }
             out.write_str("{\"subsonic-response\":")?;
-            json(doc, out)?;
+            json(doc, out, 0)?;
             out.write_str("}")?;
             if matches!(format, Format::Jsonp(_)) {
                 out.write_str(");")?;
@@ -95,12 +98,21 @@ fn document(doc: &Value, format: Format<'_>, out: &mut Sink<'_>) -> fmt::Result 
         }
         Format::Xml => {
             out.write_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")?;
-            xml(doc, "subsonic-response", out)
+            let mut has_root = false;
+            xml_root(doc, out, 0, &mut has_root)?;
+            if has_root {
+                Ok(())
+            } else {
+                Err(fmt::Error)
+            }
         }
     }
 }
 
-fn json(value: &Value, out: &mut Sink<'_>) -> fmt::Result {
+fn json(value: &Value, out: &mut Sink<'_>, depth: usize) -> fmt::Result {
+    if depth > MAX_DEPTH {
+        return Err(fmt::Error);
+    }
     match value {
         Value::Null => out.write_str("null"),
         Value::Bool(b) => out.write_str(if *b { "true" } else { "false" }),
@@ -114,7 +126,7 @@ fn json(value: &Value, out: &mut Sink<'_>) -> fmt::Result {
                     out.write_char(',')?;
                 }
                 first = false;
-                json(item, out)?;
+                json(item, out, depth + 1)?;
             }
             out.write_char(']')
         }
@@ -128,7 +140,7 @@ fn json(value: &Value, out: &mut Sink<'_>) -> fmt::Result {
                 first = false;
                 json_string(key, out)?;
                 out.write_char(':')?;
-                json(value, out)?;
+                json(value, out, depth + 1)?;
             }
             out.write_char('}')
         }
@@ -171,7 +183,27 @@ fn scalar(value: &Value, out: &mut Sink<'_>) -> fmt::Result {
     }
 }
 
-fn xml(value: &Value, name: &str, out: &mut Sink<'_>) -> fmt::Result {
+fn xml_root(value: &Value, out: &mut Sink<'_>, depth: usize, has_root: &mut bool) -> fmt::Result {
+    if depth > MAX_DEPTH {
+        return Err(fmt::Error);
+    }
+    if let Value::List(items) = value {
+        for item in items {
+            xml_root(item, out, depth + 1, has_root)?;
+        }
+        return Ok(());
+    }
+    if *has_root {
+        return Err(fmt::Error);
+    }
+    *has_root = true;
+    xml(value, "subsonic-response", out, depth)
+}
+
+fn xml(value: &Value, name: &str, out: &mut Sink<'_>, depth: usize) -> fmt::Result {
+    if depth > MAX_DEPTH {
+        return Err(fmt::Error);
+    }
     match value {
         Value::Map(entries) => {
             write!(out, "<{name}")?;
@@ -181,6 +213,9 @@ fn xml(value: &Value, name: &str, out: &mut Sink<'_>) -> fmt::Result {
                 match val {
                     Value::Null => {}
                     Value::Bool(_) | Value::Int(_) | Value::Str(_) => {
+                        if depth == MAX_DEPTH {
+                            return Err(fmt::Error);
+                        }
                         if key == "value" && matches!(val, Value::Str(_)) {
                             if let Value::Str(s) = val {
                                 text = Some(s.as_str());
@@ -215,19 +250,10 @@ fn xml(value: &Value, name: &str, out: &mut Sink<'_>) -> fmt::Result {
             }
             for (key, val) in entries {
                 match val {
-                    Value::Map(_) => xml(val, key, out)?,
+                    Value::Map(_) => xml(val, key, out, depth + 1)?,
                     Value::List(items) => {
                         for item in items.iter().filter(|v| !matches!(v, Value::Null)) {
-                            if matches!(item, Value::List(_)) {
-                                return Err(fmt::Error);
-                            }
-                            if matches!(item, Value::Map(_)) {
-                                xml(item, key, out)?;
-                            } else {
-                                write!(out, "<{key}>")?;
-                                scalar(item, out)?;
-                                write!(out, "</{key}>")?;
-                            }
+                            xml(item, key, out, depth + 2)?;
                         }
                     }
                     _ => {}
@@ -235,12 +261,7 @@ fn xml(value: &Value, name: &str, out: &mut Sink<'_>) -> fmt::Result {
             }
             write!(out, "</{name}>")
         }
-        Value::List(items) => {
-            for item in items {
-                xml(item, name, out)?;
-            }
-            Ok(())
-        }
+        Value::List(_) => Err(fmt::Error),
         _ => {
             write!(out, "<{name}>")?;
             scalar(value, out)?;

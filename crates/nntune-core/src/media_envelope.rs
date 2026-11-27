@@ -11,7 +11,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::digest_context::context_hash;
+use crate::digest_context::{context_hash, is_uuid_v4};
 use crate::digest_enrollment::OriginManifest;
 use crate::media::{ciphertext_size, FileKey, Header, KeyMode, Profile, VerifiedHeader};
 
@@ -26,21 +26,18 @@ pub struct EnvelopeContext {
 /// Check the exact scheme-2 encoding and trusted prefix, without decrypting.
 /// This does not check the wrapped key, tag, header commitment or ciphertext.
 pub fn matches_scheme2(record: &[u8], expected: &EnvelopeContext) -> bool {
-    if record.len() != 230 || &record[..10] != b"NNTMED01\0\x02" {
-        return false;
+    matching_prefix(record, expected).is_ok()
+}
+
+fn matching_prefix(record: &[u8], expected: &EnvelopeContext) -> Result<[u8; 170], EnvelopeError> {
+    if record.len() != 230 || record[170..182] != [0; 12] {
+        return Err(EnvelopeError::InvalidContext);
     }
-    for (i, id) in expected.identities.iter().enumerate() {
-        if id[6] >> 4 != 4 || id[8] >> 6 != 2 || record[10 + 16 * i..26 + 16 * i] != id[..] {
-            return false;
-        }
+    let prefix = prefix(expected)?;
+    if record[..170] != prefix {
+        return Err(EnvelopeError::InvalidContext);
     }
-    let Some(encoded_len) = ciphertext_size(expected.plaintext_len) else {
-        return false;
-    };
-    record[106..114] == expected.plaintext_len.to_be_bytes()
-        && record[114..122] == encoded_len.to_be_bytes()
-        && record[122..170] == expected.header
-        && record[170..182] == [0; 12]
+    Ok(prefix)
 }
 
 /// Internal failure class; callers must not expose it as a public oracle.
@@ -60,7 +57,7 @@ fn prefix(context: &EnvelopeContext) -> Result<[u8; 170], EnvelopeError> {
     let mut bytes = [0; 170];
     bytes[..10].copy_from_slice(b"NNTMED01\0\x02");
     for (i, id) in context.identities.iter().enumerate() {
-        if id[6] >> 4 != 4 || id[8] >> 6 != 2 {
+        if !is_uuid_v4(id) {
             return Err(EnvelopeError::InvalidContext);
         }
         bytes[10 + i * 16..26 + i * 16].copy_from_slice(id);
@@ -128,10 +125,7 @@ pub fn unwrap_scheme2(
     context: &EnvelopeContext,
     record: &[u8],
 ) -> Result<Zeroizing<[u8; 32]>, EnvelopeError> {
-    if !matches_scheme2(record, context) {
-        return Err(EnvelopeError::InvalidContext);
-    }
-    let prefix = prefix(context)?;
+    let prefix = matching_prefix(record, context)?;
     let cipher = cipher(root, &prefix)?;
     let plaintext = Zeroizing::new(
         cipher

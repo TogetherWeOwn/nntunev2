@@ -16,7 +16,10 @@ pub struct DigestReadSnapshot<'a> {
     pub plaintext_len: u64,
     pub plaintext_sha256: [u8; 32],
     pub map_id: [u8; 16],
+    /// An opaque provider version pinned to this media object.
     pub media_version: &'a str,
+    /// Opaque provider versions in canonical digest page order.
     pub page_versions: &'a [String],
+    /// Exclusive deadline. The reader checks the clock before provider reads.
     pub usable_until: SystemTime,
 }

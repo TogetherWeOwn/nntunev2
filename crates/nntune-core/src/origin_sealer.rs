@@ -1,12 +1,13 @@
 //! Bounded new-upload sealer. Digests are trusted only when retained from this
 //! origin; this module does not publish, persist, or authenticate a digest map.
 
-use crate::media::{self, FileKey, Header, Profile, Sealer, PLAIN_CHUNK_SIZE};
+use crate::digest_geometry::{DigestGeometry, MAX_PLAINTEXT};
+use crate::media::{FileKey, Header, Profile, Sealer, PLAIN_CHUNK_SIZE};
 use crate::rng::{FillRandom, SystemRng};
 use sha2::{Digest, Sha256};
 
 /// Maximum plaintext length for the new digest-map format (not a legacy read limit).
-pub const MAX_NEW_PLAINTEXT: u64 = 1 << 33;
+pub const MAX_NEW_PLAINTEXT: u64 = MAX_PLAINTEXT;
 
 /// One exact ciphertext-and-tag chunk and its origin digest (header excluded).
 pub struct SealedChunk {
@@ -31,9 +32,7 @@ impl OriginSealer {
     }
 
     fn with_rng<R: FillRandom>(plaintext_len: u64, rng: &mut R) -> crate::Result<Self> {
-        if !(1..=MAX_NEW_PLAINTEXT).contains(&plaintext_len)
-            || media::ciphertext_size(plaintext_len).is_none()
-        {
+        if plaintext_len == 0 || DigestGeometry::new(plaintext_len).is_none() {
             return Err(crate::Error::Malformed("invalid new media length".into()));
         }
         let key = FileKey::generate(rng)?;
@@ -86,6 +85,7 @@ impl OriginSealer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media;
 
     struct Fixed(u8);
     impl FillRandom for Fixed {

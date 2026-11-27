@@ -4,11 +4,13 @@
 //! authorize serving. Empty input is supported for codec/restore fixtures only;
 //! admission of new media remains the responsibility of the origin sealer.
 
-use crate::media::{chunk_offset, PLAIN_CHUNK_SIZE as CHUNK};
+use crate::media::{
+    chunk_count, chunk_offset, ciphertext_size, PLAIN_CHUNK_SIZE as CHUNK, TAG_SIZE,
+};
 use std::ops::{Range, RangeInclusive};
 
 const R2_PART_BYTES: u64 = 5_244_160;
-const MAX_PLAINTEXT: u64 = 1 << 33;
+pub(crate) const MAX_PLAINTEXT: u64 = 1 << 33;
 const PAGE_ENTRIES: u32 = 256;
 const PAGE_HEADER: u32 = 92;
 pub const MAX_PAGE_ENCODED_LEN: u32 = PAGE_HEADER + PAGE_ENTRIES * 32;
@@ -104,7 +106,7 @@ impl RangeGeometry {
             return None;
         }
         let (sealed_len, _) = self.geometry.chunk(index)?;
-        let length = u64::from(sealed_len.checked_sub(16)?);
+        let length = u64::from(sealed_len).checked_sub(TAG_SIZE)?;
         let offset = u64::from(index).checked_mul(CHUNK)?;
         let page = index.checked_div(PAGE_ENTRIES)?;
         self.geometry.page(page)?;
@@ -123,14 +125,8 @@ impl DigestGeometry {
         if plaintext_len > MAX_PLAINTEXT {
             return None;
         }
-        let chunks = plaintext_len
-            .checked_add(CHUNK - 1)?
-            .checked_div(CHUNK)?
-            .max(1);
-        let sealed_len = 48_u64
-            .checked_add(plaintext_len)?
-            .checked_add(chunks.checked_mul(16)?)?;
-        let chunks = u32::try_from(chunks).ok()?;
+        let chunks = u32::try_from(chunk_count(plaintext_len)).ok()?;
+        let sealed_len = ciphertext_size(plaintext_len)?;
         let pages = chunks
             .checked_add(PAGE_ENTRIES - 1)?
             .checked_div(PAGE_ENTRIES)?;
@@ -203,7 +199,10 @@ impl DigestGeometry {
         let final_chunk = index == self.chunks - 1;
         let start = u64::from(index).checked_mul(CHUNK)?;
         let plaintext = self.plaintext_len.checked_sub(start)?.min(CHUNK);
-        Some((u32::try_from(plaintext.checked_add(16)?).ok()?, final_chunk))
+        Some((
+            u32::try_from(plaintext.checked_add(TAG_SIZE)?).ok()?,
+            final_chunk,
+        ))
     }
 }
 
