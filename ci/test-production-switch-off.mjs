@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -6,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { open, readFile, writeFile } from 'node:fs/promises';
 import { finalSmokeFixture, mainSha, recoveryFixture } from './fixtures/production-worker-transport.mjs';
 import { admitRecovery, intentFile, workflow } from './production-maintenance/recovery-evidence.mjs';
+import { rollbackNotice } from './production-maintenance/final-smoke-rollback.mjs';
 import maintenanceWorker from './production-maintenance/worker.mjs';
 
 const checkedAt = '2026-10-01T12:00:00Z';
@@ -187,6 +189,51 @@ test('interrupted recovery retries only with the sealed candidate identity', asy
   assert.deepEqual(transport.rows.slice(1), rollout);
   assert.equal(await enter(fresh('18')), 'Recorded maintenance allocation already verified');
   assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
+});
+
+test('switch-off stays pending before restore when the pinned maintenance module differs', async (t) => {
+  const transport = finalSmokeFixture(t, fixture);
+  await transport.run('record');
+  transport.shift();
+  const { evidence, fresh } = recoveryFixture(t, transport, 'success');
+  const env = fresh('13');
+  admitRecovery(env, evidence);
+  const altered = Buffer.from('export default { fetch: () => new Response(null, { status: 200 }) };\n');
+  transport.seed.modules[0].content_base64 = altered.toString('base64');
+  const observed = createHash('sha256').update(altered).digest('hex');
+  const recorded = transport.custody.maintenance.module_sha256;
+
+  const error = await transport.run('prepare-recovery', env)
+    .then(() => assert.fail('Recovery preparation reported success'), (e) => e);
+  assert.equal(rollbackNotice('prepare-recovery', error), `::error::Switch-off pending: pinned maintenance module SHA-256 ${observed} ` +
+    `differs from the rollback receipt ${recorded}. This run submitted no restore. Keep the writer freeze and ` +
+    'reconcile the pinned maintenance version and provider audit read-only.');
+  assert.equal(transport.calls.at(-1), 'GET');
+  assert.equal(transport.calls.includes('POST'), false);
+});
+
+test('switch-off stays pending when the restored maintenance module differs from the rollback receipt', async (t) => {
+  const transport = finalSmokeFixture(t, fixture);
+  await transport.run('record');
+  transport.shift();
+  const { evidence, fresh } = recoveryFixture(t, transport, 'success');
+  const env = fresh('13');
+  admitRecovery(env, evidence);
+  await transport.run('prepare-recovery', env);
+  // The provider now serves other content under the pinned maintenance version.
+  const altered = Buffer.from('export default { fetch: () => new Response(null, { status: 200 }) };\n');
+  transport.seed.modules[0].content_base64 = altered.toString('base64');
+  const restored = createHash('sha256').update(altered).digest('hex');
+  const recorded = transport.custody.maintenance.module_sha256;
+  assert.notEqual(restored, recorded);
+
+  const error = await transport.run('recover', { ...env, CLAIM_VERIFIED: 'true' })
+    .then(() => assert.fail('Recovery reported success'), (e) => e);
+  assert.equal(rollbackNotice('recover', error), `::error::Switch-off pending: restored maintenance module SHA-256 ${restored} ` +
+    `differs from the rollback receipt ${recorded}. Keep the writer freeze and reconcile the pinned maintenance version ` +
+    'and provider audit read-only.');
+  assert.deepEqual(transport.rows[0].versions, [{ version_id: version, percentage: 100 }]);
+  assert.deepEqual(transport.calls.slice(-3), ['POST', 'GET', 'GET']);
 });
 
 test('operator switch-off requires complete readback of the pinned maintenance allocation', async (t) => {
