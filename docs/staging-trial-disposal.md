@@ -1,19 +1,26 @@
 # Stage C private trial disposal preview
 
-Stage C is the protected rollout of the dedicated PostgreSQL trial. Use its
-provisioning record to plan disposal. Dispose the same day unless the lead
-retains the trial for reruns for up to seven days. Report the disposal outcome
-to the Chief of Staff. This example uses synthetic identifiers and contains no
-executable commands.
+Stage C is the protected rollout of the dedicated PostgreSQL trial. This
+synthetic partial-setup preview defers to the authoritative
+[Retire the attempt by exact ID](ops/private-staging-trial-recovery.md#retire-the-attempt-by-exact-id)
+procedure and its
+[containment and stock-target withdrawal](ops/private-staging-trial-recovery.md#confirm-containment-and-stock-target-withdrawal)
+gates, subject to the approval and retention requirements in
+[operations rules](ops.md). Use the trial provisioning record to plan disposal.
+Dispose the same day unless the lead retains the trial for reruns for up to
+seven days. Report the disposal outcome to the Chief of Staff. This example
+uses synthetic identifiers and contains no executable commands.
 
 ## Partial setup inventory
 
 In this example, both Access routes and the Hyperdrive origin CA upload were
-created. Setup stopped before sending the Hyperdrive config create request.
-The containers used only the recorded bind mounts. No serving Worker used
-the trial and no GitHub `staging` Environment inputs were set. Every
-identifier below is a placeholder, including account, zone, host and path
-references.
+created. Setup stopped before sending any of the four Hyperdrive config create
+requests (`UPLOAD`, `AUTH`, `PUBLISH`, `ENROLL`). The containers used only the
+recorded bind mounts. No runtime SQL logins were issued, no serving or Stage C2
+qualification Worker bindings were deployed, and no GitHub `staging`
+Environment inputs were set; containment and withdrawal are recorded
+inapplicable only after scoped readbacks verify those facts. Every identifier
+below is a placeholder, including account, zone, host and path references.
 
 | Resource | Recorded identifier and scope | Setup result |
 | --- | --- | --- |
@@ -25,7 +32,7 @@ references.
 | Operator Access app, app-scoped policy and service token | `<trial-op-app-id>`, its child `<trial-op-policy-id>`, and `<trial-op-token-id>` in `<trial-account-id>` | Created |
 | Hyperdrive Access app, app-scoped policy and service token | `<trial-hd-app-id>`, its child `<trial-hd-policy-id>`, and `<trial-hd-token-id>` in `<trial-account-id>` | Created |
 | Hyperdrive origin CA upload | `<trial-origin-ca-id>` in `<trial-account-id>` | Created |
-| Dedicated Hyperdrive config | `<trial-hd-config-name>` in `<trial-account-id>`, no config ID issued | Planned only |
+| Dedicated Hyperdrive configs (`UPLOAD`, `AUTH`, `PUBLISH`, `ENROLL`) | `<trial-hd-config-name>` per entry in `<trial-account-id>`, no config IDs issued | Planned only |
 | Trial-specific GitHub Environment inputs | `staging` in `<trial-repo>`, no input names created | Planned only |
 
 ## Teardown preview and absence checks
@@ -34,30 +41,51 @@ Build the preview from IDs recorded for this trial in their original account,
 zone or Docker host. Use the same record for readback. Keep the shared
 PostgreSQL clusters, existing Hyperdrive configs and staging inputs, other
 Access apps and tokens, existing tunnels and DNS records outside the preview.
-If a create timed out or its result is unknown, reconcile it in that scope
-before adding a target. A name match alone does not establish ownership.
+No list or bulk deletion is permitted. If a create or deletion timed out or its
+result is unknown, reconcile it in that scope before adding a target or
+removing its dependencies. A name match alone does not establish ownership.
+Before removing either container, save its inspected bind-mount sources and
+volume names privately against its exact ID on `<trial-docker-host>` and match
+the bind-mount sources to the original recorded roots.
 
 | Order | Targets in this example | Readback after disposal |
 | --- | --- | --- |
-| 1 | Stop and remove `<trial-connector-container-id>`. Remove `<trial-op-record-id>` and `<trial-hd-record-id>` and delete `<trial-tunnel-id>` after its connector disconnects. | Verify the connector container ID is absent, including among stopped containers, and both DNS record IDs are absent in the recorded zone. Verify the tunnel ID is absent from the account's active tunnel inventory or is explicitly marked deleted. |
+| 1 | Save `<trial-connector-container-id>`'s inspected bind-mount sources and volume names against its exact ID, then stop and remove `<trial-connector-container-id>`. Remove `<trial-op-record-id>` and `<trial-hd-record-id>` and delete `<trial-tunnel-id>` after its connector disconnects. | Verify the connector container ID is absent, including among stopped containers, and both DNS record IDs are absent in the recorded zone. Verify the tunnel ID is absent from the account's active tunnel inventory or is explicitly marked deleted. |
 | 2 | Once step 1 is verified, remove `<trial-op-app-id>` and `<trial-hd-app-id>` with their app-scoped policies, and revoke `<trial-op-token-id>` and `<trial-hd-token-id>`. | Verify both app IDs are absent. Their recorded child policies are removed with the apps. Check that both token IDs are absent from the account's service-token inventory. |
-| 3 | Remove the origin CA upload `<trial-origin-ca-id>`. | Check that the exact CA ID is absent in the account's origin certificate inventory. |
-| 4 | Stop and remove `<trial-pg-container-id>`, then remove `<trial-internal-network-id>` and `<trial-egress-network-id>`. | Check the exact container ID among running and stopped containers and both exact network IDs on the recorded Docker host. All three IDs should be absent. |
-| 5 | Securely delete the database files and generated TLS material under `<trial-data-dir>` and the connector config and credential file under `<trial-tunnel-dir>`, then remove the two dedicated directories. | Check that both exact paths are absent on the recorded host, including any leftover symlink entries. Record path status only. |
+| 3 | Remove the Hyperdrive origin CA upload `<trial-origin-ca-id>`. | Check that the exact CA ID is absent in the recorded account's Hyperdrive CA/mTLS certificate inventory. |
+| 4 | Save `<trial-pg-container-id>`'s inspected bind-mount sources and volume names against its exact ID, stop and remove `<trial-pg-container-id>`, then remove `<trial-internal-network-id>` and `<trial-egress-network-id>`. | Check the exact container ID among running and stopped containers and both exact network IDs on the recorded Docker host. All three IDs should be absent. |
+| 5 | Match `<trial-data-dir>` and `<trial-tunnel-dir>` to the saved container mount inspection and verify both roots are dedicated to this attempt before securely deleting the database files and generated TLS material under `<trial-data-dir>` and the connector config and credential file under `<trial-tunnel-dir>`, then remove the two dedicated directories. Never follow a replacement symlink and never remove a parent path. | Check that both exact paths are absent on the recorded host, including any leftover symlink entries. Record path status only. |
 
-Keep Access in place while route disposal is unverified. For any trial that
-reaches serving, disarm its rollout and unbind its dedicated config through
-the protected lane before disposal. When setup created trial-specific
-Environment inputs, remove those and read back their absence by Environment
-and input name, using metadata for secrets. If setup created a Hyperdrive
-config, remove it and verify its exact ID is absent in the recorded account
-before removing the origin CA, even if the trial never reached serving.
+Keep Access in place while route disposal is unverified. Before removing any
+trial Hyperdrive config or trial-specific Environment input, complete
+[containment and stock-target withdrawal](ops/private-staging-trial-recovery.md#confirm-containment-and-stock-target-withdrawal):
 
-If container mount metadata identifies a volume created by the trial, record
-its exact Docker volume name and host before removing the container. Include
-that volume in the preview and verify its absence on the same host. Remove
-any trial credentials held in secure custody by their recorded references.
-Record whether those references are absent without reading secret values.
+- Reconcile every Worker binding from the attempt, including bindings deployed
+  for Stage C2 qualification while the trial was disarmed. Remove trial
+  bindings through the reviewed stock-target deployment path and verify that no
+  active deployment or separately reachable Worker version still references any
+  trial config. Keep disposal pending if a binding, deployment or removal
+  result is unresolved.
+- If any runtime SQL login was issued, keep the trial disarmed and block
+  infrastructure teardown until those roles are fenced, drained and withdrawn
+  under a separately reviewed stock-target procedure with scoped readbacks.
+
+Treat the four trial Hyperdrive configs (`UPLOAD`, `AUTH`, `PUBLISH`, `ENROLL`)
+independently. Remove each verified config and confirm its exact ID is absent
+in the recorded account before removing the origin CA, even if the trial never
+reached serving. If any sent config create or deletion is unresolved, pause
+before removing the origin CA, route, Access or database resources, keep the
+trial disarmed, and retain those dependencies pending reconciliation. When setup
+created trial-specific Environment inputs, remove those after containment and
+withdrawal are verified and read back their absence by Environment and input
+name, using metadata only for secrets.
+
+If saved container mount metadata identifies a volume created by the trial,
+record its exact Docker volume name and host before removing the container,
+include that volume in the preview and verify its absence on the same host.
+Remove any trial credentials held in secure custody by their recorded
+references after their final required use. Record whether those references are
+absent without reading secret values.
 
 The table records expected checks. For an actual disposal, record each
 observed result against its ID or path. A timeout, denied lookup or wrong
