@@ -62,8 +62,8 @@ unconnected; this runtime is not a health probe, synthetic or auto-rollback.
   is returned unfollowed and treated as a failed attempt, never a retry), a
   5000ms abort/race deadline, and immediate response-body cancellation (zero body bytes retained). Errors/responses,
   webhook URL and token are never logged, stored, rendered or returned.
-- `LOGS_URL` must be an absolute HTTP(S) log-view link without credentials or
-  whitespace, at most 1024 characters; delivery endpoints are not log links.
+- `LOGS_URL` must be an absolute HTTP(S) log-view link with a literal path,
+  at most 1024 characters. Credentials, queries and fragments are rejected.
   Missing/invalid link or webhook disables delivery, **not storage cleanup**.
   The secret endpoint never reaches the renderer. Consumer observability,
   invocation logs and traces stay disabled so automatic subrequest spans cannot
@@ -182,10 +182,9 @@ input fails closed to `null` — never a fabricated alert, never a throw.
 Breach payloads carry the verdict status, the exact `failed/total`
 rational plus 4-decimal rate, the failed/total counts, leading breached
 rule names (capped), top breakdown entry keys per dimension ranked by
-failures, release SHAs, the logs URL, and the window label. Output stays
+failures, release SHAs, the logs URL, and the DO receive-time interval. Output stays
 within alert bounds (content <= 2000 chars, one embed, 6000-char total,
-<= 25 fields): oversized strings truncate to a prefix plus "…" and
-oversized lists cap to a leading prefix with a "+N more" marker, so
+<= 25 fields). Lists render a leading prefix with a "+N more" marker, so
 identical input always yields byte-identical output.
 
 The source-only runtime above imports this helper, but no live alerting is

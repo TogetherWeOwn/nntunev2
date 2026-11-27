@@ -11,9 +11,9 @@
 //   counts: {total: integer >= 1, failed: integer 0..total},
 //   rate: {failed, total} with the same rational rules plus a decimal
 //     string matching /^\d+\.\d{4}$/,
-//   thresholds: {breached_rules: [1..N non-empty strings]},
+//   thresholds: {breached_rules: [1..129 canonical rule names]},
 //   breakdowns: {by_error_class/by_release/by_route:
-//     {buckets: [{key: string}, ...]}}}
+//     {buckets: [{key: canonical grouping label}, ...]}}}
 // Only the exact pair verdict 'breach' + reason 'breach' renders.
 // counts and rate must describe the same value: rate.failed/total must
 // equal counts.failed/total and the decimal must equal the producer's
@@ -22,18 +22,14 @@
 // for rendering but rank by failures (valid non-negative integer failed
 // counts sort first, ties break by key), so the capped "Top" fields show
 // the highest-failure entries instead of alphabetical prefixes.
-// context: {logsUrl, windowLabel}, both non-empty strings; logsUrl must
-// match /^https?:\/\/[^\/\s]\S*$/ (http/https, no whitespace) and parse
-// via WHATWG URL with an http/https protocol and a non-empty hostname;
-// windowLabel must contain a non-space character.
+// context: {logsUrl, windowLabel}. A configured log-view URL uses an absolute
+// HTTP(S) link and a literal path. The window label uses the runtime's
+// DO receive-time interval of canonical UTC timestamps.
 //
 // Bounds: content <= 2000 chars, exactly one embed, payload total
 // <= 6000 chars, <= 25 fields per embed, field names 1..256 chars,
-// field values 1..1024 chars. Present-but-oversized values are tolerated
-// and bounded, never rejected: oversized strings truncate to a prefix
-// plus "…" (U+2026), dropping a trailing high surrogate so truncation
-// never emits a lone surrogate, and oversized lists cap to a leading
-// prefix with a "+N more" marker; identical input always yields
+// field values 1..1024 chars. Lists render a leading prefix with a
+// "+N more" marker; identical input always yields
 // byte-identical output.
 // The source-only runtime imports this pure helper; it carries no webhook
 // URL or secret and performs no delivery or deployment itself.
@@ -44,8 +40,12 @@ const EXPECTED_ENVIRONMENT = 'staging';
 const BREACH = 'breach';
 
 const DECIMAL_RE = /^\d+\.\d{4}$/;
-const LOGS_URL_RE = /^https?:\/\/[^/\s]\S*$/;
-const NON_BLANK_RE = /\S/;
+const LOGS_URL_RE = /^https?:\/\/[A-Za-z0-9.-]+(?::[0-9]+)?(?:\/[A-Za-z0-9._~/-]*)?$/;
+const WINDOW_LABEL_RE = /^DO receive-time \[([0-9T.Z:-]{24}), ([0-9T.Z:-]{24})\)$/;
+const ERROR_CLASS_RE = /^[a-z][a-z0-9_]{0,63}$/;
+const RELEASE_RE = /^(?:[0-9a-f]{40}|unknown)$/;
+const ROUTE_RE = /^(?:[A-Z]+ \/[A-Za-z0-9._~/{}-]*|unknown)$/;
+const RULE_RE = /^(?:overall|error_class:[a-z][a-z0-9_]{0,63}|release:(?:[0-9a-f]{40}|unknown))$/;
 const DECIMAL_SCALE = 10000;
 const DECIMAL_PLACES = 4;
 // Largest total for which failed * 20000 + total stays an exact integer
@@ -89,6 +89,7 @@ const MINIMAL_CAPS = {
 
 const DIMENSIONS = ['by_error_class', 'by_release', 'by_route'];
 const DIMENSION_TITLES = ['Top error classes', 'Top releases', 'Top routes'];
+const DIMENSION_KEYS = [ERROR_CLASS_RE, RELEASE_RE, ROUTE_RE];
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -113,11 +114,13 @@ function extractRules(thresholds) {
     if (!isRecord(thresholds)) return null;
     const rules = thresholds.breached_rules;
     if (!Array.isArray(rules)) return null;
-    if (rules.length < 1) return null;
+    const length = rules.length;
+    // One overall rule plus 64 rules for each of two keyed dimensions.
+    if (!Number.isInteger(length) || length < 1 || length > 129) return null;
     const out = [];
-    for (let i = 0; i < rules.length; i += 1) {
+    for (let i = 0; i < length; i += 1) {
       const rule = rules[i];
-      if (typeof rule !== 'string' || rule.length < 1) return null;
+      if (typeof rule !== 'string' || !RULE_RE.test(rule)) return null;
       out.push(rule);
     }
     return out;
@@ -126,17 +129,19 @@ function extractRules(thresholds) {
   }
 }
 
-function extractBucketKeys(dimension) {
+function extractBucketKeys(dimension, keyPattern) {
   try {
     if (!isRecord(dimension)) return null;
     const buckets = dimension.buckets;
     if (!Array.isArray(buckets)) return null;
+    const length = buckets.length;
+    if (!Number.isInteger(length) || length < 0 || length > 32) return null;
     const entries = [];
-    for (let i = 0; i < buckets.length; i += 1) {
+    for (let i = 0; i < length; i += 1) {
       const bucket = buckets[i];
       if (!isRecord(bucket)) return null;
       const key = bucket.key;
-      if (typeof key !== 'string') return null;
+      if (typeof key !== 'string' || key.length > 128 || !keyPattern.test(key)) return null;
       // Ranking signal only, never a rejection: buckets without a usable
       // failed count sort as zero. Reads stay inside this try so hostile
       // getters fail closed with the verdict instead of throwing.
@@ -179,7 +184,7 @@ function extractVerdict(verdict) {
     if (verdict.verdict !== BREACH) return null;
     if (verdict.reason !== BREACH) return null;
     const counts = extractRational(verdict.counts);
-    if (counts === null) return null;
+    if (counts === null || counts.failed === 0) return null;
     const rate = verdict.rate;
     const rateRational = extractRational(rate);
     if (rateRational === null) return null;
@@ -194,7 +199,7 @@ function extractVerdict(verdict) {
     if (!isRecord(breakdowns)) return null;
     const bucketsByDim = [];
     for (let i = 0; i < DIMENSIONS.length; i += 1) {
-      const keys = extractBucketKeys(breakdowns[DIMENSIONS[i]]);
+      const keys = extractBucketKeys(breakdowns[DIMENSIONS[i]], DIMENSION_KEYS[i]);
       if (keys === null) return null;
       bucketsByDim.push(keys);
     }
@@ -211,19 +216,25 @@ function extractVerdict(verdict) {
 }
 
 function isValidLogsUrl(logsUrl) {
-  // Shape first (http/https with no whitespace), then WHATWG parsing: the
-  // regex alone admits host-less URLs such as "https://?x=1" that would
-  // render a dead logs link instead of failing closed. Pure string work,
-  // no network; the original string is rendered verbatim on success.
-  if (typeof logsUrl !== 'string' || !LOGS_URL_RE.test(logsUrl)) return false;
+  if (typeof logsUrl !== 'string' || logsUrl.length > 1024 || !LOGS_URL_RE.test(logsUrl)) return false;
   try {
     const parsed = new URL(logsUrl);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-    if (parsed.hostname === '') return false;
+    if (parsed.hostname === '' || /\/api\/+(?:v[0-9]+\/+)?webhooks(?:\/|$)/i.test(parsed.pathname)) return false;
     return true;
   } catch {
     return false;
   }
+}
+
+function isValidWindowLabel(label) {
+  if (typeof label !== 'string') return false;
+  const match = WINDOW_LABEL_RE.exec(label);
+  if (match === null) return false;
+  const [, start, end] = match;
+  const from = Date.parse(start);
+  const to = Date.parse(end);
+  return from < to && new Date(from).toISOString() === start && new Date(to).toISOString() === end;
 }
 
 function extractContext(context) {
@@ -232,9 +243,7 @@ function extractContext(context) {
     const logsUrl = context.logsUrl;
     const windowLabel = context.windowLabel;
     if (!isValidLogsUrl(logsUrl)) return null;
-    if (typeof windowLabel !== 'string' || windowLabel.length < 1 || !NON_BLANK_RE.test(windowLabel)) {
-      return null;
-    }
+    if (!isValidWindowLabel(windowLabel)) return null;
     return { logsUrl, windowLabel };
   } catch {
     return null;

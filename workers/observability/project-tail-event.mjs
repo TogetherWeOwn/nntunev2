@@ -35,7 +35,7 @@ const SHA40_RE = /^[0-9a-f]{40}$/;
 const TRACE32_RE = /^[0-9a-f]{32}$/;
 const ERROR_CLASS_RE = /^[a-z][a-z0-9_]{0,63}$/;
 const METHOD_RE = /^[A-Z]+$/;
-const PATH_RE = /^[A-Za-z0-9\-._~!$&'()*+,;=:@%/{}]+$/;
+const PATH_RE = /^[A-Za-z0-9._~/{}-]+$/;
 
 function isValidErrorClass(value) {
   return typeof value === 'string' && ERROR_CLASS_RE.test(value);
@@ -61,22 +61,17 @@ function isValidRoute(value) {
   return true;
 }
 
-function isValidPolicy(policy) {
-  if (typeof policy !== 'object' || policy === null || Array.isArray(policy)) return false;
-  if (policy.script_name !== EXPECTED_SCRIPT) return false;
-  if (policy.service !== EXPECTED_SERVICE) return false;
-  if (policy.environment !== EXPECTED_ENVIRONMENT) return false;
-  const routes = policy.routes;
-  const errorClasses = policy.error_classes;
-  if (!Array.isArray(routes) || !Array.isArray(errorClasses)) return false;
-  if (routes.length > MAX_ALLOWLIST || errorClasses.length > MAX_ALLOWLIST) return false;
-  for (let i = 0; i < routes.length; i += 1) {
-    if (!isValidRoute(routes[i])) return false;
+function readAllowlist(values, isValid) {
+  if (!Array.isArray(values)) return null;
+  const length = values.length;
+  if (!Number.isInteger(length) || length < 0 || length > MAX_ALLOWLIST) return null;
+  const allowed = new Set();
+  for (let i = 0; i < length; i += 1) {
+    const value = values[i];
+    if (!Object.hasOwn(values, i) || !isValid(value)) return null;
+    allowed.add(value);
   }
-  for (let i = 0; i < errorClasses.length; i += 1) {
-    if (!isValidErrorClass(errorClasses[i])) return false;
-  }
-  return true;
+  return allowed;
 }
 
 function normalizeOutcome(raw) {
@@ -148,7 +143,7 @@ function isValidServedEnvelope(obj) {
     }
     if (value === null) continue;
     const kind = typeof value;
-    if (kind === 'string' || kind === 'number' || kind === 'boolean') continue;
+    if (kind === 'string' || kind === 'boolean' || Number.isFinite(value)) continue;
     return false;
   }
   return true;
@@ -156,7 +151,12 @@ function isValidServedEnvelope(obj) {
 
 export function projectTailEvent(event, policy) {
   try {
-    if (!isValidPolicy(policy)) return null;
+    if (typeof policy !== 'object' || policy === null || Array.isArray(policy)) return null;
+    if (policy.script_name !== EXPECTED_SCRIPT || policy.service !== EXPECTED_SERVICE
+      || policy.environment !== EXPECTED_ENVIRONMENT) return null;
+    const routes = readAllowlist(policy.routes, isValidRoute);
+    const errorClasses = readAllowlist(policy.error_classes, isValidErrorClass);
+    if (routes === null || errorClasses === null) return null;
     if (typeof event !== 'object' || event === null || Array.isArray(event)) return null;
     let scriptName;
     try {
@@ -164,7 +164,7 @@ export function projectTailEvent(event, policy) {
     } catch {
       return null;
     }
-    if (scriptName !== policy.script_name) return null;
+    if (scriptName !== EXPECTED_SCRIPT) return null;
 
     let rawOutcome;
     try {
@@ -268,6 +268,11 @@ export function projectTailEvent(event, policy) {
                 continue;
               }
               if (typeof text !== 'string') continue;
+              // Every UTF-16 code unit contributes at least one UTF-8 byte.
+              if (text.length > MAX_STRING_BYTES) {
+                incomplete = true;
+                continue;
+              }
               let byteLength;
               try {
                 byteLength = encoder.encode(text).length;
@@ -339,7 +344,7 @@ export function projectTailEvent(event, policy) {
               } catch {
                 routeValue = undefined;
               }
-              if (typeof routeValue !== 'string' || policy.routes.indexOf(routeValue) === -1) {
+              if (!routes.has(routeValue)) {
                 routePoisoned = true;
               } else if (observedRoute === null) {
                 observedRoute = routeValue;
@@ -352,7 +357,7 @@ export function projectTailEvent(event, policy) {
               } catch {
                 errorValue = undefined;
               }
-              if (typeof errorValue !== 'string' || policy.error_classes.indexOf(errorValue) === -1) {
+              if (!errorClasses.has(errorValue)) {
                 errorPoisoned = true;
               } else if (observedError === null) {
                 observedError = errorValue;
@@ -382,8 +387,8 @@ export function projectTailEvent(event, policy) {
 
     return {
       schema_version: SCHEMA_VERSION,
-      service: policy.service,
-      environment: policy.environment,
+      service: EXPECTED_SERVICE,
+      environment: EXPECTED_ENVIRONMENT,
       outcome,
       ...(hasHttpStatus ? { http_status: httpStatus } : {}),
       failure_flags: {

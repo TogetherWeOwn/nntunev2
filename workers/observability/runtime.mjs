@@ -45,16 +45,18 @@ function canonicalObservation(row) {
     if ((row.outcome === 'exception' && !flags.exception)
       || flags.exceeded_cpu !== (row.outcome === 'exceeded_cpu')
       || flags.exceeded_memory !== (row.outcome === 'exceeded_memory')) return null;
-    if (typeof row.build_sha !== 'string'
-      || !(row.build_sha === 'unknown' || /^[0-9a-f]{40}$/.test(row.build_sha))
-      || row.release !== row.build_sha) return null;
-    if (typeof row.route !== 'string' || row.route.length > 128
-      || !(row.route === 'unknown' || /^[A-Z]+ \/[A-Za-z0-9\-._~!$&'()*+,;=:@%/{}]*$/.test(row.route))) return null;
-    if (typeof row.error_class !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(row.error_class)) return null;
+    const { build_sha: sha, route, error_class: errorClass } = row;
+    if (typeof sha !== 'string' || !(sha === 'unknown' || /^[0-9a-f]{40}$/.test(sha))
+      || row.release !== sha) return null;
+    if (typeof route !== 'string' || route.length > 128
+      || !(route === 'unknown' || /^[A-Z]+ \/[A-Za-z0-9._~/{}-]*$/.test(route))) return null;
+    if (typeof errorClass !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(errorClass)) return null;
     return {
       schema_version: 1, service: 'api', environment: 'staging', outcome: row.outcome,
       ...(status === undefined ? {} : { http_status: status }), failure_flags: flags,
-      build_sha: row.build_sha, release: row.release, route: row.route, error_class: row.error_class,
+      build_sha: sha, release: sha,
+      route: PROJECTION_POLICY.routes.includes(route) ? route : 'unknown',
+      error_class: PROJECTION_POLICY.error_classes.includes(errorClass) ? errorClass : 'unknown',
     };
   } catch {
     return null;
