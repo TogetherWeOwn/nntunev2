@@ -35,7 +35,7 @@ function mockVerifiedSession(local: SnapshotStorage) {
 	local.setItem(AUTH_GENERATION_KEY, 'current');
 	vi.stubGlobal('window', { localStorage: local });
 	vi.stubGlobal('caches', { keys: async () => [] });
-	vi.stubGlobal('navigator', { locks: { request: async (_name: string, _options: LockOptions, work: LockGrantedCallback) => work({} as Lock) } });
+	vi.stubGlobal('navigator', { locks: { request: async <T>(_name: string, _options: LockOptions, work: LockGrantedCallback<T>) => work({} as Lock) } });
 	vi.stubGlobal('fetch', vi.fn(async () => Response.json({ session_binding: binding })));
 	return { [SESSION_BINDING_HEADER]: binding };
 }
@@ -124,7 +124,7 @@ it('keeps only distinct nonblank favorites and refuses malformed locked edits', 
 	const key = favoritesKey(session)!;
 	expect(saveFavorites(session, local, ['Track_A', ' ', 'Track_A'])).toBe(true);
 	expect(local.getItem(key)).toBe('["Track_A"]');
-	vi.stubGlobal('navigator', { locks: { request: async (_name: string, _options: LockOptions, work: LockGrantedCallback) => work({} as Lock) } });
+	vi.stubGlobal('navigator', { locks: { request: async <T>(_name: string, _options: LockOptions, work: LockGrantedCallback<T>) => work({} as Lock) } });
 	expect(await updateStoredFavorites(session, local, key, () => [' '])).toBeNull();
 	expect(local.getItem(key)).toBe('["Track_A"]');
 	local.setItem(key, '[" "]');
