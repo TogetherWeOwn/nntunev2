@@ -1106,6 +1106,14 @@ test('an ambiguous or mismatched abort response stays unconfirmed', async (t) =>
 const inventoryUploadId = new URLSearchParams(uploadQuery).get('uploadId');
 const terminalInventory = (parts) => ({ next_marker: null, parts });
 const firstPartPage = ([first]) => ({ next_marker: 1, parts: [first] });
+const completeInventoryPages = [
+  [null, firstPartPage],
+  [1, ([, second]) => terminalInventory([second])],
+];
+const repeatedMarkerPages = [
+  [null, firstPartPage],
+  [1, ([, second]) => ({ next_marker: 1, parts: [second] })],
+];
 
 function mockResumeInventory(t, laterPages) {
   const confirmed = [];
@@ -1147,6 +1155,16 @@ function mockResumeInventory(t, laterPages) {
   return { confirmed, readPage, verifyCalls };
 }
 
+test('resumes from a complete two-page inventory on the first read', async (t) => {
+  const { confirmed, readPage, verifyCalls } = mockResumeInventory(t, completeInventoryPages);
+  const { statuses } = JSON.parse(await complete('multipart-resume', readPage));
+  verifyCalls(1);
+  assert.deepEqual(statuses, [
+    { status: 'resumable', upload_id: inventoryUploadId, parts: [] },
+    { status: 'resumable', upload_id: inventoryUploadId, parts: confirmed },
+  ]);
+});
+
 for (const [kind, firstAttempt] of [
   ['a complete empty inventory', [[null, () => terminalInventory([])]]],
   ['a changed multipart part checksum', [
@@ -1167,12 +1185,16 @@ for (const [kind, firstAttempt] of [
     [null, firstPartPage],
     [1, ([, second]) => terminalInventory([{ ...second, len: second.len + 1 }])],
   ]],
+  ['a repeated continuation marker', repeatedMarkerPages],
+  ['an inventory beyond the two-page limit', [
+    [null, firstPartPage],
+    [1, ([, second]) => ({ next_marker: 2, parts: [second] })],
+  ]],
 ]) {
   test(`keeps the checkpoint across ${kind} and resumes on a coherent retry`, async (t) => {
     const { confirmed, readPage, verifyCalls } = mockResumeInventory(t, [
       ...firstAttempt,
-      [null, firstPartPage],
-      [1, ([, second]) => terminalInventory([second])],
+      ...completeInventoryPages,
     ]);
     const result = JSON.parse(await complete('multipart-resume', readPage));
     verifyCalls(1);
@@ -1191,6 +1213,12 @@ for (const [kind, firstAttempt] of [
 test('stops after the retry if complete multipart inventories stay empty', async (t) => {
   const emptyPage = [null, () => terminalInventory([])];
   const { readPage, verifyCalls } = mockResumeInventory(t, [emptyPage, emptyPage]);
+  await assert.rejects(complete('multipart-resume', readPage), rejectedWith('fixture inventory did not recover'));
+  verifyCalls(0);
+});
+
+test('stops after the retry if the continuation marker keeps repeating', async (t) => {
+  const { readPage, verifyCalls } = mockResumeInventory(t, [...repeatedMarkerPages, ...repeatedMarkerPages]);
   await assert.rejects(complete('multipart-resume', readPage), rejectedWith('fixture inventory did not recover'));
   verifyCalls(0);
 });
