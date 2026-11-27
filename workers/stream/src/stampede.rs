@@ -1124,6 +1124,50 @@ mod tests {
     }
 
     #[test]
+    fn replacement_panic_wakes_a_parked_waiter() {
+        let group = Singleflight::<(), ()>::with_timeout(Duration::ZERO);
+        let key = "segment";
+        thread::scope(|scope| {
+            group
+                .call(key, || {
+                    let mut waiter = None;
+                    let mut synchronized = false;
+                    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        group.call(key, || {
+                            let flight =
+                                group.registry().get(key).unwrap().current.clone().unwrap();
+                            let (entering_wait, ready) = std::sync::mpsc::channel();
+                            waiter = Some(scope.spawn(move || {
+                                let deadline = Instant::now() + Duration::from_secs(2);
+                                let mut state = flight.state.lock().unwrap();
+                                // Cleanup cannot acquire the state mutex until this waiter parks.
+                                entering_wait.send(()).unwrap();
+                                while !state.abandoned {
+                                    let remaining =
+                                        deadline.saturating_duration_since(Instant::now());
+                                    let (next, elapsed) =
+                                        flight.ready.wait_timeout(state, remaining).unwrap();
+                                    assert!(
+                                        !elapsed.timed_out(),
+                                        "abandonment must notify parked waiters"
+                                    );
+                                    state = next;
+                                }
+                            }));
+                            synchronized = ready.recv_timeout(Duration::from_secs(2)).is_ok();
+                            panic!("simulated replacement panic");
+                        })
+                    }));
+                    assert!(panic.is_err());
+                    assert!(synchronized, "the waiter must park before the panic");
+                    waiter.unwrap().join().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
     fn different_keys_fetch_independently() {
         let group = Singleflight::<Vec<u8>, String>::new();
         let calls = AtomicUsize::new(0);
