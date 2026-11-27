@@ -77,21 +77,21 @@ it('requires the usage reset instant to agree with the stated UTC month', async 
 		.rejects.toThrow('Invalid usage payload');
 });
 
-it.each(['-1', '1.5', '2026-12-01', 'Mon, 30 Feb 2026 00:00:00 GMT', '5, 10'])(
-	'omits a countdown for an invalid Retry-After value (%s)',
-	(value) => {
-		const headers = new Headers({ 'retry-after': value });
-		expect(toPaywallModel({ status: 429, headers })).toMatchObject({
-			retryAfterSeconds: null, countdownText: null
-		});
-	}
-);
+it.each([
+	'-1', '1.5', '2026-12-01', '5, 10', 'Mon, 30 Feb 2026 00:00:00 GMT',
+	'Tue, 01 Dec 2026 00:00:99 GMT', 'Tuesday, 01-Dec-26 00:00:99 GMT', 'Tue Dec  1 00:00:99 2026'
+])('omits a countdown for an invalid Retry-After value (%s)', (value) => {
+	const headers = new Headers({ 'retry-after': value });
+	expect(toPaywallModel({ status: 429, headers })).toMatchObject({ retryAfterSeconds: null, countdownText: null });
+});
 
-it('uses the generic paywall for malformed dimensions and mismatched subscription codes', () => {
-	const headers = new Headers({ 'x-plan-limit': 'concurrent_streams=1, ingest_today=5' });
-	expect(toPaywallModel({ status: 429, headers })?.headline).toBe('Please slow down a little');
-	const body = { code: 'subscription_required', reason: 'lapsed' };
-	expect(toPaywallModel({ status: 429, headers: new Headers(), body })?.ctaHref).toBe('/pricing');
+it.each([
+	['concurrent_streams=1, ingest_today=5', undefined],
+	['stream_hours_month=100', { code: 'plan_limit_exceeded' }],
+	['stream_hours_month=100', { code: 'subscription_required', reason: 'lapsed' }]
+] as const)('uses the generic 429 paywall for inconsistent metadata (%s, %j)', (limit, body) => {
+	const model = toPaywallModel({ status: 429, headers: new Headers({ 'x-plan-limit': limit }), body });
+	expect(model).toMatchObject({ headline: 'Please slow down a little', ctaHref: '/pricing' });
 });
 
 it('handles deep malformed paywall metadata without recursive traversal', () => {

@@ -227,11 +227,11 @@ export const MAX_RETRY_AFTER_SECONDS = 3600;
 // HTTP-date uses IMF-fixdate or one of the two obsolete HTTP date forms.
 // Each pattern captures the day so we can detect a calendar rollover.
 const IMF_FIXDATE =
-	/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+	/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) [A-Z][a-z]{2} \d{4} (?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d GMT$/;
 const RFC850_DATE =
-	/^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-[A-Z][a-z]{2}-\d{2} \d{2}:\d{2}:\d{2} GMT$/;
+	/^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-[A-Z][a-z]{2}-\d{2} (?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d GMT$/;
 const ASCTIME_DATE =
-	/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} ([ \d]\d) \d{2}:\d{2}:\d{2} \d{4}$/;
+	/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} ([ \d]\d) (?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d \d{4}$/;
 
 /**
  * Parse `Retry-After` (delta-seconds or HTTP-date) into whole seconds from
