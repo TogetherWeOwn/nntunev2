@@ -1655,12 +1655,12 @@ test.describe('generated staging API Tail config (offline)', () => {
     return JSON.parse(result.stdout) as Record<string, unknown>;
   }
 
-  // Dummy shared-mirror inventory: the same id in both environments, for the
-  // api worker (the generator's mirror pin reads it) and the mb worker.
+  // Both staging Workers use the replacement config. Production stays pinned
+  // to its own inventory entry.
   const MB_INVENTORY = `[[worker.binding]]
 binding = "MB_DB"
 staging = "dummy-mb-mirror"
-prod = "dummy-mb-mirror"
+prod = "dummy-prod-mirror"
 `;
 
   function generateConfig(overrides: Record<string, string> = {}, manifestMb: string | null = MB_INVENTORY) {
@@ -1820,10 +1820,10 @@ ${MB_INVENTORY}`);
     expect(result.toml).toBeUndefined();
   });
 
-  test('generator rejects a non-shared api MB_DB inventory before writing deploy config', () => {
-    const result = generateConfig({}, MB_INVENTORY.replace('prod = "dummy-mb-mirror"', 'prod = "dummy-prod-mirror"'));
+  test('generator rejects different staging mirror pins before writing deploy config', () => {
+    const result = generateConfig({}, MB_INVENTORY.replace('staging = "dummy-mb-mirror"', 'staging = "different-staging-mirror"'));
     expect(result.status).not.toBe(0);
-    expect(result.output).toContain('api MB_DB must name the shared mirror id in both environments');
+    expect(result.output).toContain('api and mb must use the same MB_DB staging inventory id');
     expect(result.toml).toBeUndefined();
   });
 

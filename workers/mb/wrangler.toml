@@ -6,8 +6,8 @@
 #   name this Worker's per-environment service name (`nntune-mb-staging` in
 #   staging, `nntune-mb-production` in production). Pinned by
 #   `tests/wrangler_workers_dev_off.rs`.
-# - The MB mirror Hyperdrive config is one shared read mirror for both
-#   environments (docs/ops.md); the KV namespace and R2 bucket are per env.
+# - The staging MB mirror Hyperdrive id matches the staging API binding.
+#   The ids below still reference the retired mirror (docs/ops.md).
 #   `ENVIRONMENT` is informational only: the worker does not read it yet,
 #   and the per-env `ART_CACHE` binding is what selects the bucket.
 # - KV sharing (stated per decision 6): `MB_CACHE` shares the single reserved
