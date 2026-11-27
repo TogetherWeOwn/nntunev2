@@ -312,6 +312,19 @@ def failing_step_numbers(job):
     return numbers
 
 
+def newer_gate_action(newer_jobs, name, evidence, *, recovering):
+    ambiguous = False
+    for rows in newer_jobs:
+        try:
+            if gate_result(rows, name, evidence) is not None:
+                return "superseded"
+        except AmbiguousGateEvidence:
+            ambiguous = True
+    if recovering and ambiguous:
+        return f"held: ambiguous evidence for {name}"
+    return None
+
+
 def source(issue):
     match = re.search(r"<!-- incident-source: ([1-9][0-9]*):([1-9][0-9]*) -->",
                       issue.get("body") or "")
@@ -512,15 +525,16 @@ def report(api, run_id, dry_run=False, newer_evidence=None):
     for name, evidence in GATES[workflow].items():
         try:
             job = gate_result(jobs, name, evidence)
-            if job is not None and any(gate_result(rows, name, evidence) is not None for rows in newer_jobs):
-                actions.append("superseded")
-                continue
         except AmbiguousGateEvidence:
             actions.append(f"held: ambiguous evidence for {name}")
             continue
         if job is None:
             continue
         conclusion = job.get("conclusion")
+        newer_action = newer_gate_action(newer_jobs, name, evidence, recovering=conclusion == "success")
+        if newer_action is not None:
+            actions.append(newer_action)
+            continue
         failed = failing_step_numbers(job)
         # Stable workflow/job key, independent of mapping order. Names are our
         # constants, not user-controlled API strings. Never rename a live key.

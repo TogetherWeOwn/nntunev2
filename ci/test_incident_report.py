@@ -521,16 +521,36 @@ class RecentTests(unittest.TestCase):
     def test_ambiguous_combined_smoke_does_not_block_later_runs(self):
         job = dict(smoke("success"), name=ir.POST_DEPLOY_JOURNEY)
         job["steps"].append(dict(job["steps"][0], number=4, conclusion="failure"))
+        sibling = {"name": "staging-api", "conclusion": "failure", "steps": []}
         first = recent_run(10, workflow="deploy.yml", event="push")
         later = recent_run(11)
         api = StatefulAPI(runs=[first, later],
-                          jobs={(10, 1): [job], (11, 1): [smoke("failure", step="failure")]})
+                          jobs={(10, 1): [job, sibling], (11, 1): [smoke("failure", step="failure")]})
         self.assertEqual(ir.recent(api), [
+            "opened: staging-api",
             f"held: ambiguous evidence for {ir.POST_DEPLOY_SMOKE}",
             f"held: ambiguous evidence for {ir.POST_DEPLOY_JOURNEY}",
             f"opened: {SMOKE}",
         ])
-        self.assertEqual([write[:2] for write in api.writes], [("POST", "/issues")])
+        self.assertEqual([write[:2] for write in api.writes], [("POST", "/issues")] * 2)
+
+    def test_newer_ambiguous_smoke_preserves_failure_and_holds_recovery(self):
+        older = recent_run(10, minutes=90, workflow="deploy.yml", event="push")
+        newer = recent_run(11, minutes=80, updated=65, workflow="deploy.yml", event="push")
+        ambiguous = dict(smoke("success"), name=ir.POST_DEPLOY_JOURNEY)
+        ambiguous["steps"].append(dict(ambiguous["steps"][0], number=4, conclusion="failure"))
+        for conclusion, action, writes in (
+            ("failure", f"opened: {ir.POST_DEPLOY_SMOKE}", [("POST", "/issues")]),
+            ("success", f"held: ambiguous evidence for {ir.POST_DEPLOY_SMOKE}", []),
+        ):
+            with self.subTest(conclusion=conclusion):
+                gate = dict(smoke(conclusion, step=conclusion), name=ir.POST_DEPLOY_SMOKE)
+                key = "<!-- incident-key: deploy.yml:post-deploy-e2e-synthetic-smoke-health -->"
+                issues = [issue(7, body=key)] if conclusion == "success" else []
+                api = StatefulAPI(runs=[newer, older], issues=issues,
+                                  jobs={(10, 1): [gate], (11, 1): [ambiguous]})
+                self.assertEqual(ir.recent(api), [action])
+                self.assertEqual([write[:2] for write in api.writes], writes)
 
     def incident_state(self, api):
         return [(i["number"], i["state"]) for i in api.issues]
