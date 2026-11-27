@@ -27,7 +27,7 @@
 
 configure_pg_env_from_database_url() {
   local pg_assignments
-  if ! pg_assignments="$(python3 - <<'PYEOF'
+  if ! pg_assignments="$(python3 -I - <<'PYEOF'
 import os
 import re
 import shlex
@@ -47,6 +47,8 @@ sys.stdout.reconfigure(errors="surrogateescape")
 
 
 def dec(value):
+    if re.search(r"%(?![0-9a-fA-F]{2})", value):
+        fail("DATABASE_URL contains an invalid percent escape")
     decoded = unquote(value, errors="surrogateescape")
     # libpq rejects %00, and bash command substitution would silently
     # drop the NUL byte, connecting with a different value than the
@@ -198,6 +200,8 @@ if os.environ.get("PGSERVICE"):
 # or a bare database name. Keep all three working.
 params = {}
 if url.startswith(("postgres://", "postgresql://")):
+    if re.search(r"[\x00-\x20\x7f]", url):
+        fail("DATABASE_URL URI contains raw whitespace or control characters")
     # libpq tolerates a raw '#' or '?' in the password, but in URI
     # grammar they cut the authority short, so refuse them with the
     # remedy instead of misparsing. The candidate userinfo is the text
@@ -223,6 +227,8 @@ if url.startswith(("postgres://", "postgresql://")):
         parts = urlsplit(url)
     except ValueError:
         fail("DATABASE_URL is not a well-formed URI")
+    if parts.netloc.count("@") > 1:
+        fail("DATABASE_URL URI userinfo must percent-encode '@'")
     # Test the raw URL, not parts.fragment: a trailing '#' leaves the
     # fragment empty, so a fragment test would silently drop it and
     # truncate the database name or the last query value.
@@ -239,10 +245,13 @@ if url.startswith(("postgres://", "postgresql://")):
         params["user"] = dec(parts.username)
     if parts.password:
         params["password"] = dec(parts.password)
-    if parts.hostname:
-        if "," in parts.hostname:
-            fail("multi-host DATABASE_URL URI is not supported; name a single host")
-        params["host"] = dec(parts.hostname)
+    host_port = parts.netloc.rsplit("@", 1)[-1]
+    host_match = re.fullmatch(r"(?:\[([^\]]+)\]|([^:\[\]]*))(?::([0-9]+))?", host_port)
+    if not host_match:
+        fail("DATABASE_URL is not a well-formed URI")
+    host = host_match[1] or host_match[2]
+    if host:
+        params["host"] = dec(host)
     try:
         port = parts.port
     except ValueError:
@@ -257,16 +266,18 @@ if url.startswith(("postgres://", "postgresql://")):
     # Query parameters override the corresponding URI parts (libpq URI
     # semantics). Split manually: form decoding would turn a literal '+'
     # into a space, which libpq does not do.
-    for field in parts.query.split("&"):
-        if not field:
-            continue
-        key, _, value = field.partition("=")
+    for field in parts.query.split("&") if parts.query else ():
+        key, equals, value = field.partition("=")
+        if not equals:
+            fail("DATABASE_URL query parameter is missing '='")
         key = dec(key)
         if key == "service":
             fail("DATABASE_URL 'service' parameter is refused: " + SERVICE_REFUSAL)
         if key not in ENV_FOR_PARAM:
             fail(unmappable_message("query parameter", key))
         params[key] = dec(value)
+    if any("," in params.get(key, "") for key in ("host", "hostaddr", "port")):
+        fail("multi-host DATABASE_URL URI is not supported; name a single host")
 elif re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", url):
     # A URI-shaped input with any other scheme (a driver-specific
     # scheme, a typo) must not fall through to the keyword parser,
@@ -284,13 +295,13 @@ elif url:
 else:
     fail("DATABASE_URL is empty")
 
-for key, value in params.items():
-    print("export %s=%s" % (ENV_FOR_PARAM[key], shlex.quote(value)))
+if params:
+    print("export", *(f"{ENV_FOR_PARAM[key]}={shlex.quote(value)}" for key, value in params.items()))
 PYEOF
 )"; then
     return 1
   fi
-  eval "$pg_assignments"
+  eval "$pg_assignments" || return 1
   # Nothing after this point needs the URL; drop it so a later edit
   # cannot pass it to a child by accident.
   unset DATABASE_URL

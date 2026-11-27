@@ -7,7 +7,11 @@ deduplicated parent QIDs, and the traversal limits are positive integers.
 
 class Graph:
     def __init__(self, parents, barriers, max_depth, max_nodes):
-        self.parents = parents
+        if any(type(limit) is not int or limit < 1 for limit in (max_depth, max_nodes)):
+            raise ValueError("graph traversal limits must be positive integers")
+        if any(not isinstance(edges, (list, tuple)) for edges in parents.values()):
+            raise ValueError("graph parent lists must be sequences of QIDs")
+        self.parents = {node: tuple(edges) for node, edges in parents.items()}
         self.barriers = barriers
         self.max_depth = max_depth
         self.max_nodes = max_nodes

@@ -67,8 +67,9 @@
 # aborts the chunk instead of landing in the DLQ. Missing input is fatal: a
 # silent skip would report "import: done" with zero rows loaded.
 set -euo pipefail
+set +x
 
-if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
+usage() {
   cat <<'USAGE'
 Usage: DATABASE_URL=<postgres-url> ./import.sh <dump-dir>
 
@@ -82,23 +83,31 @@ official mbdump/ extracts.
 Requires: psql, python3, sha256sum and mb-validate on PATH
 (MB_VALIDATE_BIN overrides), DATABASE_URL in env (never as argv).
 USAGE
+}
+if [[ $# -eq 1 && ( "$1" == --help || "$1" == -h ) ]]; then
+  usage
   exit 0
+fi
+if [[ $# -ne 1 || -z "$1" || "$1" == -* ]]; then
+  usage >&2
+  exit 2
 fi
 
 # Pin the published target once. Later ETL publications may replace the
 # supplied symlink, but every check/hash/read in this run must use this target.
 # Published snapshots must remain immutable and retained while importing.
-dump_dir="$(CDPATH='' cd -- "$1" && pwd -P)"
+IFS= read -r -d '' dump_dir < <(CDPATH='' cd -P -- "$1" && printf '%s\0' "$PWD")
 : "${DATABASE_URL:?set DATABASE_URL via secret store, never on the command line}"
 
 VALIDATE_BIN="${MB_VALIDATE_BIN:-mb-validate}"
-CHUNK_LINES="${MB_IMPORT_CHUNK_LINES:-2000}"
-if [[ ! "$CHUNK_LINES" =~ ^[0-9]+$ ]] || (( 10#$CHUNK_LINES < 1 )); then
-  echo "import: refusing MB_IMPORT_CHUNK_LINES='$CHUNK_LINES' (positive integer required)" >&2
+CHUNK_LINES="${MB_IMPORT_CHUNK_LINES-2000}"
+CHUNK_LINES="${CHUNK_LINES#"${CHUNK_LINES%%[!0]*}"}"
+if [[ ! "$CHUNK_LINES" =~ ^[0-9]{1,10}$ ]] || (( 10#$CHUNK_LINES > 2147483647 )); then
+  echo "import: MB_IMPORT_CHUNK_LINES must be an integer in 1..2147483647" >&2
   exit 1
 fi
 if [[ "$VALIDATE_BIN" == */* ]]; then
-  [[ -x "$VALIDATE_BIN" ]] || { echo "import: mb-validate not executable at $VALIDATE_BIN" >&2; exit 1; }
+  [[ -f "$VALIDATE_BIN" && -x "$VALIDATE_BIN" ]] || { echo "import: MB_VALIDATE_BIN must name an executable file" >&2; exit 1; }
 else
   command -v "$VALIDATE_BIN" >/dev/null || { echo "import: mb-validate not on PATH (set MB_VALIDATE_BIN)" >&2; exit 1; }
 fi
@@ -115,15 +124,15 @@ command -v python3 >/dev/null || { echo "import: python3 not on PATH (FK orphan 
 # Do not reject row-level poison here: validation and FK routing stay per chunk.
 for table in artist release_group release recording track url artist_url recording_url recording_music_video recording_isrc; do
   tsv="$dump_dir/mbdump-$table.tsv"
-  if [[ ! -f "$tsv" || ! -r "$tsv" || ! -s "$tsv" ]]; then
-    echo "import: refusing $tsv (required curated TSV must be present, readable and nonempty)" >&2
+  if [[ -L "$tsv" || ! -f "$tsv" || ! -r "$tsv" || ! -s "$tsv" ]]; then
+    echo "import: refusing $tsv (required curated TSV must be a readable, nonempty regular file)" >&2
     exit 1
   fi
 done
 
 if [[ -n "${DUMP_SEQ:-}" ]]; then
   if [[ ! "$DUMP_SEQ" =~ ^[0-9]+$ ]]; then
-    echo "import: refusing non-integer DUMP_SEQ '$DUMP_SEQ'" >&2
+    echo "import: DUMP_SEQ must be an integer" >&2
     exit 1
   fi
   # Strip arbitrary zero padding before checking length. Never evaluate long
@@ -137,7 +146,7 @@ if [[ -n "${DUMP_SEQ:-}" ]]; then
 fi
 
 # Deliver the connection to psql via the PG* environment, never argv.
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=pg-env.sh
 . "$script_dir/pg-env.sh"
 configure_pg_env_from_database_url
@@ -147,7 +156,14 @@ configure_pg_env_from_database_url
 # (the cursor is the resume state, never these files) and the platform GCs
 # TMPDIR, so a leak is untracked clutter, never corruption.
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'rm -r -- "$work"' EXIT
+
+# psql's \copy uses literal filenames. Refuse characters that can change its parsing.
+if [[ "$work" == *"'"* || "$work" == *\\* || "$work" == *[[:cntrl:]]* ]]; then
+  echo "import: unsafe scratch path for psql COPY" >&2
+  exit 1
+fi
+psql() { command psql -X "$@"; }
 
 refuse_all_poison_dump() {
   local table="$1" dump_id="$2" total="$3" poison_n
@@ -268,7 +284,12 @@ for table in artist release_group release recording track url artist_url recordi
     echo "import: refusing empty $table dump; replication state remains unchanged" >&2
     exit 1
   fi
-  dump_id="$(sha256sum "$tsv" | cut -d ' ' -f 1)"
+  dump_id="$(sha256sum <"$tsv")"
+  dump_id="${dump_id%% *}"
+  if [[ ! "$dump_id" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "import: invalid SHA-256 digest for $table" >&2
+    exit 1
+  fi
   psql -v ON_ERROR_STOP=1 -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('$table', '$dump_id', 0) ON CONFLICT (table_name, dump_id) DO NOTHING;" >/dev/null
   # Duplicate-key pre-check. Entity tables key on the MBID in column 1;
   # track keys on the position tuple (release, medium, track), where
@@ -499,13 +520,12 @@ EOF
       echo "import: validator failed for $table lines $range (exit $validator_status); cursor stays at $offset" >&2
       exit 1
     fi
-    valid_n="${summary#valid=}"
-    valid_n="${valid_n%% *}"
-    poison_n="${summary##*poison=}"
-    if [[ ! "$valid_n" =~ ^[0-9]+$ || ! "$poison_n" =~ ^[0-9]+$ ]]; then
-      echo "import: cannot parse validator summary '$summary' for $table lines $range" >&2
+    if [[ ! "$summary" =~ ^valid=([0-9]+)\ poison=([0-9]+)$ ]]; then
+      echo "import: cannot parse validator summary for $table lines $range" >&2
       exit 1
     fi
+    valid_n="${BASH_REMATCH[1]}"
+    poison_n="${BASH_REMATCH[2]}"
     valid_lines="$(awk 'END { print NR+0 }' "$work/valid.tsv")"
     poison_lines="$(awk 'END { print NR+0 }' "$work/poison.tsv")"
     if [[ "$valid_lines" != "$valid_n" || "$poison_lines" != "$poison_n" ]]; then
@@ -585,11 +605,11 @@ SQL
         # Move orphan rows out of valid.tsv, appending their exact dump
         # bytes (from the part file) escaped for the poison COPY load — the
         # same escaping the validator uses (backslash, tab, CR, LF).
-        # NOTE: $fk_bad intentionally word-splits into one argv per orphan line_no.
-        if ! fk_moved="$(FK_REASON="$fk_reason" FK_OFFSET="$offset" python3 - "$work/valid.tsv" "$work/poison.tsv" "$part" $fk_bad <<'EOF'
+        if ! fk_moved="$(FK_REASON="$fk_reason" FK_OFFSET="$offset" python3 - "$work/valid.tsv" "$work/poison.tsv" "$part" 3<<<"$fk_bad" <<'EOF'
 import os, sys
 valid_path, poison_path, part_path = sys.argv[1], sys.argv[2], sys.argv[3]
-bad = sys.argv[4:]
+with os.fdopen(3) as parent_results:
+    bad = parent_results.read().split()
 reason = os.environ["FK_REASON"]
 offset = int(os.environ["FK_OFFSET"])
 with open(part_path, "rb") as f:
@@ -600,11 +620,12 @@ def esc(raw: str) -> str:
     return raw.replace("\\", "\\\\").replace("\t", "\\t").replace("\r", "\\r").replace("\n", "\\n")
 kept = []
 moved = 0
+bad_lines = set(bad)
 with open(valid_path, "r", encoding="utf-8") as f:
     for line in f:
         fields = line.rstrip("\n").rsplit("\t", 1)
         line_no = fields[1]
-        if line_no in bad:
+        if line_no in bad_lines:
             idx = int(line_no) - offset - 1
             if idx < 0 or idx >= len(raw_lines):
                 sys.stderr.write(f"fk-split: line_no {line_no} outside part range\n")

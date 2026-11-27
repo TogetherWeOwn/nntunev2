@@ -7,9 +7,23 @@ class Overrides:
         self.present = set(present)
         self.actions = {}
         for override in config["overrides"]:
-            self.actions.setdefault(override["genre_qid"], {})[override["action"]] = set(
-                override.get("roots", [])
-            )
+            action = override["action"]
+            targets = override.get("roots", [])
+            if (action not in ("add", "remove", "replace", "exclude")
+                    or type(targets) is not list
+                    or any(type(root) is not str or root not in roots.sort_order for root in targets)
+                    or len(set(targets)) != len(targets)
+                    or bool(targets) == (action == "exclude")):
+                raise ValueError("invalid override action or roots")
+            actions = self.actions.setdefault(override["genre_qid"], {})
+            if action in actions:
+                raise ValueError("duplicate override action")
+            actions[action] = set(targets)
+        for actions in self.actions.values():
+            if len(actions) > 1 and (
+                "exclude" in actions or "replace" in actions or actions["add"] & actions["remove"]
+            ):
+                raise ValueError("conflicting override actions")
 
     def resolve(self, genre_qid):
         """Return ordered roots, cap, cycle, and missing-target status."""

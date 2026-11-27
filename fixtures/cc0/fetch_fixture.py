@@ -48,10 +48,13 @@ Standard library only, so any test environment with python3 can run it.
 import argparse
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -102,39 +105,28 @@ def load_manifest(manifest_arg: str | None) -> tuple[dict, str]:
     root = repo_root()
     rel = manifest_arg or DEFAULT_MANIFEST
     path = Path(rel)
-    if not path.is_absolute():
-        path = root / rel
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise FetchError(f"cannot read manifest {path}: {exc}") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("tracks"), list):
-        raise FetchError(f"manifest {path} has no tracks list")
-    try:
+        path = (root / path).resolve()
         prefix = path.parent.relative_to(root).as_posix()
-    except ValueError as exc:
-        raise FetchError(
-            f"manifest {path} is outside the repo; its R2 prefix is undefined"
-        ) from exc
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise FetchError("cannot read a valid manifest within the repo") from exc
+    if (not isinstance(data, dict) or not isinstance(data.get("tracks"), list)
+            or not all(isinstance(track, dict) for track in data["tracks"])):
+        raise FetchError("manifest has an invalid tracks list")
     return data, prefix
 
 
 def select_track(manifest: dict, file_arg: str | None, position: int | None) -> dict:
-    tracks = manifest["tracks"]
-    if position is not None:
-        for track in tracks:
-            if track.get("position") == position:
-                return track
-        raise FetchError(f"manifest has no track at position {position}")
-    if file_arg is not None:
-        for track in tracks:
-            if track.get("file") == file_arg:
-                return track
-        raise FetchError(
-            f"manifest does not list {file_arg!r}; refusing to fetch an "
-            "unlisted key (only manifest files may be fetched)"
-        )
-    raise FetchError("give a manifest file path or --position")
+    if (file_arg is None) == (position is None):
+        raise FetchError("give exactly one of a track file or --position")
+    field, value = ("file", file_arg) if position is None else ("position", position)
+    if position is not None and (type(position) is not int or position < 1):
+        raise FetchError("track position must be a positive integer")
+    matches = [track for track in manifest["tracks"] if track.get(field) == value]
+    if len(matches) != 1 or type(matches[0][field]) is not type(value):
+        raise FetchError("track selector must match exactly one manifest entry")
+    return matches[0]
 
 
 def _is_safe_track_file(file) -> bool:
@@ -145,7 +137,7 @@ def _is_safe_track_file(file) -> bool:
     """
     if not isinstance(file, str) or not file or "\\" in file:
         return False
-    if file.startswith("/"):
+    if re.search(r"[\x00-\x1f\x7f\ud800-\udfff]", file):
         return False
     return all(part not in ("", ".", "..") for part in file.split("/"))
 
@@ -153,18 +145,22 @@ def _is_safe_track_file(file) -> bool:
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
-def _require_secure_url(url: str, env_var: str) -> None:
+def _require_secure_url(url: str, setting: str, *, base: bool = True) -> None:
     """Transports are HTTPS; plaintext HTTP is allowed only on loopback
     (local test servers). Anything else is a misconfiguration, not a skip."""
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme == "https":
-        return
-    if parsed.scheme == "http" and (parsed.hostname or "") in _LOOPBACK_HOSTS:
-        return
-    raise FetchError(
-        f"{env_var} must be an https URL (http is allowed only for "
-        f"loopback test servers), got scheme {parsed.scheme!r}"
-    )
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        secure = parsed.scheme == "https" or (
+            parsed.scheme == "http" and parsed.hostname in _LOOPBACK_HOSTS
+        )
+        authority = re.fullmatch(r"(?:[a-zA-Z0-9.-]+|\[[a-fA-F0-9:]+\])(?::[0-9]+)?", parsed.netloc)
+        if (secure and authority and parsed.port != 0
+                and not re.search(r"[\x00-\x20\x7f\\#]", url)
+                and (not base or "?" not in url)):
+            return
+    except ValueError:
+        pass
+    raise FetchError(f"{setting} requires HTTPS or loopback HTTP and a valid authority")
 
 
 class _NoCrossHostAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -177,12 +173,13 @@ class _NoCrossHostAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _require_secure_url(newurl, "fixture redirect", base=False)
+        if req.type == "https" and urllib.parse.urlsplit(newurl).scheme != "https":
+            raise FetchError("fixture redirect would downgrade HTTPS")
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is None:
             return None
-        if urllib.parse.urlparse(newurl).netloc != urllib.parse.urlparse(
-            req.full_url
-        ).netloc:
+        if urllib.parse.urlsplit(newurl)[:2] != urllib.parse.urlsplit(req.full_url)[:2]:
             for header in list(new.headers):
                 if header.lower() == "authorization" or header.lower().startswith(
                     "x-amz-"
@@ -200,7 +197,8 @@ class _NoCrossHostAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
 def verify(path: Path, track: dict) -> bool:
     """True iff `path` exists and matches the manifest bytes + sha256."""
     try:
-        if path.stat().st_size != track["bytes"]:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size != track["bytes"]:
             return False
     except OSError:
         return False
@@ -289,11 +287,19 @@ def build_request(key: str, env: dict) -> urllib.request.Request:
     endpoint = env.get(ENV_ENDPOINT, "").strip()
     account_id = env.get(ENV_ACCOUNT_ID, "").strip()
     if not endpoint and account_id:
+        if not re.fullmatch(r"[a-zA-Z0-9-]+", account_id):
+            raise FetchError(f"{ENV_ACCOUNT_ID} has an invalid format")
         endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
     if access_key and secret_key and endpoint:
         _require_secure_url(endpoint, ENV_ENDPOINT)
         bucket = env.get(ENV_BUCKET, "").strip() or DEFAULT_BUCKET
+        if (urllib.parse.urlsplit(endpoint).path not in ("", "/")
+                or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*[a-z0-9]", bucket)
+                or not re.fullmatch(r"[a-zA-Z0-9_-]+", access_key)):
+            raise FetchError("invalid R2 endpoint, bucket or access key format")
         return s3_get_url(endpoint, bucket, key, access_key, secret_key)
+    if access_key or secret_key:
+        raise FetchError("incomplete R2 credential or endpoint configuration")
     raise SkipFetch(
         "CC0 fixture fetch skipped: no R2 read access configured "
         f"(set {ENV_BASE_URL}, or {ENV_ACCESS_KEY} + {ENV_SECRET_KEY} + "
@@ -313,30 +319,39 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
         body = exc.read(65536).decode("utf-8", errors="replace")
     except Exception:
         return ""
-    code = re.search(r"<Code>([^<]+)</Code>", body)
+    code = re.search(r"<Code>(NoSuchKey|NoSuchBucket|AccessDenied|SignatureDoesNotMatch)</Code>", body)
     if code:
         return f" ({code.group(1)})"
     return ""
 
 
-def download(request: urllib.request.Request, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(f"{dest.name}.part-{os.getpid()}")
+def download(request: urllib.request.Request, dest: Path, track: dict | None = None) -> None:
     opener = urllib.request.build_opener(_NoCrossHostAuthRedirectHandler())
+    tmp = None
     try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
         with opener.open(request, timeout=300) as response:
-            with tmp.open("wb") as handle:
+            with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as handle:
+                tmp = Path(handle.name)
+                count = 0
+                digest = hashlib.sha256()
                 for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                    count += len(chunk)
+                    if track is not None and count > track["bytes"]:
+                        raise FetchError("download exceeds manifest byte count")
+                    digest.update(chunk)
                     handle.write(chunk)
+        if track is not None and (count != track["bytes"] or digest.hexdigest() != track["sha256"]):
+            raise FetchError("download does not match manifest bytes/sha256")
         os.replace(tmp, dest)
     except urllib.error.HTTPError as exc:
-        tmp.unlink(missing_ok=True)
-        raise FetchError(
-            f"download failed: {exc}{_http_error_detail(exc)}"
-        ) from exc
-    except (urllib.error.URLError, OSError) as exc:
-        tmp.unlink(missing_ok=True)
-        raise FetchError(f"download failed: {exc}") from exc
+        with exc:
+            raise FetchError(f"download failed: HTTP {exc.code}{_http_error_detail(exc)}") from exc
+    except (OSError, http.client.HTTPException) as exc:
+        raise FetchError("download failed during transport or cache write") from exc
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def fetch(
@@ -355,7 +370,11 @@ def fetch(
             f"manifest track file {track['file']!r} is not a safe relative "
             "path; refusing to fetch outside the fixture cache"
         )
-    key = f"{prefix}/{track['file']}"
+    if (type(track["bytes"]) is not int or track["bytes"] < 1
+            or not isinstance(track["sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", track["sha256"])):
+        raise FetchError("manifest track has invalid bytes or sha256")
+    key = (Path(prefix) / track["file"]).as_posix()
     cache_dir = env.get(ENV_CACHE_DIR, "").strip()
     # Always absolute: callers run from other directories and the printed
     # path is the contract (see the module docstring).
@@ -363,18 +382,12 @@ def fetch(
         Path(cache_dir).resolve() if cache_dir else repo_root() / ".fixture-cache"
     )
     dest = cache_root / key
-    if not dest.resolve().is_relative_to(cache_root.resolve()):
-        raise FetchError(f"fixture key {key!r} escapes the cache directory")
+    if not dest.resolve().is_relative_to(cache_root.resolve()) or dest.is_symlink():
+        raise FetchError("fixture destination escapes the cache or is a symlink")
     if verify(dest, track):
         return dest
     request = build_request(key, env)
-    download(request, dest)
-    if not verify(dest, track):
-        dest.unlink(missing_ok=True)
-        raise FetchError(
-            f"downloaded {key} does not match the manifest "
-            f"(bytes/sha256); deleted the cached copy"
-        )
+    download(request, dest, track)
     return dest
 
 
@@ -395,6 +408,9 @@ def main(argv: list[str] | None = None, env: dict | None = None) -> int:
         return EXIT_SKIP
     except FetchError as exc:
         print(f"fetch_fixture: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+    except (OSError, ValueError, RuntimeError):
+        print("fetch_fixture: invalid configuration or cache path", file=sys.stderr)
         return EXIT_FAIL
     print(path)
     return EXIT_OK
