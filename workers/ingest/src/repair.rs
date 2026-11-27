@@ -114,11 +114,6 @@ pub fn decide_repair(
     }))
 }
 
-// Match the repair front's request text bounds.
-fn bounded_repair_text(value: &str, max: usize) -> bool {
-    !value.is_empty() && value.len() <= max && !value.bytes().any(|b| b.is_ascii_control())
-}
-
 /// Outcome of one repair call, decided from the reply alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepairCall {
@@ -137,21 +132,14 @@ pub enum RepairCall {
 /// can be terminal-success; 4xx rejections are permanent (a retry
 /// would send the same bytes), everything else retries.
 pub fn classify_repair_reply(status: u16, body: &[u8]) -> RepairCall {
-    #[derive(serde::Deserialize)]
-    #[serde(tag = "status", rename_all = "snake_case")]
-    enum Reply {
-        Repaired,
-        Unrepairable,
-    }
-
     if body.len() > MAX_REPAIR_REPLY_BYTES {
         return RepairCall::Retry;
     }
     match status {
         200 if body.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') => {
-            match serde_json::from_slice::<Reply>(body) {
-                Ok(Reply::Repaired) => RepairCall::Repaired,
-                Ok(Reply::Unrepairable) => RepairCall::Unrepairable,
+            match serde_json::from_slice::<RepairReply>(body) {
+                Ok(RepairReply::Repaired) => RepairCall::Repaired,
+                Ok(RepairReply::Unrepairable) => RepairCall::Unrepairable,
                 Err(_) => RepairCall::Retry,
             }
         }
@@ -236,6 +224,17 @@ pub async fn call_repair_with_deadline(
         Ok((response.status().as_u16(), response.into_body()))
     });
     settle_repair_call(fetch, deadline).await
+}
+
+fn bounded_repair_text(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max && !value.bytes().any(|b| b.is_ascii_control())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RepairReply {
+    Repaired,
+    Unrepairable,
 }
 
 #[cfg(test)]

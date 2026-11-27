@@ -234,24 +234,17 @@ pub enum TranscodeCall {
 /// is ambiguous (transport damage reads the same as a front bug),
 /// and a retry replays the memoised artifact rather than a fresh
 /// encode, so conservatism costs nothing.
+///
+/// The reply must be an object with one status field. A successful
+/// reply must also carry exactly one artifact hash and one byte size.
 pub fn classify_transcode_reply(status: u16, body: &[u8]) -> TranscodeCall {
-    #[derive(serde::Deserialize)]
-    #[serde(tag = "status", rename_all = "snake_case")]
-    enum Reply {
-        Transcoded {
-            artifact_sha256: String,
-            byte_size: u64,
-        },
-        Untranscodable,
-    }
-
     if body.len() > MAX_TRANSCODE_REPLY_BYTES {
         return TranscodeCall::Retry;
     }
     match status {
         200 if body.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') => {
-            match serde_json::from_slice::<Reply>(body) {
-                Ok(Reply::Transcoded {
+            match serde_json::from_slice::<TranscodeReply>(body) {
+                Ok(TranscodeReply::Transcoded {
                     artifact_sha256,
                     byte_size,
                 }) if (1..=MAX_ARTIFACT_BYTES).contains(&byte_size) => {
@@ -263,7 +256,7 @@ pub fn classify_transcode_reply(status: u16, body: &[u8]) -> TranscodeCall {
                         Err(_) => TranscodeCall::Retry,
                     }
                 }
-                Ok(Reply::Untranscodable) => TranscodeCall::Untranscodable,
+                Ok(TranscodeReply::Untranscodable) => TranscodeCall::Untranscodable,
                 _ => TranscodeCall::Retry,
             }
         }
@@ -496,6 +489,16 @@ pub const fn classify_cache_object_rows(affected: u64) -> PublishOutcome {
     } else {
         PublishOutcome::Duplicate
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum TranscodeReply {
+    Transcoded {
+        artifact_sha256: String,
+        byte_size: u64,
+    },
+    Untranscodable,
 }
 
 /// One verified audio input awaiting `Transcoding`, recorded on the
