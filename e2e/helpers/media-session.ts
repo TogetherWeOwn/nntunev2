@@ -37,11 +37,8 @@ function normalizedArtist(value: string | null | undefined): string | null {
 
 /** True for an absolute https:// URL (staging is https-only; see access.ts). */
 function isAbsoluteHttpsUrl(value: string): boolean {
-  try {
-    return new URL(value).protocol === 'https:';
-  } catch {
-    return false;
-  }
+  return typeof value === 'string' && /^https:\/\/[^/\\?#@]+(?:[/?#]|$)/i.test(value) &&
+    !/[\s\\\p{Cc}]/u.test(value) && URL.canParse(value);
 }
 
 /**
@@ -53,27 +50,29 @@ export function mediaSessionFailure(
   snapshot: MediaSessionSnapshot | null,
   expected: ExpectedTrack,
 ): string | null {
-  if (snapshot === null) {
+  if (!snapshot) {
     return (
       'Media Session metadata is missing during browser playback ' +
         '(navigator.mediaSession.metadata is null — the player never applied it, ' +
         'or a MediaMetadata construction failure cleared it)'
     );
   }
-  if (snapshot.title !== expected.title) {
+  if (typeof expected?.title !== 'string' || !expected.title.trim() || snapshot.title !== expected.title) {
     return 'Media Session title does not match the playing ingested track';
   }
-  if (normalizedArtist(snapshot.artist) !== normalizedArtist(expected.artist)) {
+  if ((snapshot.artist !== null && typeof snapshot.artist !== 'string') ||
+      (expected.artist !== null && typeof expected.artist !== 'string') ||
+      normalizedArtist(snapshot.artist) !== normalizedArtist(expected.artist)) {
     return 'Media Session artist does not match the playing ingested track';
   }
   // Artwork-malformed regression guard (#173): `buildMediaMetadataInit`
   // absolutizes artwork, so a relative, empty or malformed src reaching the
   // OS means construction fell back or threw — the controls must not keep
   // showing a stale or broken entry.
-  if (snapshot.artworkSrcs.length === 0) {
+  if (!Array.isArray(snapshot.artworkSrcs) || snapshot.artworkSrcs.length === 0) {
     return 'Media Session artwork is empty for the playing track (expected the shared placeholder fallback)';
   }
-  const malformed = snapshot.artworkSrcs.filter((src) => !isAbsoluteHttpsUrl(src)).length;
+  const malformed = Array.from(snapshot.artworkSrcs).filter((src) => !isAbsoluteHttpsUrl(src)).length;
   if (malformed > 0) {
     return (
       `Media Session artwork has ${malformed} non-absolute-https src(s) ` +

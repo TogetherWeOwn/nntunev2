@@ -24,14 +24,14 @@ const SAMPLE_RATE = 8_000;
  * Allowlisted track ids -> sample salt. Unknown ids serve the default
  * stream (salt 0). Mirrors `TRACK_SALT` in demoMedia.ts.
  */
-export const DEMO_TRACK_SALTS: Readonly<Record<string, number>> = {
+export const DEMO_TRACK_SALTS: Readonly<Record<string, number>> = Object.freeze({
   'second-signal': 41,
   'third-light': 97,
-};
+});
 
 /** Salt for a `?track=` value; unknown (or absent) tracks use the default 0. */
 export function demoTrackSalt(track: string | null): number {
-  if (track === null || !Object.hasOwn(DEMO_TRACK_SALTS, track)) return 0;
+  if (typeof track !== 'string' || !Object.hasOwn(DEMO_TRACK_SALTS, track)) return 0;
   return DEMO_TRACK_SALTS[track] ?? 0;
 }
 
@@ -70,6 +70,7 @@ export function expectedSyntheticBody(track: string | null = null): Buffer {
  * served stream diverges from the vendored contract.
  */
 export function firstByteDifference(actual: Buffer, expected: Buffer): number | null {
+  if (!Buffer.isBuffer(actual) || !Buffer.isBuffer(expected)) throw new TypeError('Expected audio byte buffers');
   const common = Math.min(actual.length, expected.length);
   for (let i = 0; i < common; i += 1) {
     if (actual[i] !== expected[i]) return i;

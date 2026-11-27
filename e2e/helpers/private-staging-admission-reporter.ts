@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { FullResult, Reporter, TestCase, TestResult, TestStep } from '@playwright/test/reporter';
 
@@ -36,9 +36,10 @@ function properties(result: TestResult, type: string, fields: Record<string, Reg
   return result.annotations.filter((annotation) => annotation.type === type).map(({ description }) => {
     if (!description || description.length > 1024) throw new Error();
     const observed: Record<string, unknown> = JSON.parse(description);
+    if (!observed || typeof observed !== 'object' || Array.isArray(observed)) throw new Error();
     return Object.fromEntries(Object.entries(fields).map(([key, shape]) => {
       const value = observed[key];
-      if (typeof value !== 'string' || !shape.test(value)) throw new Error();
+      if (!Object.hasOwn(observed, key) || typeof value !== 'string' || !shape.test(value)) throw new Error();
       return [key, value];
     }));
   });
@@ -61,8 +62,11 @@ export default class PrivateStagingAdmissionReporter implements Reporter {
   }
 
   async onEnd(run: FullResult): Promise<{ status: 'failed' } | void> {
-    if (run.status !== 'passed') return;
+    const directory = new URL('../private-staging-results/', import.meta.url);
+    const report = fileURLToPath(new URL('admission.xml', directory));
     try {
+      rmSync(report, { force: true });
+      if (run.status !== 'passed') return;
       const { test, result } = exactlyOne(this.results);
       if (test.expectedStatus !== 'passed' || result.status !== 'passed' || result.retry !== 0) throw new Error();
       const steps = [...journeySteps(result.steps)];
@@ -70,12 +74,19 @@ export default class PrivateStagingAdmissionReporter implements Reporter {
       const observed = properties(result, 'candidate-identity', {
         phase: /^(build-identity|build-identity-final)$/, web: sha, api: sha, expected: sha, observed_at: isoTime,
       });
-      if (observed.length !== identities.length) throw new Error();
+      const [opening, closing] = observed;
+      if (observed.length !== identities.length || !opening || !closing ||
+          opening.phase !== identities[0] || closing.phase !== identities[1] ||
+          observed.some(({ web, api, expected, observed_at }) => web !== opening.expected ||
+            api !== web || expected !== web || !observed_at || new Date(observed_at).toISOString() !== observed_at) ||
+          opening.observed_at! > closing.observed_at!) throw new Error();
+      let trackProof: string | undefined;
 
       const cases = [...identities, ...Object.keys(proofs)].map((name) => {
         const title = name === 'invite-acceptance' ? 'invite redemption and Library arrival' : name;
         const step = exactlyOne(steps.filter((step) => step.title === title));
-        if (step.error || step.duration < 0 || step.annotations.some(({ type }) => type === 'skip')) throw new Error();
+        if (step.error || !Number.isFinite(step.duration) || step.duration < 0 ||
+            step.annotations.some(({ type }) => type === 'skip')) throw new Error();
         const annotations = [];
         if (identities.includes(name)) {
           const identity = exactlyOne(observed.filter(({ phase }) => phase === name));
@@ -86,15 +97,17 @@ export default class PrivateStagingAdmissionReporter implements Reporter {
             ? { ...trackFields, cutoff_listener: uuid, refused_listener: uuid }
             : trackFields;
           const value = exactlyOne(properties(result, proof, fields));
+          const identity = JSON.stringify(Object.keys(trackFields).map((key) => value[key]));
+          trackProof ??= identity;
+          if (value.build_sha !== opening.expected || trackProof !== identity) throw new Error();
           annotations.push(property(proof, value));
         }
         const evidence = annotations.length ? `<properties>${annotations.join('')}</properties>` : '';
         return `<testcase classname="private-music" name="${name}" retry="${result.retry}">${evidence}</testcase>`;
       });
 
-      const directory = new URL('../private-staging-results/', import.meta.url);
       mkdirSync(directory, { recursive: true });
-      writeFileSync(fileURLToPath(new URL('admission.xml', directory)), `<testsuite>${cases.join('')}</testsuite>\n`, { mode: 0o600 });
+      writeFileSync(report, `<testsuite>${cases.join('')}</testsuite>\n`, { mode: 0o600, flag: 'wx' });
     } catch {
       process.stderr.write('Private staging admission evidence is incomplete.\n');
       return { status: 'failed' };

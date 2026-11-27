@@ -39,10 +39,13 @@ type AudioWithPlaybackRecorder = HTMLAudioElement & {
 
 /** Runs inside Locator.evaluate. Only the numeric and boolean sample leaves the page. */
 export function observePlayback(element: Element, mode: 'arm' | 'reset' | 'sample'): PlaybackEvidence {
+  if (!(element instanceof HTMLAudioElement) || !['arm', 'reset', 'sample'].includes(mode)) {
+    throw new Error('Playback observation requires an audio element and a known mode');
+  }
   const player = element as AudioWithPlaybackRecorder;
   // The staging player uses a direct src. currentSrc can still describe the
   // outgoing media while the browser is selecting the newly assigned src.
-  const readSource = () => player.currentSrc === player.src ? player.currentSrc : '';
+  const readSource = () => !player.seeking && player.currentSrc === player.src ? player.currentSrc : '';
   const reset = (source: string) => {
     const recorder = { source, sawPlaying: false, maxCurrentTime: 0 };
     player.__nnPlayback = recorder;
@@ -64,6 +67,7 @@ export function observePlayback(element: Element, mode: 'arm' | 'reset' | 'sampl
     player.addEventListener('playing', record);
     player.addEventListener('timeupdate', record);
     player.addEventListener('emptied', () => reset(''));
+    player.addEventListener('seeking', () => reset(''));
     recorder = reset(source);
   } else if (recorder && (mode === 'reset' || recorder.source !== source)) {
     recorder = reset(source);
@@ -93,16 +97,20 @@ export function observePlayback(element: Element, mode: 'arm' | 'reset' | 'sampl
  * numbers/booleans from the snapshot — never a URL or source value.
  */
 export function playbackFailure(evidence: PlaybackEvidence, baselineTime: number): string | null {
+  if (!evidence || [evidence.hasSource, evidence.sawPlaying, evidence.paused, evidence.ended]
+    .some((value) => typeof value !== 'boolean') || !Number.isInteger(evidence.readyState) ||
+    evidence.readyState < 0 || evidence.readyState > 4) return 'Invalid audio playback state';
   if (evidence.errorCode !== null) {
-    return `audio element reported media error ${evidence.errorCode}`;
+    return Number.isInteger(evidence.errorCode) && evidence.errorCode >= 1 && evidence.errorCode <= 4
+      ? `audio element reported media error ${evidence.errorCode}` : 'Invalid audio media error';
   }
   if (!evidence.hasSource) {
     return 'audio element has no source (the synthetic track was never loaded into the player)';
   }
   if (!Number.isFinite(evidence.duration) || evidence.duration <= 0) {
-    return `audio duration is not a positive finite number (duration=${evidence.duration}) — metadata never decoded`;
+    return 'audio duration is not a positive finite number — metadata never decoded';
   }
-  const playing = evidence.sawPlaying || (!evidence.paused && !evidence.ended);
+  const playing = evidence.ended ? evidence.sawPlaying : !evidence.paused;
   // A recorded `playing` event already implies a decoded frame; without one
   // require HAVE_CURRENT_DATA so a merely-unpaused element cannot pass.
   if (!playing || (!evidence.sawPlaying && evidence.readyState < 2)) {
@@ -111,8 +119,9 @@ export function playbackFailure(evidence: PlaybackEvidence, baselineTime: number
       `sawPlaying=${evidence.sawPlaying}, readyState=${evidence.readyState})`
     );
   }
-  if (!Number.isFinite(evidence.maxCurrentTime) || !Number.isFinite(evidence.currentTime)) {
-    return `audio position is not finite (currentTime=${evidence.currentTime}, maxCurrentTime=${evidence.maxCurrentTime})`;
+  if (![baselineTime, evidence.currentTime, evidence.maxCurrentTime].every((time) =>
+    Number.isFinite(time) && time >= 0 && time <= evidence.duration) || evidence.currentTime > evidence.maxCurrentTime) {
+    return 'audio position is outside the valid playback bounds';
   }
   if (!(evidence.maxCurrentTime > baselineTime)) {
     return (

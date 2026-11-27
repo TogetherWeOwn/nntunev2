@@ -1,7 +1,7 @@
 import { API, TESTIDS } from './contract.js';
 import { playbackFailure, type PlaybackEvidence } from './playback.js';
 import { resumeFloorAfterSeek, seekProofFailure, type TimedPlayer } from './player-ui.js';
-import { queueOrderFailure } from './queue-order.js';
+import { isQueueTrackId, queueOrderFailure } from './queue-order.js';
 
 // Existing hooks for the invited browser session.
 export const PRIVATE_MUSIC = {
@@ -48,7 +48,7 @@ export function assertPrivateInvite(observed: {
   libraryStatus: number;
 }): void {
   if (
-    observed.privateListening !== true ||
+    observed?.privateListening !== true ||
     observed.destination !== PRIVATE_MUSIC.library.path ||
     observed.inviteFragmentCleared !== true ||
     observed.libraryStatus !== 200
@@ -63,24 +63,25 @@ export function assertCuratedLibrary(
   libraryOrder: readonly string[],
 ): string[] {
   if (
-    expectedDigests.length < 2 ||
+    !Array.isArray(expectedDigests) || expectedDigests.length < 2 ||
     new Set(expectedDigests).size !== expectedDigests.length ||
-    expectedDigests.some((digest) => !/^[a-f0-9]{64}$/.test(digest))
+    Array.from(expectedDigests).some((digest) => typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest))
   ) {
     throw new Error('Choose at least two distinct FLAC digests for the curated Library check');
   }
-  if (published.length !== expectedDigests.length) {
+  if (!Array.isArray(published) || published.length !== expectedDigests.length) {
     throw new Error('Expected one publication for each uploaded FLAC');
   }
   const ids = expectedDigests.map((digest) => {
-    const matches = published.filter((track) => track.sha256 === digest);
+    const matches = published.filter((track) => track?.sha256 === digest);
     const id = matches[0]?.trackId;
-    if (matches.length !== 1 || !id?.trim()) {
+    if (matches.length !== 1 || !isQueueTrackId(id)) {
       throw new Error('Each uploaded FLAC digest must identify one published track');
     }
     return id;
   });
-  const selectedOrder = libraryOrder.filter((id) => ids.includes(id));
+  const selectedOrder = Array.isArray(libraryOrder) && Array.from(libraryOrder).every(isQueueTrackId)
+    ? libraryOrder.filter((id) => ids.includes(id)) : [];
   if (
     new Set(ids).size !== ids.length ||
     selectedOrder.length !== ids.length ||
@@ -109,17 +110,13 @@ export function assertPrivateTransport(selectionOrder: string[], observed: {
     throw new Error('Play and Next must select the first and second curated tracks');
   }
   if (
-    !Number.isFinite(observed.baselineTime) ||
-    observed.baselineTime < 0 ||
     playbackFailure(observed.playback, observed.baselineTime)
   ) {
     throw new Error('Curated playback must decode and advance before seeking');
   }
   const { seek } = observed;
   if (
-    !Number.isFinite(seek.currentTime) ||
-    !Number.isFinite(seek.duration) ||
-    seek.duration <= 0 ||
+    seek.duration !== observed.playback.duration ||
     !(seek.fraction > 0.25 && seek.fraction < 0.75) ||
     seekProofFailure(seek, seek.fraction, seek.sawSeekedEvent)
   ) {
@@ -129,7 +126,8 @@ export function assertPrivateTransport(selectionOrder: string[], observed: {
   if (
     !Number.isFinite(resume.minimumTime) ||
     resume.minimumTime < resumeFloorAfterSeek(seek.currentTime, seek.duration) ||
-    resume.minimumTime > resume.playback.maxCurrentTime ||
+    resume.minimumTime > resume.playback.currentTime ||
+    resume.playback.duration !== seek.duration ||
     playbackFailure(resume.playback, seek.currentTime)
   ) {
     throw new Error('Playback must resume and advance from the sought position');
@@ -161,6 +159,7 @@ export function assertPrivateMeteredPlay(
   observed: PrivateMeteredPlay,
 ): void {
   if (
+    ![expected.userId, expected.trackId, expected.playId].every(isQueueTrackId) ||
     observed.userId !== expected.userId || observed.trackId !== expected.trackId ||
     observed.playId !== expected.playId || observed.fileBytes !== expected.fileBytes ||
     observed.durationMs !== expected.durationMs
@@ -178,15 +177,13 @@ export function assertPrivateMeteredPlay(
     throw new Error('Metered play fixture must stay within the bounded media limits');
   }
 
-  const ranges = observed.delivered
-    .map(({ start, end }) => {
-      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start ||
-        end > observed.fileBytes) {
-        throw new Error('Metered play delivered ranges must be non-empty file spans');
-      }
-      return [start, end] as const;
-    })
-    .sort(([left], [right]) => left - right);
+  const ranges = [...observed.delivered].map((range) => {
+    if (!range || !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end) ||
+        range.start < 0 || range.end <= range.start || range.end > observed.fileBytes) {
+      throw new Error('Metered play delivered ranges must be non-empty file spans');
+    }
+    return [range.start, range.end] as const;
+  }).sort(([left], [right]) => left - right);
   const merged: [number, number][] = [];
   for (const [start, end] of ranges) {
     const previous = merged.at(-1);
@@ -221,7 +218,7 @@ export function assertPrivateRefusals(
   remainingCuratedRows: number,
 ): void {
   for (const outcome of Object.keys(REFUSALS) as Array<keyof typeof REFUSALS>) {
-    if (statuses[outcome] !== REFUSALS[outcome]) {
+    if (!statuses || !Object.hasOwn(statuses, outcome) || statuses[outcome] !== REFUSALS[outcome]) {
       throw new Error(`Private listening refusal ${outcome} must return HTTP ${REFUSALS[outcome]}`);
     }
   }

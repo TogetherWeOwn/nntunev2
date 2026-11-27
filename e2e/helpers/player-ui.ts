@@ -45,6 +45,10 @@ interface Box {
   height: number;
 }
 
+function validFraction(fraction: number): boolean {
+  return Number.isFinite(fraction) && fraction >= 0 && fraction <= 1;
+}
+
 /**
  * Proven-seek region for a click at `fraction` of the seek control's
  * width. Deliberately wide (for the milestone's 0.55 click: 30%..95% of
@@ -88,14 +92,18 @@ export function seekProofFailure(
   fraction: number,
   sawSeekedEvent: boolean,
 ): string | null {
-  if (!sawSeekedEvent) {
+  if (sawSeekedEvent !== true) {
     return (
       'No "seeked" event fired after acting on the player UI seek control ' +
       '(the seek did not happen, or playback did not reach a seekable position)'
     );
   }
-  if (!state.paused) {
+  if (state?.paused !== true) {
     return 'Playback did not stay paused after the seek — the state does not prove the sought position';
+  }
+  if (!validFraction(fraction) || !Number.isFinite(state.duration) || state.duration <= 0 ||
+      !Number.isFinite(state.currentTime) || state.currentTime < 0 || state.currentTime > state.duration) {
+    return 'Invalid paused seek position, duration or fraction';
   }
   const region = seekProofRegion(state.duration, fraction);
   if (state.currentTime < region.min || state.currentTime > region.max) {
@@ -118,8 +126,8 @@ export function chooseSeekSurface(
   seekSliderUsable: boolean,
   nativeControlsPresent: boolean,
 ): SeekSurface | null {
-  if (seekSliderUsable) return 'custom';
-  if (nativeControlsPresent) return 'native';
+  if (seekSliderUsable === true) return 'custom';
+  if (nativeControlsPresent === true) return 'native';
   return null;
 }
 
@@ -165,11 +173,14 @@ export function nativeToggleClickPoint(box: Box): { x: number; y: number } {
   return { x: box.x + 16, y: box.y + box.height / 2 };
 }
 
-async function playerState(player: Locator): Promise<TimedPlayer> {
-  return player.evaluate((el) => {
-    const a = el as HTMLAudioElement;
-    return { currentTime: a.currentTime, duration: a.duration, paused: a.paused };
-  });
+async function clickAt(control: Locator, locate: (box: Box) => { x: number; y: number }): Promise<void> {
+  await control.scrollIntoViewIfNeeded();
+  const box = await control.boundingBox();
+  if (!box) throw new Error('Player control has no bounding box');
+  const point = locate({ ...box, x: 0, y: 0 });
+  if (!(point.x > 0 && point.x < box.width && point.y > 0 && point.y < box.height) ||
+      !Number.isFinite(box.width) || !Number.isFinite(box.height)) throw new Error('Invalid player control geometry');
+  await control.click({ position: point });
 }
 
 /** Wait until the player's `paused` state matches `paused`. */
@@ -179,17 +190,20 @@ export async function waitForPaused(
   timeout: number,
   message: string,
 ): Promise<TimedPlayer> {
-  const start = Date.now();
+  if (!Number.isSafeInteger(timeout) || timeout <= 0 || typeof paused !== 'boolean') {
+    throw new Error('Pause wait requires a positive timeout and a boolean state');
+  }
+  const deadline = performance.now() + timeout;
   for (;;) {
-    const state = await playerState(player);
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new Error(message);
+    const state = await player.evaluate((el) => {
+      if (!(el instanceof HTMLAudioElement)) throw new Error('Expected an audio player');
+      return { currentTime: el.currentTime, duration: el.duration, paused: el.paused };
+    }, undefined, { timeout: Math.ceil(remaining) });
+    if (performance.now() >= deadline) throw new Error(message);
     if (state.paused === paused) return state;
-    if (Date.now() - start > timeout) {
-      throw new Error(
-        `${message} (paused=${state.paused}, position=${state.currentTime.toFixed(1)}s ` +
-          `of ${state.duration.toFixed(1)}s)`,
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await new Promise((resolve) => setTimeout(resolve, Math.min(200, deadline - performance.now())));
   }
 }
 
@@ -200,24 +214,17 @@ export async function waitForPaused(
  */
 export async function togglePlayViaPlayerUi(page: Page, player: Locator): Promise<void> {
   const playPause = page.getByTestId(PENDING_TESTIDS.playerPlayPause);
-  if ((await playPause.count()) > 0 && (await playPause.isVisible())) {
+  const count = await playPause.count();
+  if (count > 1) throw new Error('Ambiguous player play/pause control');
+  if (count === 1 && (await playPause.isVisible())) {
     await playPause.click();
     return;
   }
-  const hasControls = await player.evaluate((el) => (el as HTMLAudioElement).controls);
+  const hasControls = await player.evaluate((el) => el instanceof HTMLAudioElement && el.controls);
   if (!hasControls) {
     throw new Error(seekSurfaceFailure(false, false));
   }
-  // page.mouse.click never scrolls (locator.click did): the player renders
-  // below the library list, off-viewport, so bring it into view before
-  // taking viewport-relative coordinates from boundingBox().
-  await player.scrollIntoViewIfNeeded();
-  const box = await player.boundingBox();
-  if (!box) {
-    throw new Error('The audio element has no bounding box — native transport controls are not rendered');
-  }
-  const point = nativeToggleClickPoint(box);
-  await page.mouse.click(point.x, point.y);
+  await clickAt(player, nativeToggleClickPoint);
 }
 
 /**
@@ -234,24 +241,19 @@ export async function seekViaPlayerUi(
   player: Locator,
   fraction: number,
 ): Promise<SeekTarget> {
+  if (!validFraction(fraction)) throw new Error('Seek fraction must be finite and within [0, 1]');
   const slider = page.getByTestId(TESTIDS.playerSeek);
-  const sliderVisible =
-    (await slider.count()) > 0 ? await slider.isVisible() : false;
+  const count = await slider.count();
+  if (count > 1) throw new Error('Ambiguous player seek control');
+  const sliderVisible = count === 1 && await slider.isVisible();
   const sliderEnabled = sliderVisible && (await slider.isEnabled());
-  const hasControls = await player.evaluate((el) => (el as HTMLAudioElement).controls);
+  const hasControls = await player.evaluate((el) => el instanceof HTMLAudioElement && el.controls);
   const surface = chooseSeekSurface(sliderEnabled, hasControls);
   if (surface === null) {
     throw new Error(`${seekSurfaceFailure(sliderVisible, hasControls)} Custom slider enabled=${sliderEnabled}.`);
   }
   const target: SeekTarget = { fraction, surface };
   const seekControl = surface === 'custom' ? slider : player;
-  // Same off-viewport rule as the toggle: scroll before boundingBox().
-  await seekControl.scrollIntoViewIfNeeded();
-  const box = await seekControl.boundingBox();
-  if (!box) {
-    throw new Error(`The ${surface} seek control has no bounding box — it is not rendered`);
-  }
-  const point = fractionClickPoint(box, fraction);
-  await page.mouse.click(point.x, point.y);
+  await clickAt(seekControl, (box) => fractionClickPoint(box, fraction));
   return target;
 }

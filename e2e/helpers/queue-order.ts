@@ -15,6 +15,10 @@
  * artifacts.
  */
 
+export function isQueueTrackId(id: unknown): id is string {
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{1,512}$/.test(id);
+}
+
 /**
  * Return null when `queueOrder` holds exactly the `libraryOrder` ids in the
  * same order, otherwise a human-readable failure naming the missing proof.
@@ -25,16 +29,17 @@ export function queueOrderFailure(
   libraryOrder: string[],
   queueOrder: string[] | null,
 ): string | null {
+  if (!Array.isArray(libraryOrder)) return 'Library selection order is missing';
   if (libraryOrder.length === 0) {
     return 'library is empty — ingest spec must run first (queue-order needs ingested tracks)';
   }
   if (libraryOrder.length < 2) {
     return (
-      `library holds only 1 track (${libraryOrder[0] ?? '(unknown)'}) — queue-order needs ` +
+      'library holds only 1 track — queue-order needs ' +
       '≥2 ingested tracks in library-selection order (the synthetic fixture currently ingests one)'
     );
   }
-  if (queueOrder === null) {
+  if (!Array.isArray(queueOrder)) {
     return (
       'player queue is not exposed on /library (expected queue hooks queue-list/queue-item, ' +
       'now-playing and player-next are missing) — the queue UI must be wired to the selected library order'
@@ -46,20 +51,19 @@ export function queueOrderFailure(
       'selecting the library tracks did not fill the queue'
     );
   }
-  const seen = new Set<string>();
-  for (const id of queueOrder) {
-    if (seen.has(id)) {
-      return `player queue contains a duplicate id (${id}) — queue ids must be unique`;
-    }
-    seen.add(id);
-  }
+  if (Array.from(libraryOrder).some((id) => !isQueueTrackId(id)) ||
+      Array.from(queueOrder).some((id) => !isQueueTrackId(id))) return 'Queue and library require valid track ids';
+  const selected = new Set(libraryOrder);
+  const queued = new Set(queueOrder);
+  if (selected.size !== libraryOrder.length) return 'Library selection contains duplicate track ids';
+  if (queued.size !== queueOrder.length) return 'Player queue contains a duplicate id';
   if (queueOrder.length !== libraryOrder.length) {
-    const extra = queueOrder.filter((id) => !libraryOrder.includes(id));
-    const missing = libraryOrder.filter((id) => !queueOrder.includes(id));
+    const extra = queueOrder.filter((id) => !selected.has(id));
+    const missing = libraryOrder.filter((id) => !queued.has(id));
     const detail =
       extra.length > 0
-        ? `extra queue id(s): ${extra.join(', ')}`
-        : `missing queue id(s): ${missing.join(', ')}`;
+        ? `extra queue id(s): ${extra.slice(0, 3).join(', ')}`
+        : `missing queue id(s): ${missing.slice(0, 3).join(', ')}`;
     return (
       `player queue length (${queueOrder.length}) does not match library-selection length ` +
       `(${libraryOrder.length}) — ${detail}`
