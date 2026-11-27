@@ -306,6 +306,7 @@ mod tests {
 
     fn sample_outcome(status: &str) -> ReconcileOutcome {
         use crate::billing_reconcile::{PaidInvoiceRow, ReconciledRow};
+        let (t0, t1) = (1_786_032_000, 1_786_032_100);
         ReconcileOutcome {
             row: ReconciledRow {
                 stripe_subscription_id: "sub-a".into(),
@@ -314,9 +315,9 @@ mod tests {
                 stripe_price_id: "price-plus".into(),
                 plan_id: "plus".into(),
                 status: status.into(),
-                current_period_end_unix: Some(1_786_032_100),
+                current_period_end_unix: Some(t1),
                 cancel_at_period_end: false,
-                paid_through_unix: Some(1_786_032_100),
+                paid_through_unix: Some(t1),
                 paid_invoice_id: Some("in-a".into()),
                 grace_until_unix: None,
             },
@@ -324,12 +325,12 @@ mod tests {
                 stripe_invoice_id: "in-a".into(),
                 stripe_subscription_id: "sub-a".into(),
                 plan_id: "plus".into(),
-                period_start_unix: 1_786_032_000,
-                period_end_unix: 1_786_032_100,
+                period_start_unix: t0,
+                period_end_unix: t1,
                 amount_cents: 800,
                 currency: "usd".into(),
-                paid_at_unix: 1_786_032_000,
-                covered_periods: vec![(1_786_032_000, 1_786_032_100)],
+                paid_at_unix: t0,
+                covered_periods: vec![(t0, t1)],
             }],
             fail_closed: None,
             explicit_stale: false,
