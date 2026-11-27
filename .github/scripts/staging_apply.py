@@ -33,7 +33,6 @@ from pathlib import Path
 import migration_history
 
 FILE_RE = migration_history.FILE_RE
-ROW_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 SECRET_ENV = "PLANETSCALE_MIGRATOR_URL_STAGING"
 TRUSTED_DIRNAME = ".github/scripts"
 # Names a trusted-code child is allowed to inherit. DATABASE_URL is
@@ -54,7 +53,7 @@ def normalize_url(raw, expected_database):
     """Validate the migrator URL and force sslmode=verify-full.
 
     Shared by the apply and evidence phases so both accept exactly the
-    same secrets: whatever sslmode the secret carries (or omits), the
+    same secrets: for any valid sslmode (or if it is omitted), the
     connection is verify-full in both.
     """
     if not raw:
@@ -73,6 +72,8 @@ def normalize_url(raw, expected_database):
         raise StagingApplyError("staging migrator URL does not target the expected database")
     if (set(query) - {"sslmode", "sslrootcert"}
             or len(query.get("sslmode", [])) > 1
+            or query.get("sslmode", ["verify-full"])[0] not in (
+                "disable", "allow", "prefer", "require", "verify-ca", "verify-full")
             or query.get("sslrootcert", ["system"]) != ["system"]):
         raise StagingApplyError("staging migrator URL carries unsupported connection options")
     query["sslmode"] = ["verify-full"]
@@ -178,7 +179,7 @@ def apply_files(trusted_root, data_root, migration_file, applied_by, mode,
     files = plan_files(entries, migration_file, mode)
     database_url = normalize_url(source.get(SECRET_ENV, ""), expected_database)
     if (not applied_by or len(applied_by) > 200
-            or ROW_CONTROL_RE.search(applied_by)):
+            or migration_history.LEDGER_CONTROL_RE.search(applied_by)):
         raise StagingApplyError("applied_by must be non-empty printable text")
     child = allowlisted_child_env(database_url, source)
     script = trusted_script_path(trusted_root)
@@ -271,7 +272,7 @@ def verified_row_fields(row, entry):
     fields = row.split("\t")
     if (len(fields) != 4 or fields[0] not in entry_names(entry) or fields[1] != entry["sha256"]
             or not fields[2] or not fields[3]
-            or any(ROW_CONTROL_RE.search(field) for field in fields)):
+            or any(migration_history.LEDGER_CONTROL_RE.search(field) for field in fields)):
         raise StagingApplyError("ledger row missing, ambiguous or mismatched")
     return fields
 

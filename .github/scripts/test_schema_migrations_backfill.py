@@ -36,8 +36,7 @@ class BackfillTests(unittest.TestCase):
         for target in backfill.TARGETS:
             committed = (REPO / "docs" / "ops" /
                          f"schema-migrations-backfill-2026-11-03-{target}.sql")
-            self.assertEqual(committed.read_text(encoding="utf-8"),
-                             backfill.render(target))
+            self.assertEqual(committed.read_bytes(), backfill.render(target).encode("utf-8"))
 
     def test_app_backfill_satisfies_the_gate_immediately(self):
         # The app file records exactly the frozen (2026-11-03) merged

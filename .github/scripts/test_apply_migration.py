@@ -158,6 +158,10 @@ class ComposeTests(unittest.TestCase):
             with self.assertRaisesRegex(apply_migration.ApplyError, "bound exceeded"):
                 self.compose()
 
+    def test_quote_literal_rejects_del_actor(self):
+        with self.assertRaisesRegex(apply_migration.ApplyError, "printable text"):
+            apply_migration.quote_literal("operator\x7f")
+
     def test_apply_rejects_out_of_order_prerequisites(self):
         self.write_manifest([
             ("0002_alpha.sql", "app", "SELECT 2;\n", []),

@@ -13,6 +13,7 @@ import tomllib
 FILE_RE = re.compile(r"[0-9]{4}_[A-Za-z0-9_]+\.sql\Z")
 PATH_RE = re.compile(r"migrations/[0-9]{4}_[A-Za-z0-9_]+\.sql\Z")
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
+LEDGER_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 COMMIT_RE = re.compile(r"(?!0{40})[0-9a-f]{40}\Z")
 EDGE_KEYS = ("parent", "commit", "old_path", "new_path", "old_sha256", "new_sha256")
 MAX_COMMITS = 512

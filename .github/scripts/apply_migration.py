@@ -321,7 +321,7 @@ def resolve_entry(entries, filename, sha256):
 
 
 def quote_literal(value, label="applied-by"):
-    if any(ord(ch) < 0x20 for ch in value) or not value.strip():
+    if migration_history.LEDGER_CONTROL_RE.search(value) or not value.strip():
         raise ApplyError(f"{label} must be non-empty printable text")
     return "'" + value.replace("'", "''") + "'"
 

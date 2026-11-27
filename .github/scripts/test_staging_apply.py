@@ -344,8 +344,9 @@ class StagingApplyTests(unittest.TestCase):
         self.assertIn("sslmode=verify-full", normalized)
         self.assertNotIn("require", normalized)
 
-    def test_normalize_rejects_invalid_port_and_blank_root_cert(self):
-        for url in (URL_REQUIRE.replace(".com", ".com:invalid"), URL_REQUIRE + "&sslrootcert="):
+    def test_normalize_rejects_malformed_connection_options(self):
+        for url in (URL_REQUIRE.replace(".com", ".com:invalid"), URL_REQUIRE + "&sslrootcert=",
+                    URL_REQUIRE.removesuffix("require"), URL_REQUIRE.replace("require", "invalid")):
             with self.subTest(url=url), self.assertRaises(staging_apply.StagingApplyError):
                 staging_apply.normalize_url(url, DB)
 
