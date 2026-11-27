@@ -252,6 +252,7 @@ if url.startswith(("postgres://", "postgresql://")):
     host = host_match[1] or host_match[2]
     if host:
         params["host"] = dec(host)
+    uri_hosts = [params.get("host", "")]
     try:
         port = parts.port
     except ValueError:
@@ -276,7 +277,9 @@ if url.startswith(("postgres://", "postgresql://")):
         if key not in ENV_FOR_PARAM:
             fail(unmappable_message("query parameter", key))
         params[key] = dec(value)
-    if any("," in params.get(key, "") for key in ("host", "hostaddr", "port")):
+        if key in ("host", "hostaddr", "port"):
+            uri_hosts.append(params[key])
+    if any("," in value for value in uri_hosts):
         fail("multi-host DATABASE_URL URI is not supported; name a single host")
 elif re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", url):
     # A URI-shaped input with any other scheme (a driver-specific

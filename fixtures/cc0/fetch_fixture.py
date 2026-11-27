@@ -333,15 +333,11 @@ def download(request: urllib.request.Request, dest: Path, track: dict | None = N
         with opener.open(request, timeout=300) as response:
             with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as handle:
                 tmp = Path(handle.name)
-                count = 0
-                digest = hashlib.sha256()
                 for chunk in iter(lambda: response.read(1024 * 1024), b""):
-                    count += len(chunk)
-                    if track is not None and count > track["bytes"]:
+                    if track is not None and handle.tell() + len(chunk) > track["bytes"]:
                         raise FetchError("download exceeds manifest byte count")
-                    digest.update(chunk)
                     handle.write(chunk)
-        if track is not None and (count != track["bytes"] or digest.hexdigest() != track["sha256"]):
+        if track is not None and not verify(tmp, track):
             raise FetchError("download does not match manifest bytes/sha256")
         os.replace(tmp, dest)
     except urllib.error.HTTPError as exc:

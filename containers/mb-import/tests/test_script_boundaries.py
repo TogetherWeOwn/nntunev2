@@ -37,7 +37,7 @@ class BoundaryTests(unittest.TestCase):
 
     def test_pg_uri_refusals(self):
         for url in ("postgres://user:synthetic%xy@host/db",
-                    "postgres://user:synthetic@h%2cother/db", "postgres://h/db?sslmode",
+                    "postgres://user:synthetic@h%2cother/db?host=override", "postgres://h/db?sslmode",
                     "postgres://user:synthetic\t@host/db", "postgres://[::1]suffix/db"):
             with self.subTest(url=url):
                 result = self.shell("-c", '. "$1"; configure_pg_env_from_database_url',

@@ -524,8 +524,7 @@ EOF
       echo "import: cannot parse validator summary for $table lines $range" >&2
       exit 1
     fi
-    valid_n="${BASH_REMATCH[1]}"
-    poison_n="${BASH_REMATCH[2]}"
+    valid_n="${BASH_REMATCH[1]}" poison_n="${BASH_REMATCH[2]}"
     valid_lines="$(awk 'END { print NR+0 }' "$work/valid.tsv")"
     poison_lines="$(awk 'END { print NR+0 }' "$work/poison.tsv")"
     if [[ "$valid_lines" != "$valid_n" || "$poison_lines" != "$poison_n" ]]; then
