@@ -1156,6 +1156,50 @@ impl PgStore {
         Ok(outcome)
     }
 
+    #[allow(dead_code)] // Caller activation is a separate slice.
+    async fn reconcile_locked_subscription(
+        &self,
+        user_id: &str,
+        subscription_id: &str,
+        retrieve: impl AsyncFnOnce() -> Result<crate::stripe::Subscription, StoreError>,
+        load_paid_invoices: impl AsyncFnOnce(
+            &crate::stripe::Subscription,
+        ) -> Result<Vec<crate::stripe::Invoice>, StoreError>,
+        now: i64,
+    ) -> Result<crate::billing_reconcile::ReconcileOutcome, StoreError> {
+        use crate::billing_reconcile::{reconcile_exact_target, RemoteSubscription};
+        self.run_owned_billing(async |client| {
+            crate::billing_transaction_sql::reconcile_transaction(
+                client,
+                user_id,
+                true,
+                #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+                crate::billing_transaction_sql::ReconcileProbe::None,
+                async |client| {
+                    let input = self
+                        .load_reconcile_input_on(client, user_id, Some(subscription_id))
+                        .await?;
+                    let subscription = retrieve().await?;
+                    if subscription.id != subscription_id
+                        || subscription.livemode
+                        || input.stripe_customer_id.is_none()
+                        || input.stripe_customer_id != subscription.customer
+                    {
+                        return Err(StoreError);
+                    }
+                    let invoices = load_paid_invoices(&subscription).await?;
+                    let remote = RemoteSubscription {
+                        subscription,
+                        invoices,
+                    };
+                    reconcile_exact_target(subscription_id, input, &remote, now).ok_or(StoreError)
+                },
+            )
+            .await
+        })
+        .await
+    }
+
     // The dormant workerd controls exercise the original transaction and
     // its lock-order probes. Paid dispatch uses the account fence below.
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
@@ -1169,20 +1213,37 @@ impl PgStore {
             .await
     }
 
-    #[cfg(target_arch = "wasm32")]
     async fn store_reconcile_owned_inner(
         &self,
         user_id: String,
         outcome: crate::billing_reconcile::ReconcileOutcome,
         require_open_owner: bool,
-        #[cfg(feature = "billing-owned-wasm-test")]
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
         probe: crate::billing_transaction_sql::ReconcileProbe,
     ) -> Result<(), StoreError> {
-        use crate::billing_transaction_sql::apply_reconcile_transaction as apply;
-        let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
-        crate::billing_store_classification::validate_history_target(&outcome)
-            .map_err(|_| failed())?;
-        billing_budget::with_owned_connection_from(
+        crate::billing_store_classification::validate_history_target(&outcome).map_err(|_| {
+            self.statement_failed("api.db.statement_failed.store_reconcile_outcome")
+        })?;
+        self.run_owned_billing(async |client| {
+            crate::billing_transaction_sql::apply_reconcile_transaction(
+                client,
+                user_id,
+                outcome,
+                require_open_owner,
+                #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+                probe,
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn run_owned_billing<T: 'static>(
+        &self,
+        work: impl AsyncFnOnce(&mut PgClient) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        #[cfg(target_arch = "wasm32")]
+        let result = billing_budget::with_owned_connection_from(
             || {
                 #[cfg(feature = "billing-owned-wasm-test")]
                 let target = (
@@ -1217,16 +1278,7 @@ impl PgStore {
                 }
                 Box::pin(billing_budget::bootstrap_transaction(client))
             },
-            move |client| {
-                Box::pin(apply(
-                    client,
-                    user_id,
-                    outcome,
-                    require_open_owner,
-                    #[cfg(feature = "billing-owned-wasm-test")]
-                    probe,
-                ))
-            },
+            work,
             #[cfg(feature = "billing-owned-wasm-test")]
             |expired| {
                 if let Some(observer) = &self.work_deadline_observer {
@@ -1234,40 +1286,93 @@ impl PgStore {
                 }
             },
         )
-        .await
-        .map_err(|_| failed())
-    }
-
-    // Native acceptance injects connection acquisition only. The client
-    // stays inside the budgeted operation.
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn store_reconcile_owned_inner(
-        &self,
-        user_id: String,
-        outcome: crate::billing_reconcile::ReconcileOutcome,
-        require_open_owner: bool,
-    ) -> Result<(), StoreError> {
-        let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
-        crate::billing_store_classification::validate_history_target(&outcome)
-            .map_err(|_| failed())?;
-        billing_budget::BillingBudget::run(|budget| async move {
+        .await;
+        #[cfg(not(target_arch = "wasm32"))]
+        let result = billing_budget::BillingBudget::run(|budget| async move {
             let mut client = budget.connect(|| self.connect()).await?;
             budget
                 .bootstrap(|| billing_budget::bootstrap_transaction(&mut client))
                 .await?;
-            budget
-                .work(|| {
-                    crate::billing_transaction_sql::apply_reconcile_transaction(
-                        &mut client,
-                        user_id,
-                        outcome,
-                        require_open_owner,
-                    )
-                })
-                .await
+            budget.work(|| Box::pin(work(&mut client))).await
         })
-        .await
-        .map_err(|_| failed())
+        .await;
+        result.map_err(|_| self.statement_failed("api.db.statement_failed.store_reconcile_outcome"))
+    }
+
+    async fn load_reconcile_input_on(
+        &self,
+        client: &impl PgQuery,
+        user_id: &str,
+        target_subscription_id: Option<&str>,
+    ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
+        use crate::billing_reconcile as billing;
+        let failed = || self.statement_failed("api.db.statement_failed.load_reconcile_input");
+        let stripe_customer_id = client
+            .query_typed_opt(
+                billing::reconcile_account_select_statement(),
+                &[(&user_id, Type::TEXT)],
+            )
+            .await
+            .map_err(|_| failed())?
+            .map(|row| row.try_get("stripe_customer_id"))
+            .transpose()
+            .map_err(|_| StoreError)?
+            .flatten();
+        // Require the exact selector even if both selectors return the same row.
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        if self.webhook_ack_control()
+            && target_subscription_id != Some(billing_webhook_ack_test::SUBSCRIPTION)
+        {
+            return Err(failed());
+        }
+        let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 2] = [
+            (&user_id, Type::TEXT),
+            (&target_subscription_id, Type::TEXT),
+        ];
+        let (selector, params) = if target_subscription_id.is_some() {
+            (billing::reconcile_target_select_statement(), &params[..])
+        } else {
+            (billing::reconcile_live_select_statement(), &params[..1])
+        };
+        let live = client
+            .query_typed_opt(selector, params)
+            .await
+            .map_err(|_| failed())?
+            .map(|row| {
+                Ok::<_, tokio_postgres::Error>(billing::LiveRow {
+                    stripe_subscription_id: row.try_get("stripe_subscription_id")?,
+                    stripe_customer_id: row.try_get("stripe_customer_id")?,
+                    stripe_item_id: row.try_get("stripe_subscription_item_id")?,
+                    stripe_price_id: row.try_get("stripe_price_id")?,
+                    plan_id: row.try_get("plan_id")?,
+                    status: row.try_get("status")?,
+                    paid_through_unix: row.try_get("paid_through_unix")?,
+                    paid_invoice_id: row.try_get("paid_invoice_id")?,
+                    grace_until_unix: row.try_get("grace_until_unix")?,
+                })
+            })
+            .transpose()
+            .map_err(|_| StoreError)?;
+        let bindings = client
+            .query_typed(billing::price_bindings_select_statement(), &[])
+            .await
+            .map_err(|_| failed())?
+            .into_iter()
+            .map(|row| {
+                Ok(billing::PriceBinding {
+                    price_id: row.try_get("stripe_price_id")?,
+                    plan_id: row.try_get("plan_id")?,
+                    selectable: row.try_get("selectable")?,
+                    livemode: row.try_get("livemode")?,
+                })
+            })
+            .collect::<Result<Vec<_>, tokio_postgres::Error>>()
+            .map_err(|_| StoreError)?;
+        Ok(billing::ReconcileInput {
+            stripe_customer_id,
+            live,
+            bindings,
+        })
     }
 
     /// NEW-play acquisition. The account lock serializes privacy toggles,
@@ -6184,110 +6289,9 @@ impl Store for PgStore {
     ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
         Self::bounded(
             async {
-                let failed =
-                    || self.statement_failed("api.db.statement_failed.load_reconcile_input");
                 let client = self.connect().await?;
-                let account_rows = client
-                    .query_typed(
-                        crate::billing_reconcile::reconcile_account_select_statement(),
-                        &[(&user_id, Type::TEXT)],
-                    )
+                self.load_reconcile_input_on(&client, user_id, target_subscription_id)
                     .await
-                    .map_err(|_| failed())?;
-                if account_rows.len() > 1 {
-                    return Err(StoreError);
-                }
-                let stripe_customer_id = account_rows
-                    .first()
-                    .map(|row| {
-                        row.try_get::<_, Option<String>>("stripe_customer_id")
-                            .map_err(|_| StoreError)
-                    })
-                    .transpose()?
-                    .flatten();
-                // A live-row lookup can return the same row after COMMIT.
-                // Require the exact selector in this control even in that case.
-                #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-                if self.webhook_ack_control()
-                    && target_subscription_id != Some(billing_webhook_ack_test::SUBSCRIPTION)
-                {
-                    return Err(failed());
-                }
-                let live_rows = match target_subscription_id {
-                    Some(target) => {
-                        client
-                            .query_typed(
-                                crate::billing_reconcile::reconcile_target_select_statement(),
-                                &[(&user_id, Type::TEXT), (&target, Type::TEXT)],
-                            )
-                            .await
-                    }
-                    None => {
-                        client
-                            .query_typed(
-                                crate::billing_reconcile::reconcile_live_select_statement(),
-                                &[(&user_id, Type::TEXT)],
-                            )
-                            .await
-                    }
-                }
-                .map_err(|_| failed())?;
-                if live_rows.len() > 1 {
-                    return Err(StoreError);
-                }
-                let live = live_rows
-                    .first()
-                    .map(|row| {
-                        Ok::<_, StoreError>(crate::billing_reconcile::LiveRow {
-                            stripe_subscription_id: row
-                                .try_get("stripe_subscription_id")
-                                .map_err(|_| StoreError)?,
-                            stripe_customer_id: row
-                                .try_get("stripe_customer_id")
-                                .map_err(|_| StoreError)?,
-                            stripe_item_id: row
-                                .try_get("stripe_subscription_item_id")
-                                .map_err(|_| StoreError)?,
-                            stripe_price_id: row
-                                .try_get("stripe_price_id")
-                                .map_err(|_| StoreError)?,
-                            plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
-                            status: row.try_get("status").map_err(|_| StoreError)?,
-                            paid_through_unix: row
-                                .try_get::<_, Option<i64>>("paid_through_unix")
-                                .map_err(|_| StoreError)?,
-                            paid_invoice_id: row
-                                .try_get::<_, Option<String>>("paid_invoice_id")
-                                .map_err(|_| StoreError)?,
-                            grace_until_unix: row
-                                .try_get::<_, Option<i64>>("grace_until_unix")
-                                .map_err(|_| StoreError)?,
-                        })
-                    })
-                    .transpose()?;
-                let binding_rows = client
-                    .query_typed(
-                        crate::billing_reconcile::price_bindings_select_statement(),
-                        &[],
-                    )
-                    .await
-                    .map_err(|_| failed())?;
-                let bindings = binding_rows
-                    .iter()
-                    .map(|row| {
-                        Ok::<_, StoreError>(crate::billing_reconcile::PriceBinding {
-                            price_id: row.try_get("stripe_price_id").map_err(|_| StoreError)?,
-                            plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
-                            selectable: row.try_get("selectable").map_err(|_| StoreError)?,
-                            livemode: row.try_get("livemode").map_err(|_| StoreError)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(crate::billing_reconcile::ReconcileInput {
-                    stripe_customer_id,
-                    live,
-                    bindings,
-                })
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -9505,6 +9509,12 @@ mod tests {
                 ));
                 let (_, helper) = production
                     .split_once("async fn subsonic_member_catalogue_with_cap(")
+                    .unwrap();
+                helper.split_once("\n    async fn ").unwrap().0
+            } else if operation == "load_reconcile_input" {
+                assert!(method.contains("self.load_reconcile_input_on("));
+                let (_, helper) = production
+                    .split_once("async fn load_reconcile_input_on(")
                     .unwrap();
                 helper.split_once("\n    async fn ").unwrap().0
             } else {
