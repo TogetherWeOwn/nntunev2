@@ -443,6 +443,9 @@ impl AuthStore for MemStore {
 
 impl Library for MemStore {
     fn user_account(&self, username: &str) -> Option<UserAccount> {
+        if !self.test_auth {
+            return None;
+        }
         test_identities()
             .into_iter()
             .find(|(u, _, _, _, _, _)| u == username)
@@ -518,21 +521,22 @@ impl Library for MemStore {
                 }
             }
             "byYear" => {
-                if let (Some(from), Some(to)) = (query.from_year, query.to_year) {
-                    albums.retain(|album| {
-                        album
-                            .year
-                            .is_some_and(|year| (from.min(to)..=from.max(to)).contains(&year))
-                    });
-                    albums.sort_by(|a, b| {
-                        let years = if from > to {
-                            b.year.cmp(&a.year)
-                        } else {
-                            a.year.cmp(&b.year)
-                        };
-                        years.then(a.name.cmp(&b.name))
-                    });
-                }
+                let (Some(from), Some(to)) = (query.from_year, query.to_year) else {
+                    return Vec::new();
+                };
+                albums.retain(|album| {
+                    album
+                        .year
+                        .is_some_and(|year| (from.min(to)..=from.max(to)).contains(&year))
+                });
+                albums.sort_by(|a, b| {
+                    let years = if from > to {
+                        b.year.cmp(&a.year)
+                    } else {
+                        a.year.cmp(&b.year)
+                    };
+                    years.then(a.name.cmp(&b.name))
+                });
             }
             "byGenre" => {
                 albums.retain(|album| {
@@ -583,10 +587,13 @@ impl Library for MemStore {
                     .then(a.name.cmp(&b.name))
             }),
             "byYear" => {
-                if let (Some(from), Some(to)) = (query.from_year, query.to_year) {
-                    albums
-                        .retain(|album| album.year.is_some_and(|year| (from..=to).contains(&year)));
-                }
+                let (Some(from), Some(to)) = (query.from_year, query.to_year) else {
+                    return Err((
+                        crate::envelope::code::REQUIRED_PARAM_MISSING,
+                        "Required parameter is missing.".to_string(),
+                    ));
+                };
+                albums.retain(|album| album.year.is_some_and(|year| (from..=to).contains(&year)));
                 albums.sort_by(|a, b| {
                     catalogue_date_desc(&a.release_date, &b.release_date)
                         .then_with(|| catalogue_date_desc(&a.curated_at, &b.curated_at))

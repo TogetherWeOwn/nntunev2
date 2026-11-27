@@ -64,6 +64,19 @@ impl Value {
         Value::Bool(b)
     }
 
+    /// XML 1.0 forbids these scalars even when encoded as character references.
+    /// Document field names are supplied by the endpoint builders.
+    pub(crate) fn has_valid_xml_text(&self) -> bool {
+        match self {
+            Self::Str(text) => text.chars().all(|c| {
+                matches!(c, '\t' | '\n' | '\r' | ' '..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+            }),
+            Self::Map(entries) => entries.iter().all(|(_, value)| value.has_valid_xml_text()),
+            Self::List(items) => items.iter().all(Self::has_valid_xml_text),
+            Self::Null | Self::Bool(_) | Self::Int(_) => true,
+        }
+    }
+
     /// JSON body, compact, nulls stripped.
     pub fn to_json(&self) -> String {
         let mut out = String::new();
