@@ -325,6 +325,7 @@ impl From<crate::random::CryptoError> for CredentialError {
 /// lacking `required` maps to `Forbidden`. The credential must cover
 /// `now` within its bounded lifetime, including at `expires_at`.
 /// Owner mismatches also return `Unauthenticated`.
+/// The HTTP bearer gate checks the display format before lookup.
 ///
 /// Dual-pepper transition: a record whose version matches ANY entry in
 /// `peppers` authorizes; an empty slice or an unlisted version fails
@@ -345,7 +346,6 @@ pub fn authorize(
         || now < record.created_at
         || now > record.expires_at
         || record.expires_at > record.created_at.saturating_add(MAX_CREDENTIAL_TTL_SECS)
-        || !is_plausible_credential_shape(presented_secret)
     {
         return Err(CredentialError::Unauthenticated);
     }
@@ -551,7 +551,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/library"
                 || path == "/v1/artists"
                 || path == "/v1/releases"
-                || target_after("/v1/releases/", path)
+                || one_segment_after("/v1/releases/", path)
                 || path == "/v1/tracks"
                 || path == "/v1/search"
                 || path == "/v1/playlists"

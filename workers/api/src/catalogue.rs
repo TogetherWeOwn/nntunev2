@@ -36,7 +36,7 @@
 //!   fail.
 //! - Cover art comes from our own origin only: `art_url` names the reserved
 //!   `/v1/releases/{mbid}/art` path and is always `Some` when the release
-//!   MBID is known. The art-serving slice has not landed, so the path 404s
+//!   MBID has valid UUID shape. The art-serving slice has not landed, so the path 404s
 //!   today (uniform posture, like every unbuilt surface); clients adopt the
 //!   field without reshaping later. `mb_release.caa_url` is NEVER selected
 //!   or serialized — caching Cover Archive art in a paid product is a

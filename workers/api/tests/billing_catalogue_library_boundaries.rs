@@ -68,7 +68,7 @@ fn library_rejects_nul_before_constructing_a_write() {
 fn bearer_scope_requires_a_listed_path_and_valid_target_segment() {
     for (method, path) in [
         ("GET", "/v1/playlists/list/tracks"),
-        ("GET", "/v1/releases/%2F"),
+        ("GET", "/v1/releases/release/art"),
         ("GET", "/v1/stream/track/metadata"),
         ("POST", "/v1/ingest/not-listed"),
         ("DELETE", "/v1/credentials/id/extra"),
@@ -77,6 +77,10 @@ fn bearer_scope_requires_a_listed_path_and_valid_target_segment() {
     }
     let opaque = "Track-A_2";
     assert_eq!(canonical_target_id(opaque), opaque);
+    assert_eq!(
+        scope_for_operation("GET", "/v1/releases/album.v2"),
+        RouteDecision::Bearer(Scope::LibraryRead)
+    );
     assert_eq!(
         scope_for_operation("GET", &format!("/v1/stream/{opaque}")),
         RouteDecision::Bearer(Scope::StreamRead)

@@ -242,10 +242,10 @@ async fn drive_owned_connection<T: 'static, C>(
         let (mut client, connection) = budget
             .connect(|| async {
                 let (host, port, connection_string) = target()?;
-                let config: tokio_postgres::Config =
-                    connection_string.parse().map_err(|_| StoreError)?;
                 let socket = guard.open(&host, port).map_err(|_| StoreError)?;
                 socket.opened().await.map_err(|_| StoreError)?;
+                let config: tokio_postgres::Config =
+                    connection_string.parse().map_err(|_| StoreError)?;
                 config
                     .connect_raw(socket, guard.tls())
                     .await
