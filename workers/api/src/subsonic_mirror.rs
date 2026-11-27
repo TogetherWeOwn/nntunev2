@@ -42,9 +42,10 @@ impl MirrorSelection<'_> {
             || !self.releases.iter().all(|id| canonical(id))
             || !self.releases.windows(2).all(|ids| ids[0] < ids[1])
             || !self.pairs.windows(2).all(|pairs| pairs[0] < pairs[1])
-            || !self.pairs.iter().all(|(release, recording)| {
-                canonical(recording) && self.contains_release(release)
-            })
+            || !self
+                .pairs
+                .iter()
+                .all(|(release, recording)| canonical(recording) && self.contains_release(release))
         {
             return Err(StagingRejection::BusyOrCapacity);
         }

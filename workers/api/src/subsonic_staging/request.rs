@@ -53,7 +53,8 @@ impl StagingInput {
             BodyPlan::Form { declared } => {
                 // Metadata identifies candidates by substring. Check the full
                 // media type before interpreting any bytes as credentials.
-                let value = request_header(request, "content-type").ok_or(InputError::Unreadable)?;
+                let value =
+                    request_header(request, "content-type").ok_or(InputError::Unreadable)?;
                 let units = (0..value.length()).map(|i| value.char_code_at(i) as u16);
                 if !admits_form_media_type(units) {
                     return Err(InputError::Unreadable);
@@ -84,7 +85,10 @@ mod wasm_test {
         for (content_type, accepted) in [
             ("text/plain; hint=application/x-www-form-urlencoded", false),
             ("application/x-www-form-urlencoded, text/plain", false),
-            (r#"application/x-www-form-urlencoded; name=one",two""#, false),
+            (
+                r#"application/x-www-form-urlencoded; name=one",two""#,
+                false,
+            ),
             (r#"application/x-www-form-urlencoded; name="one,two""#, true),
         ] {
             let headers = web_sys::Headers::new()?;

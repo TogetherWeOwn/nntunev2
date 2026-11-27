@@ -34,9 +34,7 @@ fn admits_form_media_type(units: impl Iterator<Item = u16>) -> bool {
     }
 
     fn take_token(bytes: &mut std::iter::Peekable<impl Iterator<Item = u8>>) -> bool {
-        let is_token = |b: &u8| {
-            b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b)
-        };
+        let is_token = |b: &u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b);
         let nonempty = bytes.next_if(is_token).is_some();
         while bytes.next_if(is_token).is_some() {}
         nonempty
