@@ -758,3 +758,40 @@ fn transcode_requests_are_refused_flac_only() {
     assert!(body_str(&resp).contains("\"code\":0"));
     assert!(body_str(&resp).contains("Transcoding is not supported"));
 }
+
+#[test]
+fn production_store_refuses_password_and_invalid_credentials_without_catalogue_leak() {
+    use nntune_subsonic::auth::AuthStore;
+
+    let prod = store();
+    assert!(prod.verify_password("mel", "any-password").is_none());
+    let app = nntune_subsonic::SubsonicApp::production(prod);
+    for (path, extra) in [
+        ("/rest/getArtists", ""),
+        ("/rest/getAlbum", &format!("id={ALBUM_A}")),
+        ("/rest/search3", "query=Song"),
+    ] {
+        for (creds, code) in [
+            ("", 40),
+            ("apiKey=key&u=mel", 43),
+            ("u=mel&t=0123456789abcdef0123456789abcdef", 10),
+            ("u=mel&p=synth-pass", 42),
+            ("apiKey=key&p=", 42),
+        ] {
+            let res = app.handle("GET", path, &format!("f=json&{creds}&{extra}"), "");
+            let txt = body_str(&res);
+            assert!(res.status == 200 && txt.contains(&format!("\"code\":{code}")));
+            for c in [
+                "Artist A",
+                "Zebra",
+                "Album A",
+                "Song One",
+                ALBUM_A,
+                SONG_1,
+                "synth-pass",
+            ] {
+                assert!(!txt.contains(c), "{path} leaked {c}");
+            }
+        }
+    }
+}

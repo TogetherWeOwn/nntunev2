@@ -288,7 +288,9 @@ impl AuthStore for ProductionStore {
     }
 
     fn verify_password(&self, _username: &str, _password: &str) -> Option<Identity> {
-        Some(self.identity.clone())
+        // Launch policy (ADR 0006) forbids password authentication; fail closed
+        // even if a caller invokes this store outside `SubsonicApp::production`.
+        None
     }
 
     fn verify_token(&self, _username: &str, _token: &str, _salt: &str) -> Option<Identity> {
