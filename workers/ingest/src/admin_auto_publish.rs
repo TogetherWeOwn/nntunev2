@@ -6,8 +6,10 @@ use crate::{
     admin_review::ObjectRef,
     catalogue_publication::{self, PublicationError, PublishedObject, VerifiedOccurrence},
     digest_candidate_identity::candidate_hashes,
+    jobs::validate_job_id,
     matching::admin_publish_match::{
-        decide_publish_match, select_release, CompleteReleaseCandidates, FileNumbering, NeedsReview,
+        decide_publish_match, select_release, CompleteReleaseCandidates, FileNumbering,
+        NeedsReview, RECORDINGS_LIMIT,
     },
     multipart::readback_inventory::VerifiedCompletedReadback,
     track_writers::track_row_for,
@@ -28,6 +30,16 @@ pub struct AuthorizedRelease<'a> {
     pub environment: [u8; 16],
     pub library: [u8; 16],
     pub files: &'a [ExpectedFile<'a>],
+}
+
+impl AuthorizedRelease<'_> {
+    fn accepts_count(&self, count: usize) -> bool {
+        (1..RECORDINGS_LIMIT).contains(&count)
+            && count == self.files.len()
+            && validate_job_id(self.job_id)
+            && (1..=128).contains(&self.owner_id.len())
+            && !self.owner_id.contains('\0')
+    }
 }
 
 /// Injected by the encrypted completion caller after authoritative commit or
@@ -81,8 +93,7 @@ pub async fn stage(
     candidates: Option<CompleteReleaseCandidates<'_>>,
     recordings: (u16, &str),
 ) -> Result<StageOutcome, PublicationError> {
-    if committed.is_empty()
-        || job.files.len() != committed.len()
+    if !job.accepts_count(committed.len())
         || !committed
             .iter()
             .zip(job.files)

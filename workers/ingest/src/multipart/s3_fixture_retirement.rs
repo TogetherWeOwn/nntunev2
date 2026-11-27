@@ -3,6 +3,7 @@
 use super::{
     encode_query_value, Digest, S3CompletionSender, Sha256, SignedReply, SignedRequest, SystemTime,
 };
+use crate::multipart::session_outcome::{valid_compact_uuid_v4 as uuid, valid_version_pin};
 
 #[cfg(feature = "fixture-provider-preflight")]
 #[path = "s3_fixture_preflight.rs"]
@@ -54,18 +55,6 @@ impl FixtureVersionRemover {
         version: &str,
         until: SystemTime,
     ) -> Result<(), FixtureRetirementError> {
-        self.delete_and_read_absence(bucket, key, version, until)
-            .await
-            .map(|_| ())
-    }
-
-    async fn delete_and_read_absence(
-        &self,
-        bucket: &str,
-        key: &str,
-        version: &str,
-        until: SystemTime,
-    ) -> Result<SignedReply, FixtureRetirementError> {
         use FixtureRetirementError::Unconfirmed;
         let deleted = self.send("DELETE", bucket, key, version, until).await?;
         if deleted.status != 204 || !deleted.body.is_empty() {
@@ -76,7 +65,7 @@ impl FixtureVersionRemover {
         if head.status != 404 || !head.body.is_empty() {
             return Err(Unconfirmed);
         }
-        Ok(head)
+        check_version(&head, version, false)
     }
 
     async fn send(
@@ -88,10 +77,7 @@ impl FixtureVersionRemover {
         until: SystemTime,
     ) -> Result<SignedReply, FixtureRetirementError> {
         use FixtureRetirementError::{Refused, Unconfirmed};
-        if !self.matches_bucket(bucket)
-            || !fixture_key(key)
-            || !super::readback::valid_version(version)
-        {
+        if !self.matches_bucket(bucket) || !fixture_key(key) || !valid_version_pin(version) {
             return Err(Refused);
         }
         self.0
@@ -134,13 +120,6 @@ fn fixture_key(key: &str) -> bool {
     if key.len() > 128 {
         return false;
     }
-    let uuid = |id: &str| {
-        let b = id.as_bytes();
-        b.len() == 32
-            && b[12] == b'4'
-            && matches!(b[16], b'8'..=b'b')
-            && b.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    };
     match key.split('/').collect::<Vec<_>>().as_slice() {
         ["media", object, generation] => uuid(object) && uuid(generation),
         ["media-digests", object, generation, map, "00000000"] => {

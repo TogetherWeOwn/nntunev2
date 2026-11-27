@@ -1,7 +1,11 @@
 use xml::{name::OwnedName, reader::XmlEvent::*, EventReader};
 
 use super::{encode_query_value, Digest, S3CompletionSender, Sha256, SignedRequest, SystemTime};
-use crate::multipart::{s3_receipt_reader, session_completion::valid_upload_id, S3_XML_NAMESPACE};
+use crate::multipart::{
+    s3_receipt_reader, session_completion::valid_upload_id, session_outcome::valid_media_key,
+    S3_XML_NAMESPACE,
+};
+use nntune_core::s3_locator::valid_bucket;
 
 impl S3CompletionSender {
     pub(crate) fn multipart_scope(&self) -> ([u8; 16], &str) {
@@ -9,6 +13,9 @@ impl S3CompletionSender {
     }
 
     pub(crate) async fn find_incomplete(&self, key: &str, until: SystemTime) -> Result<String, ()> {
+        if !valid_media_key(key) || !valid_bucket(&self.bucket) {
+            return Err(());
+        }
         let reply = self
             .signed_request(
                 SignedRequest {
@@ -81,6 +88,9 @@ impl S3CompletionSender {
         id: &str,
         until: SystemTime,
     ) -> Result<(), ()> {
+        if !valid_media_key(key) || !valid_bucket(&self.bucket) || !valid_upload_id(id) {
+            return Err(());
+        }
         let reply = self
             .signed_request(
                 SignedRequest {

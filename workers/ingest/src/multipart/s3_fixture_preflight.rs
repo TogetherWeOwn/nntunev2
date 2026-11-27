@@ -6,6 +6,7 @@ use serde::Deserialize;
 use worker::wasm_bindgen::{self, prelude::*};
 
 use super::{check_version, FixtureRetirementError, FixtureVersionRemover, BUCKET};
+use crate::multipart::session_outcome::valid_version_pin as valid_pin;
 
 const DISPOSABLE_OBJECT: &str = "00000000000040008000000000000000";
 
@@ -58,7 +59,7 @@ pub async fn qualify_disposable_version(
         let key = format!("media/{DISPOSABLE_OBJECT}/{}", scope.generation);
         let version = &scope.version;
         let sibling = &scope.sibling_version;
-        if version == sibling || !super::super::readback::valid_version(sibling) {
+        if version == sibling || !valid_pin(version) || !valid_pin(sibling) {
             return Err(Refused);
         }
         let until = super::super::now() + Duration::from_secs(20);
@@ -72,10 +73,9 @@ pub async fn qualify_disposable_version(
         require_present(version).await?;
         require_present(sibling).await?;
         for _ in 0..2 {
-            let absent = remover
-                .delete_and_read_absence(BUCKET, &key, version, until)
+            remover
+                .delete_and_confirm(BUCKET, &key, version, until)
                 .await?;
-            check_version(&absent, version, false)?;
         }
         require_present(sibling).await
     }

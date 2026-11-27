@@ -53,6 +53,9 @@ pub async fn retry_completed<'a>(
     ) -> Result<Option<CommittedOutcome>, PublicationError>,
 ) -> Result<JobView, ApiError> {
     let (caller, request) = retry_input(auth, target.body)?;
+    if !validate_job_id(target.job_id) {
+        return Err(not_found());
+    }
     let revision = request.revision;
     let mut tx = client
         .build_transaction()

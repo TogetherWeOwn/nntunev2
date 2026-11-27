@@ -4,10 +4,12 @@ use nntune_core::{
     media::{ciphertext_size, HEADER_SIZE, TAG_SIZE},
     media_envelope::EnvelopeContext,
     origin_sealer::MAX_NEW_PLAINTEXT,
-    s3_locator::{S3Locator, S3MediaMetadata},
+    s3_locator::{S3Binding, S3Locator, S3MediaMetadata},
 };
 
-use super::{CompletedVersionedMedia, Completion, MultipartError};
+use super::{
+    session_outcome::valid_version_pin, CompletedVersionedMedia, Completion, MultipartError,
+};
 
 /// Metadata observed for the exact HEAD request. Supply the configuration
 /// used and the returned locator and length independently of the expected pin.
@@ -79,6 +81,10 @@ fn compare_observation(
 ) -> Result<(), HeadReceiptError> {
     use HeadReceiptError::*;
 
+    if matches!(expected.locator().binding(), S3Binding::VersionId(pin) if !valid_version_pin(pin))
+    {
+        return Err(ExpectedObject);
+    }
     let head = head.ok_or(MissingHead)?;
     let (Some(observed_configuration), Some(observed), Some(size)) =
         (head.configuration, head.locator, head.content_length)
@@ -95,4 +101,32 @@ fn compare_observation(
     (size == expected.ciphertext_len())
         .then_some(())
         .ok_or(SizeMismatch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_coalesced_version_even_when_head_agrees() {
+        let id = 0x00000000_0000_4000_8000_000000000000_u128.to_be_bytes();
+        let key = format!("media/{0}/{0}", hex::encode(id));
+        let context = EnvelopeContext {
+            identities: [id; 6],
+            plaintext_len: 1,
+            header: [0; 48],
+        };
+        let binding = S3Binding::VersionId("one,two".into());
+        let locator = S3Locator::new("fixture-bucket".into(), key, binding).unwrap();
+        let metadata = S3MediaMetadata::from_trusted_context(locator.clone(), &context).unwrap();
+        let head = HeadReceipt {
+            configuration: Some(id),
+            locator: Some(&locator),
+            content_length: Some(metadata.ciphertext_len()),
+        };
+        assert_eq!(
+            compare_observation(&metadata, id, Some(head)),
+            Err(HeadReceiptError::ExpectedObject)
+        );
+    }
 }

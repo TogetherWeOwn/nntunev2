@@ -6,7 +6,10 @@ use worker::{Delay, Env};
 use super::{
     handoff, send_cleanup_message, CleanupClaim, CleanupKind, CleanupMessage, HandoffError,
 };
-use crate::library::{with_db_deadline, LIBRARY_DB_DEADLINE_MS};
+use crate::{
+    library::{with_db_deadline, LIBRARY_DB_DEADLINE_MS},
+    multipart::session_outcome::valid_uuid_text,
+};
 
 const CLAIM: &str = include_str!("../../../api/src/ingest_session_claim_cleanup.sql");
 const ACK: &str = include_str!("../../../api/src/ingest_session_ack_cleanup_enqueue.sql");
@@ -45,7 +48,10 @@ pub async fn dispatch_scope(
     dispatch_claims(
         &mut db,
         scope,
-        async |_, _| Ok(()),
+        async |_, claim| match claim.kind {
+            CleanupKind::AbsoluteExpiry => Ok(()),
+            CleanupKind::TerminalReconcile => Err(()),
+        },
         |message, delay| send_cleanup_message(env, message, delay),
         db_deadline,
     )
@@ -136,11 +142,18 @@ impl CleanupScope<'_> {
     }
 
     async fn claim(&self, db: &mut Client) -> Result<Vec<CleanupClaim>, ()> {
+        if ![self.environment_id, self.library_id, self.session_id]
+            .into_iter()
+            .all(valid_uuid_text)
+            || self.principal_id.is_empty()
+            || self.principal_id.contains('\0')
+        {
+            return Err(());
+        }
         let tx = begin(db).await?;
         let rows = tx.query(CLAIM, &self.params()).await.map_err(|_| ())?;
-        // No caller receives a sendable claim unless COMMIT returned success.
-        tx.commit().await.map_err(|_| ())?;
-        rows.iter()
+        let claims: Vec<_> = rows
+            .iter()
             .map(|row| {
                 let kind = match row.try_get::<_, &str>("kind").map_err(|_| ())? {
                     "absolute_expiry" => CleanupKind::AbsoluteExpiry,
@@ -156,7 +169,10 @@ impl CleanupScope<'_> {
                 .filter(|claim| claim.session_id.eq_ignore_ascii_case(self.session_id))
                 .ok_or(())
             })
-            .collect()
+            .collect::<Result<_, _>>()?;
+        // No caller receives a sendable claim unless COMMIT returned success.
+        tx.commit().await.map_err(|_| ())?;
+        Ok(claims)
     }
 
     async fn ack(&self, db: &mut Client, kind: CleanupKind, claim_id: &str) -> Result<bool, ()> {

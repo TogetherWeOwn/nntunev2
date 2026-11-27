@@ -3,7 +3,10 @@
 use nntune_core::s3_locator::{S3Binding, S3Locator};
 use tokio_postgres::{types::Type, Client, IsolationLevel, Transaction};
 
-use super::{load, not_found, Authorization, BoundaryError, ReviewJob, ReviewStatus, READ_SCOPE};
+use super::{
+    load, not_found, versioned_object, Authorization, BoundaryError, ReviewJob, ReviewStatus,
+    READ_SCOPE,
+};
 use crate::{
     api_error::ApiError, jobs::validate_job_id, multipart::session_outcome::uuid_text,
     queue::validate_mbid,
@@ -65,7 +68,7 @@ pub async fn select<'a>(
     if job.view.status != ReviewStatus::Published || job.view.revision != selection.revision {
         return Ok(None);
     }
-    let Some(object) = job.object else {
+    let Ok(object) = versioned_object(&job) else {
         return Ok(None);
     };
     let locator = object.media.locator();

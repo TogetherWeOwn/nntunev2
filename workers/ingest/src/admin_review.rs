@@ -2,12 +2,14 @@
 
 use nntune_core::s3_locator::{S3Binding, S3MediaMetadata};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::{
     api_error::ApiError,
     caller_auth::{authenticate_scoped, owns_job, Caller},
     jobs::validate_job_id,
     matching::admin_publish_match::NeedsReview,
+    multipart::session_outcome::valid_version_pin,
 };
 
 pub const READ_SCOPE: &str = "ingest:review:read";
@@ -106,10 +108,16 @@ pub async fn queue(
     let limit = if limit == 0 { 50 } else { limit };
     let offset = request.offset.unwrap_or(0);
     let jobs = list(&caller.user_id, request.status, limit, offset).await?;
+    let mut seen = HashSet::with_capacity(usize::from(limit));
     if jobs.len() > usize::from(limit)
-        || jobs
-            .iter()
-            .any(|job| !owns_job(&caller, &job.owner_id) || !validate_job_id(&job.view.job_id))
+        || jobs.iter().any(|job| {
+            !owns_job(&caller, &job.owner_id)
+                || !validate_job_id(&job.view.job_id)
+                || request
+                    .status
+                    .is_some_and(|status| status != job.view.status)
+                || !seen.insert(job.view.job_id.as_str())
+        })
     {
         return Err(BoundaryError::Unavailable.into());
     }
@@ -182,7 +190,9 @@ fn retry_input(auth: &Authorization<'_>, body: &[u8]) -> Result<(Caller, RetryRe
 fn versioned_object(job: &ReviewJob) -> Result<&ObjectRef, BoundaryError> {
     job.object
         .as_ref()
-        .filter(|object| matches!(object.media.locator().binding(), S3Binding::VersionId(_)))
+        .filter(|object| {
+            matches!(object.media.locator().binding(), S3Binding::VersionId(pin) if valid_version_pin(pin))
+        })
         .ok_or(BoundaryError::Conflict)
 }
 
@@ -224,6 +234,45 @@ impl From<BoundaryError> for ApiError {
             BoundaryError::MissingOrFenced => not_found(),
             BoundaryError::Conflict => ApiError::by_code("conflict", "ingest state changed"),
             BoundaryError::Unavailable => ApiError::by_code("service_unavailable", ""),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queue_refuses_wrong_status_and_duplicate_rows() {
+        let secret = "synthetic-admin-review-queue-fixture";
+        let grant = crate::caller_auth::issue("owner", READ_SCOPE, 10, secret.as_bytes());
+        let bearer = format!("Bearer {grant}");
+        let auth = Authorization {
+            bearer: Some(&bearer),
+            secret: Some(secret),
+            now: 1,
+        };
+        for (status, count) in [(ReviewStatus::Failed, 1), (ReviewStatus::Accepted, 2)] {
+            let list = async |_: &str, _, _, _| {
+                Ok((0..count)
+                    .map(|_| ReviewJob {
+                        view: JobView {
+                            job_id: "upload".into(),
+                            revision: 1,
+                            status,
+                            reason: None,
+                        },
+                        owner_id: "owner".into(),
+                        object: None,
+                        retried_revision: None,
+                    })
+                    .collect())
+            };
+            let request = QueueRequest {
+                status: Some(ReviewStatus::Accepted),
+                ..Default::default()
+            };
+            assert_eq!(queue(&auth, list, request).await.unwrap_err().status, 503);
         }
     }
 }

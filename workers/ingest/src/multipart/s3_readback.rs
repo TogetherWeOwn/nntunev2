@@ -13,8 +13,12 @@ use super::{
     content_length, fetch_response, next_response_chunk, RequestDeadline, S3CompletionSender,
     SignedRequest,
 };
-use crate::multipart::readback_inventory::{
-    BucketReadbackResponse, CompletedReadbackInventory, ReadbackScope, VerifiedCompletedReadback,
+use crate::multipart::{
+    readback_inventory::{
+        BucketReadbackResponse, CompletedReadbackInventory, ReadbackScope,
+        VerifiedCompletedReadback,
+    },
+    session_outcome::{valid_readback_framing, valid_version_pin},
 };
 
 impl S3CompletionSender {
@@ -47,7 +51,7 @@ impl S3CompletionSender {
         pin: ReadbackPin<'_>,
         until: SystemTime,
     ) -> Result<BucketReadbackResponse<WorkerReadbackBody>, ()> {
-        let version = pin.version.filter(|id| valid_version(id)).ok_or(())?;
+        let version = pin.version.filter(|id| valid_version_pin(id)).ok_or(())?;
         let (request, mut deadline) = self.prepare_request(
             SignedRequest {
                 configuration: pin.configuration,
@@ -64,7 +68,10 @@ impl S3CompletionSender {
         let response = deadline.run(fetch_response(&request)).await?;
         let headers = response.headers();
         let version = headers.get("x-amz-version-id").map_err(|_| ())?;
-        if version.as_deref().is_some_and(|id| !valid_version(id)) {
+        let length = content_length(&headers)?;
+        if version.as_deref().is_some_and(|id| !valid_version_pin(id))
+            || !valid_readback_framing(length, headers.has("transfer-encoding").map_err(|_| ())?)
+        {
             return Err(());
         }
         let reader = response
@@ -79,7 +86,7 @@ impl S3CompletionSender {
                 object_key: pin.object_key.into(),
                 version,
                 status: response.status(),
-                content_length: content_length(&headers)?,
+                content_length: length,
                 has_content_range: headers.has("content-range").map_err(|_| ())?,
                 has_content_encoding: false, // fetch_response refuses content encoding.
                 body: WorkerReadbackBody {
@@ -90,14 +97,6 @@ impl S3CompletionSender {
             },
         })
     }
-}
-
-pub(super) fn valid_version(id: &str) -> bool {
-    id != "null"
-        && (1..=1024).contains(&id.len())
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && byte != b',')
 }
 
 fn transport_error() -> io::Error {
