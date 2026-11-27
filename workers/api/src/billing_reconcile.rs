@@ -2068,6 +2068,47 @@ mod tests {
         assert_eq!(outcome.fail_closed, Some(FailClosedReason::AmbiguousItems));
     }
 
+    #[test]
+    fn live_invoice_and_mismatched_invoice_customer_fail_closed() {
+        let seeded = anchored("plus", NOW + 100, "in_seed");
+        let seed_inv = paid_invoice("in_seed", PRICE_PLUS, NOW, NOW + 100, NOW);
+        let mut live_inv = paid_invoice("in_live", PRICE_PLUS, NOW + 100, NOW + 200, NOW + 100);
+        live_inv.livemode = true;
+
+        // Live-mode invoice fails the pass closed even beside a valid test invoice.
+        let remote = RemoteSubscription {
+            subscription: subscription("active", PRICE_PLUS),
+            invoices: vec![seed_inv.clone(), live_inv],
+        };
+        let out = reconcile_subscription(&seeded, &remote, NOW + 100);
+        assert_eq!(out.fail_closed, Some(FailClosedReason::WrongLivemode));
+        assert!(out.disable_new_purchases() && out.history.is_empty());
+        assert_eq!(
+            (out.row.plan_id.as_str(), out.row.paid_through_unix),
+            ("plus", Some(NOW + 100))
+        );
+        assert_eq!(out.row.paid_invoice_id.as_deref(), Some("in_seed"));
+
+        // Foreign or unbound invoice customer confers no coverage or history row.
+        for cus in [Some("cus_other".to_string()), None] {
+            let mut foreign =
+                paid_invoice("in_foreign", PRICE_PLUS, NOW + 100, NOW + 200, NOW + 100);
+            foreign.customer = cus;
+            let remote = RemoteSubscription {
+                subscription: subscription("active", PRICE_PLUS),
+                invoices: vec![seed_inv.clone(), foreign],
+            };
+            let out = reconcile_subscription(&seeded, &remote, NOW + 100);
+            assert_eq!(
+                (out.fail_closed, out.row.paid_through_unix),
+                (None, Some(NOW + 100))
+            );
+            assert_eq!(out.row.paid_invoice_id.as_deref(), Some("in_seed"));
+            assert_eq!(out.history.len(), 1);
+            assert_eq!(out.history[0].stripe_invoice_id, "in_seed");
+        }
+    }
+
     // --- Known non-entitling statuses: recorded, quiet -------------------------------
 
     #[test]

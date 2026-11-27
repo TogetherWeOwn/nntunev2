@@ -557,7 +557,7 @@ struct RawEvent {
     #[serde(rename = "type", default)]
     event_type: Option<String>,
     #[serde(default)]
-    livemode: bool,
+    livemode: Option<bool>,
     #[serde(default)]
     data: Option<EventData>,
 }
@@ -913,11 +913,13 @@ pub fn verify_webhook_signature(
 }
 
 /// Parse a verified webhook body into its event envelope. Rejects bodies
-/// without a string `id`, `type`, or object `data.object`.
+/// without a string `id`, `type`, boolean `livemode`, or object `data.object`.
 fn parse_event(raw_body: &[u8]) -> Result<StripeEvent, WebhookError> {
     let raw: RawEvent =
         serde_json::from_slice(raw_body).map_err(|_| WebhookError::MalformedEvent)?;
-    let (Some(id), Some(event_type), Some(data)) = (raw.id, raw.event_type, raw.data) else {
+    let (Some(id), Some(event_type), Some(livemode), Some(data)) =
+        (raw.id, raw.event_type, raw.livemode, raw.data)
+    else {
         return Err(WebhookError::MalformedEvent);
     };
     if !data.object.is_object() {
@@ -926,7 +928,7 @@ fn parse_event(raw_body: &[u8]) -> Result<StripeEvent, WebhookError> {
     Ok(StripeEvent {
         id,
         event_type,
-        livemode: raw.livemode,
+        livemode,
         object: data.object,
     })
 }
@@ -1358,6 +1360,23 @@ mod tests {
                 verify_webhook_signature(&body, &header, SECRET, NOW),
                 Err(WebhookError::MalformedEvent),
                 "body {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn event_missing_or_non_boolean_livemode_rejects_fail_closed() {
+        for body in [
+            serde_json::json!({"id": "evt_missing", "type": "invoice.paid", "data": {"object": {"id": "in_1"}}}),
+            serde_json::json!({"id": "evt_null", "type": "invoice.paid", "livemode": null, "data": {"object": {"id": "in_1"}}}),
+            serde_json::json!({"id": "evt_str", "type": "invoice.paid", "livemode": "false", "data": {"object": {"id": "in_1"}}}),
+        ] {
+            let bytes = body.to_string().into_bytes();
+            let header = test_signature_header(&bytes, NOW, SECRET);
+            assert_eq!(
+                verify_webhook_signature(&bytes, &header, SECRET, NOW),
+                Err(WebhookError::MalformedEvent),
+                "event without explicit boolean livemode must fail closed: {body}"
             );
         }
     }
