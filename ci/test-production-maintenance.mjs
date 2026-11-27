@@ -423,6 +423,46 @@ test('a successful first release hands its original intent to recovery preparati
   assert.deepEqual(rows, before);
 });
 
+test('recovery preparation binds the admitted rollback intent to its Worker', async (t) => {
+  const production = finalSmokeFixture(t, rollbackFixture);
+  await production.prepare();
+  const { fresh, evidence } = recoveryFixture(t, production, 'success');
+  const sealedIntent = readFileSync(join(production.temp, intentFile));
+  const rollout = structuredClone(production.rows);
+  const allocation = 'production-final-allocation.sealed';
+  const admit = (env) => {
+    admitRecovery(env, evidence);
+    assert.match(readFileSync(env.GITHUB_OUTPUT, 'utf8'), /^allow-submit=true$/m);
+    assert.deepEqual(readFileSync(join(env.RUNNER_TEMP, intentFile)), sealedIntent);
+  };
+
+  await t.test('another configured Worker refuses the same archive before readback', async (t) => {
+    const staging = finalSmokeFixture(t, { ...rollbackFixture, workerId: 'c'.repeat(32) });
+    staging.state.name = 'nntune-web-staging';
+    staging.shift();
+    assert.deepEqual(staging.custody, { ...production.custody, worker: staging.env.WORKER_ID });
+    assert.deepEqual(staging.rows, rollout);
+    const recovery = { ...fresh('13'), WORKER_ID: staging.env.WORKER_ID };
+    admit(recovery);
+
+    await assert.rejects(staging.run('prepare-recovery', recovery), /Rollback intent or final allocation is missing, invalid or stale/);
+    assert.equal(existsSync(join(recovery.RUNNER_TEMP, allocation)), false);
+    assert.deepEqual(staging.calls, []);
+    assert.deepEqual(staging.rows, rollout);
+  });
+
+  await t.test('the original Worker prepares the allocation from the same archive', async () => {
+    const recovery = fresh('14');
+    admit(recovery);
+    const callCount = production.calls.length;
+
+    await production.run('prepare-recovery', recovery);
+    assert.equal(existsSync(join(recovery.RUNNER_TEMP, allocation)), true);
+    assert.deepEqual(production.calls.slice(callCount), ['GET', 'GET', 'GET', 'GET']);
+    assert.deepEqual(production.rows, rollout);
+  });
+});
+
 test('first-release switch-off recovers maintenance from a fresh runner and repeats without writes', async (t) => {
   const transport = finalSmokeFixture(t, { ...rollbackFixture, sha: mainSha() }, 'lost');
   assert.equal(transport.custody.previous, undefined);
