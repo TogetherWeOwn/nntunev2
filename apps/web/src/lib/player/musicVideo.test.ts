@@ -36,7 +36,6 @@ it('cleans up a failed script insertion and shares a single retry', async () => 
 		expect(vi.getTimerCount()).toBe(0);
 		const pending = loadYouTubeApi();
 		expect(loadYouTubeApi()).toBe(pending);
-		await Promise.resolve();
 		stale?.();
 		host.YT = { Player: class {} };
 		host.onYouTubeIframeAPIReady?.();

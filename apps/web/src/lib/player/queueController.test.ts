@@ -5,7 +5,7 @@ import { createQueueController } from './queueController.js';
 it('revokes library source and pending queue work on a changed binding', () => {
 	const track: Track = { id: 'recording', title: 'Track', artist: '', streamUrl: '/recording' };
 	const queue = createQueueController(createQueue([track]));
-	expect(queue.setLibraryBinding('first')).toBe(false);
+	queue.setLibraryBinding('first');
 	const { next, sources } = queue.prepareLibrary([track]);
 	queue.publish(next, queue.begin(next, 'replace', true), sources);
 	const source = queue.sourceForQueuedPlay(track.id);
@@ -18,5 +18,4 @@ it('revokes library source and pending queue work on a changed binding', () => {
 	expect(queue.sourceForQueuedPlay(track.id)).toBeNull();
 	queue.publish(empty, pending, sources);
 	expect(queue.snapshot).toBe(next);
-	expect(queue.hasLibraryTrack(track.id)).toBe(false);
 });

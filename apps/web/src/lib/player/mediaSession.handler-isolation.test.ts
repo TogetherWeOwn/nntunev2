@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
+import { writable } from 'svelte/store';
+import { emptySeek } from './absoluteSeek.js';
 import {
 	applyMediaSession,
 	clearMediaSession,
 	type MediaMetadataInit,
 	type MediaSessionLike
 } from './mediaSession.js';
-import { DEMO_TRACKS } from './queue.js';
+import { createQueue, currentTrack, DEMO_TRACKS } from './queue.js';
+import { bindSystemTransport } from './systemTransport.js';
 
 /**
  * Handler isolation: one rejected action must not take down the rest of
@@ -145,14 +148,15 @@ describe('mediaSession early handler isolation', () => {
 		expect(tearingDown.handlers.get('nexttrack')).toBeTypeOf('function');
 	});
 
-	it('revokes the retained OS callback when clearing the same session throws', () => {
+	it.each(['replacing', 'clearing'])('revokes a retained OS callback when %s it throws', (operation) => {
 		const { session, handlers } = isolatedSession(null, []);
 		const options = { session, MetadataCtor: FakeMetadata, baseUrl: BASE };
 		const callbacks = handlerSet();
 		applyMediaSession(DEMO_TRACKS[1]!, callbacks, options);
 		const retained = handlers.get('nexttrack')!;
 		vi.spyOn(session, 'setActionHandler').mockImplementation(() => { throw new Error('unsupported'); });
-		clearMediaSession(options);
+		if (operation === 'clearing') clearMediaSession(options);
+		else applyMediaSession(DEMO_TRACKS[0]!, handlerSet(), options);
 		retained();
 		expect(callbacks.onNext).not.toHaveBeenCalled();
 	});
@@ -164,4 +168,26 @@ describe('mediaSession early handler isolation', () => {
 			expect((session.metadata as FakeMetadata).init.artwork?.[0]?.src).toBe(`${BASE}/placeholder-artwork.svg`);
 		}
 	);
+
+	it('clears the old OS state before binding a successor source', ({ onTestFinished }) => {
+		const { session, handlers } = isolatedSession(null, []);
+		vi.stubGlobal('navigator', { mediaSession: session });
+		vi.stubGlobal('MediaMetadata', FakeMetadata);
+		const abort = new AbortController();
+		onTestFinished(() => { abort.abort(); vi.unstubAllGlobals(); });
+		const state = createQueue([DEMO_TRACKS[0]!]), queue = writable(state);
+		const audio = new EventTarget() as HTMLAudioElement;
+		let track = currentTrack(state);
+		const playCurrent = vi.fn(async () => {});
+		bindSystemTransport(queue, audio, () => track, { playCurrent, pauseCurrent: vi.fn() }, abort.signal,
+			{ audio, attachment: 0, availability: writable(emptySeek), matches: () => !!track, positionIntent: () => 0, dispatch: vi.fn() });
+		const play = handlers.get('play')!;
+		expect(session.metadata).toBeInstanceOf(FakeMetadata);
+		track = null;
+		queue.set(createQueue([DEMO_TRACKS[1]!]));
+		expect(session.metadata).toBeNull();
+		expect(handlers.get('play')).toBeNull();
+		play();
+		expect(playCurrent).not.toHaveBeenCalled();
+	});
 });
