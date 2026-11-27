@@ -1,11 +1,14 @@
-//! Off-route FLAC handoff for the encrypted upload producer.
+//! Off-route FLAC handoff and completion evidence for the encrypted upload producer.
 
 use std::ops::Range;
 
-use nntune_core::s3_locator::S3MediaMetadata;
+use nntune_core::{media_envelope::EnvelopeContext, s3_locator::S3MediaMetadata};
+use nntune_ingest::multipart::{
+    readback_inventory::VerifiedCompletedReadback, session_outcome::CommittedOutcome,
+};
 
-use super::{CommittedOutcome, VerifiedCompletedReadback};
-
+#[cfg(any(test, target_arch = "wasm32"))]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(any(target_arch = "wasm32", all(test, feature = "postgres-tests")))]
 use {
     super::{
@@ -14,7 +17,6 @@ use {
     },
     nntune_core::digest_readback::EnrolledReadbackError,
     nntune_ingest::multipart::readback_inventory::CompletedReadbackInventory,
-    std::time::{Duration, SystemTime, UNIX_EPOCH},
     tokio_postgres::Client,
 };
 #[cfg(target_arch = "wasm32")]
@@ -22,6 +24,39 @@ use {
     nntune_core::digest_readback::EnrolledEnvelope,
     nntune_ingest::multipart::s3_completion::S3CompletionSender,
 };
+
+pub(super) fn matches_outcome(
+    context: &EnvelopeContext,
+    map: [u8; 16],
+    outcome: &CommittedOutcome,
+) -> bool {
+    let [root, _, _, object, generation, configuration] = context.identities;
+    [
+        (&outcome.map, map),
+        (&outcome.object, object),
+        (&outcome.generation, generation),
+        (&outcome.configuration, configuration),
+        (&outcome.root_version, root),
+    ]
+    .into_iter()
+    .all(|(actual, expected)| {
+        let mut expected = format!("{:032x}", u128::from_be_bytes(expected));
+        for boundary in [20, 16, 12, 8] {
+            expected.insert(boundary, '-');
+        }
+        actual == &expected
+    })
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+pub(super) fn readback_deadline(
+    now: SystemTime,
+    expires: u64,
+    target_deadline: SystemTime,
+) -> Option<SystemTime> {
+    let deadline = target_deadline.min(UNIX_EPOCH.checked_add(Duration::from_secs(expires))?);
+    (now < deadline).then_some(deadline)
+}
 
 /// Indexed, authenticated FLAC bound to the exact scoped completion result.
 /// The index is in memory. Consumers still establish read authority and custody.
@@ -113,15 +148,11 @@ impl OpenedUpload<'_> {
         {
             return Err(Refused);
         }
-        let auth_until = UNIX_EPOCH
-            .checked_add(Duration::from_secs(expires as u64))
-            .ok_or(Refused)?;
-        let until = self.target.usable_until().min(auth_until);
-        if UNIX_EPOCH + Duration::from_millis(crate::worker_entry::now_millis()) >= until {
-            return Err(Refused);
-        }
+        let now = UNIX_EPOCH + Duration::from_millis(crate::worker_entry::now_millis());
+        let until =
+            readback_deadline(now, expires as u64, self.target.usable_until()).ok_or(Refused)?;
         let verified = verify(until).await.map_err(|_| Unconfirmed)?;
-        if !std::ptr::eq(verified.inventory(), inventory) || !verified.has_flac_seek() {
+        if !verified.has_flac_seek() {
             return Err(Refused);
         }
         let outcome = self

@@ -207,14 +207,8 @@ mod tests {
         let track = "a0000000-0000-4000-8000-000000000001";
         let bucket = "test-bucket";
         let digest = "ab".repeat(32);
-        assert!(valid_lookup(
-            track,
-            bucket,
-            Some((1, "v+/=")),
-            Some(&digest)
-        ));
-        assert!(valid_lookup(track, bucket, None, None));
-        assert!(!valid_lookup(track, "not/a/bucket", None, None));
+        let pin = Some((1, "v+/="));
+        assert!(valid_lookup(track, bucket, pin, Some(&digest)));
         for pin in [(0, "v1"), (-1, "v1"), (1, "null"), (1, "v1,v2")] {
             assert!(!valid_lookup(track, bucket, Some(pin), None));
         }

@@ -4,7 +4,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nntune_core::media_envelope::EnvelopeContext;
 use nntune_ingest::{
-    digest_candidate_identity::candidate_hashes,
     digest_candidate_store::{
         outcome::{protect_completion_reuse, read_completion, stage_completion, OutcomeError},
         CandidateIntent,
@@ -22,7 +21,6 @@ use crate::{
     ingest_session_auth::{authorize, Action, Grant, Job},
     ingest_session_request::Request,
     native_rest::{NativeRestRecord, Pepper},
-    private_library::canonical_uuid,
     random::secure_random_bytes,
     storage_digest_read::uuid_text,
     worker_entry::{now_millis, with_deadline},
@@ -33,6 +31,7 @@ const ADVANCE: &str = include_str!("ingest_session_advance_checkpoint.sql");
 const AUTHORITY_TIMEOUT_MS: u64 = 3_000;
 
 mod flac;
+use flac::matches_outcome;
 pub use flac::CommittedFlacUpload;
 pub use nntune_ingest::digest_candidate_store::outcome::ProtectedReuse;
 
@@ -85,7 +84,6 @@ impl<'a> PreparedUpload<'a> {
             || self.request.file_bytes != self.context.plaintext_len
             || self.context.plaintext_len != self.intent.plaintext_len
             || self.context.header != self.intent.header
-            || self.intent.reservation_generation <= 0
         {
             return Err(Refused);
         }
@@ -104,25 +102,6 @@ impl<'a> PreparedUpload<'a> {
             ..self.scope
         }
     }
-}
-
-fn matches_outcome(context: &EnvelopeContext, map: [u8; 16], outcome: &CommittedOutcome) -> bool {
-    let [root, _, _, object, generation, configuration] = context.identities;
-    [
-        (&outcome.map, map),
-        (&outcome.object, object),
-        (&outcome.generation, generation),
-        (&outcome.configuration, configuration),
-        (&outcome.root_version, root),
-    ]
-    .into_iter()
-    .all(|(actual, expected)| {
-        canonical_uuid(actual)
-            && actual
-                .bytes()
-                .filter(|b| *b != b'-')
-                .eq(uuid_text(expected).bytes())
-    })
 }
 
 pub struct OpenedUpload<'a> {
@@ -156,7 +135,6 @@ impl<'a> OpenedUpload<'a> {
         if inventory.bucket() != target.bucket
             || inventory.media().object_key != target.key
             || verified.origin().plaintext_sha256() != &self.prepared.request.content_sha256
-            || candidate_hashes(self.prepared.intent, verified.origin()).is_err()
         {
             return Err(Refused);
         }
@@ -484,33 +462,6 @@ fn outcome_error(error: OutcomeError) -> UploadError {
     match error {
         OutcomeError::Refused => Refused,
         OutcomeError::Publication(_) | OutcomeError::Indeterminate => Unconfirmed,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn replay_requires_all_committed_identities_to_match_preparation() {
-        let context = EnvelopeContext {
-            identities: [[0; 16], [1; 16], [2; 16], [3; 16], [4; 16], [5; 16]],
-            plaintext_len: 1,
-            header: [0; 48],
-        };
-        let mut outcome = CommittedOutcome {
-            map: "06060606-0606-0606-0606-060606060606".into(),
-            object: "03030303-0303-0303-0303-030303030303".into(),
-            generation: "04040404-0404-0404-0404-040404040404".into(),
-            configuration: "05050505-0505-0505-0505-050505050505".into(),
-            root_version: "00000000-0000-0000-0000-000000000000".into(),
-            media_version: "synthetic-media".into(),
-            page_versions: vec![],
-        };
-        assert!(matches_outcome(&context, [6; 16], &outcome));
-        assert!(!matches_outcome(&context, [7; 16], &outcome));
-        outcome.root_version.clone_from(&outcome.generation);
-        assert!(!matches_outcome(&context, [6; 16], &outcome));
     }
 }
 

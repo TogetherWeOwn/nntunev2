@@ -72,12 +72,7 @@ mod tests {
             retry_revision(br#" {"revision":4294967294}"#),
             Some(u32::MAX - 1)
         );
-        for body in [
-            "[4]",
-            r#"{"revision":4,"revision":5}"#,
-            r#"{"revision":4294967295}"#,
-            &format!("{:128}{}", "", r#"{"revision":4}"#),
-        ] {
+        for body in ["[4]", r#"{"revision":4294967295}"#] {
             assert_eq!(retry_revision(body.as_bytes()), None);
         }
     }

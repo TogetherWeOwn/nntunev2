@@ -118,12 +118,13 @@ mod tests {
             "#EXTM3U\n#EXTINF:-1,A URL\nhttps://example.invalid/track\n\
              #EXTINF:-1,A path\n../track\n#EXTINF:-1,Missing ID\n\
              #EXTINF:8,Unsupported duration\n{A}\n#EXTINF:-1,Bad\0label\n{A}\n\
-             {A}\n#EXTINF-1,Missing colon\n{B}\n\
+             {A}\n#EXTINF-1,Missing colon\n{B}\n#EXTINF:-1,\u{feff} \u{feff}\n{A}\n\
              #EXTINF:-1,Valid\n{A}\n#EXTINF:-1,Missing final ID"
         );
         assert_eq!(
             preview(input.as_bytes(), &BTreeSet::from([A])),
             Ok(vec![
+                PreviewRow::Malformed,
                 PreviewRow::Malformed,
                 PreviewRow::Malformed,
                 PreviewRow::Malformed,
@@ -169,18 +170,5 @@ mod tests {
         assert_eq!(preview(&input, &ids), Ok(vec![]));
         input.push(b'\xff');
         assert_eq!(preview(&input, &ids), Err(PreviewError::TooManyBytes));
-    }
-
-    #[test]
-    fn rejects_labels_made_entirely_of_export_whitespace() {
-        let input =
-            format!("\u{feff}#EXTM3U\n#EXTINF:-1,\u{feff} \u{feff}\n{A}\n#EXTINF:-1,Visible\n{A}");
-        assert_eq!(
-            preview(input.as_bytes(), &BTreeSet::from([A])),
-            Ok(vec![
-                PreviewRow::Malformed,
-                PreviewRow::Matched { track_id: A }
-            ])
-        );
     }
 }

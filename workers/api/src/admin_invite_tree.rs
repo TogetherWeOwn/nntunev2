@@ -76,11 +76,7 @@ pub(crate) async fn read_on(
             invitee_ids.push(id);
         }
     }
-    let next_cursor = if rows.len() > PAGE_SIZE {
-        Some(invitee_ids.get(PAGE_SIZE - 1).ok_or(StoreError)?.clone())
-    } else {
-        None
-    };
+    let next_cursor = (rows.len() > PAGE_SIZE).then(|| invitee_ids[PAGE_SIZE - 1].clone());
     Ok(Page(InviteTreePage {
         user_id,
         inviter_id: first.try_get("invited_by")?,

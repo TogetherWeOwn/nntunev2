@@ -47,12 +47,6 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    if req.method != "POST"
-        || !matches!(req.path.as_str(), CHECKOUT | PORTAL)
-        || !ctx.cfg.paid_billing_enabled()
-    {
-        return not_found();
-    }
     let (claims, _) = match preference_authenticate(ctx, req, true).await {
         Ok(pair) => pair,
         Err(response) => return response,

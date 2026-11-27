@@ -76,7 +76,6 @@ pub async fn stage_admission(
     };
     if policy.owner_user_id != admission.issuer
         || !policy.invite_ids.contains(&admission.invite_id)
-        || admission.recipient == admission.issuer
         || !canonical_uuid(admission.track_id)
         || !crate::ledger::is_valid_key_field(admission.recipient, 128)
         || !crate::ledger::is_valid_key_field(admission.job_id, 64)

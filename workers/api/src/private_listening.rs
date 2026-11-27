@@ -1,6 +1,9 @@
 use crate::auth::{InviteRecord, INVITE_KIND_ADMIN};
 use serde::Deserialize;
 
+// The trial publisher also uses this deadline as a PostgreSQL timestamp.
+const MAX_EXPIRY: u64 = 253_402_300_799;
+
 /// Time-bounded policy referencing this environment's owner-issued invites.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,7 +21,7 @@ impl PrivateListening {
         }
         let policy: Self = serde_json::from_str(raw).ok()?;
         if !crate::ledger::is_valid_key_field(&policy.owner_user_id, 128)
-            || !(1..=i64::MAX as u64).contains(&policy.expires_at)
+            || !(1..=MAX_EXPIRY).contains(&policy.expires_at)
             || policy.invite_ids.len() > 8
             || policy.invite_ids.iter().any(|id| *id <= 0)
             || policy
@@ -58,8 +61,8 @@ mod tests {
             .to_string()
         };
         let scope = json!({"environment_id": id, "library_id": id});
-        assert!(PrivateListening::parse(&policy(i64::MAX as u64, scope.clone())).is_some());
-        assert!(PrivateListening::parse(&policy(i64::MAX as u64 + 1, scope)).is_none());
+        assert!(PrivateListening::parse(&policy(MAX_EXPIRY, scope.clone())).is_some());
+        assert!(PrivateListening::parse(&policy(MAX_EXPIRY + 1, scope)).is_none());
         assert!(PrivateListening::parse(&policy(100, json!([id, id]))).is_none());
         assert!(PrivateListening::parse(r#"["owner",[1],100,null]"#).is_none());
     }

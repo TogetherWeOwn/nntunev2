@@ -90,9 +90,6 @@ impl Presence {
             .saturating_add(ONLINE_SECS)
             .min(claims.expires_at);
         if let Some(entry) = self.devices.get_mut(&claims.session_id) {
-            if entry.created_at != claims.created_at {
-                return Err(PresenceError::InvalidSession);
-            }
             if sequence <= entry.sequence {
                 return Err(PresenceError::StaleSequence);
             }
