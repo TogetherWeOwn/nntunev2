@@ -150,7 +150,7 @@ impl IntakeRejection {
 pub struct IntakeEstimate {
     pub file_count: usize,
     pub segment_count: usize,
-    /// Summed `bytes="…"` over all `<segment>` elements.
+    /// Summed `bytes="…"` over all `<segment>` elements (saturating).
     pub declared_bytes: u64,
 }
 
@@ -298,13 +298,9 @@ fn count_elements(body: &str, name: &str, over: usize) -> Result<usize, ()> {
     Ok(count)
 }
 
-fn is_xml_space(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
-}
-
 /// Skip XML whitespace, returning the new offset.
 fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() && is_xml_space(bytes[i]) {
+    while matches!(bytes.get(i), Some(b' ' | b'\t' | b'\r' | b'\n')) {
         i += 1;
     }
     i
@@ -362,7 +358,7 @@ fn check_well_formed(body: &str) -> bool {
 
     while i < bytes.len() {
         if bytes[i] != b'<' {
-            if stack.is_empty() && !is_xml_space(bytes[i]) {
+            if stack.is_empty() && !matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
                 return false;
             }
             i += 1;
@@ -448,13 +444,15 @@ fn check_well_formed(body: &str) -> bool {
                     return false;
                 }
                 j = skip_ws(bytes, attr_end);
-                if bytes.get(j) != Some(&b'=') {
+                if j < bytes.len() && bytes[j] == b'=' {
+                    j = skip_ws(bytes, j + 1);
+                    match skip_quoted(bytes, j) {
+                        Some(e) => j = e,
+                        None => return false,
+                    }
+                } else {
                     return false;
                 }
-                j = match skip_quoted(bytes, skip_ws(bytes, j + 1)) {
-                    Some(e) => e,
-                    None => return false,
-                };
             }
             if !self_closing {
                 if stack.len() >= MAX_DEPTH {
@@ -483,6 +481,7 @@ fn sum_segment_bytes(body: &str) -> Result<u128, ()> {
         let tag = &body[open.start..open.end];
         let tag_bytes = tag.as_bytes();
         let mut k = open.name_end - open.start - 1;
+        let mut tag_value: Option<u128> = None;
         loop {
             k = skip_ws(tag_bytes, k);
             if k >= tag_bytes.len() || tag_bytes[k] == b'>' || tag[k..].starts_with("/>") {
@@ -507,15 +506,21 @@ fn sum_segment_bytes(body: &str) -> Result<u128, ()> {
                 if value_end >= tag_bytes.len() {
                     return Err(());
                 }
-                if attr_name == "bytes" {
+                if attr_name == "bytes" && tag_value.is_none() {
                     let raw = &tag[value_start..value_end];
                     if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
                         return Err(());
                     }
-                    total = total.saturating_add(raw.parse::<u128>().unwrap_or(u128::MAX));
+                    match raw.parse::<u128>() {
+                        Ok(n) => tag_value = Some(n),
+                        Err(_) => total = u128::MAX,
+                    }
                 }
                 k = value_end + 1;
             }
+        }
+        if let Some(n) = tag_value {
+            total = total.saturating_add(n);
         }
         offset = open.end;
     }

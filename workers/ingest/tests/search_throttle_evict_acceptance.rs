@@ -1,4 +1,9 @@
-//! Offline coverage for bounded search-throttle accounting.
+//! Search-throttle map-cap pin (tests-only).
+//!
+//! - `SEARCH_THROTTLE_MAX_KEYS == 4096` per dimension (`by_ip`, `by_account`)
+//!   in [`SearchThrottleStore`](nntune_ingest::rate_limit::SearchThrottleStore);
+//! - filling the store to exactly 4096 tracked keys keeps every key tracked
+//!   (no early clear: a spent 1-token bucket still denies on re-check);
 //!
 //! Run only this file:
 //!
@@ -88,4 +93,24 @@ fn overflow_preserves_spent_buckets_until_refill() {
     let refilled = NOW + cfg.window_secs;
     assert!(is_allow(&store.check(&overflow, &cfg, refilled)));
     assert!(!is_allow(&store.check(&overflow, &cfg, refilled)));
+}
+
+#[test]
+fn caps_ip_and_account_keys_independently() {
+    let cfg = SearchRateLimitConfig {
+        max_attempts: CAP as u32 + 1,
+        ..one_shot_cfg()
+    };
+    for distinct_ips in [true, false] {
+        let mut store = SearchThrottleStore::new();
+        let key = |i: usize| {
+            let (ip, account) = if distinct_ips { (i, 0) } else { (0, i) };
+            SearchThrottleKey::new(&ip.to_string(), &account.to_string())
+        };
+        for i in 0..CAP {
+            assert!(is_allow(&store.check(&key(i), &cfg, NOW)));
+        }
+        assert!(!is_allow(&store.check(&key(CAP), &cfg, NOW)));
+        assert!(is_allow(&store.check(&key(0), &cfg, NOW)));
+    }
 }

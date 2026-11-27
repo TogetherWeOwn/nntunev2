@@ -417,7 +417,7 @@ fn is_redirect(status: u16) -> bool {
 /// use can be stopped by this API. Errors never return a partial result.
 ///
 /// Revalidates 301/302/303/307/308 locations and follows at most
-/// `config.max_redirects` hops. A missing Location or other non-2xx status
+/// `config.max_redirects` hops, up to `MAX_REDIRECTS`. A missing Location or other non-2xx status
 /// becomes UpstreamStatus(status). See the module's runtime follow-up before
 /// connecting this model to any URL-fetch route: only the admin-gated
 /// ingest path may call it, and only with operator-configured URLs.
@@ -649,6 +649,8 @@ mod tests {
             resolve_location("nzb.example", "/dl?src=https://cdn.example/x"),
             Ok("https://nzb.example/dl?src=https://cdn.example/x".to_string())
         );
+        let oversized = format!("/{}", "a".repeat(MAX_FETCH_URL_BYTES));
+        assert!(resolve_location("nzb.example", &oversized).is_err());
     }
 
     #[test]

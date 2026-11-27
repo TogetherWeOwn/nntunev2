@@ -484,7 +484,7 @@ fn bad_scheme_credentials_and_non_allowlisted_blocked_before_fetch() {
 fn redirect_loop_blocked_at_cap_with_stable_4xx() {
     let dns = FakeDns::with(ALLOWED_HOST, &[IpAddr::V4(PUBLIC_V4)]);
     let mut cfg = config(&[ALLOWED_HOST]);
-    cfg.max_redirects = 2;
+    cfg.max_redirects = u32::MAX;
     let mut transport = FakeTransport::default().serve(ALLOWED_URL, redirect_response(ALLOWED_URL));
 
     let err = fetch_nzb(ALLOWED_URL, &cfg, &dns, &mut transport)
@@ -492,8 +492,7 @@ fn redirect_loop_blocked_at_cap_with_stable_4xx() {
     assert_eq!(err, FetchRejection::TooManyRedirects);
     assert_eq!(err.code(), "nzb_fetch_too_many_redirects");
     assert!((400..500).contains(&err.http_status()));
-    // Initial fetch + 2 followed redirects, then the loop is cut off.
-    assert_eq!(transport.calls.len(), 3);
+    assert_eq!(transport.calls.len(), 1 + MAX_REDIRECTS as usize);
 }
 
 /// Every redirect hop is re-guarded from scratch: a hop to a forbidden
