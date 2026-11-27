@@ -12,7 +12,9 @@
 //! numbers only, never material; date ranges live in the operator
 //! manifest, not the bundle).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,8 @@ use sha2::{Digest, Sha256};
 /// newer versions fail-closed.
 pub const BUNDLE_FORMAT_VERSION: u32 = 1;
 pub const MANIFEST_FILE: &str = "manifest.json";
+/// Bound metadata allocation independently of the size of the backup files.
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 /// One content file inside the bundle, addressed by SHA-256.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,11 +65,13 @@ pub struct Manifest {
     pub files: Vec<BundleFile>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum BundleError {
     Io(String),
     Json(String),
     UnsupportedFormat(u32),
+    DuplicatePath,
+    ManifestTooLarge,
     HashMismatch { path: String },
     MissingFile { path: String },
 }
@@ -73,18 +79,21 @@ pub enum BundleError {
 impl core::fmt::Display for BundleError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            BundleError::Io(e) => write!(f, "bundle io: {e}"),
-            BundleError::Json(e) => write!(f, "bundle json: {e}"),
-            BundleError::UnsupportedFormat(v) => {
-                write!(f, "unsupported bundle format: {v}")
-            }
-            BundleError::HashMismatch { path } => {
-                write!(f, "bundle hash mismatch: {path}")
-            }
-            BundleError::MissingFile { path } => {
-                write!(f, "bundle missing file: {path}")
-            }
+            BundleError::Io(_) => f.write_str("bundle io failure"),
+            BundleError::Json(_) => f.write_str("invalid bundle JSON"),
+            BundleError::UnsupportedFormat(_) => f.write_str("unsupported bundle format"),
+            BundleError::DuplicatePath => f.write_str("duplicate bundle path"),
+            BundleError::ManifestTooLarge => f.write_str("bundle manifest too large"),
+            BundleError::HashMismatch { .. } => f.write_str("bundle size or hash mismatch"),
+            BundleError::MissingFile { .. } => f.write_str("bundle missing file"),
         }
+    }
+}
+
+// Parser diagnostics and file paths may contain member data.
+impl core::fmt::Debug for BundleError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
     }
 }
 
@@ -117,35 +126,83 @@ pub struct BundleWriter {
     tool: String,
     tables: Vec<TableCount>,
     keyring_versions: BTreeMap<u32, ()>,
-    staged: Vec<String>,
+    staged: BTreeMap<String, String>,
 }
 
-/// Reject bundle-relative paths that could escape the bundle root.
-/// `Path::components` parses per-platform (on Unix `C:\x` is an
-/// ordinary file name), so check both the parsed components (prefix,
-/// root, parent) and the Windows spellings explicitly: backslash
-/// separators and drive-letter/`:` spellings are never valid in a
-/// bundle path, and the bundle must verify identically on every
-/// platform the tool builds on.
-fn is_unsafe_bundle_path(rel: &str) -> bool {
-    if rel.is_empty() {
-        return true;
+fn content_path_key(rel: &str) -> Result<String, BundleError> {
+    let key = rel.to_uppercase();
+    let first = key.split_once('/').map_or(key.as_str(), |(first, _)| first);
+    if rel.contains(['\\', ':', '\0'])
+        || rel
+            .split('/')
+            .any(|p| p.is_empty() || p.ends_with(['.', ' ']))
+        || first.eq_ignore_ascii_case(MANIFEST_FILE)
+    {
+        return Err(BundleError::Io("invalid bundle path".into()));
     }
-    if rel.contains('\\') || rel.contains(':') {
-        return true;
+    Ok(key)
+}
+
+fn missing(rel: &str) -> BundleError {
+    BundleError::MissingFile { path: rel.into() }
+}
+
+/// Check each directory before descending so a static symlink cannot redirect
+/// a read or write. The caller owns the scratch tree and keeps it stable.
+fn entry_path(dir: &Path, rel: &str, create_parents: bool) -> Result<PathBuf, BundleError> {
+    // Normalize a trailing slash or "." before checking the root itself.
+    let mut path: PathBuf = dir.components().collect();
+    for part in rel.split('/') {
+        if create_parents {
+            fs::create_dir_all(&path)
+                .map_err(|_| BundleError::Io("bundle directory creation".into()))?;
+        }
+        let meta = fs::symlink_metadata(&path).map_err(|_| missing(rel))?;
+        if !meta.is_dir() {
+            return Err(BundleError::Io("invalid bundle directory".into()));
+        }
+        path.push(part);
     }
-    let path = Path::new(rel);
-    if path.is_absolute() {
-        return true;
+    Ok(path)
+}
+
+fn open_bundle_file(dir: &Path, rel: &str) -> Result<File, BundleError> {
+    let path = entry_path(dir, rel, false)?;
+    let meta = fs::symlink_metadata(&path).map_err(|_| missing(rel))?;
+    if !meta.is_file() {
+        return Err(BundleError::Io("invalid bundle file type".into()));
     }
-    path.components().any(|c| {
-        matches!(
-            c,
-            std::path::Component::Prefix(_)
-                | std::path::Component::RootDir
-                | std::path::Component::ParentDir
-        )
-    })
+    File::open(path).map_err(|_| missing(rel))
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), BundleError> {
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| BundleError::Io("bundle file creation".into()))?;
+    if file.write_all(bytes).is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(BundleError::Io("bundle file write".into()));
+    }
+    Ok(())
+}
+
+fn hash_file(mut input: impl Read) -> Result<(u64, String), BundleError> {
+    let mut digest = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0; 32 * 1024];
+    loop {
+        let n = input
+            .read(&mut buffer)
+            .map_err(|_| BundleError::Io("bundle file read".into()))?;
+        if n == 0 {
+            return Ok((bytes, hex_of(&digest.finalize())));
+        }
+        digest.update(&buffer[..n]);
+        bytes += n as u64;
+    }
 }
 
 impl BundleWriter {
@@ -157,24 +214,19 @@ impl BundleWriter {
             created_at_unix,
             tables: Vec::new(),
             keyring_versions: BTreeMap::new(),
-            staged: Vec::new(),
+            staged: BTreeMap::new(),
         }
     }
 
-    /// Stage one file (relative path inside the bundle). Parent
-    /// directories are created. Refuses absolute, prefixed, rooted
-    /// and parent paths, including Windows spellings (see
-    /// [`is_unsafe_bundle_path`]).
+    /// Stage one new file under its canonical bundle-relative path.
     pub fn stage_file(&mut self, rel: &str, bytes: &[u8]) -> Result<(), BundleError> {
-        if is_unsafe_bundle_path(rel) {
-            return Err(BundleError::Io(format!("unsafe bundle path: {rel}")));
+        let key = content_path_key(rel)?;
+        if self.staged.contains_key(&key) {
+            return Err(BundleError::DuplicatePath);
         }
-        let full = self.dir.join(rel);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| BundleError::Io(format!("mkdir: {e}")))?;
-        }
-        std::fs::write(&full, bytes).map_err(|e| BundleError::Io(format!("write: {e}")))?;
-        self.staged.push(rel.to_string());
+        let path = entry_path(&self.dir, rel, true)?;
+        write_new_file(&path, bytes)?;
+        self.staged.insert(key, rel.into());
         Ok(())
     }
 
@@ -191,13 +243,12 @@ impl BundleWriter {
 
     pub fn finish(self) -> Result<Manifest, BundleError> {
         let mut files = Vec::with_capacity(self.staged.len());
-        for rel in &self.staged {
-            let bytes = std::fs::read(self.dir.join(rel))
-                .map_err(|e| BundleError::Io(format!("read back: {e}")))?;
+        for rel in self.staged.values() {
+            let (bytes, sha256_hex) = hash_file(open_bundle_file(&self.dir, rel)?)?;
             files.push(BundleFile {
                 path: rel.clone(),
-                sha256_hex: sha256_hex(&bytes),
-                bytes: bytes.len() as u64,
+                sha256_hex,
+                bytes,
             });
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -212,77 +263,56 @@ impl BundleWriter {
             },
             files,
         };
-        let json = serde_json::to_string_pretty(&manifest)
-            .map_err(|e| BundleError::Json(e.to_string()))?;
-        std::fs::write(self.dir.join(MANIFEST_FILE), json)
-            .map_err(|e| BundleError::Io(format!("manifest write: {e}")))?;
+        let json = serde_json::to_vec_pretty(&manifest)
+            .map_err(|_| BundleError::Json("manifest serialization".into()))?;
+        if json.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(BundleError::ManifestTooLarge);
+        }
+        write_new_file(&entry_path(&self.dir, MANIFEST_FILE, true)?, &json)?;
         Ok(manifest)
     }
 }
 
-/// Read the manifest without trusting it: unknown format versions
-/// refuse fail-closed before any restore. A symlinked manifest is
-/// refused outright: it could point outside the bundle boundary.
+/// Read bounded manifest metadata and reject invalid format versions and paths.
 pub fn read_manifest(dir: &Path) -> Result<Manifest, BundleError> {
-    let manifest_path = dir.join(MANIFEST_FILE);
-    let meta = std::fs::symlink_metadata(&manifest_path).map_err(|_| BundleError::MissingFile {
-        path: MANIFEST_FILE.to_string(),
-    })?;
-    if meta.file_type().is_symlink() {
-        return Err(BundleError::Io(format!("refuses symlink: {MANIFEST_FILE}")));
+    let file = open_bundle_file(dir, MANIFEST_FILE)?;
+    let mut raw = Vec::new();
+    file.take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| BundleError::Io("manifest read".into()))?;
+    if raw.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(BundleError::ManifestTooLarge);
     }
-    let raw = std::fs::read(&manifest_path).map_err(|_| BundleError::MissingFile {
-        path: MANIFEST_FILE.to_string(),
-    })?;
     let manifest: Manifest =
-        serde_json::from_slice(&raw).map_err(|e| BundleError::Json(e.to_string()))?;
+        serde_json::from_slice(&raw).map_err(|_| BundleError::Json("manifest parsing".into()))?;
     if manifest.format_version != BUNDLE_FORMAT_VERSION {
         return Err(BundleError::UnsupportedFormat(manifest.format_version));
+    }
+    let mut paths = BTreeSet::new();
+    for file in &manifest.files {
+        if !paths.insert(content_path_key(&file.path)?) {
+            return Err(BundleError::DuplicatePath);
+        }
     }
     Ok(manifest)
 }
 
-/// Verify every manifest-listed file exists with the recorded hash.
-/// Returns the manifest on success. Symlinks are refused at every
-/// level: `fs::read` follows them, so without this check a crafted
-/// bundle could verify bytes from outside the bundle boundary — either
-/// via a symlinked file or via a symlinked intermediate directory
-/// (e.g. `blobs/` pointing elsewhere).
+/// Verify every manifest-listed regular file against its size and SHA-256.
+/// The caller must keep the offline bundle tree stable through verification
+/// and any subsequent restore reads.
 pub fn verify_bundle(dir: &Path) -> Result<Manifest, BundleError> {
     let manifest = read_manifest(dir)?;
     for f in &manifest.files {
-        if is_unsafe_bundle_path(&f.path) {
-            return Err(BundleError::Io(format!("unsafe bundle path: {}", f.path)));
-        }
-        let full = dir.join(&f.path);
-        // Walk the file and every ancestor directory down to (but
-        // excluding) the bundle root: any symlink in the chain could
-        // redirect reads outside the bundle. `full` is
-        // `dir.join(rel)` with `rel` relative and `..`-free, so the
-        // ancestor chain always reaches `dir`.
-        let mut cur: &Path = &full;
-        loop {
-            let meta = std::fs::symlink_metadata(cur).map_err(|_| BundleError::MissingFile {
-                path: f.path.clone(),
-            })?;
-            if meta.file_type().is_symlink() {
-                return Err(BundleError::Io(format!("refuses symlink: {}", f.path)));
-            }
-            if cur == dir {
-                break;
-            }
-            match cur.parent() {
-                Some(parent) => cur = parent,
-                None => break,
-            }
-        }
-        let bytes = std::fs::read(&full).map_err(|_| BundleError::MissingFile {
+        let file = open_bundle_file(dir, &f.path)?;
+        let mismatch = || BundleError::HashMismatch {
             path: f.path.clone(),
-        })?;
-        if bytes.len() as u64 != f.bytes || sha256_hex(&bytes) != f.sha256_hex {
-            return Err(BundleError::HashMismatch {
-                path: f.path.clone(),
-            });
+        };
+        if file.metadata().map_err(|_| missing(&f.path))?.len() != f.bytes {
+            return Err(mismatch());
+        }
+        let (bytes, hash) = hash_file(file.take(f.bytes.saturating_add(1)))?;
+        if bytes != f.bytes || hash != f.sha256_hex {
+            return Err(mismatch());
         }
     }
     Ok(manifest)
@@ -320,7 +350,7 @@ mod tests {
         let mut w = writer_in(&dir);
         w.stage_file("blobs/x.bin", b"secretbox-bytes").unwrap();
         w.finish().unwrap();
-        std::fs::write(dir.join("blobs/x.bin"), b"tampered").unwrap();
+        std::fs::write(dir.join("blobs/x.bin"), b"secretbox-byte!").unwrap();
         assert!(matches!(
             verify_bundle(&dir),
             Err(BundleError::HashMismatch { .. })
@@ -373,6 +403,8 @@ mod tests {
         std::fs::remove_dir_all(dir.join("blobs")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, dir.join("blobs")).unwrap();
+        let root = dir.join("blobs/.");
+        assert!(matches!(read_manifest(&root), Err(BundleError::Io(_))));
         #[cfg(unix)]
         assert!(matches!(verify_bundle(&dir), Err(BundleError::Io(_))));
         let _ = std::fs::remove_dir_all(&dir);
@@ -380,15 +412,71 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_paths_refused() {
+    fn manifest_paths_and_error_redaction() {
         let dir =
             std::env::temp_dir().join(format!("nntune-backup-test-{}-{}", std::process::id(), 3));
         let _ = std::fs::remove_dir_all(&dir);
         let mut w = writer_in(&dir);
-        assert!(w.stage_file("../evil", b"x").is_err());
-        assert!(w.stage_file("/abs", b"x").is_err());
-        assert!(w.stage_file("a/../../evil", b"x").is_err());
+        const PRIVATE: &str = "synthetic-member@example.invalid";
+        let rel = format!("data/{PRIVATE}");
+        w.stage_file(&rel, b"x").unwrap();
+        for alias in [&rel, &rel.to_uppercase()] {
+            assert_eq!(w.stage_file(alias, b"y"), Err(BundleError::DuplicatePath));
+        }
+        assert!(writer_in(&dir).stage_file(&rel, b"y").is_err());
+        assert_eq!(fs::read(dir.join(&rel)).unwrap(), b"x");
+        let mut manifest = w.finish().unwrap();
+        assert_eq!(verify_bundle(&dir), Ok(manifest.clone()));
+        let path = dir.join(MANIFEST_FILE);
+        manifest.files.push(manifest.files[0].clone());
+        for alias in [&rel, &rel.to_uppercase()] {
+            manifest.files[1].path.clone_from(alias);
+            fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert_eq!(verify_bundle(&dir), Err(BundleError::DuplicatePath));
+        }
+        manifest.files.pop();
+        for bad in [
+            format!("../{PRIVATE}"),
+            format!("data/./{PRIVATE}"),
+            format!("/{PRIVATE}"),
+            format!("data//{PRIVATE}"),
+            "manifest.json".into(),
+        ] {
+            manifest.files[0].path = bad;
+            fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert!(matches!(read_manifest(&dir), Err(BundleError::Io(_))));
+        }
+        manifest.files[0].path.clone_from(&rel);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(dir.join(&rel), b"").unwrap();
+        let mismatch = verify_bundle(&dir).unwrap_err();
+        fs::remove_file(dir.join(&rel)).unwrap();
+        fs::create_dir(dir.join(&rel)).unwrap();
+        let err = verify_bundle(&dir).unwrap_err();
+        assert_eq!(err, BundleError::Io("invalid bundle file type".into()));
+        fs::write(&path, format!(r#"{{"format_version":"{PRIVATE}"}}"#)).unwrap();
+        let malformed = read_manifest(&dir).unwrap_err();
+        for err in [mismatch, malformed] {
+            assert!(!format!("{err} / {err:?}").contains(PRIVATE));
+        }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_bounds_and_version() {
+        let dir = std::env::temp_dir().join(format!("nntune-backup-test-{}-8", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut manifest = writer_in(&dir).finish().unwrap();
+        assert_eq!(verify_bundle(&dir), Ok(manifest.clone()));
+        manifest.format_version = BUNDLE_FORMAT_VERSION + 1;
+        let path = dir.join(MANIFEST_FILE);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let err = read_manifest(&dir).unwrap_err();
+        assert_eq!(err, BundleError::UnsupportedFormat(manifest.format_version));
+        let file = File::create(path).unwrap();
+        file.set_len(MAX_MANIFEST_BYTES + 1).unwrap();
+        assert_eq!(read_manifest(&dir), Err(BundleError::ManifestTooLarge));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

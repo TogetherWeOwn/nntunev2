@@ -19,6 +19,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
+use nntune_core::original_source::{MAX_CIPHERTEXT_BYTES, MAX_RECORD_BYTES};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Value bound into the drill `nzb_ref_envelope_version` column: the
@@ -44,6 +45,9 @@ const PURPOSE_PAYLOAD: &str = "payload";
 /// AAD table/field pins for the posted-file NZB reference envelope.
 const AAD_TABLE: &str = "track_sources";
 const AAD_FIELD: &str = "nzb_ref";
+// Bounds the framed identity allocation while allowing scoped IDs and row keys.
+const MAX_IDENTITY_BYTES: usize = 1024;
+const GCM_TAG_LEN: usize = 16;
 
 /// Envelope failure modes. Authentication failures and unknown versions
 /// collapse to [`EnvelopeError::Crypto`]: the caller learns nothing
@@ -52,7 +56,7 @@ const AAD_FIELD: &str = "nzb_ref";
 pub enum EnvelopeError {
     /// Authentication failure, bad key length, or unknown version.
     Crypto,
-    /// Stored-shape failure (short/long wrapped DEK, negative versions).
+    /// Envelope or identity length outside the supported bounds.
     CorruptStoredData,
     /// OS randomness unavailable; fail closed, never fall back.
     RandomnessUnavailable,
@@ -132,6 +136,12 @@ pub fn seal_media_key(
     row_key: &str,
     media_key_payload: &[u8],
 ) -> Result<Envelope, EnvelopeError> {
+    if !(1..=MAX_RECORD_BYTES).contains(&media_key_payload.len())
+        || user_id.len() > MAX_IDENTITY_BYTES
+        || row_key.len() > MAX_IDENTITY_BYTES
+    {
+        return Err(EnvelopeError::CorruptStoredData);
+    }
     let mut dek_bytes = [0u8; DEK_LEN];
     fill_random(&mut dek_bytes)?;
     let dek = Dek(dek_bytes);
@@ -196,7 +206,14 @@ pub fn open_media_key(
     kek_version: u32,
     envelope: &Envelope,
 ) -> Result<Vec<u8>, EnvelopeError> {
-    if envelope.dek_wrapped.len() != WRAPPED_DEK_LEN {
+    if envelope_version != ENVELOPE_VERSION_V2 || payload_format != PAYLOAD_FORMAT_MEDIA_KEY_V1 {
+        return Err(EnvelopeError::Crypto);
+    }
+    if envelope.dek_wrapped.len() != WRAPPED_DEK_LEN
+        || !(GCM_TAG_LEN + 1..=MAX_CIPHERTEXT_BYTES).contains(&envelope.ciphertext.len())
+        || user_id.len() > MAX_IDENTITY_BYTES
+        || row_key.len() > MAX_IDENTITY_BYTES
+    {
         return Err(EnvelopeError::CorruptStoredData);
     }
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| EnvelopeError::Crypto)?;
@@ -277,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_kek_version_fails_closed() {
+    fn wrong_kek_fails_closed() {
         let env = seal_media_key(&test_kek(0x11), 7, "drill-user", "drill-user:track-1", b"x")
             .expect("seal");
         assert_eq!(
@@ -326,6 +343,67 @@ mod tests {
                 7,
                 &env
             ),
+            Err(EnvelopeError::CorruptStoredData)
+        );
+    }
+
+    #[test]
+    fn authenticated_unknown_versions_are_refused() {
+        let (kek, dek, nonce) = (test_kek(0x11), test_kek(0x22), [0; NONCE_LEN]);
+        let refused = Err(EnvelopeError::Crypto);
+        for (version, format, expected) in [(2, 1, Ok(true)), (3, 1, refused), (2, 2, refused)] {
+            let seal = |key: &[u8], purpose, kek_version, msg: &[u8]| {
+                let aad = aad_v2(purpose, "u", "u:t", version, format, kek_version);
+                Aes256Gcm::new_from_slice(key)
+                    .unwrap()
+                    .encrypt(&Nonce::from(nonce), Payload { msg, aad: &aad })
+                    .unwrap()
+            };
+            let env = Envelope {
+                dek_wrapped_nonce: nonce,
+                dek_wrapped: seal(&kek, PURPOSE_DEK, Some(7), &dek),
+                payload_nonce: nonce,
+                ciphertext: seal(&dek, PURPOSE_PAYLOAD, None, b"synthetic"),
+            };
+            let opened = open_media_key(&kek, "u", "u:t", version, format, 7, &env);
+            assert_eq!(opened.map(|bytes| bytes == b"synthetic"), expected);
+        }
+    }
+
+    #[test]
+    fn envelope_bounds_and_authentication() {
+        let kek = test_kek(0x11);
+        let mut env = seal_media_key(&kek, 7, "u", "u:t", b"synthetic").unwrap();
+        let open =
+            |env: &Envelope, key_version| open_media_key(&kek, "u", "u:t", 2, 1, key_version, env);
+        assert_eq!(open(&env, 8), Err(EnvelopeError::Crypto));
+        env.dek_wrapped[0] ^= 1;
+        assert_eq!(open(&env, 7), Err(EnvelopeError::Crypto));
+        env.dek_wrapped[0] ^= 1;
+        env.ciphertext[0] ^= 1;
+        assert_eq!(open(&env, 7), Err(EnvelopeError::Crypto));
+        env.ciphertext[0] ^= 1;
+        env.ciphertext.pop();
+        assert_eq!(open(&env, 7), Err(EnvelopeError::Crypto));
+        env.ciphertext.truncate(GCM_TAG_LEN);
+        assert_eq!(open(&env, 7), Err(EnvelopeError::CorruptStoredData));
+        env.ciphertext.resize(MAX_CIPHERTEXT_BYTES + 1, 0);
+        assert_eq!(open(&env, 7), Err(EnvelopeError::CorruptStoredData));
+
+        let identity = "x".repeat(MAX_IDENTITY_BYTES + 1);
+        for (owner, payload) in [
+            ("u", env.ciphertext.as_slice()),
+            (identity.as_str(), b"x"),
+            ("u", b""),
+        ] {
+            assert!(matches!(
+                seal_media_key(&kek, 7, owner, "u:t", payload),
+                Err(EnvelopeError::CorruptStoredData)
+            ));
+        }
+        let env = seal_media_key(&kek, 7, "u", "u:t", b"synthetic").unwrap();
+        assert_eq!(
+            open_media_key(&kek, "u", &identity, 2, 1, 7, &env),
             Err(EnvelopeError::CorruptStoredData)
         );
     }
