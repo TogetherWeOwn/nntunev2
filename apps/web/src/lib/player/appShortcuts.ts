@@ -9,9 +9,9 @@ type Help = ReturnType<typeof ShortcutHelp>;
 const handlers: Partial<Record<ShortcutAction, (media: Media, help: Help) => boolean | void>> = {
 	'toggle-play': (media) => {
 		const status = get(media.playbackStatus);
-		if (status === 'unavailable' || status === 'error') return false;
 		if (status === 'playing' || status === 'starting') media.pauseCurrent();
-		else void media.playCurrent();
+		else if (status === 'paused' || status === 'blocked') void media.playCurrent();
+		else return false;
 	},
 	'restart-track': (media) => {
 		if (!get(media.seekFeedback).restartCanSeek) return false;
@@ -27,7 +27,9 @@ export const appShortcutActions = [...Object.keys(handlers), 'close-shortcuts'] 
 
 export function handleAppShortcut(event: KeyboardEvent, media: Media, help: Help | undefined): void {
 	if (!help || help.isOpen() || event.repeat || (event.shiftKey && event.key !== '?')) return;
-	const action = actionForShortcutEvent(event, document);
+	const scope = event.view?.document ?? globalThis.document;
+	if (!scope) return;
+	const action = actionForShortcutEvent(event, scope);
 	const handler = action ? handlers[action] : undefined;
 	if (handler && handler(media, help) !== false) event.preventDefault();
 }

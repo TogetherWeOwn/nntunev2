@@ -12,30 +12,34 @@
 
 	let { volume, muted, restricted = false, part = 'both', ready, onvolumeinput, ontogglemute }: Props = $props();
 	const volumeId = $props.id();
+	const validVolume = (value: number) => Number.isFinite(value) && value >= 0 && value <= 1;
+	const canAdjust = $derived(ready && !restricted && validVolume(volume));
+	const displayedVolume = $derived(validVolume(volume) ? volume * 100 : 0);
 
 	function handleInput(event: Event & { currentTarget: HTMLInputElement }): void {
 		const input = event.currentTarget;
-		const observed = onvolumeinput(Number(input.value) / 100);
+		const requested = input.valueAsNumber / 100;
+		const observed = canAdjust && validVolume(requested) ? onvolumeinput(requested) : NaN;
 		// Rejected writes can leave the prop unchanged but the native thumb moved.
-		input.value = String(observed * 100);
+		input.valueAsNumber = validVolume(observed) ? observed * 100 : displayedVolume;
 	}
 </script>
 
 {#if part !== 'status'}
 	<div class="nt-sound">
 		<label for={volumeId}>
-			Volume {Math.round(volume * 100)}%
+			Volume {Math.round(displayedVolume)}%
 			<input
 				id={volumeId}
 				type="range"
 				min="0"
 				max="100"
-				value={volume * 100}
-				disabled={!ready || restricted}
+				value={displayedVolume}
+				disabled={!canAdjust}
 				oninput={handleInput}
 			/>
 		</label>
-		<button type="button" aria-pressed={muted} onclick={ontogglemute}>Mute</button>
+		<button type="button" disabled={!ready} aria-pressed={muted} onclick={() => { if (ready) ontogglemute(); }}>Mute</button>
 	</div>
 {/if}
 {#if part !== 'controls'}<p role="status" hidden={!restricted}>Use system volume controls.</p>{/if}

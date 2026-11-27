@@ -3,11 +3,20 @@
 	let { value, feedback, onchange }: Props = $props();
 	const presets = ['0.5', '0.75', '1', '1.25', '1.5', '1.75', '2'];
 	let attempt = $state(0);
+
+	function change(control: HTMLSelectElement): void {
+		if (value === null || !presets.includes(control.value)) {
+			control.value = value ?? '';
+			return;
+		}
+		onchange(control);
+		attempt += 1;
+	}
 </script>
 <div>
 	<label for="library-playback-speed">Playback speed</label>
 	<select id="library-playback-speed" data-testid="library-playback-speed" value={value ?? ''} disabled={value === null}
-		onchange={(event) => { onchange(event.currentTarget); attempt += 1; }}>
+		onchange={(event) => change(event.currentTarget)}>
 		{#if value === null || !presets.includes(value)}
 			<option value={value ?? ''}>{value === null ? 'Unavailable' : `${value}x`}</option>
 		{/if}

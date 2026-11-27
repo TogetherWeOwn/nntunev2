@@ -20,9 +20,9 @@
 		const plural = count === 1 ? '' : 's';
 		if (field === 'minutes') {
 			const ms = count * 60_000;
-			if (!Number.isFinite(ms) || ms <= 0) errors.minutes = 'Enter a positive finite number of minutes.';
+			if (!(ms > 0 && ms <= Number.MAX_SAFE_INTEGER - Date.now())) errors.minutes = 'Enter a positive finite number of minutes within the supported range.';
 			else arm({ kind: 'duration', ms }, `Sleep in ${raw} minute${plural}`);
-		} else if (!Number.isInteger(count) || count < 1) errors.tracks = 'Enter a whole positive integer count of tracks.';
+		} else if (!Number.isSafeInteger(count) || count < 1) errors.tracks = 'Enter a whole positive integer count of tracks.';
 		else arm({ kind: 'stop-after-tracks', count }, `Sleep after ${count} track${plural}`);
 	}
 </script>
@@ -34,7 +34,8 @@
 		submit(field, String(new FormData(event.currentTarget).get(field) ?? '').trim());
 	}}>
 		<label for={`${id}-${field}`}>{label}</label>
-		<input id={`${id}-${field}`} name={field} type="number" min="1" {value} data-testid={`sleep-timer-${field}`}
+		<input id={`${id}-${field}`} name={field} type="number" min={field === 'minutes' ? 0 : 1}
+			step={field === 'minutes' ? 'any' : 1} {value} data-testid={`sleep-timer-${field}`}
 			aria-invalid={errorId ? 'true' : undefined} aria-describedby={errorId} aria-errormessage={errorId} />
 		<button class="nt-button nt-button--ghost" type="submit" data-testid={`sleep-timer-set-${action}`}>{button}</button>
 		{#if errorId}<p id={errorId} class="sleep-error" role="alert">{errors[field]}</p>{/if}

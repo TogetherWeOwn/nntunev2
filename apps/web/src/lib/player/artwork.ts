@@ -17,14 +17,18 @@ export interface ResolveArtworkOptions {
 export function isUsableArtworkSrc(src: unknown): src is string {
 	if (typeof src !== 'string') return false;
 	const trimmed = src.trim();
-	if (trimmed === '') return false;
-	return (
-		trimmed.startsWith('/') ||
-		trimmed.startsWith('data:') ||
-		trimmed.startsWith('blob:') ||
-		trimmed.startsWith('http://') ||
-		trimmed.startsWith('https://')
-	);
+	if (/[\\\p{Cc}]/u.test(trimmed)) return false;
+	if (trimmed.startsWith('/')) return !trimmed.startsWith('//');
+	if (trimmed.startsWith('data:')) return /^data:image\/[\w.+-]+(?:;[^,]*)?,.+$/is.test(trimmed);
+	if (trimmed.startsWith('blob:null/')) return trimmed.length > 'blob:null/'.length;
+	const address = trimmed.startsWith('blob:') ? trimmed.slice(5) : trimmed;
+	if (!/^https?:\/\/[^/?#]/.test(address)) return false;
+	try {
+		const url = new URL(address);
+		return !url.username && !url.password && (!trimmed.startsWith('blob:') || url.pathname.length > 1);
+	} catch {
+		return false;
+	}
 }
 
 export interface ResolvedArtwork {
@@ -41,7 +45,6 @@ export function resolveArtwork(
 	src: unknown,
 	options: ResolveArtworkOptions = {}
 ): ResolvedArtwork {
-	const fallbackSrc = options.fallbackSrc ?? ARTWORK_PLACEHOLDER_SRC;
 	const alt =
 		typeof options.alt === 'string' && options.alt.trim() !== ''
 			? options.alt
@@ -49,20 +52,20 @@ export function resolveArtwork(
 	if (isUsableArtworkSrc(src)) {
 		return { src: src.trim(), alt, isFallback: false };
 	}
-	return { src: fallbackSrc, alt, isFallback: true };
+	const fallback = options.fallbackSrc;
+	return { src: isUsableArtworkSrc(fallback) ? fallback.trim() : ARTWORK_PLACEHOLDER_SRC, alt, isFallback: true };
 }
 
 /**
- * Next `src` to use after an `<img>` error. Returns the fallback when
- * the failed source is not already the fallback, else `null` (already
- * on the placeholder: stop, do not loop, never a broken-image state).
+ * Next `src` to use after an `<img>` error, or null to stop retrying.
  */
 export function nextArtworkSrcAfterError(
 	currentSrc: string,
 	fallbackSrc: string = ARTWORK_PLACEHOLDER_SRC
 ): string | null {
-	if (currentSrc === fallbackSrc) return null;
-	return fallbackSrc;
+	if (!isUsableArtworkSrc(fallbackSrc)) return null;
+	const fallback = fallbackSrc.trim();
+	return currentSrc.trim() === fallback ? null : fallback;
 }
 
 /** Clear a previous image error when the source changes, so returning to it retries. */

@@ -14,10 +14,14 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 		return () => { if (owner === binding) { owner = null; outcome = null; } };
 	}
 	function view(snapshot: QueueState) {
-		const binding = owner, track = currentTrack(snapshot), generation = queue.selectionGeneration;
-		if (!binding || !track || queue.purging || snapshot !== queue.snapshot || !queue.isCurrent(queue.revision)) return null;
+		const binding = owner, generation = queue.selectionGeneration, revision = queue.revision;
+		const isCurrent = () => binding === owner && !queue.purging && snapshot === queue.snapshot &&
+			queue.selectionGeneration === generation && queue.isCurrent(revision);
+		if (!binding || !isCurrent()) return null;
+		const track = currentTrack(snapshot);
+		if (!track) return null;
 		const membership = binding.member.read(track.id);
-		if (!membership || binding !== owner || queue.purging || queue.selectionGeneration !== generation) return null;
+		if (!membership || !isCurrent()) return null;
 		return { ...membership, id: track.id, title: displayTitle(track), receipt: `${binding.version}:${generation}` };
 	}
 	const matches = (current: Selection | null, previous: Selection) => current?.receipt === previous.receipt &&
@@ -25,13 +29,17 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 	async function activate(intent: Selection): Promise<void> {
 		const target = view(queue.snapshot);
 		if (!owner || !target || target.loading || !matches(target, intent)) return;
-		const pressed = !target.pressed, pending = owner.member.write(target.id);
-		// The owner publishes the optimistic membership before awaiting the scoped lock.
-		const applied = view(queue.snapshot);
-		const result = await pending, completed = view(queue.snapshot);
-		if (!result || !applied || !completed || applied.receipt !== intent.receipt || applied.id !== intent.id ||
-			applied.pressed !== pressed || !matches(completed, applied)) return;
-		outcome = { ...completed, text: `${pressed ? 'Starred' : 'Unstarred'} ${target.title}${result === 'visit' ? ' for this visit' : ''}.` };
+		const pressed = !target.pressed;
+		try {
+			const pending = owner.member.write(target.id);
+			// The owner publishes the optimistic membership before awaiting the scoped lock.
+			const applied = view(queue.snapshot);
+			const result = await pending, completed = view(queue.snapshot);
+			if ((result !== 'saved' && result !== 'visit') || !applied || !completed ||
+				applied.receipt !== intent.receipt || applied.id !== intent.id ||
+				applied.pressed !== pressed || !matches(completed, applied)) return;
+			outcome = { ...completed, text: `${pressed ? 'Starred' : 'Unstarred'} ${target.title}${result === 'visit' ? ' for this visit' : ''}.` };
+		} catch { /* A failed owner write has no success announcement. */ }
 	}
 	return {
 		bind, view, activate,

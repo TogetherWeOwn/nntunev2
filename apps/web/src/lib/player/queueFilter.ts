@@ -15,6 +15,9 @@
 
 import { canonicalMetadata, findNeedle, literalId } from '../library/canonical-compare.js';
 
+// Bound the canonical normalization and mixed literal/canonical boundary search.
+const MAX_FILTER_QUERY_LENGTH = 4096;
+
 export interface QueueFilterTrack {
 	id: string;
 	title: string;
@@ -26,7 +29,7 @@ export interface QueueFilterTrack {
 // Try each possible separator: ids and artists may themselves contain spaces.
 // Only the artist part of a spanning query receives canonical normalization.
 function matchesIdArtistBoundary(id: string, artist: string, query: string): boolean {
-	for (let boundary = query.indexOf(' '); boundary !== -1; boundary = query.indexOf(' ', boundary + 1)) {
+	for (let boundary = query.indexOf(' '); boundary !== -1 && boundary <= id.length; boundary = query.indexOf(' ', boundary + 1)) {
 		if (
 			id.endsWith(query.slice(0, boundary)) &&
 			artist.startsWith(canonicalMetadata(query.slice(boundary + 1)))
@@ -36,8 +39,12 @@ function matchesIdArtistBoundary(id: string, artist: string, query: string): boo
 }
 
 export function matchesQueueQuery(track: QueueFilterTrack, query: string): boolean {
-	const needle = findNeedle(query);
+	const literal = typeof query === 'string' ? query.trim().toLowerCase() : null;
+	if (literal === null || literal.length > MAX_FILTER_QUERY_LENGTH) return false;
+	const needle = findNeedle(literal);
 	if (!needle.literal) return true;
+	if (typeof track.id !== 'string' || (track.title != null && typeof track.title !== 'string') ||
+		(track.artist != null && typeof track.artist !== 'string')) return false;
 	const artist = canonicalMetadata(track.artist ?? '');
 	// An actual title may equal the id; only construction knows its provenance.
 	if (track.title?.trim() && !track.titleIsFallback) {

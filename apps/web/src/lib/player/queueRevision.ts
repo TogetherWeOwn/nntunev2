@@ -4,8 +4,12 @@ export function createQueueRevision() {
 	let alive = true;
 	return {
 		get revision() { return revision; },
-		revoke() { return ++revision; },
+		revoke() {
+			if (revision === Number.MAX_SAFE_INTEGER) alive = false;
+			if (alive) revision += 1;
+			return revision;
+		},
 		isCurrent(receipt: number) { return alive && receipt === revision; },
-		destroy() { alive = false; revision += 1; }
+		destroy() { alive = false; }
 	};
 }

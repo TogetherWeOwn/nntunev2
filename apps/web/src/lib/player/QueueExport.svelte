@@ -14,6 +14,7 @@
 	let generation = 0;
 	let alive = true;
 	const download = createM3UDownload();
+	const canExport = () => !loading && queue.tracks.length > 0;
 
 	function releaseDownload(): void {
 		download.release();
@@ -30,6 +31,7 @@
 	// identity also fences same-tick edits before this effect has flushed.
 	$effect(() => {
 		queue;
+		loading;
 		clearFeedback();
 	});
 
@@ -46,28 +48,33 @@
 	});
 
 	async function copyQueueText(): Promise<void> {
+		if (!alive || !canExport()) return;
 		const action = clearFeedback();
 		const snapshot = queue;
 		const account = authGeneration;
-		if (!alive || snapshot.tracks.length === 0) return;
-		const text = formatQueueText(snapshot);
+		const isCurrent = () => alive && canExport() && queue === snapshot &&
+			account === authGeneration && action === generation;
+		let text: string | undefined;
 		try {
+			text = formatQueueText(snapshot);
 			// The clipboard getter and the write may both fail; keep manual copy usable.
-			if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('No clipboard');
-			await navigator.clipboard.writeText(text);
+			const clipboard = navigator.clipboard;
+			if (!isCurrent()) return;
+			await clipboard.writeText(text);
 		} catch {
-			if (!alive || queue !== snapshot || account !== authGeneration || action !== generation) return;
-			status = 'Clipboard unavailable. Copy the queue manually below.';
-			fallback = text;
+			if (!isCurrent()) return;
+			status = text === undefined ? 'Could not prepare the queue as text.' :
+				'Clipboard unavailable. Copy the queue manually below.';
+			fallback = text ?? null;
 			return;
 		}
-		if (!alive || queue !== snapshot || account !== authGeneration || action !== generation) return;
+		if (!isCurrent()) return;
 		status = 'Copied queue as text.';
 	}
 
 	function downloadQueueM3U(): void {
+		if (!alive || !canExport()) return;
 		clearFeedback();
-		if (!alive || queue.tracks.length === 0) return;
 		const link = document.createElement('a');
 		try {
 			status = download.download(link, () => formatQueueM3U(queue), 'queue.m3u');
@@ -85,7 +92,7 @@
 		<button
 			class="nt-button"
 			type="button"
-			disabled={queue.tracks.length === 0}
+			disabled={!canExport()}
 			aria-describedby="queue-export-scope queue-export-status"
 			onclick={downloadQueueM3U}
 		>
@@ -94,7 +101,7 @@
 		<button
 			class="nt-button"
 			type="button"
-			disabled={queue.tracks.length === 0}
+			disabled={!canExport()}
 			aria-describedby="queue-export-scope queue-export-status"
 			onclick={() => void copyQueueText()}
 		>
