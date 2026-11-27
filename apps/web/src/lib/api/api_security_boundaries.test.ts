@@ -2,6 +2,7 @@ import { expect, it, vi } from 'vitest';
 import { JsonBodyTooLargeError, MAX_JSON_BODY_BYTES, readCappedJson } from './cappedJson.js';
 import { API_REQUEST_TIMEOUT_MS, ApiClient, ApiError } from './client.js';
 import { parseErrorBody } from './errors.js';
+import * as authFence from '../auth-fence.js';
 import { cspSources } from '../security/headers.js';
 import { bindVerifiedLocalLyrics, createLyricsResolver, type ExactLyricsProvider } from '../server/lyrics.js';
 
@@ -11,11 +12,19 @@ it('rejects oversized JSON without waiting for upstream cancellation to settle',
 		start: (controller) => controller.enqueue(new Uint8Array(MAX_JSON_BODY_BYTES + 1)),
 		cancel
 	}));
-
 	await expect(readCappedJson(response)).rejects.toBeInstanceOf(JsonBodyTooLargeError);
 	expect(cancel).toHaveBeenCalledOnce();
 	expect(response.body?.locked).toBe(false);
 }, 500);
+
+it.each([null, new ReadableStream({
+	start(controller) { controller.enqueue('null'); controller.close(); }
+})])('requires a byte stream for a native response (%s)', async (body) => {
+	const response = new Response(body);
+	const json = vi.spyOn(response, 'json').mockResolvedValue(null);
+	await expect(readCappedJson(response)).rejects.toBeInstanceOf(SyntaxError);
+	expect(json).not.toHaveBeenCalled();
+});
 
 it('rejects malformed UTF-8 as a typed failure even inside an otherwise valid JSON string', async () => {
 	const fetchFn = vi.fn(async () => new Response(Uint8Array.of(0x22, 0xc0, 0x22)));
@@ -50,19 +59,33 @@ it.each(['//other.example/health', '/\\other.example/health', '/\t/other.example
 	}
 );
 
-it('preserves a configured API path and encoded query while refusing redirects', async () => {
-	const fetchFn = vi.fn(async () => Response.json({ ok: true }));
-	const client = new ApiClient({ baseUrl: 'https://api.example:443/prefix/', fetchFn });
-	await expect(client.post('/v1/auth/magic/finish?next=%2Fhome', {})).resolves.toEqual({ ok: true });
-	expect(fetchFn).toHaveBeenCalledWith('https://api.example/prefix/v1/auth/magic/finish?next=%2Fhome',
-		expect.objectContaining({ redirect: 'error' }));
+it('fences auth mutations under a configured API prefix and refuses redirects', async () => {
+	const mutation = vi.spyOn(authFence, 'runAuthMutation');
+	try {
+		const fetchFn = vi.fn(async () => Response.json({ ok: true }));
+		const client = new ApiClient({ baseUrl: 'https://api.example:443/prefix/', fetchFn });
+		await expect(client.post('/v1/auth/magic/finish?next=%2Fhome', {})).resolves.toEqual({ ok: true });
+		expect(mutation).toHaveBeenCalledOnce();
+		expect(fetchFn).toHaveBeenCalledWith('https://api.example/prefix/v1/auth/magic/finish?next=%2Fhome',
+			expect.objectContaining({ redirect: 'error' }));
+	} finally {
+		mutation.mockRestore();
+	}
 });
 
-it('requires a session binding for protected routes under a configured API prefix', async () => {
+it.each([true, false])('checks the origin of the document base (same origin: %s)', async (sameOrigin) => {
+	const appOrigin = 'https://app.example';
+	const baseURI = sameOrigin ? `${appOrigin}/base/` : 'https://other.example/';
 	const fetchFn = vi.fn(async () => Response.json({ ok: true }));
-	const client = new ApiClient({ baseUrl: 'https://api.example/prefix', fetchFn });
-	await expect(client.get('/v1/me/taste/session?cursor=next')).rejects.toThrow('session binding');
-	expect(fetchFn).not.toHaveBeenCalled();
+	vi.stubGlobal('document', { baseURI, location: { origin: appOrigin } });
+	try {
+		const pending = new ApiClient({ baseUrl: '', fetchFn }).get('/health');
+		if (sameOrigin) await expect(pending).resolves.toEqual({ ok: true });
+		else await expect(pending).rejects.toThrow('application origin');
+		expect(fetchFn).toHaveBeenCalledTimes(sameOrigin ? 1 : 0);
+	} finally {
+		vi.unstubAllGlobals();
+	}
 });
 
 it('times out even when the transport never settles after abort', async () => {
@@ -118,6 +141,7 @@ it('fails closed for malformed local lyrics metadata', async () => {
 	const resolve = createLyricsResolver();
 	await expect(resolve({ mediaPath: 7 as unknown as string, sidecar: { path: '7.lrc', lrc } }))
 		.resolves.toBeNull();
+	await expect(resolve({ mediaPath: 'album/', sidecar: { path: 'album/.lrc', lrc } })).resolves.toBeNull();
 	const identity = { libraryScope: Symbol(), trackId: 'x', occurrenceKey: 'y', sourceRevision: 'z' };
 	expect(bindVerifiedLocalLyrics(identity, identity, {
 		identity, embedded: lrc, instrumental: 0 as unknown as boolean
