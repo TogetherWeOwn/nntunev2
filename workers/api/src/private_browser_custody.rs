@@ -100,9 +100,12 @@ async fn serve(
     req: &handlers::Request,
     body: &CollectedBody,
 ) -> WorkerResult<Response> {
-    let (Some(settings), Some(playback), Some(secret)) =
-        (Settings::load(env), service(cfg), custody_secret(env))
-    else {
+    let (Some(settings), Some(playback), Some(secret), Some(root)) = (
+        Settings::load(env),
+        service(cfg),
+        custody_secret(env),
+        root_secret(env),
+    ) else {
         return fixed_response(404);
     };
     let Some(bearer) = admitted_bearer(req, body, secret.as_bytes()) else {
@@ -118,9 +121,6 @@ async fn serve(
             if req.path == LEASE_PATH {
                 return Ok(Some(None));
             }
-            let Some(root) = root_secret(env) else {
-                return Ok(None);
-            };
             let root = PlaybackRoot {
                 version: settings.root_version,
                 secret: &root,
@@ -158,7 +158,7 @@ pub(crate) fn project(
 ) -> Result<CustodySnapshot, StoreError> {
     let pins = resolved.read.playback_snapshot()?;
     let locator = resolved.media.locator();
-    Ok(CustodySnapshot {
+    let snapshot = CustodySnapshot {
         bearer_sha256: Sha256::digest(bearer.as_bytes()).into(),
         catalogue_reference: PrivatePlayback::catalogue_reference(receipt),
         reference_id: pins.reference_id,
@@ -178,7 +178,9 @@ pub(crate) fn project(
         header: resolved.context.header.to_vec(),
         envelope_record: resolved.record.to_vec(),
         page_hashes: resolved.ordered_page_hashes,
-    })
+    };
+    snapshot.pins().ok_or(StoreError)?;
+    Ok(snapshot)
 }
 
 #[cfg(test)]

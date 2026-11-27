@@ -106,6 +106,20 @@ pub(crate) fn mint_grant(
     })
 }
 
+pub(crate) fn verify_grant_signature(secret: &[u8], signed: &str, signature: &str) -> bool {
+    if secret.len() < MIN_SECRET_BYTES || signature.len() != 43 {
+        return false;
+    }
+    let (Ok(signature), Ok(mut mac)) = (
+        crate::b64::decode(signature),
+        Hmac::<sha2::Sha256>::new_from_slice(secret),
+    ) else {
+        return false;
+    };
+    mac.update(signed.as_bytes());
+    mac.verify_slice(&signature).is_ok()
+}
+
 #[path = "private_browser_receipt.rs"]
 pub mod browser;
 
@@ -289,7 +303,8 @@ impl PrivatePlayback<'_> {
             else {
                 return Ok(None);
             };
-            Ok(current(db).await?.is_some().then_some(resolved))
+            let active = current(db).await?.is_some();
+            Ok((active && now() < resolved.read.pins().usable_until).then_some(resolved))
         };
         with_deadline(operation, LOOKUP_TIMEOUT_MS, StoreError).await
     }
