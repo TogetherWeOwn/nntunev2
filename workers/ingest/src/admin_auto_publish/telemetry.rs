@@ -120,7 +120,7 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(matcher_counter(&result)).unwrap(),
                 json!({
-                    "name": MATCHER_COUNTER_NAME,
+                    "name": "nntune_ingest_admin_match_attempts_total",
                     "labels": {"outcome": outcome},
                     "increment": 1,
                 })
@@ -140,7 +140,7 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(counter).unwrap(),
                 json!({
-                    "name": MATCHER_COUNTER_NAME,
+                    "name": "nntune_ingest_admin_match_attempts_total",
                     "labels": {"outcome": "needs_review", "reason": label},
                     "increment": 1,
                 })

@@ -74,7 +74,7 @@ fn assert_bounded(
     );
     assert_eq!(
         counter,
-        json!({"name": MATCHER_COUNTER_NAME, "labels": labels, "increment": 1})
+        json!({"name": "nntune_ingest_admin_match_attempts_total", "labels": labels, "increment": 1})
     );
     assert_clean(&counter.to_string());
 
@@ -100,7 +100,7 @@ fn assert_bounded(
         want_fields["build_sha"] = json!(want_s);
         assert_eq!(
             got,
-            json!({"ts": "2026-10-15T20:00:00.123Z", "level": level, "worker": "ingest", "trace_id": tid, "event": MATCHER_DIAGNOSTIC_EVENT, "fields": want_fields})
+            json!({"ts": "2026-10-15T20:00:00.123Z", "level": level, "worker": "ingest", "trace_id": tid, "event": "ingest.admin_match.attempted", "fields": want_fields})
         );
         for (k, v) in got["fields"].as_object().unwrap() {
             let s = v.as_str().unwrap();
@@ -173,21 +173,15 @@ fn matched_ambiguous_and_refused_matcher_outcomes_emit_only_bounded_redacted_tel
         (ALBUM, &plain, close),
         (&q, &lp, dup),
     ] {
-        check_review(
-            select_release(query, cand(look, hits)).unwrap_err(),
-            ReleaseUnresolved,
-            "release_unresolved",
-        );
+        let err = select_release(query, cand(look, hits)).unwrap_err();
+        check_review(err, ReleaseUnresolved, "release_unresolved");
     }
 
     let mut wrong = release_lookup(ALBUM).unwrap();
     wrong.score_query = format!("{FILE} {BEARER} {OBJ}");
     for ev in [None, cand(&wrong, vec![hit(REL_A, ALBUM, None, 0.9)])] {
-        check_review(
-            select_release(ALBUM, ev).unwrap_err(),
-            SearchEvidence,
-            "search_evidence",
-        );
+        let err = select_release(ALBUM, ev).unwrap_err();
+        check_review(err, SearchEvidence, "search_evidence");
     }
 
     let dec = |n, files: &[Numbers<'_>], st, b: &str| {
@@ -199,36 +193,38 @@ fn matched_ambiguous_and_refused_matcher_outcomes_emit_only_bounded_redacted_tel
     let bad_b = format!(
         r#"{{"err":"{BEARER} {KEY} {FILE} {USER} private-staging-bucket/{OBJ} {DIGEST}"}}"#
     );
-    check_review(
+    let rv = check_review;
+    rv(
         select_release(&bad_q, None).unwrap_err(),
         InvalidQuery,
         "invalid_query",
     );
-    check_review(
+    rv(
         dec(2, &[num("2"), num("1")], 200, &body),
         PositionMismatch,
         "position_mismatch",
     );
-    check_review(
+    rv(
         dec(2, &[num(&bad_t), num("2")], 200, &body),
         FileNumbering,
         "file_numbering",
     );
-    check_review(
+    rv(
         dec(1, &nums[..1], 200, &body),
         CountMismatch,
         "count_mismatch",
     );
-    check_review(
+    rv(
         dec(2, &nums, 503, &bad_b),
         RecordingEvidence,
         "recording_evidence",
     );
-    check_review(
+    rv(
         dec(2, &nums, 200, &bad_b),
         RecordingEvidence,
         "recording_evidence",
     );
+    // `stage()`/`stage_completed_release()` need a live Postgres tx (covered by `auto_publish.rs`).
     assert_bounded(&Err(PublicationError::Refused), "refused", None, "warn");
     assert_bounded(
         &Err(PublicationError::Indeterminate),
@@ -284,7 +280,9 @@ fn metering_events_and_failure_diagnostics_exclude_private_input_markers() {
         } else {
             "ingest.meter.write_failed"
         };
-        let f = fields_from_json(json!({"build_sha": BUILD_SHA_UNKNOWN, "reason": code})).unwrap();
+        let raw = nntune_ingest::meter_failure_fields(&err, BUILD_SHA_UNKNOWN.into());
+        assert_eq!(raw, json!({"build_sha": BUILD_SHA_UNKNOWN, "reason": code}));
+        let f = fields_from_json(raw).unwrap();
         let line = LogRecord::new(LogWorker::Ingest, Level::Error, TRACE, ev, f, TS)
             .unwrap()
             .to_json_line();
@@ -298,14 +296,26 @@ fn metering_events_and_failure_diagnostics_exclude_private_input_markers() {
 
 #[test]
 fn admin_auto_publish_and_telemetry_stay_off_route_without_live_sinks() {
-    let main_fn = include_str!("../src/lib.rs")
-        .split_once("pub async fn main(")
-        .unwrap()
-        .1;
-    let main_fn = main_fn.split_once("#[cfg(test)]").unwrap().0;
+    fn prod(s: &str) -> &str {
+        s.split_once("\n#[cfg(test)]").map_or(s, |(p, _)| p)
+    }
+    let lib = include_str!("../src/lib.rs");
+    let head = prod(lib)
+        .lines()
+        .filter(|l| {
+            !"pub mod admin_auto_publish;|pub mod admin_review;|pub mod catalogue_publication;"
+                .split('|')
+                .any(|m| l.trim() == m)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let main = prod(lib.split_once("\npub async fn main(").unwrap().1);
+    let consumer = prod(include_str!("../src/queue_consumer.rs"));
     let syms =
         "admin_auto_publish|admin_review|catalogue_publication|matcher_counter|matcher_diagnostic";
-    assert!(syms.split('|').all(|s| !main_fn.contains(s)));
+    assert!([head.as_str(), main, consumer]
+        .into_iter()
+        .all(|s| syms.split('|').all(|k| !s.contains(k))));
     let sinks =
         "console_log!|console_error!|console_warn!|console_debug!|crate::emit(|analytics_engine(";
     for src in [
@@ -313,7 +323,6 @@ fn admin_auto_publish_and_telemetry_stay_off_route_without_live_sinks() {
         include_str!("../src/admin_auto_publish/completed_upload.rs"),
         include_str!("../src/admin_auto_publish/telemetry.rs"),
     ] {
-        let prod = src.split_once("#[cfg(test)]").map_or(src, |(p, _)| p);
-        assert!(sinks.split('|').all(|s| !prod.contains(s)));
+        assert!(sinks.split('|').all(|k| !prod(src).contains(k)));
     }
 }

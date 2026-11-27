@@ -647,7 +647,7 @@ impl MeterSink for EdgeMeterSink<'_> {
     }
 }
 
-fn meter_failure_fields(err: &MeterWriteError, build_sha: String) -> serde_json::Value {
+pub fn meter_failure_fields(err: &MeterWriteError, build_sha: String) -> serde_json::Value {
     serde_json::json!({"build_sha": build_sha, "reason": err.reason_code()})
 }
 
