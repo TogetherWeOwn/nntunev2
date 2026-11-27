@@ -104,7 +104,7 @@ function isFresh(entry: CacheEntry, now: number): boolean {
 }
 
 function parseSidecar({ mediaPath, sidecar }: LocalLyrics): TimedLyrics | null {
-	if (!mediaPath || !sidecar) return null;
+	if (typeof mediaPath !== 'string' || !mediaPath || mediaPath.endsWith('/') || !sidecar) return null;
 	const dot = mediaPath.lastIndexOf('.');
 	const stem = dot > mediaPath.lastIndexOf('/') + 1 ? mediaPath.slice(0, dot) : mediaPath;
 	const expected = `${stem}.lrc`;
@@ -128,7 +128,8 @@ export function bindVerifiedLocalLyrics(
 	current: LyricsTrackIdentity | null,
 	evidence: VerifiedLocalLyrics | null
 ) {
-	if (!current || requested !== current || !evidence || evidence.instrumental) return null;
+	if (!current || requested !== current || !evidence ||
+		(evidence.instrumental !== undefined && evidence.instrumental !== false)) return null;
 	const { libraryScope, trackId, occurrenceKey, sourceRevision } = current;
 	if (typeof libraryScope !== 'symbol' || [trackId, occurrenceKey, sourceRevision].some((key) =>
 		typeof key !== 'string' || key.length > MAX_IDENTITY_LENGTH || !key.trim()
@@ -156,7 +157,7 @@ function exactMatch(track: ExactTrack, reply: ExactTrack): boolean {
 export function createLyricsResolver(provider?: ExactLyricsProvider, now = Date.now) {
 	const cache = new Map<string, CacheEntry>();
 	return async function resolve(local: LocalLyrics, track?: ExactTrack): Promise<ResolvedLyrics | null> {
-		if (local.instrumental) return null;
+		if (!local || (local.instrumental !== undefined && local.instrumental !== false)) return null;
 		const localResult = resolveLocal(local);
 		if (localResult) return localResult;
 		if (!provider || !track) return null;
@@ -193,7 +194,8 @@ export function createLyricsResolver(provider?: ExactLyricsProvider, now = Date.
 		}
 		let value: ResolvedLyrics | null = null;
 		if (reply?.kind === 'match') {
-			if (!reply.track || !exactMatch(query, reply.track) || typeof reply.instrumental !== 'boolean') return null;
+			if (!reply.track || !exactMatch(query, reply.track) || typeof reply.instrumental !== 'boolean' ||
+				(reply.syncedLyrics !== null && typeof reply.syncedLyrics !== 'string')) return null;
 			if (!reply.instrumental && reply.syncedLyrics !== null) {
 				const cues = parseTimedLrc(reply.syncedLyrics);
 				if (!cues) return null; // Bad payload is not a confirmed miss.

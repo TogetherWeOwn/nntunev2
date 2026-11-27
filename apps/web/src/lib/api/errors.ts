@@ -84,42 +84,29 @@ export function parseErrorBody(body: unknown, status: number): ParsedApiError {
 		message: `request failed with status ${status}`,
 		retryable: retryableFromStatus(status)
 	};
-	if (!body || typeof body !== 'object') return fallback;
+	if (!body || typeof body !== 'object' || Array.isArray(body)) return fallback;
 	const record = body as { code?: unknown; message?: unknown; retryable?: unknown; error?: unknown };
+	const detail = Object.hasOwn(record, 'message') ? record.message : undefined;
+	const legacy = Object.hasOwn(record, 'error') ? record.error : undefined;
 	const message =
-		typeof record.message === 'string' && record.message.length > 0
-			? record.message
-			: typeof record.error === 'string' && record.error.length > 0
-				? record.error
+		typeof detail === 'string' && detail.length > 0
+			? detail
+			: typeof legacy === 'string' && legacy.length > 0
+				? legacy
 				: fallback.message;
-	// Preserve provider re-auth signals for inline credential refresh and the
-	// legacy indexer signal, which remains outside the shared registry.
-	for (const candidate of [record.code, record.error]) {
-		if (candidate === 'provider_auth_expired' || candidate === 'indexer_auth_expired') {
-			return {
-				code: candidate,
-				message,
-				retryable: typeof record.retryable === 'boolean' ? record.retryable : fallback.retryable
-			};
-		}
+	const code = Object.hasOwn(record, 'code') ? record.code : undefined;
+	const retryable = Object.hasOwn(record, 'retryable') && typeof record.retryable === 'boolean'
+		? record.retryable : fallback.retryable;
+	if (typeof code === 'string') {
+		const known = KNOWN_ERROR_CODES.has(code) || CLIENT_LOCAL_ERROR_CODES.has(code) ||
+			code === 'indexer_auth_expired';
+		const authCode = code === 'unauthorized' || code === 'reauth_required' ||
+			code === 'provider_auth_expired' || code === 'indexer_auth_expired';
+		return { code: known && (!authCode || status === 401) ? code : 'request_failed', message, retryable };
 	}
-	if (
-		typeof record.code === 'string' &&
-		(KNOWN_ERROR_CODES.has(record.code) || CLIENT_LOCAL_ERROR_CODES.has(record.code))
-	) {
-		return {
-			code: record.code,
-			message,
-			retryable: typeof record.retryable === 'boolean' ? record.retryable : fallback.retryable
-		};
-	}
-	if (typeof record.code === 'string') {
-		// Unknown envelope code: do not infer a different category from its status.
-		return {
-			code: 'request_failed',
-			message,
-			retryable: typeof record.retryable === 'boolean' ? record.retryable : fallback.retryable
-		};
+	// Legacy credential refresh signals apply only to a 401 without a string code.
+	if (status === 401 && (legacy === 'provider_auth_expired' || legacy === 'indexer_auth_expired')) {
+		return { code: legacy, message, retryable };
 	}
 	// Legacy body without a code: derive category and retry policy from status.
 	return { code: fallback.code, message, retryable: fallback.retryable };
