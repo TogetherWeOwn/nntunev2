@@ -164,13 +164,12 @@ impl ProbeTally {
         }
     }
 
-    /// Fold one valid answer for an unseen batch index. Replays, malformed
-    /// answers and out-of-range indices leave the tally untouched.
+    /// Fold a bounded count for an unseen batch index. State transitions
+    /// validate segment evidence before calling this count-only fold.
     pub fn record(&mut self, outcome: &ProbeOutcome) -> bool {
         if outcome.batch_index >= self.total_batches
             || self.missing_by_batch.contains_key(&outcome.batch_index)
             || outcome.present.len().saturating_add(outcome.missing.len()) > MAX_PROBE_SEGMENTS
-            || !outcome.has_segment_evidence()
         {
             return false;
         }
@@ -231,7 +230,7 @@ pub fn apply_probe_batch(
     if state != JobState::Probing {
         return (state, 0);
     }
-    let next = if tally.record(outcome) && tally.is_complete() {
+    let next = if outcome.has_segment_evidence() && tally.record(outcome) && tally.is_complete() {
         JobState::Verifying
     } else {
         JobState::Probing
