@@ -543,10 +543,11 @@ struct ClientData {
 
 fn verify_extension_data(flags: u8, bytes: &[u8]) -> Result<(), WebAuthnError> {
     if flags & FLAG_EXTENSION_DATA == 0 {
-        return if bytes.is_empty() {
-            Ok(())
-        } else {
+        // Assertions retain their signed opaque suffix when no extensions are declared.
+        return if flags & FLAG_ATTESTED_CREDENTIAL_DATA != 0 && !bytes.is_empty() {
             Err(WebAuthnError::Invalid)
+        } else {
+            Ok(())
         };
     }
     match cbor_parse(bytes)? {

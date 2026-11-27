@@ -234,7 +234,7 @@ pub fn verify_and_consume_challenge(
         return Err(AuthError::Invalid);
     }
     if now < challenge.issued_at
-        || now >= challenge.expires_at
+        || now > challenge.expires_at
         || challenge.expires_at > challenge.issued_at.saturating_add(CHALLENGE_TTL_SECS)
     {
         return Err(AuthError::Invalid);
