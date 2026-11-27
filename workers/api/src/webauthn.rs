@@ -11,7 +11,7 @@
 //! - `clientDataJSON.type` is exactly `webauthn.create`/`webauthn.get`,
 //!   `challenge` constant-time-equals the server-issued challenge,
 //!   `origin` constant-time-equals the configured canonical origin, and
-//!   `crossOrigin` is not true.
+//!   `crossOrigin` is absent or false.
 //! - `authenticatorData.rpIdHash == SHA-256(rp_id)` and both the
 //!   user-present (UP) and user-verified (UV) flags are set. RP policy:
 //!   user verification is **required**. A passkey is the
@@ -21,8 +21,8 @@
 //!   that cannot verify the user (no PIN/biometric) are refused. The BE/BS
 //!   (backup eligible/state) bits are deliberately not recorded: nothing in
 //!   the product branches on synced-vs-device-bound credentials yet.
-//! - Sign-count clone detection: a nonzero presented counter must be
-//!   strictly greater than the stored counter.
+//! - Sign-count clone detection: when either counter is nonzero, the
+//!   presented counter must be strictly greater than the stored counter.
 //!
 //! Stored credential public keys are the raw COSE_Key CBOR bytes exactly
 //! as they appeared in the attested credential data (never re-encoded).
@@ -37,7 +37,10 @@ const MAX_INPUT_BYTES: usize = 16 * 1024;
 /// authenticatorData flag bits (WebAuthn §6.1).
 const FLAG_USER_PRESENT: u8 = 0x01;
 const FLAG_USER_VERIFIED: u8 = 0x04;
+const FLAG_BACKUP_ELIGIBLE: u8 = 0x08;
+const FLAG_BACKUP_STATE: u8 = 0x10;
 const FLAG_ATTESTED_CREDENTIAL_DATA: u8 = 0x40;
+const FLAG_EXTENSION_DATA: u8 = 0x80;
 /// Max CBOR nesting depth accepted.
 const MAX_CBOR_DEPTH: usize = 8;
 
@@ -283,7 +286,11 @@ fn parse_cose_key(bytes: &[u8]) -> Result<CoseKey, WebAuthnError> {
         }
         (1, -8, 6) => {
             let x: [u8; 32] = x.try_into().map_err(|_| WebAuthnError::Invalid)?;
-            ed25519_dalek::VerifyingKey::from_bytes(&x).map_err(|_| WebAuthnError::Invalid)?;
+            let key =
+                ed25519_dalek::VerifyingKey::from_bytes(&x).map_err(|_| WebAuthnError::Invalid)?;
+            if key.is_weak() {
+                return Err(WebAuthnError::Invalid);
+            }
             Ok(CoseKey::EdDsa { x })
         }
         _ => Err(WebAuthnError::Invalid),
@@ -309,13 +316,12 @@ fn verify_signature(key: &CoseKey, message: &[u8], signature: &[u8]) -> Result<(
                 .map_err(|_| WebAuthnError::Invalid)
         }
         CoseKey::EdDsa { x } => {
-            use ed25519_dalek::Verifier;
             let verifying =
                 ed25519_dalek::VerifyingKey::from_bytes(x).map_err(|_| WebAuthnError::Invalid)?;
             let sig_bytes: [u8; 64] = signature.try_into().map_err(|_| WebAuthnError::Invalid)?;
             let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
             verifying
-                .verify(message, &sig)
+                .verify_strict(message, &sig)
                 .map_err(|_| WebAuthnError::Invalid)
         }
     }
@@ -332,30 +338,32 @@ fn verify_client_data(
     expected_type: &str,
     expect: &Expect<'_>,
 ) -> Result<(), WebAuthnError> {
-    if client_data_json.len() > MAX_INPUT_BYTES {
+    if client_data_json.len() > MAX_INPUT_BYTES
+        || client_data_json
+            .iter()
+            .copied()
+            .find(|b| !b.is_ascii_whitespace())
+            != Some(b'{')
+    {
         return Err(WebAuthnError::Invalid);
     }
-    let value: serde_json::Value =
+    // Deserializing directly rejects duplicate security fields, while
+    // allowing new WebAuthn fields the RP does not use.
+    #[derive(serde::Deserialize)]
+    struct ClientData {
+        #[serde(rename = "type")]
+        ceremony_type: String,
+        challenge: String,
+        origin: String,
+        #[serde(default, rename = "crossOrigin")]
+        cross_origin: bool,
+    }
+    let data: ClientData =
         serde_json::from_slice(client_data_json).map_err(|_| WebAuthnError::Invalid)?;
-    let obj = value.as_object().ok_or(WebAuthnError::Invalid)?;
-    let type_ = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or(WebAuthnError::Invalid)?;
-    let challenge = obj
-        .get("challenge")
-        .and_then(|v| v.as_str())
-        .ok_or(WebAuthnError::Invalid)?;
-    let origin = obj
-        .get("origin")
-        .and_then(|v| v.as_str())
-        .ok_or(WebAuthnError::Invalid)?;
-    if obj.get("crossOrigin").and_then(|v| v.as_bool()) == Some(true) {
-        return Err(WebAuthnError::Invalid);
-    }
-    if !ct_eq_str(type_, expected_type)
-        || !ct_eq_str(challenge, expect.challenge)
-        || !ct_eq_str(origin, expect.origin)
+    if data.cross_origin
+        || !ct_eq_str(&data.ceremony_type, expected_type)
+        || !ct_eq_str(&data.challenge, expect.challenge)
+        || !ct_eq_str(&data.origin, expect.origin)
     {
         return Err(WebAuthnError::Invalid);
     }
@@ -365,6 +373,20 @@ fn verify_client_data(
 struct AuthData {
     sign_count: u32,
     attested: Option<RegisteredCredential>,
+}
+
+fn verify_extension_data(flags: u8, bytes: &[u8]) -> Result<(), WebAuthnError> {
+    if flags & FLAG_EXTENSION_DATA == 0 {
+        return if bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(WebAuthnError::Invalid)
+        };
+    }
+    match cbor_parse(bytes)? {
+        Cbor::Map(entries) if entries.iter().all(|(key, _)| key.as_text().is_some()) => Ok(()),
+        _ => Err(WebAuthnError::Invalid),
+    }
 }
 
 fn parse_auth_data(
@@ -384,11 +406,13 @@ fn parse_auth_data(
     let user_present = flags & FLAG_USER_PRESENT != 0;
     let user_verified = flags & FLAG_USER_VERIFIED != 0;
     let has_attested = flags & FLAG_ATTESTED_CREDENTIAL_DATA != 0;
-    if !user_present || !user_verified || has_attested != attested {
+    let invalid_backup = flags & FLAG_BACKUP_STATE != 0 && flags & FLAG_BACKUP_ELIGIBLE == 0;
+    if !user_present || !user_verified || has_attested != attested || invalid_backup {
         return Err(WebAuthnError::Invalid);
     }
     let sign_count = u32::from_be_bytes([bytes[33], bytes[34], bytes[35], bytes[36]]);
     if !attested {
+        verify_extension_data(flags, &bytes[37..])?;
         return Ok(AuthData {
             sign_count,
             attested: None,
@@ -412,6 +436,7 @@ fn parse_auth_data(
     let cred_id = bytes[cred_id_start..cred_id_end].to_vec();
     let mut pos = cred_id_end;
     let cose = cbor_parse_at(bytes, &mut pos, 0)?;
+    verify_extension_data(flags, &bytes[pos..])?;
     // The stored bytes are the exact CBOR slice (never re-encoded).
     let public_key_cose = bytes[cred_id_end..pos].to_vec();
     drop(cose);
@@ -717,6 +742,30 @@ mod tests {
             &expect()
         )
         .is_err());
+    }
+
+    #[test]
+    fn client_data_requires_a_json_object() {
+        let list = format!(r#"["webauthn.get","{CHALLENGE}","{ORIGIN}",false]"#);
+        assert_eq!(
+            verify_client_data(list.as_bytes(), "webauthn.get", &expect()),
+            Err(WebAuthnError::Invalid)
+        );
+    }
+
+    #[test]
+    fn attestation_rejects_weak_ed25519_keys() {
+        let mut weak_key = [0; 32];
+        weak_key[0] = 1; // Compressed Edwards identity point.
+        let mut cose = vec![0xa4, 1, 1, 3, 0x27, 0x20, 6, 0x21];
+        enc_bytes(&weak_key, &mut cose);
+        let auth = auth_data(0x45, 0, Some((b"cred-weak", &cose)));
+        let obj = attestation("none", &auth, empty_map());
+        let client_data = client_data("webauthn.create", CHALLENGE, ORIGIN);
+        assert_eq!(
+            verify_attestation(&obj, &client_data, &expect()),
+            Err(WebAuthnError::Invalid)
+        );
     }
 
     #[test]

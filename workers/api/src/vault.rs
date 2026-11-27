@@ -199,12 +199,18 @@ fn host_shape_ok(host: &str) -> bool {
     if host.parse::<IpAddr>().is_ok() {
         return true;
     }
-    !host.starts_with('.')
-        && !host.ends_with('.')
-        && !host.contains("..")
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    // Require DNS labels only after strict IPv4 parsing. A transport may
+    // interpret alternate numeric spellings as IP literals instead of
+    // consulting the resolver that approved this name.
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) && matches!(url::Host::parse(host), Ok(url::Host::Domain(_)))
 }
 
 // Address guard is single-owned by `nntune_ssrf_guard::ip_is_forbidden`

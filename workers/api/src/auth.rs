@@ -133,7 +133,10 @@ pub fn consume_magic_link(
     if record.used {
         return Err(AuthError::Invalid);
     }
-    if now > record.expires_at {
+    if now < record.issued_at
+        || now >= record.expires_at
+        || record.expires_at > record.issued_at.saturating_add(MAGIC_LINK_TTL_SECS)
+    {
         return Err(AuthError::Invalid);
     }
     record.used = true;
@@ -228,7 +231,10 @@ pub fn verify_and_consume_challenge(
     if challenge.consumed {
         return Err(AuthError::Invalid);
     }
-    if now > challenge.expires_at {
+    if now < challenge.issued_at
+        || now >= challenge.expires_at
+        || challenge.expires_at > challenge.issued_at.saturating_add(CHALLENGE_TTL_SECS)
+    {
         return Err(AuthError::Invalid);
     }
     if challenge

@@ -18,6 +18,10 @@ type HmacSha256 = Hmac<Sha256>;
 pub const CLOCK_SKEW_SECS: u64 = 60;
 /// Absolute lifetime from authentication, not refreshed by rotation (one day).
 pub const MAX_SESSION_SECS: u64 = 86_400;
+// Browser cookie size budget. Real session IDs are 22 bytes and user IDs
+// are generated server-side, so ordinary signed tokens are far smaller.
+const MAX_TOKEN_BYTES: usize = 4096;
+const MAC_B64_BYTES: usize = 43;
 /// Freshness window for privilege-gated operations (10 minutes). A session
 /// whose authentication age (`now - created_at`) exceeds this window must
 /// re-authenticate before a privilege change, even though the session itself
@@ -252,7 +256,7 @@ pub(crate) fn verify_listen_context(
     claims: &SessionClaims,
     presented: Option<&str>,
 ) -> bool {
-    let Some(presented) = presented.filter(|value| value.len() == 43) else {
+    let Some(presented) = presented.filter(|value| value.len() == MAC_B64_BYTES) else {
         return false;
     };
     let matches = |secret: &[u8]| {
@@ -271,7 +275,7 @@ pub fn issue_session(
     now: u64,
     ttl_secs: u64,
 ) -> Result<String, SessionError> {
-    if ttl_secs == 0 {
+    if ttl_secs == 0 || now == u64::MAX || user_id.is_empty() || user_id.len() > MAX_TOKEN_BYTES {
         return Err(SessionError::Invalid);
     }
     let claims = SessionClaims {
@@ -282,10 +286,7 @@ pub fn issue_session(
         expires_at: now.saturating_add(ttl_secs.min(MAX_SESSION_SECS)),
         rotation_counter: 0,
     };
-    let payload = serde_json::to_vec(&claims).expect("claims serialize");
-    let payload_b64 = crate::b64::encode(&payload);
-    let sig = sign(secret, &payload_b64)?;
-    Ok(format!("{}.{}", payload_b64, crate::b64::encode(&sig)))
+    sign_refreshed_claims(secret, &claims)
 }
 
 /// Verify signature and time bounds only; this does NOT authenticate a
@@ -294,7 +295,13 @@ pub fn issue_session(
 /// Short secrets fail closed (see [`MIN_SECRET_LEN`]).
 pub fn verify_session(secret: &[u8], token: &str, now: u64) -> Result<SessionClaims, SessionError> {
     check_secret_len(secret)?;
+    if token.len() > MAX_TOKEN_BYTES {
+        return Err(SessionError::Invalid);
+    }
     let (payload_b64, sig_b64) = token.split_once('.').ok_or(SessionError::Invalid)?;
+    if sig_b64.len() != MAC_B64_BYTES {
+        return Err(SessionError::Invalid);
+    }
     let sig = crate::b64::decode(sig_b64).map_err(|_| SessionError::Invalid)?;
     let expected = sign(secret, payload_b64)?;
     if sig.len() != expected.len() || sig.ct_eq(&expected).unwrap_u8() != 1 {
@@ -398,6 +405,9 @@ pub fn rotate_session(
     // Dual path: a pre-cutover token verifies here and is re-signed below
     // with the primary, so rotation migrates sessions onto the new secret.
     let claims = verify_session_dual(keys, token, now)?;
+    if now < claims.created_at {
+        return Err(SessionError::Invalid);
+    }
     let next = SessionClaims {
         session_id: claims.session_id,
         user_id: claims.user_id,
@@ -411,12 +421,9 @@ pub fn rotate_session(
             .checked_add(1)
             .ok_or(SessionError::Invalid)?,
     };
-    let payload = serde_json::to_vec(&next).expect("claims serialize");
-    let payload_b64 = crate::b64::encode(&payload);
     // Always re-sign with the primary: rotation migrates, never mints
     // under the previous secret.
-    let sig = sign(keys.primary, &payload_b64)?;
-    Ok(format!("{}.{}", payload_b64, crate::b64::encode(&sig)))
+    sign_refreshed_claims(keys.primary, &next)
 }
 
 /// Recovery is an explicitly client-bound retry, never a stale-cookie grace
@@ -476,6 +483,9 @@ pub(crate) fn sign_refreshed_claims(
 ) -> Result<String, SessionError> {
     let payload = serde_json::to_vec(claims).expect("claims serialize");
     let payload_b64 = crate::b64::encode(&payload);
+    if payload_b64.len() + 1 + MAC_B64_BYTES > MAX_TOKEN_BYTES {
+        return Err(SessionError::Invalid);
+    }
     let sig = sign(secret, &payload_b64)?;
     Ok(format!("{}.{}", payload_b64, crate::b64::encode(&sig)))
 }
@@ -574,12 +584,9 @@ pub fn reauthenticate_session(
         expires_at: now.saturating_add(ttl_secs.min(MAX_SESSION_SECS)),
         rotation_counter: 0,
     };
-    let payload = serde_json::to_vec(&next).expect("claims serialize");
-    let payload_b64 = crate::b64::encode(&payload);
     // Always mint under the primary: re-auth migrates off the previous
     // secret, never mints under it.
-    let sig = sign(keys.primary, &payload_b64)?;
-    let token = format!("{}.{}", payload_b64, crate::b64::encode(&sig));
+    let token = sign_refreshed_claims(keys.primary, &next)?;
     let new_record = SessionRecord {
         id: next.session_id.clone(),
         user_id: next.user_id.clone(),
