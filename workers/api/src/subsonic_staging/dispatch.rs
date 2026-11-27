@@ -23,7 +23,8 @@ use crate::subsonic_http::CredentialParseError;
 use crate::subsonic_snapshot_plan::build_owned_bounded_snapshot;
 use crate::subsonic_staging_response::{
     finish_document, prepare, respond_fixed_rejection, respond_unreadable,
-    respond_unsupported_method, DocumentError, StagingDocument, DOCUMENT_BYTES,
+    respond_unsupported_method, with_request_format, DocumentError, StagingDocument,
+    DOCUMENT_BYTES,
 };
 use crate::worker_entry::{
     load_staging_account,
@@ -113,15 +114,17 @@ where
         Ok(params) => params,
         Err(error) => return finish_document(Err(error)),
     };
-    let (format, refusal) = match request_format(&params) {
+    let (format, refusal, opening) = match with_request_format(&params, || {
+        credentials.map(|credentials| (credentials, open_app()))
+    }) {
         Ok(formats) => formats,
         Err(error) => return finish_document(Err(error)),
     };
-    let credentials = match credentials {
-        Ok(credentials) => credentials,
+    let (credentials, opening) = match opening {
+        Ok(opening) => opening,
         Err(message) => return scope.protocol_failure(refusal, code::GENERIC, message),
     };
-    let mut app = match open_app().await {
+    let mut app = match opening.await {
         Ok(app) => app,
         Err(reason) => return reject_xml(reason),
     };
@@ -297,21 +300,6 @@ impl StagingConstruction {
         .ok_or_else(|| reject(BusyOrCapacity))?;
         prepare(budget, &doc, format, DOCUMENT_BYTES)
     }
-}
-
-fn request_format(params: &Params) -> Result<(Format<'_>, RejectionFormat), DocumentError> {
-    let selector = params.get("f");
-    let format = match selector {
-        Some("json") => Format::Json,
-        Some("jsonp") => Format::Jsonp(
-            params
-                .get("callback")
-                .filter(|cb| envelope::is_valid_jsonp_callback(cb))
-                .ok_or(DocumentError::InvalidCallback)?,
-        ),
-        _ => Format::Xml,
-    };
-    Ok((format, RejectionFormat::from_safe_selector(selector)))
 }
 
 #[cfg(feature = "staging-body-wasm-test")]

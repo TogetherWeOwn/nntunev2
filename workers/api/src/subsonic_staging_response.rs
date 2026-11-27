@@ -14,30 +14,32 @@ pub use worker_response::{
 
 #[cfg(any(test, target_arch = "wasm32"))]
 use nntune_subsonic::{
-    envelope::{JSONP_CONTENT_TYPE, JSON_CONTENT_TYPE, XML_CONTENT_TYPE},
-    staging_rejection::{RejectionFormat, StagingRejection},
+    capped_render::Format, envelope::is_valid_jsonp_callback, staging_rejection::RejectionFormat,
+    Params,
 };
 
+/// Resolve the representation before invoking the staging connector.
 #[cfg(any(test, target_arch = "wasm32"))]
-impl StagingDocument {
-    fn validate_response(&self) -> Result<RejectionFormat, DocumentError> {
-        let unavailable = |format| DocumentError::Rejected(StagingRejection::Unavailable, format);
-        let format = match self.content_type {
-            XML_CONTENT_TYPE => RejectionFormat::Xml,
-            JSON_CONTENT_TYPE | JSONP_CONTENT_TYPE => RejectionFormat::Json,
-            _ => return Err(unavailable(RejectionFormat::Xml)),
-        };
-        if self.bytes.is_empty() {
-            return Err(unavailable(format));
-        }
-        if self.bytes.len() > DOCUMENT_BYTES {
-            return Err(DocumentError::Rejected(
-                StagingRejection::RequestOrDocumentTooLarge,
-                format,
-            ));
-        }
-        Ok(format)
-    }
+pub(crate) fn with_request_format<T>(
+    params: &Params,
+    open: impl FnOnce() -> T,
+) -> Result<(Format<'_>, RejectionFormat, T), DocumentError> {
+    let selector = params.get("f");
+    let format = match selector {
+        Some("json") => Format::Json,
+        Some("jsonp") => Format::Jsonp(
+            params
+                .get("callback")
+                .filter(|cb| is_valid_jsonp_callback(cb))
+                .ok_or(DocumentError::InvalidCallback)?,
+        ),
+        _ => Format::Xml,
+    };
+    Ok((
+        format,
+        RejectionFormat::from_safe_selector(selector),
+        open(),
+    ))
 }
 
 #[cfg(test)]
@@ -45,24 +47,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn invalid_documents_cannot_reach_worker_response_construction() {
-        use RejectionFormat::Json;
-        let validate = |content_type, size| {
-            StagingDocument {
-                content_type,
-                bytes: vec![b'x'; size],
-            }
-            .validate_response()
-        };
-        assert!(validate("text/html", 1).is_err());
-        assert!(validate(JSON_CONTENT_TYPE, 0).is_err());
-        assert_eq!(validate(JSONP_CONTENT_TYPE, DOCUMENT_BYTES), Ok(Json));
-        assert_eq!(
-            validate(JSONP_CONTENT_TYPE, DOCUMENT_BYTES + 1),
-            Err(DocumentError::Rejected(
-                StagingRejection::RequestOrDocumentTooLarge,
-                Json
-            ))
-        );
+    fn invalid_jsonp_format_never_opens_the_app() {
+        for query in ["f=jsonp", "f=jsonp&callback=invalid%20callback"] {
+            let params = Params::parse(query);
+            assert!(matches!(
+                with_request_format(&params, || panic!("invalid callback reached connector")),
+                Err(DocumentError::InvalidCallback)
+            ));
+        }
+        let params = Params::parse("f=jsonp&callback=fixture.cb");
+        assert!(matches!(
+            with_request_format(&params, || 200),
+            Ok((Format::Jsonp("fixture.cb"), RejectionFormat::Json, 200))
+        ));
     }
 }
