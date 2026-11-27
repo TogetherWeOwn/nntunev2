@@ -13,8 +13,8 @@
 //!
 //! Native + wasm32 compatible.
 
-use std::collections::HashMap;
-use std::fmt;
+use std::{collections::HashMap, fmt};
+use validation::{parse_config_value, REDACTED_KEY};
 
 /// Version of `config/schema.json` this accessor implements. Bump together
 /// with the schema file; the cross-check test fails on drift.
@@ -54,11 +54,12 @@ pub struct KeySpec {
 
 impl KeySpec {
     /// Parse one raw KV text value into the declared type. Numbers and bools
-    /// tolerate surrounding whitespace; strings keep their exact spelling
-    /// for field-specific validation. Empty or whitespace-only strings are
-    /// rejected, matching the CI parity checker (`config_parity_check.py`)
-    /// for required strings. Bools accept only `true` and `false`, in any
-    /// ASCII case.
+    /// tolerate surrounding whitespace; strings are kept exact for
+    /// field-specific validation after parsing, and empty/whitespace-only
+    /// strings are rejected, matching the CI
+    /// parity checker (`config_parity_check.py`), which rejects empty
+    /// required strings. Bools accept only `true`/`false`
+    /// (case-insensitive).
     fn parse(&self, raw: &str) -> Result<Value, ConfigError> {
         let invalid = || ConfigError::InvalidType {
             key: self.name,
@@ -330,103 +331,6 @@ impl Config {
             _ => None,
         }
     }
-
-    fn validate_identity(self) -> Result<Self, ConfigError> {
-        let rp_id = self
-            .get_str("auth.rp_id")
-            .ok_or(ConfigError::MissingRequired("auth.rp_id"))?;
-        let origin = self
-            .get_str("auth.rp_origin")
-            .ok_or(ConfigError::MissingRequired("auth.rp_origin"))?;
-        let host = rp_origin_host(rp_id).ok_or(ConfigError::InvalidValue("auth.rp_id"))?;
-        if !valid_rp_origin(origin, host) {
-            return Err(ConfigError::InvalidValue("auth.rp_origin"));
-        }
-        Ok(self)
-    }
-}
-
-// An undeclared name is arbitrary input, including potential secrets or newlines.
-const REDACTED_KEY: &str = "<redacted>";
-
-fn parse_config_value(spec: &KeySpec, raw: &str) -> Result<Value, ConfigError> {
-    let value = spec.parse(raw)?;
-    let Value::U64(number) = value else {
-        return Ok(value);
-    };
-    let bounds = match spec.name {
-        // Match the API's credential lifetimes and invite throttle.
-        "auth.challenge_ttl_secs" => 1..=300,
-        "auth.invite_redemption_max_attempts" => 1..=10,
-        "auth.invite_redemption_window_secs" => 300..=300,
-        "auth.magic_link_ttl_secs" => 1..=900,
-        // Schema v1 caps the effective lifetime for positive session TTLs.
-        "session.ttl_secs" if number > 0 => return Ok(Value::U64(number.min(86_400))),
-        "session.ttl_secs" => return Err(ConfigError::InvalidValue(spec.name)),
-        "ingest.max_nzb_bytes" => 1..=2 * 1024 * 1024,
-        // Retries match the Queue consumer budget. Payloads survive the
-        // 15-day replay window and expire within the current 30-day retention.
-        "ingest.payload_retry_attempts" => 4..=4,
-        "ingest.payload_ttl_secs" => 15 * 86_400..=30 * 86_400,
-        // KV requires at least 60 seconds. The MB cache interface takes u32.
-        "mb.lookup_cache_ttl_s" | "mb.search_cache_ttl_s" => 60..=u64::from(u32::MAX),
-        "mb.max_query_chars" => 1..=100,
-        "mb.search_limit" => 1..=25,
-        // The streaming buffer flushes one minimum-size R2 part at a time.
-        "stream.r2_min_part_bytes" => 5 * 1024 * 1024..=5 * 1024 * 1024,
-        _ => return Ok(value),
-    };
-    if !bounds.contains(&number) {
-        return Err(ConfigError::InvalidValue(spec.name));
-    }
-    Ok(value)
-}
-
-// This config accepts conventional ASCII DNS names and the API's local-dev
-// loopbacks. A letter-led final label avoids ambiguous numeric IPv4 spellings.
-fn rp_origin_host(rp_id: &str) -> Option<&str> {
-    match rp_id {
-        "::1" => return Some("[::1]"),
-        "localhost" | "127.0.0.1" => return Some(rp_id),
-        _ => {}
-    }
-    let (_, tld) = rp_id.rsplit_once('.')?;
-    (rp_id.len() <= 253
-        && matches!(tld.as_bytes().first(), Some(b'a'..=b'z'))
-        && rp_id.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && !label.starts_with("xn--")
-                && label
-                    .bytes()
-                    .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
-        }))
-    .then_some(rp_id)
-}
-
-fn valid_rp_origin(origin: &str, host: &str) -> bool {
-    let (authority, default_port) = if let Some(authority) = origin.strip_prefix("https://") {
-        (authority, 443)
-    } else if let (true, Some(authority)) = (
-        matches!(host, "localhost" | "127.0.0.1" | "[::1]"),
-        origin.strip_prefix("http://"),
-    ) {
-        (authority, 80)
-    } else {
-        return false;
-    };
-    match authority.strip_prefix(host) {
-        Some("") => true,
-        Some(suffix) => suffix.strip_prefix(':').is_some_and(|port| {
-            port.len() <= 5
-                && !port.starts_with('0')
-                && port.bytes().all(|b| b.is_ascii_digit())
-                && port.parse::<u16>().is_ok_and(|port| port != default_port)
-        }),
-        None => false,
-    }
 }
 
 #[cfg(test)]
@@ -502,14 +406,16 @@ mod tests {
 
     #[test]
     fn u64_type_parser_accepts_endpoints_and_rejects_overflow() {
-        // Endpoints pin current `trimmed.parse::<u64>()` behavior.
+        // Raw u64 endpoints parse before the session lifetime policy is applied.
         let spec = spec_for("session.ttl_secs").unwrap();
-        for (raw, expected) in [("0", 0u64), ("18446744073709551615", u64::MAX)] {
-            assert_eq!(
-                spec.parse(raw),
-                Ok(Value::U64(expected)),
-                "endpoint {raw:?} must parse"
-            );
+        let cases = [
+            ("0", 0, Err(ConfigError::InvalidValue("session.ttl_secs"))),
+            ("18446744073709551615", u64::MAX, Ok(Value::U64(86_400))),
+        ];
+        for (raw, expected, effective) in cases {
+            let parsed = spec.parse(raw).expect("u64 endpoint parses");
+            assert_eq!(parsed, Value::U64(expected), "endpoint {raw:?} must parse");
+            assert_eq!(parse_config_value(spec, raw), effective);
         }
         // Overflow and non-decimal shapes fail as InvalidType.
         for bad in ["18446744073709551616", "0x10", "+18446744073709551616"] {
@@ -541,16 +447,19 @@ mod tests {
         raw.insert("auth.rp_id".to_string(), spaced.to_string());
         assert_eq!(
             Config::load(&raw),
-            Err(ConfigError::InvalidValue("auth.rp_id"))
+            Err(ConfigError::InvalidValue("auth.rp_id")),
+            "KV must reject a padded RP hostname"
         );
 
         let mut config = Config::load(&identity()).expect("identity loads");
+        let original = config.clone();
         let env = kv(&[("RP_ID", spaced)]);
         assert_eq!(
             config.apply_env(&env),
-            Err(ConfigError::InvalidValue("auth.rp_id"))
+            Err(ConfigError::InvalidValue("auth.rp_id")),
+            "an environment override must also reject a padded RP hostname"
         );
-        assert_eq!(config.get_str("auth.rp_id"), Some("staging.nntune.com"));
+        assert_eq!(config, original);
     }
 
     #[test]
@@ -562,6 +471,7 @@ mod tests {
             Err(ConfigError::UnknownKey(REDACTED_KEY.to_owned()))
         );
 
+        // Redirect policy is a Worker invariant outside KV config.
         raw.remove("debug.backdoor");
         raw.insert(
             "vault.indexer_allow_redirects".to_string(),
@@ -569,7 +479,8 @@ mod tests {
         );
         assert_eq!(
             Config::load(&raw),
-            Err(ConfigError::UnknownKey(REDACTED_KEY.to_owned()))
+            Err(ConfigError::UnknownKey(REDACTED_KEY.to_owned())),
+            "KV cannot override the redirect policy"
         );
     }
 
@@ -608,11 +519,7 @@ mod tests {
         // One good override plus one bad override: the whole overlay fails
         // and NONE of the values change (no partial application).
         let mut config = Config::load(&identity()).expect("identity loads");
-        let env = kv(&[
-            ("RP_ID", "other.example"),
-            ("RP_ORIGIN", "https://other.example"),
-            ("SESSION_TTL_SECS", "soon"),
-        ]);
+        let env = kv(&[("RP_ID", "other.example"), ("SESSION_TTL_SECS", "soon")]);
         assert_eq!(
             config.apply_env(&env),
             Err(ConfigError::InvalidType {
@@ -939,6 +846,109 @@ mod tests {
                 Err(ConfigError::UnknownKey(REDACTED_KEY.to_owned())),
                 "{env} fixture with unknown key must fail"
             );
+        }
+    }
+}
+
+mod validation {
+    use super::{Config, ConfigError, KeySpec, Value};
+
+    impl Config {
+        pub(super) fn validate_identity(self) -> Result<Self, ConfigError> {
+            let rp_id = self
+                .get_str("auth.rp_id")
+                .ok_or(ConfigError::MissingRequired("auth.rp_id"))?;
+            let origin = self
+                .get_str("auth.rp_origin")
+                .ok_or(ConfigError::MissingRequired("auth.rp_origin"))?;
+            let host = rp_origin_host(rp_id).ok_or(ConfigError::InvalidValue("auth.rp_id"))?;
+            if !valid_rp_origin(origin, host) {
+                return Err(ConfigError::InvalidValue("auth.rp_origin"));
+            }
+            Ok(self)
+        }
+    }
+
+    // An undeclared name is arbitrary input, including potential secrets or newlines.
+    pub(super) const REDACTED_KEY: &str = "<redacted>";
+
+    pub(super) fn parse_config_value(spec: &KeySpec, raw: &str) -> Result<Value, ConfigError> {
+        let value = spec.parse(raw)?;
+        let Value::U64(number) = value else {
+            return Ok(value);
+        };
+        let bounds = match spec.name {
+            // Match the API's credential lifetimes and invite throttle.
+            "auth.challenge_ttl_secs" => 1..=300,
+            "auth.invite_redemption_max_attempts" => 1..=10,
+            "auth.invite_redemption_window_secs" => 300..=300,
+            "auth.magic_link_ttl_secs" => 1..=900,
+            // Schema v1 caps the effective lifetime for positive session TTLs.
+            "session.ttl_secs" if number > 0 => return Ok(Value::U64(number.min(86_400))),
+            "session.ttl_secs" => return Err(ConfigError::InvalidValue(spec.name)),
+            "ingest.max_nzb_bytes" => 1..=2 * 1024 * 1024,
+            // Retries match the Queue consumer budget. Payloads survive the
+            // 15-day replay window and expire within the current 30-day retention.
+            "ingest.payload_retry_attempts" => 4..=4,
+            "ingest.payload_ttl_secs" => 15 * 86_400..=30 * 86_400,
+            // KV requires at least 60 seconds. The MB cache interface takes u32.
+            "mb.lookup_cache_ttl_s" | "mb.search_cache_ttl_s" => 60..=u64::from(u32::MAX),
+            "mb.max_query_chars" => 1..=100,
+            "mb.search_limit" => 1..=25,
+            // The streaming buffer flushes one minimum-size R2 part at a time.
+            "stream.r2_min_part_bytes" => 5 * 1024 * 1024..=5 * 1024 * 1024,
+            _ => return Ok(value),
+        };
+        if !bounds.contains(&number) {
+            return Err(ConfigError::InvalidValue(spec.name));
+        }
+        Ok(value)
+    }
+
+    // This config accepts conventional ASCII DNS names and the API's local-dev
+    // loopbacks. A letter-led final label avoids ambiguous numeric IPv4 spellings.
+    fn rp_origin_host(rp_id: &str) -> Option<&str> {
+        match rp_id {
+            "::1" => return Some("[::1]"),
+            "localhost" | "127.0.0.1" => return Some(rp_id),
+            _ => {}
+        }
+        let (_, tld) = rp_id.rsplit_once('.')?;
+        (rp_id.len() <= 253
+            && matches!(tld.as_bytes().first(), Some(b'a'..=b'z'))
+            && rp_id.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && !label.starts_with("xn--")
+                    && label
+                        .bytes()
+                        .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+            }))
+        .then_some(rp_id)
+    }
+
+    fn valid_rp_origin(origin: &str, host: &str) -> bool {
+        let (authority, default_port) = if let Some(authority) = origin.strip_prefix("https://") {
+            (authority, 443)
+        } else if let (true, Some(authority)) = (
+            matches!(host, "localhost" | "127.0.0.1" | "[::1]"),
+            origin.strip_prefix("http://"),
+        ) {
+            (authority, 80)
+        } else {
+            return false;
+        };
+        match authority.strip_prefix(host) {
+            Some("") => true,
+            Some(suffix) => suffix.strip_prefix(':').is_some_and(|port| {
+                port.len() <= 5
+                    && !port.starts_with('0')
+                    && port.bytes().all(|b| b.is_ascii_digit())
+                    && port.parse::<u16>().is_ok_and(|port| port != default_port)
+            }),
+            None => false,
         }
     }
 }
