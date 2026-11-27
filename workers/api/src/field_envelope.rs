@@ -74,7 +74,7 @@ impl Context<'_> {
         Ok(out)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, all(target_arch = "wasm32", feature = "ledger-wasm-test")))]
     pub(crate) fn aad(&self, purpose: &str, kek_version: Option<u32>) -> Vec<u8> {
         self.checked_aad(purpose, kek_version).unwrap()
     }
