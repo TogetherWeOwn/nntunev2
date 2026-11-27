@@ -31,10 +31,22 @@ const observer = createPlayerListenHistory({
 });
 const detach = observer.attach(audio, 'fixture-track', () => grant);
 
+function media(name: string) {
+	if (name !== 'playing' && name !== 'ended') return audio.dispatchEvent(new Event(name));
+	const property = name === 'playing' ? 'paused' : 'ended';
+	const previous = Object.getOwnPropertyDescriptor(audio, property);
+	Object.defineProperty(audio, property, { configurable: true, value: name === 'ended' });
+	try { return audio.dispatchEvent(new Event(name)); }
+	finally {
+		if (previous) Object.defineProperty(audio, property, previous);
+		else Reflect.deleteProperty(audio, property);
+	}
+}
+
 const fixture = {
 	read,
 	issue: (id: string) => { grant = id; },
-	media: (name: string) => audio.dispatchEvent(new Event(name)),
+	media,
 	setEnded: (ended: boolean) => Object.defineProperty(audio, 'ended', { configurable: true, value: ended }),
 	abandon: () => observer.finish(audio),
 	detach,
