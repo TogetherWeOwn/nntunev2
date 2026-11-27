@@ -315,7 +315,7 @@ redacted_debug!(
 struct Record {
     seed: Seed,
     state: State,
-    reservation: Option<Reservation>,
+    reservation: Option<(Time, Reservation)>,
     lease_until: Option<Time>,
     deliveries: usize,
     outbox: Vec<Vec<(String, String)>>,
@@ -597,6 +597,9 @@ impl AuthorityStore {
         }
         let now = call.now;
         let s = &rec.seed;
+        if now < s.origin.issued_at {
+            return Err(Denial::Unavailable);
+        }
         if now >= s.cap_expires_at
             || now >= s.origin.hard_deadline
             || now >= s.origin.grant_expires_at
@@ -620,7 +623,7 @@ impl AuthorityStore {
         self.reservations
             .insert(reservation.reservation_id.clone(), origin.clone());
         rec.state = State::Reserved;
-        rec.reservation = Some(reservation.clone());
+        rec.reservation = Some((now, reservation.clone()));
         let n = rec.outbox.len();
         rec.event(n, &call.resolver_role, "reserved", "none", now);
         Ok(reservation)
@@ -640,14 +643,19 @@ impl AuthorityStore {
             State::Revoked => return Err(Denial::Denied),
             _ => return Err(Denial::Conflict),
         }
-        if rec.reservation.as_ref().map(|r| &r.reservation_id) != Some(&request.reservation_id) {
+        let Some((reserved_at, reservation)) = &rec.reservation else {
+            return Err(Denial::Denied);
+        };
+        if reservation.reservation_id != request.reservation_id {
             return Err(Denial::Denied);
         }
         let now = request.call.now;
+        if now < *reserved_at {
+            return Err(Denial::Unavailable);
+        }
         let role = request.call.resolver_role.clone();
-        let reserved_until = rec.reservation.as_ref().map_or(0, |r| r.until);
         let s = &rec.seed;
-        if now >= reserved_until
+        if now >= reservation.until
             || now >= s.cap_expires_at
             || now >= s.origin.hard_deadline
             || now >= s.origin.grant_expires_at
@@ -881,6 +889,32 @@ mod review_pins {
             terminal_ack: true,
             interleave: None,
         }
+    }
+
+    #[test]
+    fn rejects_reservation_and_delivery_before_their_authority_exists() {
+        let mut m = AuthorityStore::new("staging");
+        m.freeze(seed()).unwrap();
+        assert_eq!(
+            m.reserve(&id(1), &id(10), call_at(999), nonce(1)),
+            Err(Denial::Unavailable)
+        );
+        let frozen = m.inspect(&id(1)).unwrap();
+        assert_eq!(frozen.state, State::Frozen);
+        assert!(frozen.outbox.is_empty());
+
+        let r = m.reserve(&id(1), &id(10), call_at(1001), nonce(1)).unwrap();
+        assert_eq!(
+            m.first_finalize(finalize_request(r.reservation_id.clone(), 1000)),
+            Err(Denial::Unavailable)
+        );
+        let reserved = m.inspect(&id(1)).unwrap();
+        assert_eq!(reserved.state, State::Reserved);
+        assert_eq!(reserved.deliveries, 0);
+        assert_eq!(reserved.outbox.len(), 1);
+        assert!(m
+            .first_finalize(finalize_request(r.reservation_id, 1001))
+            .is_ok());
     }
 
     #[test]
