@@ -2224,6 +2224,238 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exact_target_rejects_mismatched_subscription_and_isolates_customer_and_invoices() {
+        let remote = RemoteSubscription {
+            subscription: subscription("active", PRICE_PLUS),
+            invoices: vec![paid_invoice("in_target", PRICE_PLUS, NOW, NOW + 100, NOW)],
+        };
+        let mut other_live = anchored("pro-5x", NOW + 500, "in_other_sub");
+        other_live.live.as_mut().unwrap().stripe_subscription_id = "sub_requested".into();
+        for input in [
+            fresh(),
+            anchored("plus", NOW + 100, "in_target"),
+            other_live.clone(),
+        ] {
+            assert!(reconcile_exact_target("sub_requested", input, &remote, NOW).is_none());
+        }
+
+        // Cross-account customer mismatch fails closed without leaking another target's row.
+        for bad_customer in [Some("cus_other".to_string()), None] {
+            let mut foreign = remote.clone();
+            foreign.subscription.customer = bad_customer;
+            let out = reconcile_exact_target("sub_123", other_live.clone(), &foreign, NOW).unwrap();
+            assert_eq!(out.fail_closed, Some(FailClosedReason::CustomerMismatch));
+            assert!(out.disable_new_purchases() && !out.explicit_stale && out.history.is_empty());
+            assert_eq!(
+                (
+                    out.row.stripe_customer_id.as_str(),
+                    out.row.plan_id.as_str()
+                ),
+                ("cus_123", "free")
+            );
+            assert_eq!(out.row.paid_through_unix, None);
+            assert_eq!(
+                (out.row.paid_invoice_id, out.read_plan, out.read_anchor),
+                (None, None, None)
+            );
+        }
+
+        // Foreign subscription or customer invoices cannot advance coverage or leak into history.
+        let mut wrong_sub = paid_invoice("in_wrong_sub", PRICE_PLUS, NOW, NOW + 500, NOW + 10);
+        wrong_sub.subscription = Some("sub_other".into());
+        let mut wrong_cus = paid_invoice("in_wrong_cus", PRICE_PLUS, NOW, NOW + 600, NOW + 20);
+        wrong_cus.customer = Some("cus_other".into());
+        let mixed = RemoteSubscription {
+            subscription: subscription("active", PRICE_PLUS),
+            invoices: vec![
+                paid_invoice("in_target", PRICE_PLUS, NOW, NOW + 100, NOW),
+                wrong_sub,
+                wrong_cus,
+            ],
+        };
+        let out = reconcile_exact_target(
+            "sub_123",
+            anchored("plus", NOW + 100, "in_target"),
+            &mixed,
+            NOW,
+        )
+        .unwrap();
+        assert!(out.fail_closed.is_none() && !out.explicit_stale);
+        assert_eq!(out.row.paid_through_unix, Some(NOW + 100));
+        assert_eq!(out.row.paid_invoice_id.as_deref(), Some("in_target"));
+        assert_eq!(out.history.len(), 1);
+        assert_eq!(out.history[0].stripe_invoice_id, "in_target");
+        assert_eq!(out.history[0].stripe_subscription_id, "sub_123");
+    }
+
+    #[test]
+    fn exact_target_stale_terminal_release_preserves_folded_state_and_fresh_release_clears_grace() {
+        let end = NOW + 100;
+        let grace = end + RENEWAL_GRACE_SECS;
+        let mut foreign_inv = paid_invoice("in_foreign", PRICE_PLUS, NOW, end, NOW);
+        foreign_inv.subscription = Some("sub_other".into());
+        for (stored_status, stored_grace) in [("active", None), ("past_due", Some(grace))] {
+            let mut input = anchored("plus", end, "in_anchor");
+            let live = input.live.as_mut().unwrap();
+            live.status = stored_status.into();
+            live.grace_until_unix = stored_grace;
+            for terminal in ["canceled", "incomplete_expired"] {
+                let older = paid_invoice("in_older", PRICE_PLUS, NOW - 100, NOW, NOW - 10);
+                for stale_invoices in [vec![], vec![older], vec![foreign_inv.clone()]] {
+                    let remote = RemoteSubscription {
+                        subscription: subscription(terminal, PRICE_PRO),
+                        invoices: stale_invoices,
+                    };
+                    let stale =
+                        reconcile_exact_target("sub_123", input.clone(), &remote, NOW).unwrap();
+                    assert!(
+                        stale.explicit_stale
+                            && stale.fail_closed.is_none()
+                            && stale.history.is_empty()
+                    );
+                    assert_eq!(stale.row.status, stored_status);
+                    assert_eq!(
+                        (
+                            stale.row.plan_id.as_str(),
+                            stale.row.stripe_price_id.as_str()
+                        ),
+                        ("plus", PRICE_PLUS)
+                    );
+                    assert_eq!(stale.row.paid_through_unix, Some(end));
+                    assert_eq!(
+                        (stale.row.paid_invoice_id, stale.row.grace_until_unix),
+                        (None, stored_grace)
+                    );
+                    assert_eq!(
+                        (stale.read_plan.as_deref(), stale.read_anchor.as_deref()),
+                        (Some("plus"), Some("in_anchor"))
+                    );
+                }
+                let fresh_remote = RemoteSubscription {
+                    subscription: subscription(terminal, PRICE_PRO),
+                    invoices: vec![paid_invoice("in_anchor", PRICE_PLUS, NOW, end, NOW)],
+                };
+                let fresh =
+                    reconcile_exact_target("sub_123", input.clone(), &fresh_remote, NOW).unwrap();
+                assert!(
+                    !fresh.explicit_stale
+                        && fresh.fail_closed.is_none()
+                        && fresh.history.is_empty()
+                );
+                assert_eq!(
+                    (fresh.row.status.as_str(), fresh.row.plan_id.as_str()),
+                    (terminal, "plus")
+                );
+                assert_eq!(
+                    (fresh.row.paid_through_unix, fresh.row.grace_until_unix),
+                    (Some(end), None)
+                );
+                assert_eq!(fresh.row.paid_invoice_id.as_deref(), Some("in_anchor"));
+                assert_eq!(
+                    (fresh.read_plan.as_deref(), fresh.read_anchor.as_deref()),
+                    (Some("plus"), Some("in_anchor"))
+                );
+            }
+        }
+    }
+
+    // Pure offline fold-to-classification contract; `apply_reconcile_transaction`
+    // SQL ordering is verified by the disposable-PostgreSQL suites in CI.
+    #[test]
+    fn exact_target_fold_to_classification_enforces_identity_isolation_and_release_ordering() {
+        use crate::billing_store_classification::{
+            classify_explicit_stale, classify_target, classify_write, has_slot_suppression_proof,
+            validate_equal_end_provenance, validate_history_target, validate_read_provenance,
+            Accepted, Identity, ObservedTarget, Refused, Target,
+        };
+
+        let end = NOW + 100;
+        let req = Identity {
+            user_id: "user-a",
+            subscription_id: "sub_123",
+        };
+        let obs = |user_id, predicate_stale, equal_end_provenance_changed| ObservedTarget {
+            identity: Identity {
+                user_id,
+                subscription_id: "sub_123",
+            },
+            predicate_stale,
+            other_live_holder: false,
+            equal_end_provenance_changed,
+            matching_proof_cancel_conflict: false,
+        };
+        let release_remote = RemoteSubscription {
+            subscription: subscription("canceled", PRICE_PLUS),
+            invoices: vec![paid_invoice("in_anchor", PRICE_PLUS, NOW, end, NOW)],
+        };
+
+        // 1. Replacement live row cannot supply read provenance; delayed release is refused
+        //    once the target exists, and foreign account ownership fails closed first.
+        let mut replacement = anchored("plus", end, "in_rep");
+        replacement.live.as_mut().unwrap().stripe_subscription_id = "sub_replacement".into();
+        let isolated =
+            reconcile_exact_target("sub_123", replacement, &release_remote, NOW).unwrap();
+        assert_eq!(
+            (
+                isolated.read_plan.as_deref(),
+                isolated.read_anchor.as_deref()
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            classify_target(&req, &[obs("user-b", false, false)]),
+            Err(Refused)
+        );
+        assert_eq!(validate_read_provenance(&isolated, true), Err(Refused));
+
+        // 2. Stale terminal release missing anchor preserves folded active state as StaleOwned.
+        let owned_input = anchored("plus", end, "in_anchor");
+        let stale_remote = RemoteSubscription {
+            subscription: subscription("canceled", PRICE_PLUS),
+            invoices: vec![],
+        };
+        let stale =
+            reconcile_exact_target("sub_123", owned_input.clone(), &stale_remote, NOW).unwrap();
+        assert!(stale.explicit_stale && stale.row.status == "active");
+        let own = classify_target(&req, &[obs("user-a", true, false)]).unwrap();
+        assert_eq!(
+            classify_explicit_stale(&own, stale.history.is_empty()),
+            Ok(Accepted::StaleOwned)
+        );
+
+        // 3. Out-of-order release after equal-end proof change fails closed; matching proof applies.
+        let fresh = reconcile_exact_target("sub_123", owned_input, &release_remote, NOW).unwrap();
+        assert!(!fresh.explicit_stale && fresh.row.status == "canceled");
+        assert_eq!(validate_history_target(&fresh), Ok(()));
+        assert_eq!(validate_read_provenance(&fresh, true), Ok(()));
+        let changed = classify_target(&req, &[obs("user-a", true, true)]).unwrap();
+        assert_eq!(
+            validate_equal_end_provenance(&fresh, &changed),
+            Err(Refused)
+        );
+        let unchanged = Target::Owned {
+            predicate_stale: false,
+            other_live_holder: false,
+            equal_end_provenance_changed: false,
+            matching_proof_cancel_conflict: false,
+        };
+        assert_eq!(validate_equal_end_provenance(&fresh, &unchanged), Ok(()));
+        let returned = [Identity {
+            user_id: "user-a",
+            subscription_id: "sub_123",
+        }];
+        assert_eq!(
+            classify_write(
+                &req,
+                &unchanged,
+                &returned,
+                has_slot_suppression_proof(&fresh)
+            ),
+            Ok(Accepted::AppliedOwned)
+        );
+    }
+
     // --- Renewal grace: set once, kept verbatim, cleared on recovery -----------------
 
     #[test]
