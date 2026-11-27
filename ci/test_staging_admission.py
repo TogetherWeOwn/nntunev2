@@ -776,6 +776,22 @@ class DraftPrivateContractTests(Base):
         self.assertEqual(self.coverage(root), dict.fromkeys(self.CASES, "incomplete"))
 
 
+class PrivateEvidenceMapTests(unittest.TestCase):
+    def test_offline_map_covers_requested_areas_and_keeps_live_gaps_explicit(self):
+        text = (HERE.parent / "docs/ops/private-staging-evidence-map.md").read_text(encoding="utf-8")
+        for area in ("Encrypted upload", "Library visibility", "Playback", "Access refusals"):
+            self.assertIn(f"| {area} |", text)
+        for selector in (
+            "private-publication", "private-library", "private-play",
+            "private-anonymous-refusal", "private-unlisted-refusal", "private-cutoff-refusal",
+            "build-identity", "build-identity-final",
+        ):
+            self.assertIn(f"`{selector}`", text)
+        self.assertIn("ciphertext at rest", text)
+        self.assertIn("protected encrypted-storage and upload evidence", text)
+        self.assertIn("synthetic test data only", text)
+
+
 class ProduceTests(Base):
     def test_positive_receipt_is_satisfied(self):
         receipt = World().receipt
