@@ -112,6 +112,18 @@ it('rejects malformed organizer snapshots and actions atomically', () => {
 	expect(moved.items[1].parentId).toBeNull();
 });
 
+it('preserves API playlist names and requires identifiable snapshot owners', () => {
+	const playlist = { ownerId: 'me', id: 'playlist', kind: 'playlist', parentId: null };
+	for (const name of ['Side\tA', 'Side\u2028A', '\uFEFF', '🎵'.repeat(120)]) {
+		const row = { ...playlist, name };
+		expect(createPlaylistOrganizer('me', [row, { ownerId: 'other' }])?.items).toEqual([row]);
+	}
+	for (const name of ['\u0085', 'Side\0A', '\ud800', '🎵'.repeat(121)]) {
+		expect(createPlaylistOrganizer('me', [{ ...playlist, name }])).toBeNull();
+	}
+	expect(createPlaylistOrganizer('me', [{ ...playlist, name: 'Playlist' }, { ownerId: null }])).toBeNull();
+});
+
 it('finishes listener teardown even when an earlier cleanup fails', () => {
 	const target = new EventTarget();
 	const handler = vi.fn();

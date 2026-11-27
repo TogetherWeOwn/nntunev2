@@ -36,6 +36,12 @@ function isOwnedRef(value: unknown, ownerId: string): value is ItemRef {
 	return isRecord(value) && value.ownerId === ownerId && isId(value.id);
 }
 
+function isPlaylistName(name: string): boolean {
+	// The API trims stored names and permits interior whitespace, including line breaks.
+	return /^.{1,120}$/su.test(name) && /\P{White_Space}/u.test(name) &&
+		!name.includes('\0') && !/\p{Cs}/u.test(name);
+}
+
 /** Create or reset the local model from a synthetic owner snapshot. */
 export function createPlaylistOrganizer(
 	ownerId: string,
@@ -45,12 +51,13 @@ export function createPlaylistOrganizer(
 	const items: OrganizerItem[] = [];
 	const byId = new Map<string, OrganizerItem>();
 	for (const row of rows as readonly unknown[]) {
+		// Only skip foreign rows once their owner is known.
 		if (!isRecord(row) || !isId(row.ownerId)) return null;
 		if (row.ownerId !== ownerId) continue;
 		const { id, kind, name, parentId } = row;
 		if (!isId(id) || byId.has(id) || (kind !== 'folder' && kind !== 'playlist') ||
-			typeof name !== 'string' || normalizeFolderName(name) === null ||
-			(parentId !== null && !isId(parentId))) return null;
+			(parentId !== null && !isId(parentId)) || typeof name !== 'string') return null;
+		if (kind === 'playlist' ? !isPlaylistName(name) : normalizeFolderName(name) === null) return null;
 		const item = { ownerId, id, kind, name, parentId } as const;
 		items.push(item);
 		byId.set(id, item);
