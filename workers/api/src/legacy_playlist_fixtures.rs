@@ -25,9 +25,10 @@
 //! ones). Those are future cutover inputs, not delivered reads: no current
 //! endpoint returns them, and this validator changes no runtime behavior.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 const SCHEMA_NAME: &str = "legacy-playlist-fixtures/v1";
@@ -115,10 +116,78 @@ struct SourceEntry {
     resolved: Option<(String, String)>,
 }
 
+// Value's default deserializer silently keeps the last value for a repeated key.
+struct UniqueJson(Value);
+
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct UniqueVisitor;
+
+        impl<'de> Visitor<'de> for UniqueVisitor {
+            type Value = UniqueJson;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("JSON with unique keys in each object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<UniqueJson, A::Error> {
+                let mut result = Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if result.contains_key(&key) {
+                        return Err(de::Error::custom("duplicate JSON object key"));
+                    }
+                    result.insert(key, map.next_value::<UniqueJson>()?.0);
+                }
+                Ok(UniqueJson(Value::Object(result)))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<UniqueJson, A::Error> {
+                let mut result = Vec::new();
+                while let Some(value) = seq.next_element::<UniqueJson>()? {
+                    result.push(value.0);
+                }
+                Ok(UniqueJson(Value::Array(result)))
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<UniqueJson, E> {
+                Ok(UniqueJson(value.into()))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<UniqueJson, E> {
+                Ok(UniqueJson(value.into()))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<UniqueJson, E> {
+                Ok(UniqueJson(value.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<UniqueJson, E> {
+                Ok(UniqueJson(value.into()))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<UniqueJson, E> {
+                Ok(UniqueJson(value.into()))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<UniqueJson, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+        }
+
+        d.deserialize_any(UniqueVisitor)
+    }
+}
+
 /// Parse and validate a whole corpus document, including the corpus-wide
 /// uniqueness and identity-space rules.
 pub fn validate_corpus(json: &str) -> Result<()> {
-    let root: Value =
+    let UniqueJson(root) =
         serde_json::from_str(json).map_err(|e| malformed(format!("unparsable JSON: {e}")))?;
     let obj = as_object(&root, "corpus")?;
     for key in obj.keys() {
@@ -149,13 +218,12 @@ pub fn validate_corpus(json: &str) -> Result<()> {
         .filter(|cases| !cases.is_empty())
         .ok_or_else(|| malformed("corpus `cases` must be a non-empty array"))?;
 
-    let mut case_ids: Vec<&str> = Vec::new();
+    let mut case_ids = BTreeSet::new();
     for case in cases {
         if let Some(id) = case.get("id").and_then(Value::as_str) {
-            if case_ids.contains(&id) {
+            if !case_ids.insert(id) {
                 return Err(malformed(format!("duplicate case id `{id}`")));
             }
-            case_ids.push(id);
         }
     }
     for case in cases {
@@ -165,30 +233,28 @@ pub fn validate_corpus(json: &str) -> Result<()> {
     // Corpus-wide identity rules: internal ids and public handles are
     // unique, disjoint identity spaces across every case, and no track
     // handle collides with any of them.
-    let mut internal_ids: Vec<i64> = Vec::new();
-    let mut public_ids: Vec<&str> = Vec::new();
+    let mut internal_ids = BTreeSet::new();
+    let mut public_ids = BTreeSet::new();
     for case in cases {
         let playlist = &case["playlist"];
         let internal = playlist["internal_id"].as_i64().unwrap_or_default();
-        if internal_ids.contains(&internal) {
+        if !internal_ids.insert(internal) {
             return Err(err(
                 FixtureErrorKind::IdentityConfusion,
                 format!("duplicate internal_id {internal} across cases"),
             ));
         }
-        internal_ids.push(internal);
         let public = playlist["public_id"].as_str().unwrap_or_default();
-        if public_ids.contains(&public) {
+        if !public_ids.insert(public) {
             return Err(err(
                 FixtureErrorKind::IdentityConfusion,
                 format!("duplicate public_id `{public}` across cases"),
             ));
         }
-        public_ids.push(public);
     }
-    let internal_texts: Vec<String> = internal_ids.iter().map(i64::to_string).collect();
-    for public in &public_ids {
-        if internal_texts.iter().any(|t| t == public) {
+    let internal_texts: BTreeSet<String> = internal_ids.iter().map(i64::to_string).collect();
+    for &public in &public_ids {
+        if internal_texts.contains(public) {
             return Err(err(
                 FixtureErrorKind::IdentityConfusion,
                 format!("public_id `{public}` is an internal id rendered as text"),
@@ -198,7 +264,7 @@ pub fn validate_corpus(json: &str) -> Result<()> {
     for case in cases {
         for entry in case["entries"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
             if let Some(track) = entry.get("track_public_id").and_then(Value::as_str) {
-                if public_ids.contains(&track) || internal_texts.iter().any(|t| t == track) {
+                if public_ids.contains(track) || internal_texts.contains(track) {
                     return Err(err(
                         FixtureErrorKind::IdentityConfusion,
                         format!("track handle `{track}` collides with a playlist identity"),
@@ -579,6 +645,25 @@ mod tests {
     use super::*;
 
     const CORPUS: &str = include_str!("../tests/fixtures/legacy-playlists-v1.json");
+
+    #[test]
+    fn rejects_duplicate_keys_before_fixture_validation() {
+        assert_eq!(validate_corpus(CORPUS), Ok(()));
+        for (key, repeated) in [
+            (r#""version": 1"#, r#""version": 2, "version": 1"#),
+            (
+                r#""status": "resolved""#,
+                r#""statu\u0073": "unresolved", "status": "resolved""#,
+            ),
+        ] {
+            assert!(CORPUS.contains(key));
+            let duplicate = CORPUS.replacen(key, repeated, 1);
+            assert_eq!(
+                validate_corpus(&duplicate).unwrap_err().kind,
+                FixtureErrorKind::MalformedSchema
+            );
+        }
+    }
 
     fn case_by_id(id: &str) -> Value {
         let corpus: Value = serde_json::from_str(CORPUS).expect("corpus parses");

@@ -47,6 +47,12 @@ pub struct PgTransaction<'a>(Transaction<'a>);
 
 type Param<'a> = (&'a (dyn ToSql + Sync), Type);
 
+// Postgres stores these watchdogs as signed 32-bit milliseconds and uses zero
+// to disable them. Keep every production watchdog finite.
+fn watchdog_ms(ms: u64) -> u64 {
+    ms.clamp(1, i32::MAX as u64)
+}
+
 mod sealed {
     pub trait Sealed {}
 }
@@ -169,6 +175,7 @@ impl PgClient {
     }
 
     pub(crate) async fn set_statement_timeout(&self, ms: u64) -> Result<(), Error> {
+        let ms = watchdog_ms(ms);
         self.0
             .batch_execute(&format!("SET statement_timeout = {ms}"))
             .await
@@ -195,6 +202,7 @@ macro_rules! impl_pg_billing {
     ($pg:ty $(, $inner:tt)?) => {
         impl PgBilling for $pg {
             async fn begin_billing(&self, remaining_ms: u64) -> Result<(), Error> {
+                let remaining_ms = watchdog_ms(remaining_ms);
                 let lock_ms = remaining_ms.min(4_000);
                 let statement_ms = remaining_ms.min(5_000);
                 let idle_ms = remaining_ms.min(5_000);
@@ -242,6 +250,7 @@ impl PgTransaction<'_> {
     }
 
     pub(crate) async fn set_local_statement_timeout(&self, ms: u64) -> Result<(), Error> {
+        let ms = watchdog_ms(ms);
         self.0
             .batch_execute(&format!("SET LOCAL statement_timeout = {ms}"))
             .await
@@ -259,5 +268,18 @@ impl PgTransaction<'_> {
 
     pub(crate) async fn rollback(self) -> Result<(), Error> {
         self.0.rollback().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::watchdog_ms;
+
+    #[test]
+    fn watchdog_stays_enabled_and_within_postgres_range() {
+        let max = i32::MAX as u64;
+        for (requested, bounded) in [(0, 1), (1, 1), (500, 500), (max, max), (u64::MAX, max)] {
+            assert_eq!(watchdog_ms(requested), bounded);
+        }
     }
 }

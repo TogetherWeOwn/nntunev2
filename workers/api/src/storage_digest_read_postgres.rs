@@ -6,9 +6,25 @@ use tokio_postgres::Client;
 use tokio_postgres::NoTls;
 
 const OBJECT: &str = "21000000-0000-4000-8000-000000000012";
+const FIXTURE_DATABASE: &str = "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci";
 
-async fn connect(url: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
+fn fixture_database(
+    actions: Option<&str>,
+    runner: Option<&str>,
+    url: Option<&str>,
+) -> Option<&'static str> {
+    (actions == Some("true") && runner == Some("github-hosted") && url == Some(FIXTURE_DATABASE))
+        .then_some(FIXTURE_DATABASE)
+}
+
+async fn connect() -> Client {
+    let database = fixture_database(
+        std::env::var("GITHUB_ACTIONS").ok().as_deref(),
+        std::env::var("RUNNER_ENVIRONMENT").ok().as_deref(),
+        std::env::var("NNTUNE_TEST_DATABASE_URL").ok().as_deref(),
+    )
+    .expect("disposable GitHub-hosted migration database required");
+    let (client, connection) = tokio_postgres::connect(database, NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
     client
         .batch_execute("SET statement_timeout = '10s'")
@@ -30,15 +46,8 @@ async fn observed_deadline(client: &Client) -> SystemTime {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pins_require_authorization_and_live_committed_protection() {
-    let url = std::env::var("NNTUNE_TEST_DATABASE_URL").expect("disposable database URL");
-    assert!(
-        std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
-            && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
-            && url == "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci",
-        "disposable GitHub-hosted migration database required"
-    );
-    let mut client = connect(&url).await;
-    let observer = connect(&url).await;
+    let mut client = connect().await;
+    let observer = connect().await;
     // The race fixture leaves object 12 readable but detached, with a finite read_until.
     let fixture = observer
         .query_one(
@@ -204,4 +213,20 @@ async fn pins_require_authorization_and_live_committed_protection() {
         "DELETE FROM public.storage_validated_digest_references WHERE object_id = $1::text::uuid AND reference_id = $2::text::uuid",
         &[&OBJECT, &reference_text],
     ).await.unwrap(), 1);
+}
+
+#[test]
+fn fixture_database_requires_exact_hosted_runner_and_target() {
+    let actions = Some("true");
+    let runner = Some("github-hosted");
+    let url = Some(FIXTURE_DATABASE);
+    assert_eq!(fixture_database(actions, runner, url), url);
+    for (actions, runner, url) in [
+        (None, runner, url),
+        (actions, Some("self-hosted"), url),
+        (actions, runner, None),
+        (actions, runner, Some("postgresql://localhost/nntune_ci")),
+    ] {
+        assert_eq!(fixture_database(actions, runner, url), None);
+    }
 }

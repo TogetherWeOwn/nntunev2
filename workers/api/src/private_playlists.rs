@@ -6,6 +6,7 @@ use crate::library::{check_name, clamp_page_size, new_public_id, page_cursor, MA
 use crate::meter_sink::is_uuid_shaped;
 use crate::postgres::{PgConnect, PgQuery};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use tokio_postgres::types::{ToSql, Type};
 
 const LIST: &str = "
@@ -55,7 +56,7 @@ RETURNING jsonb_build_object('id', public_id, 'name', name)::text";
 const APPEND: &str = concat!(
     "
 WITH next AS (
-  SELECT greatest(jsonb_array_length(p.items), (SELECT max(e.position) + 1
+  SELECT greatest(jsonb_array_length(p.items), (SELECT max(e.position)::bigint + 1
     FROM playlist_tracks e WHERE e.playlist_id = p.id)) AS position
   FROM playlists p WHERE p.id = $2
 )
@@ -77,7 +78,7 @@ WITH entries AS (
   SELECT e.id, e.track_id, e.position, row_number() OVER (ORDER BY e.position) AS ordinal
   FROM playlist_tracks e JOIN playlists p ON p.id = e.playlist_id
   WHERE p.id = $2 AND NOT e.is_legacy
-    AND e.position >= jsonb_array_length(p.items) AND e.position < $4
+    AND e.position >= jsonb_array_length(p.items)
 ), moves AS (
   SELECT e.id, e.track_id, e.position, slot.position AS destination
   FROM unnest($3::text[]) WITH ORDINALITY AS requested(id, ordinal)
@@ -85,6 +86,7 @@ WITH entries AS (
   JOIN entries slot ON slot.ordinal = requested.ordinal
 ), valid AS (
   SELECT 1 WHERE cardinality($3) > 0
+    AND NOT EXISTS (SELECT FROM entries WHERE position >= $4)
     AND (SELECT count(*) FROM entries) = cardinality($3)
     AND (SELECT count(DISTINCT id) FROM moves) = cardinality($3)
     AND NOT EXISTS (SELECT FROM moves m WHERE m.position <> m.destination AND NOT EXISTS (",
@@ -157,12 +159,7 @@ fn validate(cmd: Command<'_>) -> Result<(u16, Command<'_>), Response> {
     if cmd.handle().is_some_and(|id| !handle_shape(id)) {
         return Err(not_found());
     }
-    let title = |name: String| {
-        check_name(&name)
-            .ok()
-            .filter(|name| !name.contains('\0'))
-            .ok_or_else(invalid_request)
-    };
+    let title = |name: String| check_name(&name).map_err(|_| invalid_request());
     match cmd {
         Command::List(ref after, _) if after.as_deref().is_some_and(|id| !handle_shape(id)) => {
             Err(invalid_request())
@@ -177,13 +174,18 @@ fn validate(cmd: Command<'_>) -> Result<(u16, Command<'_>), Response> {
         {
             Err(invalid_request())
         }
+        Command::Reorder(_, ref ids) => {
+            let mut unique = BTreeSet::new();
+            if ids.iter().any(|id| !unique.insert(id.to_ascii_lowercase())) {
+                return Err(not_found());
+            }
+            Ok((200, cmd))
+        }
         Command::Create(name) => Ok((201, Command::Create(title(name)?))),
         Command::Rename(id, name) => Ok((200, Command::Rename(id, title(name)?))),
         Command::Append(..) => Ok((201, cmd)),
         Command::Delete(_) => Ok((202, cmd)),
-        Command::List(..) | Command::Read(_) | Command::Reorder(..) | Command::Remove(..) => {
-            Ok((200, cmd))
-        }
+        Command::List(..) | Command::Read(_) | Command::Remove(..) => Ok((200, cmd)),
     }
 }
 
@@ -279,6 +281,10 @@ pub(super) async fn execute(
     } else {
         None
     };
+    // Delete may still return an existing operation after the playlist is gone.
+    if handle.is_some() && target.is_none() && !deleting {
+        return Ok(None);
+    }
     let target = (&target as &(dyn ToSql + Sync), Type::INT8);
     let max_items = MAX_ITEMS as i32;
     let cap = (&max_items as &(dyn ToSql + Sync), Type::INT4);
@@ -311,4 +317,24 @@ pub(super) async fn execute(
     };
     tx.commit().await.map_err(|_| StoreError)?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_duplicate_reorder_ids_before_sql_case_insensitively() {
+        let handle = "plFullyResolved0000000";
+        let entry = "abcdef00-0000-4000-8000-000000000001";
+        let another = "abcdef00-0000-4000-8000-000000000002";
+        let order = |second: String| Command::Reorder(handle, vec![entry.into(), second]);
+        for duplicate in [entry.to_owned(), entry.to_ascii_uppercase()] {
+            assert!(matches!(validate(order(duplicate)), Err(response) if response.status == 404));
+        }
+        assert!(matches!(validate(order(another.into())), Ok((200, _))));
+        assert!(
+            matches!(validate(order("invalid".into())), Err(response) if response.status == 400)
+        );
+    }
 }

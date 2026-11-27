@@ -64,8 +64,25 @@ mod tests {
     #[test]
     fn signal_parser_rejects_unknown_and_case_variants() {
         for text in [
-            "", "unknown", "Love", "LOVE", "Dislike", "DISLIKE", "Hide", "HIDE", "Ban", "BAN",
-            "Snooze", "SNOOZE", " love", "love ", "snooze\n",
+            "",
+            "unknown",
+            "Love",
+            "LOVE",
+            "Dislike",
+            "DISLIKE",
+            "Hide",
+            "HIDE",
+            "Ban",
+            "BAN",
+            "Snooze",
+            "SNOOZE",
+            " love",
+            "love ",
+            "snooze\n",
+            "hide\0",
+            "love\u{200b}",
+            "\u{00a0}ban",
+            "ｓｎｏｏｚｅ",
         ] {
             assert_eq!(TasteSignal::parse(text), None, "{text:?}");
         }

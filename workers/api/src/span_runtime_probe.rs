@@ -1,28 +1,39 @@
 //! Feature-gated real-workerd observations for the Worker span regression.
+
+#[cfg(target_arch = "wasm32")]
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
-use futures_util::future::join_all;
-use serde_json::{json, Value};
-use worker::observability::{active_span, enter_span_async, in_current_span, start_span};
-use worker::{event, Context, Delay, Env, Request, Response, Result};
+#[cfg(target_arch = "wasm32")]
+use {
+    futures_util::future::join_all,
+    serde_json::{json, Value},
+    worker::observability::{active_span, enter_span_async, in_current_span, start_span},
+    worker::{event, Context, Delay, Env, Request, Response},
+};
 
+#[cfg(target_arch = "wasm32")]
 const TASKS: usize = 8;
+#[cfg(target_arch = "wasm32")]
 static ACTIVE_SCENARIOS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(target_arch = "wasm32")]
 struct ActiveScenario;
+#[cfg(target_arch = "wasm32")]
 impl Drop for ActiveScenario {
     fn drop(&mut self) {
         ACTIVE_SCENARIOS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn ident() -> Option<String> {
     active_span().map(|span| span.span_context().span_id)
 }
 
+#[cfg(target_arch = "wasm32")]
 async fn sample(idx: usize) -> Value {
     let before = ident();
     Delay::from(Duration::from_millis(3 + (idx % 3 * 4) as u64)).await;
@@ -31,6 +42,7 @@ async fn sample(idx: usize) -> Value {
     json!({"before": before, "mid": mid, "end": ident()})
 }
 
+#[cfg(target_arch = "wasm32")]
 async fn task(idx: usize, scoped: bool) -> Value {
     let mut observation = if scoped {
         enter_span_async(&format!("span-probe-{idx}"), |_| sample(idx)).await
@@ -41,6 +53,7 @@ async fn task(idx: usize, scoped: bool) -> Value {
     observation
 }
 
+#[cfg(target_arch = "wasm32")]
 async fn scenario(scoped: bool) -> Value {
     ACTIVE_SCENARIOS.fetch_add(1, Ordering::SeqCst);
     let _active = ActiveScenario;
@@ -66,17 +79,67 @@ async fn scenario(scoped: bool) -> Value {
     })
 }
 
-#[event(fetch)]
-pub async fn span_probe(req: Request, _env: Env, _ctx: Context) -> Result<Response> {
-    let url = req.url()?;
-    if url.path() != "/probe" {
-        return Response::error("not found", 404);
+fn probe_mode(method: &str, path: &str, query: Option<&str>) -> Result<bool, (u16, &'static str)> {
+    if path != "/probe" {
+        return Err((404, "not found"));
     }
-    let scoped = match url.query() {
-        Some("mode=scoped") => true,
-        Some("mode=unscoped") => false,
-        _ => return Response::error("bad mode", 400),
+    if method != "GET" {
+        return Err((405, "method not allowed"));
+    }
+    match query {
+        Some("mode=scoped") => Ok(true),
+        Some("mode=unscoped") => Ok(false),
+        _ => Err((400, "bad mode")),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[event(fetch)]
+pub async fn span_probe(req: Request, _env: Env, _ctx: Context) -> worker::Result<Response> {
+    let url = req.url()?;
+    // The SDK's Method conversion treats unknown verbs as GET.
+    let scoped = match probe_mode(&req.inner().method(), url.path(), url.query()) {
+        Ok(scoped) => scoped,
+        Err((status, message)) => {
+            let mut response = Response::error(message, status)?;
+            if status == 405 {
+                response.headers_mut().set("Allow", "GET")?;
+            }
+            return Ok(response);
+        }
     };
     let result = enter_span_async("span-probe-root", |_| scenario(scoped)).await;
     Response::from_json(&result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_mode;
+
+    #[test]
+    fn probe_requires_exact_get_path_and_single_mode() {
+        assert_eq!(probe_mode("GET", "/probe", Some("mode=scoped")), Ok(true));
+        assert_eq!(
+            probe_mode("GET", "/probe", Some("mode=unscoped")),
+            Ok(false)
+        );
+        for method in ["POST", "HEAD", "OPTIONS", "get", "CUSTOM"] {
+            assert!(matches!(
+                probe_mode(method, "/probe", Some("mode=scoped")),
+                Err((405, _))
+            ));
+        }
+        assert!(matches!(
+            probe_mode("GET", "/probe/", Some("mode=scoped")),
+            Err((404, _))
+        ));
+        for query in [
+            None,
+            Some(""),
+            Some("mode=scoped&mode=unscoped"),
+            Some("mode=%73coped"),
+        ] {
+            assert!(matches!(probe_mode("GET", "/probe", query), Err((400, _))));
+        }
+    }
 }

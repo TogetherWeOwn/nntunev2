@@ -63,10 +63,18 @@ pub(crate) trait TrialStorage {
 #[cfg(target_arch = "wasm32")]
 use nntune_ingest::multipart::s3_completion::S3CompletionSender;
 
+#[cfg(any(test, target_arch = "wasm32"))]
+fn valid_storage_identity(configuration: [u8; 16], bucket: &str) -> bool {
+    configuration[6] >> 4 == 4
+        && configuration[8] >> 6 == 2
+        && nntune_core::s3_locator::valid_bucket(bucket)
+}
+
 #[cfg(target_arch = "wasm32")]
 impl TrialStorage for S3CompletionSender {
     fn matches_storage(&self, configuration: [u8; 16], bucket: &str) -> bool {
-        self.matches_storage(configuration, bucket)
+        valid_storage_identity(configuration, bucket)
+            && S3CompletionSender::matches_storage(self, configuration, bucket)
     }
     async fn open_upload<'a>(
         &'a self,
@@ -121,5 +129,26 @@ impl TrialStorage for S3CompletionSender {
         until: SystemTime,
     ) -> Result<VerifiedCompletedReadback<'i, 'r>, EnrolledReadbackError> {
         self.verify_readback(inventory, envelope, until).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_storage_identity;
+
+    #[test]
+    fn sealed_storage_requires_canonical_configuration_and_bucket() {
+        let mut configuration = [1; 16];
+        configuration[6] = 0x40;
+        configuration[8] = 0x80;
+        assert!(valid_storage_identity(configuration, "trial-fixture"));
+        for bucket in ["", "Trial-Fixture", "trial..fixture", "127.0.0.1"] {
+            assert!(!valid_storage_identity(configuration, bucket));
+        }
+        for index in [6, 8] {
+            let mut invalid = configuration;
+            invalid[index] = 0;
+            assert!(!valid_storage_identity(invalid, "trial-fixture"));
+        }
     }
 }
