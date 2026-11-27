@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -864,6 +865,42 @@ class DraftPrivateContractTests(Base):
             suite.append(private.find(f"./testcase[@name='{phase}']"))
         root.set("tests", "3")
         self.assertEqual(self.coverage(root), dict.fromkeys(self.CASES, "incomplete"))
+
+
+class PrivateEvidenceMapTests(unittest.TestCase):
+    def test_offline_map_covers_requested_areas_and_keeps_live_gaps_explicit(self):
+        text = (HERE.parent / "docs/ops/private-staging-evidence-map.md").read_text(encoding="utf-8")
+        table = text.split("## Synthetic map\n", 1)[1].split("## Build identity boundary\n", 1)[0]
+        rows = [line.strip("|").split("|") for line in table.splitlines() if line.startswith("|")]
+        areas = [
+            ("Encrypted upload", ["private-publication"], []),
+            ("Library visibility", ["private-library"], []),
+            ("Playback", ["private-play"], ["seek", "queue"]),
+            ("Access refusals", ["private-anonymous-refusal", "private-unlisted-refusal",
+                                 sa.PRIVATE_CUTOFF_PROOF], []),
+        ]
+        cases = set()
+        proofs = set()
+        for row, (area, track_properties, extra_cases) in zip(rows[2:], areas, strict=True):
+            with self.subTest(area=area):
+                label, properties, mapping, _, _ = row
+                self.assertEqual(label.strip(), area)
+                self.assertEqual(re.findall(r"`([^`]+)`", properties), track_properties)
+                mapped_cases = [sa.PRIVATE_TRACK_PROOFS[proof] for proof in track_properties] + extra_cases
+                self.assertEqual(re.findall(r"`([^`]+)`", mapping), mapped_cases)
+                cases.update(mapped_cases)
+                proofs.update(track_properties)
+        self.assertEqual(proofs, sa.PRIVATE_TRACK_PROOFS.keys())
+        self.assertEqual(cases, sa.PRIVATE_CRITERIA - {"video-off"})
+        for criterion in ("invite-acceptance", "video-off", "paid-signup"):
+            self.assertIn(f"`{criterion}`", table)
+        self.assertIn(f"`{sa.PRIVATE_TRACK_FILE}`", table)
+        for phase in sa.IDENTITY_PHASES:
+            self.assertIn(f"`{phase}`", text)
+        self.assertIn("Ciphertext-at-rest verification requires protected storage evidence.", rows[2][3])
+        self.assertIn("Rank 77c must supply protected proof of encrypted upload", rows[2][4])
+        self.assertIn("synthetic test data only", text)
+        self.assertIn("`jq`", text)
 
 
 class ProduceTests(Base):
