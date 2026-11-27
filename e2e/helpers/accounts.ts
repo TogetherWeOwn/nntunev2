@@ -193,11 +193,11 @@ function locationNote(location: string | undefined): string {
  * untrusted and can carry userinfo/query/fragment secrets, so diagnostics
  * carry only the fixed context, category, status and variable names.
  */
-function throwOnRedirect(status: number, headers: Record<string, string>, context: string): void {
+function throwOnRedirect(status: number, headers: Record<string, string>, url: string, context: string): void {
   if (status < 300 || status >= 400) return;
   const location = headers['location'] ?? headers['Location'];
   const note = locationNote(location);
-  if (location && isAccessRedirect(location)) {
+  if (location && isAccessRedirect(location, url)) {
     throw new Error(
       `[${context}] hit the Cloudflare Access wall (HTTP ${status}, ${note}). ` +
         'Set CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET for a QA service ' +
@@ -252,7 +252,7 @@ export async function apiGet(
       maxRedirects: 0,
     }),
   );
-  throwOnRedirect(res.status(), res.headers(), context);
+  throwOnRedirect(res.status(), res.headers(), url, context);
   return res;
 }
 
@@ -276,7 +276,7 @@ export async function apiPost(
       maxRedirects: 0,
     }),
   );
-  throwOnRedirect(res.status(), res.headers(), context);
+  throwOnRedirect(res.status(), res.headers(), url, context);
   return res;
 }
 
@@ -302,7 +302,7 @@ export async function apiOptions(
       maxRedirects: 0,
     }),
   );
-  throwOnRedirect(res.status(), res.headers(), context);
+  throwOnRedirect(res.status(), res.headers(), url, context);
   return res;
 }
 
@@ -897,6 +897,6 @@ export async function apiDelete(
       maxRedirects: 0,
     }),
   );
-  throwOnRedirect(res.status(), res.headers(), context);
+  throwOnRedirect(res.status(), res.headers(), url, context);
   return res;
 }

@@ -27,12 +27,9 @@ test('unconfigured environment skips with a reason, never fails', () => {
   }
 });
 
-test('unknown track position is an error, not a skip', () => {
-  expect(() => cc0Track(99, unconfiguredEnv())).toThrow(/position 99/);
-});
-
-test('offline boundaries reject external manifests and treat a missing fetcher as failure', () => {
+test('offline boundaries reject unknown tracks, external manifests and missing fetchers', () => {
   const env = unconfiguredEnv();
+  expect(() => cc0Track(99, env)).toThrow(/position 99/);
   expect.soft(() => cc0File('../outside.json', 'track.flac', env)).toThrow(/outside the repository/);
   expect(() => cc0Track(1, { ...env, PATH: env.NNTUNE_FIXTURE_CACHE_DIR })).toThrow(/could not run/);
 });

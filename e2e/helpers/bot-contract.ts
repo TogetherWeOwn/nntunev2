@@ -753,9 +753,7 @@ export function decodeCorpusFile(raw: unknown, name: string): Check<unknown[]> {
   if (raw.version !== BOT_CONTRACT.corpusVersion) {
     return fail(`corpus-error: ${name} version ${String(raw.version)} != checker ${BOT_CONTRACT.corpusVersion}`);
   }
-  if (!Array.isArray(raw.vectors) || raw.vectors.length === 0) {
-    return fail(`corpus-error: ${name} vectors must be a non-empty array`);
-  }
+  if (!Array.isArray(raw.vectors) || !raw.vectors.length) return fail(`corpus-error: ${name} requires vectors`);
   const seen = new Set<string>();
   for (const vec of raw.vectors) {
     if (!isRecord(vec) || typeof vec.id !== 'string' || vec.id.length === 0) {

@@ -108,13 +108,8 @@ function main() {
     process.exit(1);
   }
   const dataFile = files.find((block) => !isPar2File(block));
-  if (!dataFile) {
-    process.stderr.write('no non-PAR2 file block found.\n');
-    process.exit(1);
-  }
-  const segments = dataFile.match(/<segment\b[^>]*>[\s\S]*?<\/segment>/g) ?? [];
-  if (segments.length === 0) {
-    process.stderr.write('chosen file block carries no segments; refusing an empty fixture.\n');
+  if (!dataFile || !/<segment\b[^>]*>[\s\S]*?<\/segment>/.test(dataFile)) {
+    process.stderr.write('no non-PAR2 file block with segments; refusing an empty fixture.\n');
     process.exit(1);
   }
   const doc =

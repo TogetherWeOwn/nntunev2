@@ -40,7 +40,7 @@ export async function assertServingBuildMatchesPromotion(
   // apiGet fetches with maxRedirects: 0 so a staging 302 never carries the
   // Access pair to another origin (see helpers/accounts.ts).
   const res = await apiGet(request, `${baseURL}${API.build}`, accessHeaders(), context);
-  const bodyText = await readApiText(res, context);
+  const bodyText = await res.text().catch(() => '');
   assertNoAccessWall(
     { status: res.status(), headers: res.headers(), bodyText, url: `${baseURL}${API.build}` },
     context,

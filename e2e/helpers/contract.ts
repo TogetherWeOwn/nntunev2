@@ -290,7 +290,7 @@ const SECRET_KEY_RE = /password|passwd|secret|api[_-]?key|private[_-]?key|sessio
 /**
  * Fail when a plan-limit body leaks secrets: any known secret VALUE in the
  * raw text, or any credential-shaped KEY in the parsed JSON. Diagnostics
- * name only the secret's name (or the offending key) — values are never
+ * name only the configured secret or the category. Response values are never
  * interpolated, matching the seam-diagnostics contract in access.ts.
  * Returns null when clean.
  */
@@ -299,28 +299,21 @@ export function secretLeak(
   secrets: NamedSecret[],
   context: string,
 ): string | null {
-  const leaked = (value: string) => secrets.find((secret) => secret.value && value.includes(secret.value));
-  const redacted = (secret: NamedSecret) =>
-    `[${context}] plan-limit body leaks the ${secret.name} (value redacted): refusing to pass with credential material in a limit refusal.`;
-  const rawLeak = leaked(bodyText);
-  if (rawLeak) return redacted(rawLeak);
-  let parsed: unknown;
+  const pending: unknown[] = [];
   try {
-    parsed = JSON.parse(bodyText) as unknown;
+    pending.push(JSON.parse(bodyText));
   } catch {
-    return null;
+    // The raw body is still checked below.
   }
-  const pending = [parsed];
+  pending.push(bodyText);
   while (pending.length) {
     const value = pending.pop();
-    const stringLeak = typeof value === 'string' ? leaked(value) : undefined;
-    if (stringLeak) return redacted(stringLeak);
+    const leak = typeof value === 'string' && secrets.find((secret) => secret.value && value.includes(secret.value));
+    if (leak) return `[${context}] plan-limit body leaks the ${leak.name} (value redacted).`;
     if (typeof value !== 'object' || value === null) continue;
     for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      const decodedLeak = leaked(key);
-      if (decodedLeak) return redacted(decodedLeak);
       if (SECRET_KEY_RE.test(key)) return `[${context}] plan-limit body carries a credential-shaped key (name redacted).`;
-      pending.push(entry);
+      pending.push(key, entry);
     }
   }
   return null;

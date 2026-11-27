@@ -52,9 +52,9 @@ export function qaAuthHeader(): Record<string, string> {
  * offline self-tests without launching a browser.
  */
 export function isStagingOrigin(requestUrl: string, baseURL: string): boolean {
+  if (!/^https?:/i.test(requestUrl)) return false;
   try {
-    const request = new URL(requestUrl);
-    return ['http:', 'https:'].includes(request.protocol) && request.origin === new URL(baseURL).origin;
+    return new URL(requestUrl).origin === new URL(baseURL).origin;
   } catch {
     return false;
   }
@@ -185,11 +185,8 @@ export function stagingBaseUrl(required: 'skip' | 'fail-closed', context: string
     }
     return null;
   }
-  let target: URL;
-  try {
-    if (!/^https:\/\/[^\s/\\@?#]+\/*$/i.test(raw)) throw new Error();
-    target = new URL(raw);
-  } catch {
+  const target = URL.parse(raw);
+  if (!target || !/^https:\/\/[^\s/\\@?#]+\/*$/i.test(raw)) {
     throw new Error(
       `[${context}] STAGING_BASE_URL must be an https:// origin without credentials, path, query or fragment.`,
     );
@@ -244,16 +241,12 @@ export function syntheticNntpEndpoint(): NntpEndpoint & { hasPassword: boolean }
   return { host, port, user, tls: true, hasPassword: Boolean(process.env.SYNTHETIC_NNTP_PASS) };
 }
 
-export function isAccessRedirect(location: string, requestUrl = 'https://placeholder.invalid'): boolean {
+export function isAccessRedirect(location: string, requestUrl: string): boolean {
   if (!location || /[\s\\]/.test(location)) return false;
-  try {
-    const target = new URL(location, requestUrl);
-    return target.protocol === 'https:' &&
-      (target.hostname.endsWith('.cloudflareaccess.com') ||
-        /^\/cdn-cgi\/access(?:\/|$)/.test(target.pathname));
-  } catch {
-    return false;
-  }
+  const target = URL.parse(location, requestUrl);
+  return target?.protocol === 'https:' &&
+    (target.hostname.endsWith('.cloudflareaccess.com') ||
+      /^\/cdn-cgi\/access(?:\/|$)/.test(target.pathname));
 }
 
 export async function readApiText(res: ApiResponseLike, context: string): Promise<string> {

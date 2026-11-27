@@ -288,7 +288,7 @@ def counts(element):
 
 cases, totals, consistent = [], [0, 0, 0, 0], True
 for suite in suites:
-    if suite.tag != "testsuite":
+    if suite.tag != "testsuite" or suite.find(".//testsuite") is not None:
         raise ValueError("invalid JUnit suite")
     actual = [0, 0, 0, 0]
     for case in suite.findall("testcase"):
@@ -304,6 +304,7 @@ for suite in suites:
     totals = [a + b for a, b in zip(totals, declared)]
 if root.tag == "testsuites" and any(field in root.attrib for field in fields):
     consistent = consistent and counts(root) == totals
+consistent = consistent and len(list(root.iter("testcase"))) == len(cases)
 print(json.dumps([totals, cases, consistent]))
 `], { input: xml, encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 * 1024 });
   return parsed.status === 0 ? JSON.parse(parsed.stdout) : null;
@@ -363,7 +364,7 @@ const tokenLine = '- seam token: missing (QA_AUTH_TOKEN unset)';
 // 2. Evidence must exist and parse.
 let xml;
 try {
-  xml = readFileSync(JUNIT_PATH, 'utf8');
+  xml = readFileSync(JUNIT_PATH);
 } catch {
   summaryLines = [
     `- junit evidence: absent (${JUNIT_PATH})`,

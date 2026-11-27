@@ -1267,9 +1267,9 @@ test.describe('redirect location-state diagnostics (value-free)', () => {
       }),
     }) as unknown as APIRequestContext;
 
-  const redirectMessage = async (location?: string): Promise<string> => {
+  const redirectMessage = async (location?: string, path = '/probe'): Promise<string> => {
     try {
-      await apiGet(fakeRedirect(location), 'https://staging.example/probe', {}, 'probe');
+      await apiGet(fakeRedirect(location), `https://staging.example${path}`, {}, 'probe');
     } catch (error) {
       return (error as Error).message;
     }
@@ -1317,6 +1317,7 @@ test.describe('redirect location-state diagnostics (value-free)', () => {
     expect(message).toMatch(/location present/i);
     expect(message).not.toMatch(/malformed/i);
     expect(message).not.toContain('sentinel-rel-query');
+    expect(await redirectMessage('login', '/cdn-cgi/access/probe')).toMatch(/Access wall/);
   });
 });
 
@@ -1999,11 +2000,11 @@ test('offline boundaries reconcile JUnit counts and bind skips to their spec', (
   const skip = '<testcase classname="other-ingest-play-meter.spec.ts" name="ingested track carries recording_mbids"><skipped/></testcase>';
   try {
     for (const [xml, status] of [
-      [wrap(pass, 1), 0],
-      [wrap('', 1), 1],
       [wrap(pass, 2), 1],
       [wrap(pass + '<testcase name="failed"><failure/></testcase>', 2), 1],
       [wrap(pass + skip, 2, 1), 1],
+      [wrap(pass + '<testsuite tests="1" failures="1"><testcase name="nested"><failure/></testcase></testsuite>', 1), 1],
+      [Buffer.from(wrap(pass + '\xff', 1), 'latin1'), 1],
       [wrap(pass.replace('/>', '><system-out><![CDATA[<skipped/>]]></system-out></testcase>'), 1), 0],
       [wrap(pass, 1).replace('</testsuites>', ''), 1],
     ] as const) {
