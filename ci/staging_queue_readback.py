@@ -82,6 +82,27 @@ def has_no_jobs(run, inventory):
     return not jobs
 
 
+def approval_identity(record):
+    require(isinstance(record, dict), "missing approval candidate or staging decision")
+    rid, attempt, sha = (record.get(key) for key in ("run_id", "run_attempt", "head_sha"))
+    require(positive_id(rid) and positive_id(attempt) and isinstance(sha, str) and SHA.fullmatch(sha),
+            "invalid approval identity")
+    return rid, attempt, sha
+
+
+def match_approval(evidence, runs):
+    if "approval_candidate" not in evidence and "approval" not in evidence:
+        return None
+    candidate = approval_identity(evidence.get("approval_candidate"))
+    approval = evidence.get("approval")
+    require(approval_identity(approval) == candidate
+            and approval.get("environment") == "staging" and approval.get("state") == "approved",
+            "staging approval does not match the selected run attempt")
+    rid, attempt, sha = candidate
+    require(runs.get(rid) == (attempt, sha), "approval candidate is absent from the current run inventory")
+    return {"run_id": rid, "run_attempt": attempt, "head_sha": sha}
+
+
 def select(evidence, pinned_runs, pinned_shas):
     require(isinstance(evidence, dict), "missing input object")
     workflow, inventory, jobs = (evidence.get(key) for key in ("workflow", "runs", "jobs"))
@@ -104,7 +125,7 @@ def select(evidence, pinned_runs, pinned_shas):
                     and isinstance(sha, str) and SHA.fullmatch(sha)
                     and isinstance(run.get("event"), str) and isinstance(run.get("head_branch"), str),
                     "duplicate or out-of-scope workflow run")
-            runs[rid] = sha
+            runs[rid] = (run["run_attempt"], sha)
             numbers.add(number)
             head_repo = run.get("head_repository")
             from_main = run_path["ref"] in (None, "main", "refs/heads/main", sha)
@@ -116,20 +137,26 @@ def select(evidence, pinned_runs, pinned_shas):
             else:
                 kept[rid] = "keep_existing_jobs"
 
+    approval = match_approval(evidence, runs)
     # Run numbers increase within the workflow. A rerun keeps its number.
     newest = max(eligible, key=eligible.get, default=None)
     rows = []
-    for rid, sha in sorted(runs.items()):
-        if rid in pinned_runs or sha in pinned_shas:
+    for rid, (_, sha) in sorted(runs.items()):
+        if approval and rid == approval["run_id"]:
+            disposition = "keep_approved"
+        elif rid in pinned_runs or sha in pinned_shas:
             disposition = "keep_pinned"
         elif rid == newest:
             disposition = "keep_newest_eligible"
         else:
             disposition = kept.get(rid, "superseded")
         rows.append({"run_id": rid, "head_sha": sha, "disposition": disposition})
-    return {"status": "complete", "newest_eligible_run_id": newest, "runs": rows,
-            "unlisted_pins": {"run_ids": sorted(pinned_runs.difference(runs)),
-                              "head_shas": sorted(pinned_shas.difference(runs.values()))}}
+    report = {"status": "complete", "newest_eligible_run_id": newest, "runs": rows,
+              "unlisted_pins": {"run_ids": sorted(pinned_runs.difference(runs)),
+                                "head_shas": sorted(pinned_shas.difference(sha for _, sha in runs.values()))}}
+    if approval:
+        report["matched_approval"] = approval
+    return report
 
 
 def main():

@@ -41,3 +41,39 @@ to a different run or attempt, and inputs beyond the supported limits return
 close together. REST pages are a point-in-time observation and can change
 between requests or after the capture. Treat the report as operator evidence
 only. The CLI reads stdin and writes its report to stdout.
+
+### Checking an approval for the selected run
+
+When recovery depends on staging approval, include these two objects in the
+same input alongside the REST pages. This synthetic example names run `1234`,
+attempt `2`.
+
+```json
+{
+  "approval_candidate": {
+    "run_id": 1234,
+    "run_attempt": 2,
+    "head_sha": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "approval": {
+    "run_id": 1234,
+    "run_attempt": 2,
+    "head_sha": "0123456789abcdef0123456789abcdef01234567",
+    "environment": "staging",
+    "state": "approved"
+  }
+}
+```
+
+Take the candidate identity from the selected Actions run. Record the approval
+identity from independently checked staging review evidence for that exact
+attempt. GitHub deployment review history is scoped to the run ID. If the
+decision cannot be attributed to the attempt, omit `approval` and keep the
+preview indeterminate. An operator pin only preserves the named run or SHA.
+
+When both records match the current inventory, `matched_approval` reports the
+run ID, attempt and SHA and the run gets `keep_approved`. If the approval names
+an earlier run with the same SHA or an earlier attempt than the selected one,
+the report is `indeterminate` without any dispositions, even with a pin. The
+CLI compares the supplied records offline. Environment authorization stays
+with GitHub.

@@ -110,6 +110,77 @@ class QueueReadbackTests(unittest.TestCase):
                                  "keep_newest_eligible" if expected else "keep_outside_selection")
         self.assert_indeterminate(snapshot(run(1), run(1, status="queued", run_attempt=2), jobs={1: []}))
 
+    def test_approval_protects_only_the_exact_run_attempt(self):
+        sha = "a" * 40
+        candidate = {"run_id": 2, "run_attempt": 1, "head_sha": sha}
+        approval = candidate | {"environment": "staging", "state": "approved"}
+        older = run(1, head_sha=sha)
+        current, successor = run(2, head_sha=sha, status="queued"), run(3)
+        gate = job(2, name="gate", head_sha=sha)
+        evidence = snapshot(older, current, successor, jobs={1: [], 2: [gate], 3: []})
+        code, report = self.invoke(evidence)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["runs"][1]["disposition"], "keep_existing_jobs")
+
+        evidence["approval_candidate"] = candidate
+
+        code, report = self.invoke(evidence | {"approval": approval})
+        self.assertEqual(code, 0)
+        self.assertEqual(report.get("matched_approval"), candidate)
+        self.assertEqual(report["newest_eligible_run_id"], 3)
+        self.assertEqual([row["disposition"] for row in report["runs"]],
+                         ["superseded", "keep_approved", "keep_newest_eligible"])
+
+        # A selected run with no job record would otherwise be superseded by
+        # the newer eligible push. Approval must protect that exact run.
+        selected, newer = run(4, head_sha=sha), run(5)
+        selected_candidate = {"run_id": 4, "run_attempt": 1, "head_sha": sha}
+        selected_evidence = snapshot(selected, newer, jobs={4: [], 5: []})
+        selected_evidence["approval_candidate"] = selected_candidate
+        code, report = self.invoke(selected_evidence | {"approval": selected_candidate | {
+            "environment": "staging", "state": "approved"}})
+        self.assertEqual(code, 0)
+        self.assertEqual(report["runs"], [
+            {"run_id": 4, "head_sha": sha, "disposition": "keep_approved"},
+            {"run_id": 5, "head_sha": newer["head_sha"], "disposition": "keep_newest_eligible"},
+        ])
+
+        # The earlier approved run has finished and is absent from the active pages.
+        earlier_approval = approval | {"run_id": older["id"]}
+        after_completion = snapshot(current, successor, jobs={2: [gate], 3: []})
+        self.assert_indeterminate(after_completion | {"approval_candidate": candidate,
+                                                       "approval": earlier_approval}, "--pin-sha", sha)
+
+        for stale in (approval | {"head_sha": "b" * 40}, approval | {"run_attempt": True}):
+            with self.subTest(approval=stale):
+                self.assert_indeterminate(evidence | {"approval": stale}, "--pin-sha", sha)
+
+        retry = snapshot(older, current | {"run_attempt": 2, "status": "waiting"}, successor,
+                         jobs={1: [], 3: []})
+        retry["approval_candidate"] = candidate | {"run_attempt": 2}
+        self.assert_indeterminate(retry | {"approval": approval}, "--pin-run", "2")
+        code, report = self.invoke(retry | {"approval": approval | {"run_attempt": 2}})
+        self.assertEqual(code, 0)
+        self.assertEqual(report.get("matched_approval"), retry["approval_candidate"])
+        self.assertEqual(report["runs"][1]["disposition"], "keep_approved")
+
+    def test_approval_requires_a_current_candidate_and_explicit_staging_decision(self):
+        current = run(2, run_attempt=2, status="waiting")
+        candidate = {"run_id": 2, "run_attempt": 2, "head_sha": current["head_sha"]}
+        approval = candidate | {"environment": "staging", "state": "approved"}
+        evidence = snapshot(current)
+        for fields in ({"approval_candidate": candidate}, {"approval": approval},
+                       {"approval_candidate": candidate, "approval": approval | {"state": "rejected"}},
+                       {"approval_candidate": candidate, "approval": approval | {"environment": "production"}}):
+            with self.subTest(fields=fields):
+                self.assert_indeterminate(evidence | fields)
+
+        for stale in (candidate | {"run_attempt": 1}, candidate | {"run_id": 1},
+                      candidate | {"head_sha": "b" * 40}):
+            with self.subTest(candidate=stale):
+                self.assert_indeterminate(evidence | {"approval_candidate": stale,
+                                                      "approval": approval | stale})
+
     def test_complete_run_and_job_pages_are_required(self):
         # Only the last row of the second jobs page has a started job.
         job_rows = [job(1, jid) for jid in range(1, 101)] + [job(1, 101, status="in_progress")]
