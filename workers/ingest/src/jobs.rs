@@ -420,7 +420,7 @@ mod tests {
         };
 
         let mut cp = checkpoint_at(JobState::Matching);
-        let manifest = |sha| {
+        let manifest = |sha: &str| {
             AcceptedAudioManifest::from_entries(
                 &cp.job_id,
                 &cp.user_id,
