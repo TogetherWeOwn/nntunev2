@@ -165,6 +165,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unfinished_fields_even_without_a_buffered_byte() {
+        let mut bits = BitInput::default();
+        let mut input = [0xa0].as_slice();
+        assert_eq!(bits.read(&mut input, 3), Ok(Some(5)));
+        assert_eq!(bits.read(&mut input, 8), Ok(None));
+        assert!(FrameCrc::default().into_footer(&mut bits).is_err());
+        let mut rest = [0x20].as_slice();
+        let mut count = 0;
+        assert_eq!(bits.read(&mut rest, 5), Err(()));
+        assert_eq!(bits.unary(&mut rest, &mut count, 31), Err(()));
+        assert_eq!(rest, [0x20]);
+        assert_eq!(bits.read(&mut rest, 8), Ok(Some(1)));
+        assert_eq!(bits.unary(&mut rest, &mut count, 31), Ok(false));
+        assert_eq!(count, 5);
+        assert!(FrameCrc::default().into_footer(&mut bits).is_err());
+        assert_eq!(bits.read(&mut [0x80].as_slice(), 1), Err(()));
+        assert_eq!(bits.unary(&mut [0x80].as_slice(), &mut count, 31), Ok(true));
+        assert!(FrameCrc::default().into_footer(&mut bits).is_ok());
+    }
+
+    #[test]
     fn rejects_wrong_and_truncated_crc() {
         let body = padded_frame_body();
         let [high, low] = PADDED_CRC;

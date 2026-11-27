@@ -31,8 +31,7 @@ pub(crate) struct SubframeSamples {
     order: usize,
     warmup: [i64; 32],
     coefficients: [i16; 32],
-    predictor: Option<Predictor>,
-    residuals: ResidualReader,
+    predictive: Option<(Predictor, ResidualReader)>,
 }
 
 impl SubframeSamples {
@@ -50,8 +49,12 @@ impl SubframeSamples {
             return Err(());
         }
         restore_wasted(0, header.sample_bits, header.wasted)?;
-        let predictor = if matches!(state, State::Predict) {
-            Some(Predictor::fixed(0, &[], header.sample_bits)?)
+        let predictive = if matches!(state, State::Predict) {
+            Some(with_residuals(
+                Predictor::fixed(0, &[], header.sample_bits)?,
+                block_size,
+                order,
+            ))
         } else {
             None
         };
@@ -63,8 +66,7 @@ impl SubframeSamples {
             order: usize::from(order),
             warmup: [0; 32],
             coefficients: [0; 32],
-            predictor,
-            residuals: ResidualReader::new(block_size, order),
+            predictive,
         })
     }
 
@@ -106,11 +108,10 @@ impl SubframeSamples {
                     if index + 1 == self.order {
                         self.state = match self.header.kind {
                             SubframeKind::Fixed(order) => {
-                                self.predictor = Some(Predictor::fixed(
-                                    order,
-                                    &self.warmup[..self.order],
-                                    width,
-                                )?);
+                                let predictor =
+                                    Predictor::fixed(order, &self.warmup[..self.order], width)?;
+                                self.predictive =
+                                    Some(with_residuals(predictor, self.block_size, order));
                                 State::Predict
                             }
                             _ => State::LpcSetup,
@@ -138,12 +139,14 @@ impl SubframeSamples {
                 } => {
                     self.coefficients[next] = signed(field!(precision), precision) as i16;
                     self.state = if next + 1 == self.order {
-                        self.predictor = Some(Predictor::lpc(
+                        let predictor = Predictor::lpc(
                             &self.coefficients[..self.order],
                             shift,
                             &self.warmup[..self.order],
                             width,
-                        )?);
+                        )?;
+                        self.predictive =
+                            Some(with_residuals(predictor, self.block_size, self.order as u8));
                         State::Predict
                     } else {
                         State::Coefficients {
@@ -153,13 +156,14 @@ impl SubframeSamples {
                         }
                     };
                 }
-                State::Predict => match self.residuals.read(bits, input)? {
-                    Residual::Sample(value) => {
-                        break self.predictor.as_mut().ok_or(())?.restore(value)?
+                State::Predict => {
+                    let (predictor, residuals) = self.predictive.as_mut().ok_or(())?;
+                    match residuals.read(bits, input)? {
+                        Residual::Sample(value) => break predictor.restore(value)?,
+                        Residual::NeedInput => return Ok(Samples::NeedInput),
+                        Residual::End => return Err(()),
                     }
-                    Residual::NeedInput => return Ok(Samples::NeedInput),
-                    Residual::End => return Err(()),
-                },
+                }
                 State::Rejected => return Err(()),
             }
         };
@@ -167,6 +171,11 @@ impl SubframeSamples {
         self.emitted += 1;
         Ok(Samples::Sample(sample))
     }
+}
+
+fn with_residuals(predictor: Predictor, block_size: u16, order: u8) -> (Predictor, ResidualReader) {
+    let residuals = ResidualReader::new(block_size, order, predictor.max_folded_residual());
+    (predictor, residuals)
 }
 
 fn signed(word: u64, width: u8) -> i64 {
