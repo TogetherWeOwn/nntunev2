@@ -882,11 +882,14 @@ mod tests {
         // A single claim that overflows u64 is over any sane cap, not a parse
         // error to quibble over.
         let doc = "<?xml?><nzb><segment bytes=\"99999999999999999999999\">x@y</segment></nzb>";
+        let combined = "<nzb><segment bytes='18446744073709551615'/><segment bytes='1'/></nzb>";
         let limits = IntakeLimits {
             max_declared_bytes: u64::MAX,
             ..DEFAULT_LIMITS
         };
-        match estimate_nzb_with_limits(doc, &limits).unwrap_err() {
+        let overflow = estimate_nzb_with_limits(doc, &limits);
+        assert_eq!(estimate_nzb_with_limits(combined, &limits), overflow);
+        match overflow.unwrap_err() {
             IntakeRejection::DeclaredBytesOverCap { declared, max } => {
                 assert_eq!((declared, max), (u64::MAX, u64::MAX));
             }

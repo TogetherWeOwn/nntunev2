@@ -100,10 +100,8 @@ fn overflow_preserves_spent_buckets_until_refill() {
 
 #[test]
 fn caps_ip_and_account_keys_independently() {
-    let cfg = SearchRateLimitConfig {
-        max_attempts: CAP as u32 + 1,
-        ..one_shot_cfg()
-    };
+    let mut cfg = one_shot_cfg();
+    cfg.max_attempts = CAP as u32 + 1;
     for distinct_ips in [true, false] {
         let mut store = SearchThrottleStore::new();
         let key = |i: usize| {
