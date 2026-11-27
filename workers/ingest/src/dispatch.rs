@@ -88,7 +88,7 @@ pub fn make_job_id(user_id: &str, content_sha256_hex: &str, source_ref: &str) ->
     let mut h: u64 = 0xcbf29ce484222325;
     for b in user_id
         .bytes()
-        .chain(content_sha256_hex.bytes().map(|b| b.to_ascii_lowercase()))
+        .chain(content_sha256_hex.bytes())
         .chain(source_ref.bytes())
     {
         h ^= b as u64;

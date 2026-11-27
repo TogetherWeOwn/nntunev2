@@ -2086,7 +2086,6 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
         }
     };
     if validate_queue_msg(&msg).is_err() {
-        // Native retries move an invalid envelope to the dead-letter queue.
         retry_raw(&raw, UNPERSISTED_RETRY_SECS);
         return;
     }

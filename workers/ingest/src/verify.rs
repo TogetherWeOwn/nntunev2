@@ -563,7 +563,7 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
         ));
     }
     if !scratch_progress_matches(job_id, files, progress) {
-        return Err(VerifyError::Permanent("invalid scratch progress".into()));
+        *progress = VerifyProgress::new(progress.round);
     }
     let round = progress.round;
     let mut spend = Spend {

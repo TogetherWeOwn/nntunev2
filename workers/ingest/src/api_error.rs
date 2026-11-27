@@ -5,7 +5,8 @@
 //! the registry HTTP status. Validation messages are user-facing by
 //! construction; 5xx messages never carry binding or upstream detail.
 
-use serde::{ser::SerializeStruct, Serialize, Serializer};
+use serde::{Serialize, Serializer};
+use std::ops::Deref;
 
 use crate::nzb_intake::IntakeRejection;
 
@@ -99,30 +100,27 @@ fn message_for_server_error(code: &str) -> &'static str {
 /// status, the serialized body is exactly `{code, message, retryable}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
-    pub code: &'static str,
+    spec: CodeSpec,
     pub message: String,
-    pub retryable: bool,
-    pub status: u16,
+}
+
+impl Deref for ApiError {
+    type Target = CodeSpec;
+
+    fn deref(&self) -> &CodeSpec {
+        &self.spec
+    }
 }
 
 impl Serialize for ApiError {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let declared = spec(self.code);
-        let spec = if declared.status == self.status {
-            declared
-        } else {
-            FALLBACK
-        };
-        let message = if spec.status >= 500 {
-            message_for_server_error(spec.code)
+        let message = if self.status >= 500 {
+            message_for_server_error(self.code)
         } else {
             &self.message
         };
-        let mut body = serializer.serialize_struct("ApiError", 3)?;
-        body.serialize_field("code", spec.code)?;
-        body.serialize_field("message", message)?;
-        body.serialize_field("retryable", &spec.retryable)?;
-        body.end()
+        serde_json::json!({"code": self.code, "message": message, "retryable": self.retryable})
+            .serialize(serializer)
     }
 }
 
@@ -137,12 +135,7 @@ impl ApiError {
         } else {
             message.into()
         };
-        Self {
-            code: spec.code,
-            message,
-            retryable: spec.retryable,
-            status: spec.status,
-        }
+        Self { spec, message }
     }
 
     pub fn unauthorized(message: impl Into<String>) -> Self {

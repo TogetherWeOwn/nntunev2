@@ -91,10 +91,8 @@ pub struct QueueMsg {
 impl QueueMsg {
     /// Check bytes read from the content-addressed upload store.
     pub(crate) fn matches_upload_payload(&self, payload: &[u8]) -> bool {
-        self.payload_ref
-            .as_deref()
-            .and_then(|key| key.strip_prefix(PAYLOAD_KEY_PREFIX))
-            .is_some_and(|digest| content_sha256_hex(payload) == digest)
+        let digest = content_sha256_hex(payload);
+        self.payload_ref.as_deref() == Some(&format!("{PAYLOAD_KEY_PREFIX}{digest}"))
     }
 }
 

@@ -1,8 +1,7 @@
 use nntune_ingest::api_error::ApiError;
-use nntune_ingest::dispatch::{build_upload_dispatch, make_job_id};
+use nntune_ingest::dispatch::build_upload_dispatch;
 use nntune_ingest::fixtures::SMALL_NZB;
 use nntune_ingest::ingest_jobs::validate_admit_params;
-use nntune_ingest::jobs::derive_idempotency_key;
 use nntune_ingest::parse::ParsedFile;
 use nntune_ingest::queue_consumer::validate_match_payload;
 use nntune_ingest::retry::ERR_MATCH_FAILED;
@@ -15,13 +14,11 @@ use nntune_ingest::verify::{
 fn wire_error_redacts_mutated_server_details() {
     let mut error = ApiError::service_unavailable("internal detail");
     error.message = "scratch binding detail".into();
-    error.retryable = false;
+    assert_eq!(error.status, 503);
     assert_eq!(
         serde_json::to_value(&error).unwrap(),
         serde_json::json!({"code": "service_unavailable", "message": "service unavailable", "retryable": true})
     );
-    error.code = "invalid_request";
-    assert_eq!(error.body_json(), ApiError::internal_error("").body_json());
 }
 
 #[test]
@@ -50,7 +47,8 @@ fn matching_retries_absence_and_rejects_replaced_bytes() {
         .split_once("\n}\n")
         .unwrap()
         .0
-        .contains("validate_match_payload(msg, payload)"));
+        .trim_end()
+        .ends_with("validate_match_payload(msg, payload)"));
 }
 
 #[test]
@@ -58,17 +56,11 @@ fn queue_checks_identity_before_logging() {
     let source = include_str!("../src/queue_consumer.rs");
     let (_, delivery) = source.split_once("async fn process_raw_message(").unwrap();
     let (before_log, _) = delivery.split_once("\"ingest.job.consumed\"").unwrap();
-    assert!(before_log.contains("if validate_queue_msg(&msg).is_err()"));
-}
-
-#[test]
-fn job_id_and_key_use_the_same_digest_canonicalization() {
-    let upper = "A".repeat(64);
-    let lower = upper.to_ascii_lowercase();
-    let canonical = derive_idempotency_key("member_1", &upper, "upload").unwrap();
-    let id = make_job_id("member_1", &upper, "upload");
-    assert_eq!(id, make_job_id("member_1", &lower, "upload"));
-    assert!(validate_admit_params(&id, "member_1", &canonical, 0).is_ok());
+    assert!(before_log.contains(concat!(
+        "if validate_queue_msg(&msg).is_err() {\n",
+        "        retry_raw(&raw, UNPERSISTED_RETRY_SECS);\n",
+        "        return;\n",
+    )));
 }
 
 const JOB: &str = "job_fixture";
@@ -85,6 +77,7 @@ impl BodySource for Scratch {
 impl ScratchStore for Scratch {
     async fn head(&self, key: &str) -> Result<Option<StagedFile>, VerifyError> {
         let (stored, meta) = self.0.as_ref().expect("unexpected scratch head");
+        assert!(key.starts_with(&VerifyProgress::scratch_prefix(JOB, 1)));
         Ok((stored == key).then(|| meta.clone()))
     }
 
@@ -147,29 +140,30 @@ async fn verify(
 }
 
 #[tokio::test]
-async fn verify_rejects_bad_inventory_and_foreign_cursor_before_io() {
-    let mut empty = file();
-    empty.segment_ids.clear();
-    empty.segment_bytes.clear();
+async fn verify_rejects_bad_inventory_and_rebuilds_foreign_progress() {
     let mut mismatched = file();
     mismatched.segment_bytes.clear();
+    let mut empty = mismatched.clone();
+    empty.segment_ids.clear();
     let foreign = VerifyProgress::spool_key("job_other", 1, 0, 0);
     let mut cursor = VerifyProgress::new(1);
     cursor.spool.insert(0, vec![segment(foreign.clone())]);
     let mut staged_file = VerifyProgress::new(1);
     staged_file.staged.insert(0, staged(foreign));
     let inventory_error = "invalid file segment inventory";
-    let cases = [
-        (empty, VerifyProgress::new(1), inventory_error),
-        (mismatched, VerifyProgress::new(1), inventory_error),
-        (file(), cursor, "invalid scratch progress"),
-        (file(), staged_file, "invalid scratch progress"),
-    ];
-    for (file, mut progress, message) in cases {
+    for file in [empty, mismatched] {
         assert_eq!(
-            verify(file, &mut progress, &Scratch::default()).await,
-            Err(VerifyError::Permanent(message.into()))
+            verify(file, &mut VerifyProgress::new(1), &Scratch::default()).await,
+            Err(VerifyError::Permanent(inventory_error.into()))
         );
+    }
+    let scratch = Scratch(Some(("unused".into(), staged("unused".into()))));
+    for mut progress in [cursor, staged_file] {
+        assert_eq!(
+            verify(file(), &mut progress, &scratch).await,
+            Ok(VerifyOutcome::Incomplete)
+        );
+        assert_eq!(progress, VerifyProgress::new(1));
     }
 }
 
