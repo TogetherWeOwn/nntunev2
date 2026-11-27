@@ -54,7 +54,14 @@ export function readMiniPlayerHint(): MiniPlayerHint | null {
 
 /** Record a selection; replaces any previous hint. */
 export function setMiniPlayerHint(hint: MiniPlayerHint): void {
-	current = hint;
+	const { trackId, title, artist } = hint ?? {};
+	if (typeof trackId !== 'string' || trackId.length > 1024 || !trackId.trim() ||
+		typeof title !== 'string' || title.length > 4096 ||
+		(artist !== null && (typeof artist !== 'string' || artist.length > 4096))) {
+		clearMiniPlayerHint();
+		return;
+	}
+	current = Object.freeze({ trackId, title, artist });
 	emit();
 }
 

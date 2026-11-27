@@ -150,16 +150,20 @@ export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Pr
 	if (revocation && (!revocation.generation || pending)) throw stale;
 	// Snapshot local sign-out before queuing, including an absent generation.
 	const original = stale && !revocation ? generation() : undefined;
-	localEpoch++;
+	const epoch = ++localEpoch;
 	pending++;
 	let dispatched = false;
+	const assertIntent = () => {
+		if (stale && (epoch !== localEpoch || (original !== undefined && original !== generation()))) throw stale;
+	};
 	const send = async (locked: boolean, clear?: ClearMarker) => {
-		if (locked && original !== undefined && original !== generation()) throw stale;
 		try {
 			signal.throwIfAborted();
+			assertIntent();
 			if (!invalidateGeneration() && locked) {
 				if (revocation) throw stale;
 				clear = await markBeforeDispatch(signal);
+				assertIntent();
 			}
 			signal.throwIfAborted();
 			dispatched = true;

@@ -23,6 +23,8 @@ export interface Toast {
 
 /** How long a toast stays up before it dismisses itself. */
 export const TOAST_DURATION_MS = 8000;
+const MAX_ACTIVE_TOASTS = 8;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 type ToastListener = (toasts: readonly Toast[]) => void;
 
@@ -92,9 +94,11 @@ export function pushToast(
 	message: string,
 	options: { action?: ToastAction; durationMs?: number } = {}
 ): () => void {
-	const durationMs = options.durationMs ?? TOAST_DURATION_MS;
+	const requested = options.durationMs ?? TOAST_DURATION_MS;
+	const durationMs = Number.isFinite(requested) && requested <= MAX_TIMER_DELAY_MS ? requested : TOAST_DURATION_MS;
 	const toast: Toast = { id: nextId++, message, ...(options.action ? { action: options.action } : {}) };
-	active = [...active, toast];
+	if (active.length === MAX_ACTIVE_TOASTS) clearTimer(active.shift()!.id);
+	active.push(toast);
 	if (durationMs > 0) scheduleDismiss(toast.id, durationMs);
 	emit();
 	return () => dismissToast(toast.id);

@@ -37,7 +37,7 @@ export function readRightPanel(): Snippet | null {
 
 /** Publish panel content, or null to close the slot. */
 export function setRightPanel(panel: Snippet | null): void {
-	current = panel;
+	current = typeof panel === 'function' ? panel : null;
 	for (const listener of listeners) {
 		try {
 			listener(current);

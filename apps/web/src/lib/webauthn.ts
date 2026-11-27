@@ -33,13 +33,13 @@ export interface AuthenticationOptionsJSON {
 	extensions?: AuthenticationExtensionsClientInputs;
 }
 
-/** Decode a base64url string to raw bytes. */
+/** Decode canonical, unpadded base64url to raw bytes. */
 export function decodeBase64Url(value: string): Uint8Array<ArrayBuffer> {
+	if (typeof value !== 'string' || /[^A-Za-z0-9_-]/.test(value)) throw new TypeError('Invalid base64url');
 	const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
-	const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
-	const binary = atob(padded);
-	const bytes = new Uint8Array(binary.length);
-	for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+	const binary = atob(base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '='));
+	const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+	if (encodeBase64Url(bytes) !== value) throw new TypeError('Invalid base64url');
 	return bytes;
 }
 
@@ -100,9 +100,9 @@ export function toCreationOptions(
 	const { challenge, user, excludeCredentials, authenticatorSelection, ...rest } = options;
 	return {
 		...rest,
-		challenge: decodeBase64Url(challenge),
-		user: { ...user, id: decodeBase64Url(user.id) },
-		excludeCredentials: excludeCredentials?.map(toCredentialDescriptor),
+		challenge: decodeChallenge(challenge),
+		user: { ...user, id: decodeField(user.id, 64) },
+		excludeCredentials: toCredentialList(excludeCredentials),
 		authenticatorSelection: {
 			...authenticatorSelection,
 			residentKey: 'required',
@@ -123,20 +123,23 @@ export function toRequestOptions(
 	const { challenge, allowCredentials, ...rest } = options;
 	return {
 		...rest,
-		challenge: decodeBase64Url(challenge),
+		challenge: decodeChallenge(challenge),
 		userVerification: 'required',
 		...(allowCredentials === undefined
 			? {}
-			: { allowCredentials: allowCredentials.map(toCredentialDescriptor) })
+			: { allowCredentials: toCredentialList(allowCredentials) })
 	};
 }
 
 function toCredentialDescriptor(
 	descriptor: CredentialDescriptorJSON
 ): PublicKeyCredentialDescriptor {
+	if (descriptor.type !== undefined && descriptor.type !== 'public-key') {
+		throw new TypeError('Invalid WebAuthn credential type');
+	}
 	return {
-		id: decodeBase64Url(descriptor.id),
-		type: descriptor.type ?? 'public-key',
+		id: decodeField(descriptor.id, MAX_CREDENTIAL_ID),
+		type: 'public-key',
 		transports: descriptor.transports
 	};
 }
@@ -145,31 +148,66 @@ function toCredentialDescriptor(
 export function serializePublicKeyCredential(
 	credential: PublicKeyCredential
 ): Record<string, unknown> {
+	if (credential.type !== 'public-key' || typeof credential.id !== 'string' ||
+		!credential.id.length || credential.id.length > Math.ceil(MAX_CREDENTIAL_ID * 4 / 3) ||
+		/[^A-Za-z0-9_-]/.test(credential.id)) throw new TypeError('Invalid public-key credential');
+	const rawId = encodeField(credential.rawId, MAX_CREDENTIAL_ID);
 	const response = credential.response;
 	const serializedResponse: Record<string, unknown> = {
-		clientDataJSON: encodeBase64Url(response.clientDataJSON)
+		clientDataJSON: encodeField(response.clientDataJSON, MAX_RESPONSE_BYTES)
 	};
 
 	if ('attestationObject' in response) {
 		const attestation = response as AuthenticatorAttestationResponse;
-		serializedResponse.attestationObject = encodeBase64Url(attestation.attestationObject);
+		serializedResponse.attestationObject = encodeField(attestation.attestationObject, MAX_RESPONSE_BYTES);
 		if (typeof attestation.getTransports === 'function') {
 			serializedResponse.transports = attestation.getTransports();
 		}
 	} else {
 		const assertion = response as AuthenticatorAssertionResponse;
-		serializedResponse.authenticatorData = encodeBase64Url(assertion.authenticatorData);
-		serializedResponse.signature = encodeBase64Url(assertion.signature);
+		serializedResponse.authenticatorData = encodeField(assertion.authenticatorData, MAX_RESPONSE_BYTES);
+		serializedResponse.signature = encodeField(assertion.signature, 1024);
 		serializedResponse.userHandle =
-			assertion.userHandle === null ? null : encodeBase64Url(assertion.userHandle);
+			assertion.userHandle === null ? null : encodeField(assertion.userHandle, 64);
 	}
 
 	return {
 		id: credential.id,
-		rawId: encodeBase64Url(credential.rawId),
+		rawId,
 		type: credential.type,
 		authenticatorAttachment: credential.authenticatorAttachment,
 		response: serializedResponse,
 		clientExtensionResults: credential.getClientExtensionResults()
 	};
+}
+
+const MAX_CREDENTIAL_ID = 1024;
+const MAX_RESPONSE_BYTES = 16 * 1024;
+
+function toCredentialList(descriptors: CredentialDescriptorJSON[] | undefined) {
+	if (descriptors === undefined) return;
+	if (!Array.isArray(descriptors) || descriptors.length > 64) throw new TypeError('Invalid WebAuthn credential list');
+	return Array.from(descriptors, toCredentialDescriptor);
+}
+
+function decodeField(value: string, maxBytes: number): Uint8Array<ArrayBuffer> {
+	if (typeof value !== 'string' || !value.length || value.length > Math.ceil(maxBytes * 4 / 3)) {
+		throw new TypeError('Invalid WebAuthn field length');
+	}
+	return decodeBase64Url(value);
+}
+
+function decodeChallenge(value: string): Uint8Array<ArrayBuffer> {
+	// Accept correctly padded challenges at this boundary for existing callers.
+	if (typeof value === 'string' && value.length <= 44 && value.length % 4 === 0) {
+		value = value.replace(/={1,2}$/, '');
+	}
+	return decodeField(value, 32);
+}
+
+function encodeField(value: ArrayBuffer, maxBytes: number): string {
+	if (!(value instanceof ArrayBuffer) || !value.byteLength || value.byteLength > maxBytes) {
+		throw new TypeError('Invalid WebAuthn response buffer');
+	}
+	return encodeBase64Url(value);
 }

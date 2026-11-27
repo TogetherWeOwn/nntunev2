@@ -19,7 +19,7 @@ function object(value: unknown): value is Record<string, unknown> {
 }
 
 function text(value: unknown): value is string {
-	return typeof value === 'string' && value.trim().length > 0;
+	return typeof value === 'string' && value.length <= 4096 && value.trim().length > 0;
 }
 
 function httpsUrl(value: unknown): boolean {
@@ -47,7 +47,7 @@ function httpsUrl(value: unknown): boolean {
 }
 
 function textArray(value: unknown): boolean {
-	if (!Array.isArray(value) || value.length === 0) return false;
+	if (!Array.isArray(value) || value.length === 0 || value.length > 32) return false;
 	for (let i = 0; i < value.length; i += 1) {
 		if (!text(value[i])) return false;
 	}
@@ -62,6 +62,7 @@ export function validateAttributionInventory(value: unknown): string[] {
 	if (!Array.isArray(value.entries) || value.entries.length === 0) {
 		return [...errors, 'entries must be a non-empty array'];
 	}
+	if (value.entries.length > 128) return [...errors, 'entries must contain at most 128 records'];
 	const ids = new Set<string>();
 	const packages = new Set<string>();
 	// Indexed loop (not forEach) so sparse holes are diagnosed instead of

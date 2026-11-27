@@ -57,6 +57,7 @@ export function startTrackDrag(event: DragEvent, ids: readonly string[], queue: 
 }
 
 export function activeTrackDrag(event: DragEvent): TrackDrag | null {
+	if (!Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) return null;
 	return session && event.dataTransfer?.types.includes(TRACK_TYPE) ? session : null;
 }
 

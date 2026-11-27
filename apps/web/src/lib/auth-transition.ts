@@ -19,7 +19,7 @@
 
 export type LocalAuthTransitionListener = () => void;
 
-const listeners = new Set<LocalAuthTransitionListener>();
+const listeners = new Map<LocalAuthTransitionListener, symbol>();
 
 /**
  * Subscribe to same-window auth transitions. Returns an idempotent
@@ -28,17 +28,19 @@ const listeners = new Set<LocalAuthTransitionListener>();
 export function subscribeLocalAuthTransition(
 	listener: LocalAuthTransitionListener
 ): () => void {
+	let subscription: symbol | undefined;
 	try {
-		listeners.add(listener);
+		subscription = listeners.get(listener) ?? Symbol();
+		listeners.set(listener, subscription);
 	} catch {
-		// Subscription must never throw, even on a hostile Set.
+		// Subscription must never throw.
 	}
 	let unsubscribed = false;
 	return () => {
 		if (unsubscribed) return;
 		unsubscribed = true;
 		try {
-			listeners.delete(listener);
+			if (listeners.get(listener) === subscription) listeners.delete(listener);
 		} catch {
 			// Unsubscribe must never throw either.
 		}
@@ -50,15 +52,15 @@ export function subscribeLocalAuthTransition(
  * A no-op without subscribers; never throws.
  */
 export function notifyLocalAuthTransition(): void {
-	let snapshot: LocalAuthTransitionListener[];
+	let snapshot: Array<[LocalAuthTransitionListener, symbol]>;
 	try {
 		snapshot = [...listeners];
 	} catch {
 		return;
 	}
-	for (const listener of snapshot) {
+	for (const [listener, subscription] of snapshot) {
 		try {
-			listener();
+			if (listeners.get(listener) === subscription) listener();
 		} catch {
 			// One failing listener must never suppress the other local resets.
 		}
