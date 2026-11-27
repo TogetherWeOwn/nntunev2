@@ -698,7 +698,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				? 'Could not start the next track. Choose a track to continue.' : undefined;
 			// Keep the ended track selected until the successor has a grant.
 			const handoff = () => preparePlay(track.id, () => audio.ended && evidence.isCurrent() && ownsOrigin(),
-				(grant) => playSelected(result.queue, index, grant, '', grant), { failureMessage });
+				(grant) => playSelected(result.queue, index, grant, '', grant), { failureMessage, retireSuperseded: true });
 			// Arm before the first grant settles so a reconnect during a stalled request is retained.
 			const armed = playIntent;
 			let onlineSeen = false, retryStarted = false, listenerArmed = false;
@@ -708,9 +708,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				if (!listeners || retryStarted || listenerArmed || globalThis.navigator?.onLine !== false || !canRetry()) return;
 				cancelPendingReconnect();
 				const reconnect = new AbortController();
-				const entry = { audio, abort: () => reconnect.abort() };
-				const release = () => { if (pendingReconnect === entry) pendingReconnect = undefined; };
+				let unsubscribe = () => {};
+				const entry = { audio, abort: () => { unsubscribe(); reconnect.abort(); } };
+				const release = () => {
+					unsubscribe();
+					if (pendingReconnect === entry) pendingReconnect = undefined;
+				};
 				pendingReconnect = entry;
+				unsubscribe = queue.subscribe(() => { if (!queue.isCurrent(revision)) cancelPendingReconnect(); });
 				listenerArmed = true;
 				onlineSeen = false;
 				globalThis.addEventListener?.('online', () => {

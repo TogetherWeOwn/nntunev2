@@ -230,12 +230,12 @@ test('clearing audio.ended before a queued native play cancels the armed reconne
 	}
 });
 
-test('native replay while the reconnect retry grant is in flight prevents successor replacement', async () => {
+test('native replay while the reconnect retry grant is in flight retires the revoked stream and lets Play open a fresh grant', async () => {
 	const network = simulateConnectivity();
 	try {
 		const { player, media, queue, fetchFn, src, attach, delayGrant, toggleDuringFirstPlay, requests } = setup();
 		await toggleDuringFirstPlay();
-		const first = src();
+		const tab = src().split('/')[5];
 		const ended = attach(false);
 		network.drop();
 		fetchFn.mockRejectedValueOnce(new TypeError('Failed to fetch'));
@@ -250,16 +250,18 @@ test('native replay while the reconnect retry grant is in flight prevents succes
 		ended.paused = false;
 		ended.dispatchEvent(new Event('play'));
 		retryGrant.reply(undefined);
-		await new Promise((resolve) => setTimeout(resolve, 0));
+		await vi.waitFor(() => expect(player.queueAnnouncement.text).toBe('Playback stopped. Press Play to continue.'));
+		expect([queue.snapshot.currentIndex, src(), media.audio]).toEqual([0, '', undefined]);
 
-		expect([requests().length, queue.snapshot.currentIndex, src(), media.audio, ended.ended, ended.paused])
-			.toEqual([4, 0, first, ended, false, false]);
+		// Pressing Play requests a fresh valid grant for track 1 instead of reusing the revoked play ID.
+		await media.playCurrent();
+		expect([requests().length, queue.snapshot.currentIndex, src()]).toEqual([5, 0, `/v1/plays/media/first/${tab}/play-3`]);
 	} finally {
 		network.cleanup();
 	}
 });
 
-test('replaying the ended track offline aborts the superseded reconnect listener without accumulating listeners', async () => {
+test('replaying or reordering while offline aborts the superseded reconnect listener without accumulating listeners', async () => {
 	const network = simulateConnectivity();
 	try {
 		const { player, media, queue, fetchFn, src, attach, toggleDuringFirstPlay } = setup();
@@ -267,17 +269,21 @@ test('replaying the ended track offline aborts the superseded reconnect listener
 		const first = src();
 		const ended = attach(false);
 		network.drop();
-		for (let round = 0; round < 3; round++) {
+		for (let round = 0; round < 2; round++) {
 			fetchFn.mockRejectedValueOnce(new TypeError('Failed to fetch'));
 			ended.finish();
 			await vi.waitFor(() => expect(network.onlineListeners).toBe(1));
 			await vi.waitFor(() => expect(player.queueAnnouncement.text).toBe('Could not start the next track. Choose a track to continue.'));
-			ended.ended = false;
-			ended.paused = false;
-			ended.dispatchEvent(new Event('play'));
+			if (round === 0) {
+				ended.ended = false;
+				ended.paused = false;
+				ended.dispatchEvent(new Event('play'));
+			} else {
+				expect(player.moveQueuedTrack(0, 1)).toBe(true);
+			}
 			expect(network.onlineListeners).toBe(0);
 		}
-		expect([queue.snapshot.currentIndex, src(), media.audio]).toEqual([0, first, ended]);
+		expect([queue.snapshot.currentIndex, src(), media.audio]).toEqual([1, first, ended]);
 	} finally {
 		network.cleanup();
 	}
