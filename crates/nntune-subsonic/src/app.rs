@@ -461,6 +461,44 @@ mod tests {
     }
 
     #[test]
+    fn production_stream_refuses_every_format_without_a_source() {
+        let app = SubsonicApp::production(MemStore::seeded());
+        let missing = get(&app, "/rest/stream", "apiKey=test-key-1&id=unknown&f=json");
+        assert_eq!(missing.status, 200);
+        assert_eq!(missing.content_type, JSON_CONTENT_TYPE);
+        assert!(std::str::from_utf8(&missing.body)
+            .unwrap()
+            .contains("\"code\":70"));
+        for format in ["", "&format=flac", "&format=raw", "&format=mp3"] {
+            let query = format!("apiKey=test-key-1&id=so-1&f=json{format}");
+            let response = get(&app, "/rest/stream", &query);
+            assert_eq!(response, missing);
+        }
+    }
+
+    #[test]
+    fn production_cover_art_refuses_fixture_bytes_for_every_account() {
+        let fixture = MemStore::seeded();
+        let app = SubsonicApp::production(fixture.clone());
+        let legacy = SubsonicApp::new(fixture);
+        let path = "/rest/getCoverArt.view";
+        let served = get(&legacy, path, "apiKey=test-key-1&id=al-1");
+        assert_eq!(served.body, crate::library::PLACEHOLDER_PNG);
+
+        for key in ["test-key-1", "other-key-1", "admin-key-1"] {
+            let response = |id| get(&app, path, &format!("apiKey={key}&id={id}&f=json"));
+            let unknown = response("unknown");
+            assert_eq!(unknown.status, 200);
+            assert_eq!(unknown.content_type, JSON_CONTENT_TYPE);
+            assert!(std::str::from_utf8(&unknown.body)
+                .unwrap()
+                .contains("\"code\":70"));
+            assert_eq!(response("al-1"), unknown);
+            assert_eq!(response("coverart:al-1"), unknown);
+        }
+    }
+
+    #[test]
     fn production_empty_mount_never_accepts_fixture_credentials() {
         let app = SubsonicApp::production(MemStore::empty());
         let res = get(&app, "/rest/ping", "apiKey=test-key-1&f=json");

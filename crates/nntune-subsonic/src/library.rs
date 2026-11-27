@@ -171,6 +171,7 @@ pub trait Library: AuthStore {
     fn random_songs(&self, identity: &Identity, size: usize) -> Vec<Song>;
     fn genres(&self) -> Vec<(String, i64, i64)>;
     fn audio(&self, song_id: &str) -> Option<Vec<u8>>;
+    /// Legacy fixture seam. Launch dispatch requires a separate, member-scoped art adapter.
     fn cover(&self, cover_id: &str) -> Option<Vec<u8>>;
     fn avatar(&self, username: &str) -> Option<Vec<u8>>;
     fn lyrics(&self, artist: &str, title: &str) -> Option<String>;
