@@ -429,57 +429,55 @@ struct Request {
     chunked: bool,
 }
 
-/// Read the header block, leaving any already-buffered body bytes in
-/// `leftover` for the body reader.
-fn read_head(stream: &mut impl Read) -> Result<(Request, Vec<u8>), ApiError> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        if buf.len() > MAX_HEADER_BYTES {
-            return Err(ApiError::invalid());
-        }
-        let n = stream.read(&mut byte)?;
-        if n == 0 {
-            return Err(ApiError::invalid());
-        }
-        buf.push(byte[0]);
-        if buf.ends_with(b"\r\n\r\n") {
-            break;
-        }
+fn read_head(stream: &mut impl Read) -> Result<Request, ApiError> {
+    let mut budget = MAX_HEADER_BYTES;
+    let mut line = Vec::new();
+    read_crlf_line(stream, &mut line, &mut budget).map_err(ApiError::request_body)?;
+    let first = std::str::from_utf8(&line).map_err(|_| ApiError::invalid())?;
+    let mut parts = first.split(' ');
+    let (Some(method), Some(path), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(ApiError::invalid());
+    };
+    if !is_token(method)
+        || !path.starts_with('/')
+        || !path.bytes().all(|b| b.is_ascii_graphic())
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+    {
+        return Err(ApiError::invalid());
     }
-    let head = String::from_utf8_lossy(&buf);
-    let mut lines = head.lines();
-    let mut first = lines
-        .next()
-        .ok_or_else(ApiError::invalid)?
-        .split_whitespace();
-    let method = first.next().ok_or_else(ApiError::invalid)?.to_string();
-    let path = first.next().ok_or_else(ApiError::invalid)?.to_string();
+    let (method, path, http_11) = (method.to_string(), path.to_string(), version == "HTTP/1.1");
     let mut content_length = None;
     let mut chunked = false;
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            let value = value.trim();
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse::<u64>().ok();
-            } else if name.eq_ignore_ascii_case("transfer-encoding")
-                && value.eq_ignore_ascii_case("chunked")
-            {
-                chunked = true;
+    loop {
+        read_crlf_line(stream, &mut line, &mut budget).map_err(ApiError::request_body)?;
+        if line.is_empty() {
+            break;
+        }
+        let field = String::from_utf8_lossy(&line);
+        let (name, value) = split_field(&field).ok_or_else(ApiError::invalid)?;
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ApiError::invalid());
             }
+            content_length = Some(value.parse().map_err(|_| ApiError::invalid())?);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if !http_11 || chunked || !value.eq_ignore_ascii_case("chunked") {
+                return Err(ApiError::invalid());
+            }
+            chunked = true;
         }
     }
-    // The head reader consumes byte-by-byte, so nothing past the header
-    // terminator has been read yet.
-    Ok((
-        Request {
-            method,
-            path,
-            content_length,
-            chunked,
-        },
-        Vec::new(),
-    ))
+    if chunked && content_length.is_some() {
+        return Err(ApiError::invalid());
+    }
+    Ok(Request {
+        method,
+        path,
+        content_length,
+        chunked,
+    })
 }
 
 /// Body reader over a socket: fixed-length or chunked, always bounded
@@ -522,24 +520,16 @@ impl<'a> BodyReader<'a> {
 
     fn read_chunk_header(&mut self) -> io::Result<u64> {
         let mut line = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            if line.len() > 32 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk header"));
-            }
-            let n = self.stream.read(&mut byte)?;
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunk header"));
-            }
-            line.push(byte[0]);
-            if line.ends_with(b"\r\n") {
-                break;
-            }
-        }
+        let mut budget = 32;
+        read_crlf_line(self.stream, &mut line, &mut budget)?;
         let text = String::from_utf8_lossy(&line);
-        let size = text.trim().split(';').next().unwrap_or("");
-        u64::from_str_radix(size.trim(), 16)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk size"))
+        let size = text.split_once(';').map_or(text.as_ref(), |(size, _)| {
+            size.trim_end_matches([' ', '\t'])
+        });
+        if !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(invalid_framing());
+        }
+        u64::from_str_radix(size, 16).map_err(|_| invalid_framing())
     }
 }
 
@@ -568,28 +558,7 @@ impl Read for BodyReader<'_> {
                 if self.chunk_left == 0 {
                     let size = self.read_chunk_header()?;
                     if size == 0 {
-                        // Trailer part ends with a blank line; consume it.
-                        let mut trailer = Vec::new();
-                        let mut byte = [0u8; 1];
-                        loop {
-                            let n = self.stream.read(&mut byte)?;
-                            if n == 0 {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "chunk trailer",
-                                ));
-                            }
-                            trailer.push(byte[0]);
-                            if trailer.len() > MAX_HEADER_BYTES {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "chunk trailer",
-                                ));
-                            }
-                            if trailer == b"\r\n" || trailer.ends_with(b"\r\n\r\n") {
-                                break;
-                            }
-                        }
+                        read_chunk_trailers(self.stream)?;
                         self.done = true;
                         return Ok(0);
                     }
@@ -604,9 +573,30 @@ impl Read for BodyReader<'_> {
                 if self.chunk_left == 0 {
                     let mut crlf = [0u8; 2];
                     self.stream.read_exact(&mut crlf)?;
+                    if crlf != *b"\r\n" {
+                        return Err(invalid_framing());
+                    }
                 }
                 Ok(n)
             }
+        }
+    }
+}
+
+fn read_chunk_trailers(stream: &mut dyn Read) -> io::Result<()> {
+    let mut budget = MAX_HEADER_BYTES;
+    let mut line = Vec::new();
+    loop {
+        read_crlf_line(stream, &mut line, &mut budget)?;
+        if line.is_empty() {
+            return Ok(());
+        }
+        let field = String::from_utf8_lossy(&line);
+        let (name, _) = split_field(&field).ok_or_else(invalid_framing)?;
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            return Err(invalid_framing());
         }
     }
 }
@@ -707,7 +697,7 @@ fn close_connection(stream: &mut TcpStream) {
 
 fn handle(stream: &mut TcpStream, config: &ServerConfig, gate: &RwLock<()>) {
     let result = (|| -> Result<(), ApiError> {
-        let (req, _leftover) = read_head(stream)?;
+        let req = read_head(stream)?;
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/health") => {
                 respond_json(stream, 200, br#"{"ok":true}"#)?;
@@ -734,7 +724,11 @@ fn handle(stream: &mut TcpStream, config: &ServerConfig, gate: &RwLock<()>) {
                 }
                 let _guard = gate.write().unwrap_or_else(|e| e.into_inner());
                 let dir = staging_dir(config, &cleanup.job_id, &cleanup.staging_id);
-                let _ = fs::remove_dir_all(&dir);
+                if let Err(err) = fs::remove_dir_all(&dir) {
+                    if err.kind() != io::ErrorKind::NotFound {
+                        return Err(err.into());
+                    }
+                }
                 // Remove the now-empty parents too (best effort): the
                 // `t/` lane dir, then the per-job dir.
                 if let Some(lane) = dir.parent() {
@@ -797,6 +791,44 @@ fn handle(stream: &mut TcpStream, config: &ServerConfig, gate: &RwLock<()>) {
     }
     // Route guards have dropped, so teardown never holds the mutation gate.
     close_connection(stream);
+}
+
+fn invalid_framing() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP framing")
+}
+
+/// Read one line without consuming body bytes. The shared budget includes CRLF.
+fn read_crlf_line(stream: &mut dyn Read, line: &mut Vec<u8>, budget: &mut usize) -> io::Result<()> {
+    line.clear();
+    let mut byte = [0u8; 1];
+    for _ in 0..*budget {
+        stream.read_exact(&mut byte)?;
+        match byte[0] {
+            b'\r' if line.len() + 2 <= *budget => {
+                stream.read_exact(&mut byte)?;
+                if byte[0] != b'\n' {
+                    return Err(invalid_framing());
+                }
+                *budget -= line.len() + 2;
+                return Ok(());
+            }
+            b'\t' | b' '..=b'~' | 0x80..=0xff => line.push(byte[0]),
+            _ => return Err(invalid_framing()),
+        }
+    }
+    Err(invalid_framing())
+}
+
+fn is_token(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+fn split_field(line: &str) -> Option<(&str, &str)> {
+    let (name, value) = line.split_once(':')?;
+    is_token(name).then(|| (name, value.trim_matches([' ', '\t'])))
 }
 
 /// Serve until the listener fails. Connections run on their own

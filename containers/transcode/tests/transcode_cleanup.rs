@@ -86,3 +86,19 @@ fn cleanup_validates_identity() {
     assert_eq!(status, 400);
     assert_eq!(reply["error"], "invalid_request");
 }
+
+#[test]
+fn cleanup_reports_when_scratch_removal_fails() {
+    let h = Harness::start();
+    let job = "job_cleanup_failure";
+    stage_input(&h, job, HEX_A, b"staged");
+    let files = h.scratch_files();
+    let staging = files[0].parent().unwrap().parent().unwrap();
+    std::fs::remove_dir_all(staging).unwrap();
+    std::fs::write(staging, b"not a directory").unwrap();
+
+    let (status, reply) = cleanup(&h, job, HEX_A);
+    assert_eq!(status, 500, "{reply}");
+    assert_eq!(reply["error"], "transcode_unavailable");
+    assert_eq!(std::fs::read(staging).unwrap(), b"not a directory");
+}
