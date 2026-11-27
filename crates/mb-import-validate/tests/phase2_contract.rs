@@ -46,78 +46,13 @@ const RETIRED_OUTPUTS: &[&str] = &[
     "mbdump-recording_isrc.tsv",
 ];
 
-fn fixture(name: &str) -> &'static [u8] {
-    match name {
-        "mbdump-artist.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-artist.tsv")
-        }
-        "mbdump-release_group.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-release_group.tsv")
-        }
-        "mbdump-release.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-release.tsv")
-        }
-        "mbdump-recording.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-recording.tsv")
-        }
-        "mbdump-track.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-track.tsv")
-        }
-        "mbdump-release_credit.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-release_credit.tsv")
-        }
-        "mbdump-artist_alias.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-artist_alias.tsv")
-        }
-        "mbdump-recording_alias.tsv" => {
-            include_bytes!(
-                "../../../containers/mb-import/tests/expected/mbdump-recording_alias.tsv"
-            )
-        }
-        "mbdump-release_alias.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-release_alias.tsv")
-        }
-        "mbdump-release_group_alias.tsv" => {
-            include_bytes!(
-                "../../../containers/mb-import/tests/expected/mbdump-release_group_alias.tsv"
-            )
-        }
-        "mbdump-work_alias.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-work_alias.tsv")
-        }
-        "mbdump-label_alias.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-label_alias.tsv")
-        }
-        "mbdump-artist_recording.tsv" => {
-            include_bytes!(
-                "../../../containers/mb-import/tests/expected/mbdump-artist_recording.tsv"
-            )
-        }
-        "mbdump-artist_release.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-artist_release.tsv")
-        }
-        "mbdump-artist_work.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-artist_work.tsv")
-        }
-        "mbdump-recording_recording.tsv" => {
-            include_bytes!(
-                "../../../containers/mb-import/tests/expected/mbdump-recording_recording.tsv"
-            )
-        }
-        "mbdump-recording_work.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-recording_work.tsv")
-        }
-        "mbdump-work.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-work.tsv")
-        }
-        "mbdump-label.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-label.tsv")
-        }
-        "mbdump-release_label.tsv" => {
-            include_bytes!("../../../containers/mb-import/tests/expected/mbdump-release_label.tsv")
-        }
-        _ => panic!("fixture is outside the closed publication set: {name}"),
-    }
+fn fixture_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../containers/mb-import/tests/expected")
+}
+
+fn fixture(name: &str) -> Vec<u8> {
+    assert!(PUBLISHED.contains(&name), "unexpected fixture: {name}");
+    fs::read(fixture_dir().join(name)).unwrap()
 }
 
 #[test]
@@ -140,9 +75,7 @@ fn fixture_inventory_is_the_closed_phase2_publication_set() {
         .chain(RETIRED_OUTPUTS)
         .map(|name| (*name).to_owned())
         .collect();
-    let fixture_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../containers/mb-import/tests/expected");
-    let actual: BTreeSet<_> = fs::read_dir(fixture_dir)
+    let actual: BTreeSet<_> = fs::read_dir(fixture_dir())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .collect();
@@ -151,7 +84,7 @@ fn fixture_inventory_is_the_closed_phase2_publication_set() {
 
 #[test]
 fn every_reader_has_a_nonempty_synthetic_contract_case() {
-    let credits = release_credits::lookup(fixture("mbdump-release_credit.tsv"), RELEASE).unwrap();
+    let credits = release_credits::lookup(&fixture("mbdump-release_credit.tsv"), RELEASE).unwrap();
     assert_eq!(credits.len(), 2);
 
     for (kind, name, query) in [
@@ -183,7 +116,7 @@ fn every_reader_has_a_nonempty_synthetic_contract_case() {
         ),
     ] {
         assert!(
-            !aliases::lookup(fixture(name), kind, query)
+            !aliases::lookup(&fixture(name), kind, query)
                 .unwrap()
                 .is_empty(),
             "alias fixture must have a hit: {name}"
@@ -218,19 +151,19 @@ fn every_reader_has_a_nonempty_synthetic_contract_case() {
         ),
     ] {
         assert!(
-            !relationships::lookup(projection, fixture(name), source)
+            !relationships::lookup(projection, &fixture(name), source)
                 .unwrap()
                 .is_empty(),
             "relationship fixture must have a hit: {name}"
         );
     }
 
-    assert!(works::lookup(fixture("mbdump-work.tsv"), WORK)
+    assert!(works::lookup(&fixture("mbdump-work.tsv"), WORK)
         .unwrap()
         .is_some());
     assert!(!release_labels::lookup(
-        fixture("mbdump-label.tsv"),
-        fixture("mbdump-release_label.tsv"),
+        &fixture("mbdump-label.tsv"),
+        &fixture("mbdump-release_label.tsv"),
         RELEASE,
     )
     .unwrap()
@@ -270,9 +203,11 @@ fn readers_fail_closed_on_truncated_or_malformed_synthetic_inputs() {
     assert!(works::lookup(&works[..works.len() - 1], WORK).is_err());
     let labels = fixture("mbdump-label.tsv");
     let release_labels = fixture("mbdump-release_label.tsv");
-    assert!(release_labels::lookup(&labels[..labels.len() - 1], release_labels, RELEASE).is_err());
-    assert!(
-        release_labels::lookup(labels, &release_labels[..release_labels.len() - 1], RELEASE)
-            .is_err()
-    );
+    assert!(release_labels::lookup(&labels[..labels.len() - 1], &release_labels, RELEASE).is_err());
+    assert!(release_labels::lookup(
+        &labels,
+        &release_labels[..release_labels.len() - 1],
+        RELEASE
+    )
+    .is_err());
 }

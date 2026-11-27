@@ -76,11 +76,12 @@ def canonical_manifest(objects: dict[str, bytes]) -> tuple[bytes, str]:
             {
                 "key": name,
                 "bytes": len(body),
+                "rows": body.count(b"\n"),
                 "sha256": hashlib.sha256(body).hexdigest(),
             }
         )
     manifest = {
-        "profile": "phase2-r2/v1",
+        "profile": "phase2-fixture/v1",
         "tables": entries,
     }
     raw = json.dumps(manifest, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()
@@ -99,6 +100,7 @@ class Phase2PublisherContract(unittest.TestCase):
     def test_inventory_is_deterministic_and_excludes_retired_outputs(self) -> None:
         objects = inventory()
         raw, digest = canonical_manifest(objects)
+        self.assertEqual(digest, "58440d8676623f4831639f2af61cc860a6bf41bce664b1fa2e807dfd7d3fe5ab")
         admit_bundle(objects, raw, digest)
         reversed_objects = dict(reversed(list(objects.items())))
         self.assertEqual(canonical_manifest(reversed_objects), (raw, digest))
@@ -115,27 +117,27 @@ class Phase2PublisherContract(unittest.TestCase):
         raw, digest = canonical_manifest(objects)
         missing = dict(objects)
         missing.pop("mbdump-work.tsv")
-        with self.assertRaises(ValueError):
-            canonical_manifest(missing)
+        with self.assertRaisesRegex(ValueError, "closed publication set"):
+            admit_bundle(missing, raw, digest)
 
         extra = dict(objects)
         extra["mbdump-url.tsv"] = (EXPECTED / "mbdump-url.tsv").read_bytes()
-        with self.assertRaises(ValueError):
-            canonical_manifest(extra)
+        with self.assertRaisesRegex(ValueError, "closed publication set"):
+            admit_bundle(extra, raw, digest)
 
         mutated = dict(objects)
-        mutated["mbdump-work.tsv"] += b"tampered\n"
-        with self.assertRaises(ValueError):
+        mutated["mbdump-work.tsv"] = b"0" + objects["mbdump-work.tsv"][1:]
+        with self.assertRaisesRegex(ValueError, "pinned manifest"):
             admit_bundle(mutated, raw, digest)
 
         truncated = dict(objects)
         truncated["mbdump-work.tsv"] = truncated["mbdump-work.tsv"][:-1]
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "TSV envelope"):
             admit_bundle(truncated, raw, digest)
 
         artwork = dict(objects)
         artwork["mbdump-release.tsv"] = (EXPECTED / "mbdump-release.tsv").read_bytes()
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "unstripped artwork field"):
             admit_bundle(artwork, raw, digest)
 
 
