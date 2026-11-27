@@ -34,6 +34,7 @@
 
 use crate::handlers::{Config, StoreError};
 use crate::vault::{self, VaultBlob, VaultError};
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 
@@ -218,6 +219,9 @@ impl RewrapParams {
             ));
         }
         validate_new_run(&run.env, run.from_version, run.to_version)?;
+        if run.finished_at.is_some() {
+            return Err(JobError::InvalidParams("pass requires an unfinished run"));
+        }
         if !self.dry_run && run.id.is_empty() {
             return Err(JobError::InvalidParams(
                 "live pass requires a persisted run",
@@ -288,6 +292,11 @@ pub fn validate_new_run(env: &str, from_version: u32, to_version: u32) -> Result
     }
     if to_version == 0 {
         return Err(JobError::InvalidParams("to_version must not be zero"));
+    }
+    if to_version > i32::MAX as u32 {
+        return Err(JobError::InvalidParams(
+            "to_version must fit the stored KEK version",
+        ));
     }
     if from_version >= to_version {
         return Err(JobError::InvalidParams(
@@ -408,6 +417,21 @@ pub async fn run_rewrap_pass(
         let batch = store
             .claim_batch(params.to_version, cursor.as_deref(), params.batch_limit)
             .await?;
+        if batch.len() > params.batch_limit as usize {
+            return Err(JobError::Store);
+        }
+        // Reject repeated identities before any CAS write. The store owns
+        // the ordering because its collation can differ from Rust's.
+        let mut seen = HashSet::with_capacity(batch.len() + 1);
+        seen.extend(cursor.as_deref());
+        for claim in &batch {
+            if claim.user_id.is_empty()
+                || !seen.insert(claim.user_id.as_str())
+                || claim.kek_version >= params.to_version
+            {
+                return Err(JobError::Store);
+            }
+        }
         if batch.is_empty() {
             report.complete = true;
             break;
@@ -501,6 +525,9 @@ async fn rewrap_one_row(
                 lost_claims += 1;
                 match store.reload_row(&current.user_id).await? {
                     None => return Ok((RowOutcome::Gone, current.user_id, lost_claims)),
+                    Some(reloaded) if reloaded.user_id != current.user_id => {
+                        return Err(JobError::Store);
+                    }
                     Some(reloaded) if reloaded.kek_version >= params.to_version => {
                         return Ok((RowOutcome::Gone, current.user_id, lost_claims));
                     }

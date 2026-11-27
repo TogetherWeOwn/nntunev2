@@ -7,8 +7,9 @@ use nntune_core::original_source::{
 };
 use zeroize::Zeroizing;
 
+pub use crate::field_envelope::FieldEnvelope;
 use crate::{
-    field_envelope::{self, Context, FieldEnvelope},
+    field_envelope::{self, Context},
     rotation::KekSource,
 };
 
@@ -110,10 +111,10 @@ pub fn read_original_source(
     keks: &impl KekSource,
     track_id: &str,
 ) -> Result<OriginalSource, SourceServiceError> {
-    authorization.authorize(track_id)?;
     if !canonical_track_id(track_id) {
         return Err(SourceServiceError::Invalid);
     }
+    authorization.authorize(track_id)?;
     let [first, second] = repository.metadata(track_id)?;
     if second.is_some() {
         return Err(SourceServiceError::Invalid);

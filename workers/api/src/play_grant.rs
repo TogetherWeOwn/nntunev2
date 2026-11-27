@@ -39,6 +39,11 @@ pub const MIN_SECRET_BYTES: usize = 32;
 /// cap (`grant::MAX_GRANT_TTL`); longer requests clamp to it.
 pub const MAX_GRANT_TTL: u64 = 900;
 
+/// Lease epochs start at 1 and are stored as PostgreSQL BIGINT.
+pub(crate) fn valid_lease_epoch(epoch: u64) -> bool {
+    (1..=i64::MAX as u64).contains(&epoch)
+}
+
 /// Why no grant was minted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MintError {
@@ -83,8 +88,7 @@ pub fn issue_v2_at(
         _ => return Err(MintError::NotConfigured),
     };
     let exp_unix = now_unix.saturating_add(ttl_secs.min(MAX_GRANT_TTL));
-    // Lease epochs start at 1 and are stored as PostgreSQL BIGINT.
-    if !(1..=i64::MAX as u64).contains(&lease_epoch)
+    if !valid_lease_epoch(lease_epoch)
         || exp_unix <= now_unix
         || crate::ledger::derive_play_idempotency_key(user_id, track_id, play_id).is_err()
     {

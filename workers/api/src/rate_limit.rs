@@ -84,12 +84,20 @@ pub struct TokenBucket {
 
 impl TokenBucket {
     /// `capacity`: burst size; `refill_per_sec`: sustained rate. Negative
-    /// (or NaN) inputs clamp to 0. The bucket starts full.
+    /// and non-finite inputs clamp to 0. The bucket starts full.
     pub fn new(capacity: f64, refill_per_sec: f64, now_s: u64) -> Self {
+        let nonnegative_finite = |value: f64| {
+            if value.is_finite() {
+                value.max(0.0)
+            } else {
+                0.0
+            }
+        };
+        let capacity = nonnegative_finite(capacity);
         Self {
-            capacity: capacity.max(0.0),
-            tokens: capacity.max(0.0),
-            refill_per_sec: refill_per_sec.max(0.0),
+            capacity,
+            tokens: capacity,
+            refill_per_sec: nonnegative_finite(refill_per_sec),
             last_tick_s: now_s,
         }
     }
