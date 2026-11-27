@@ -54,6 +54,7 @@ class WorkflowReadRatchet(unittest.TestCase):
             anchor = git("rev-parse", "HEAD")
             for content, expected in (
                     (raw_read + "jobs:\n  new:\n    env:\n      REF: *pinned\n", 1),
+                    ("jobs:\n  matrix:\n    strategy:\n      matrix:\n        target: [{id: {name: linux}}]\n", 0),
                     ("env: {}\nenv: {}\n", 2),
                     ("jobs: &cycle\n  loop: *cycle\n", 2),
                     ("jobs:\n  sample:\n    steps:\n      - id: {invalid: value}\n", 2),

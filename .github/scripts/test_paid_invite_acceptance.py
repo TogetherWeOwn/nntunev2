@@ -64,6 +64,8 @@ class AcceptanceTest(unittest.TestCase):
         fixture = self
 
         class Server(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_GET(self):
                 fixture.requests.append((self.path, dict(self.headers)))
                 reply = fixture.routes[self.path]
@@ -71,13 +73,14 @@ class AcceptanceTest(unittest.TestCase):
                     reply = fixture.late_responses.get(self.path, reply)
                 self.send_response(reply if isinstance(reply, int) else 200)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("Connection", "close")
                 self.send_header("Location", "https://outside.invalid/privateRedirect")
                 for name, value in fixture.framing:
                     self.send_header(name, value)
                 self.end_headers()
                 body = json.dumps(reply).encode()
                 if fixture.chunk_end is not None:
-                    body = f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n" + fixture.chunk_end
+                    body = f'{len(body):x};note="fixture; value"\r\n'.encode() + body + b"\r\n0\r\n" + fixture.chunk_end
                 self.wfile.write(body)
 
             def log_message(self, *_args):
@@ -135,10 +138,10 @@ class AcceptanceTest(unittest.TestCase):
     def test_admit_requires_the_chunked_body_terminator(self):
         self.evidence = self.admission
         self.framing = [("Transfer-Encoding", "chunked")]
-        self.chunk_end = b""
+        self.chunk_end = b"X-Fixture: trailer\r\n"
         self.run_case("invalid_response", "admit")
         self.assertEqual([path for path, _ in self.requests], ["/api/build"])
-        self.chunk_end = b"\r\n"
+        self.chunk_end += b"\r\n"
         self.run_case("admitted", "admit")
 
     def test_finish_verifies_payment_and_teardown_with_redacted_output(self):

@@ -11,6 +11,11 @@ import sys
 STAGING = "staging.nntune.com"
 STRIPE = "api.stripe.com"
 MAX_BYTES = 64 * 1024
+HTTP_TOKEN = rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+HTTP_QUOTED = rb'"(?:[\t !#-\[\]-~\x80-\xff]|\\[\t \x21-\x7e\x80-\xff])*"'
+CHUNK_SIZE = re.compile(rb"([0-9a-fA-F]+)(?:[ \t]*;[ \t]*" + HTTP_TOKEN
+                        + rb"(?:[ \t]*=[ \t]*(?:" + HTTP_TOKEN + rb"|" + HTTP_QUOTED + rb"))?)*\r\n")
+TRAILER_FIELD = re.compile(HTTP_TOKEN + rb":[\t \x21-\x7e\x80-\xff]*\r\n")
 ENROLLMENT_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 PREREQUISITES = (
     "staging_isolated", "invoice_history", "effective_privileges",
@@ -54,13 +59,22 @@ def read_json(source):
 
 def read_chunked_json(stream):
     # Require the final CRLF, which http.client treats as optional at EOF.
-    body = bytearray()
+    body, framing_budget = bytearray(), MAX_BYTES
+
+    def framing_line():
+        nonlocal framing_budget
+        line = stream.readline(min(framing_budget + 1, 8192))
+        framing_budget -= len(line)
+        require(framing_budget >= 0 and line.endswith(b"\r\n"), "invalid_response")
+        return line
+
     while True:
-        size_line = stream.readline(19)
-        require(re.fullmatch(rb"[0-9a-fA-F]{1,16}\r\n", size_line), "invalid_response")
-        size = int(size_line, 16)
+        size_line = CHUNK_SIZE.fullmatch(framing_line())
+        require(size_line, "invalid_response")
+        size = int(size_line[1], 16)
         if size == 0:
-            require(stream.read(2) == b"\r\n", "invalid_response")
+            while (trailer := framing_line()) != b"\r\n":
+                require(TRAILER_FIELD.fullmatch(trailer), "invalid_response")
             return read_json(BytesIO(body))
         require(len(body) + size <= MAX_BYTES, "input_too_large")
         chunk = stream.read(size)
@@ -82,7 +96,8 @@ def get_json(host, path, headers):
             length = response.getheader("Content-Length")
             transfer = response.getheader("Transfer-Encoding")
             if transfer is not None:
-                require(transfer.lower() == "chunked" and length is None, "invalid_response")
+                require(response.version == 11 and transfer.strip(" \t").lower() == "chunked"
+                        and length is None, "invalid_response")
                 payload = read_chunked_json(response.fp)
             else:
                 if length is not None:

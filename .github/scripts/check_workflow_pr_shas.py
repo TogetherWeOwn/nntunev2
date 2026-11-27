@@ -52,6 +52,9 @@ def scalar_fields(node, location, ancestors, visits):
             yield from scalar_fields(child, (*location, key), ancestors, visits)
     elif isinstance(node, yaml.SequenceNode):
         for child in node.value:
+            if len(location) != 3 or location[0] != "jobs" or location[2] != "steps":
+                yield from scalar_fields(child, (*location, ""), ancestors, visits)
+                continue
             fields = mapping_fields(child) if isinstance(child, yaml.MappingNode) else {}
             inputs = fields.get("with")
             destination = step_scalar(mapping_fields(inputs), "path") if isinstance(inputs, yaml.MappingNode) else ""
