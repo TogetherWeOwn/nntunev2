@@ -8,6 +8,8 @@ use nntune_transcode::contract::{
 };
 use serde_json::{json, Value};
 
+const RUNTIME: &str = include_str!("../src/runtime.rs");
+
 fn job() -> Value {
     let sha = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
     json!({
@@ -23,6 +25,9 @@ fn job() -> Value {
 
 #[test]
 fn staging_identity_and_encoder_parameters_are_checked_before_dispatch() {
+    let entrypoints = RUNTIME.matches("match read_request(&mut req).await");
+    assert_eq!(entrypoints.count(), 2);
+    assert!(RUNTIME.contains("read_job_request(stream.map"));
     let read = |body: Value| {
         read_job_request(stream::iter([Ok(body.to_string().into_bytes())]), pending())
             .now_or_never()
@@ -45,6 +50,7 @@ fn staging_identity_and_encoder_parameters_are_checked_before_dispatch() {
 
 #[test]
 fn request_cap_and_deadline_apply_until_eof() {
+    assert!(RUNTIME.contains("select(deadline, Box::pin(self.run(&parsed)))"));
     let mut bytes = job().to_string().into_bytes();
     bytes.resize(MAX_REQUEST_BYTES, b' ');
     let read = |tail| {
@@ -54,7 +60,6 @@ fn request_cap_and_deadline_apply_until_eof() {
     };
     assert!(read(vec![]).is_ok());
     assert_eq!(read(vec![b' ']).unwrap_err().status, 413);
-
     let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
     let (deadline, fire) = futures_util::future::abortable(pending::<()>());
     let stalled = stream::iter([Ok(bytes)]).chain(stream::pending());
@@ -68,21 +73,21 @@ fn request_cap_and_deadline_apply_until_eof() {
 #[test]
 fn corrupt_result_markers_fail_before_replay_or_rerun() {
     let req = parse_request(job().to_string().as_bytes()).unwrap();
-    let rejected = Err(ApiFault::new(500, "transcode_unavailable"));
+    let fault = ApiFault::new(500, "transcode_unavailable");
     for marker in [
         json!({"status":"transcoded", "staging_id":req.staging_id}),
         json!({"status":"untranscodable", "staging_id":req.staging_id, "artifact_sha256":"private_diagnostic"}),
         json!({"status":"untranscodable", "staging_id":"invalid"}),
     ] {
-        assert_eq!(
-            plan(&req, Some(marker.to_string().as_bytes()), &req.staging_id),
-            rejected
-        );
+        let marker = marker.to_string();
+        let result = plan(&req, Some(marker.as_bytes()), &req.staging_id);
+        assert_eq!(result.unwrap_err(), fault);
     }
 }
 
 #[test]
 fn reply_boundaries_accept_only_bounded_public_envelopes() {
+    assert!(RUNTIME.contains("validate_do_reply(status, &bytes)?"));
     let timeout = br#"{"error":"transcode_timeout"}"#;
     let mut body = timeout.to_vec();
     body.resize(MAX_RESULT_BYTES, b' ');
@@ -93,9 +98,8 @@ fn reply_boundaries_accept_only_bounded_public_envelopes() {
     for body in [body.as_slice(), br#"{"error":"private_diagnostic"}"#] {
         assert_eq!(classify_container_reply(503, body), rejected);
     }
-    let terminal = br#"{"status":"untranscodable"}"#;
     assert_eq!(validate_do_reply(503, timeout), Ok(()));
-    assert_eq!(validate_do_reply(200, terminal), Ok(()));
+    assert!(validate_do_reply(200, br#"{"status":"untranscodable"}"#).is_ok());
     let rejected = Err(transcode_unavailable_fault());
     assert_eq!(validate_do_reply(503, &body[..MAX_RESULT_BYTES]), rejected);
     for (status, body) in [

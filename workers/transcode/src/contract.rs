@@ -114,8 +114,7 @@ pub fn parse_request(body: &[u8]) -> Result<TranscodeRequest, ApiFault> {
     Ok(req)
 }
 
-/// Read a job envelope within one deadline and verify its staging
-/// identity before routing it or touching scratch state.
+/// Read and validate a job envelope within one deadline.
 pub async fn read_job_request<S, D>(
     mut stream: S,
     deadline: D,

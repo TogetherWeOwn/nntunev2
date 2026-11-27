@@ -152,9 +152,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
     // fetch and owns it through body completion, releasing it on every exit.
     let deadline = Box::pin(Delay::from(Duration::from_millis(DO_TRANSCODE_DEADLINE_MS)));
     let fetch = Box::pin(async {
-        let mut response = stub.fetch_with_request(request).await.map_err(|_| {
-            console_log!("transcode DO call failed job={}", parsed.job_id);
-        })?;
+        let mut response = stub.fetch_with_request(request).await.map_err(|_| ())?;
         let status = response.status_code();
         // The shared reader preserves Empty and materialised bodies, checking
         // the length BEFORE cloning. It runs inside this timed fetch future.
@@ -210,8 +208,7 @@ impl DurableObject for TranscodeContainer {
         if self.state.id().name().as_deref() != Some(parsed.job_id.as_str()) {
             return fault_response(&ApiFault::invalid());
         }
-        // Bound the object's own work as well as the caller's wait.
-        // Expiry drops local work; already dispatched I/O can still settle.
+        // Expiry drops local work. Already dispatched I/O can still settle.
         let deadline = Box::pin(Delay::from(Duration::from_millis(DO_TRANSCODE_DEADLINE_MS)));
         match select(deadline, Box::pin(self.run(&parsed))).await {
             Either::Right((Ok(body), _)) => json_response(200, body),
