@@ -79,13 +79,14 @@ mod wasm_test {
     use super::*;
     use crate::subsonic_http::STAGING_SOURCE_BYTES;
     use crate::subsonic_staging::StagingConstruction;
+    use worker::js_sys::Array;
     use worker::wasm_bindgen::{self, prelude::*};
 
     #[wasm_bindgen]
     pub async fn staging_input_test(
         request: web_sys::Request,
         limit: Option<u32>,
-    ) -> Result<u32, JsValue> {
+    ) -> Result<Array, JsValue> {
         let input = if let Some(limit) = limit {
             StagingInput::collect_with_budget(&request, ConstructionBudget::new(limit as usize))
                 .await
@@ -120,6 +121,9 @@ mod wasm_test {
         scope
             .parse_credentials()
             .map_err(|error| JsValue::from_str(&format!("credentials:{error:?}")))?;
-        Ok(scope.input.budget.charged() as u32)
+        Ok(Array::of2(
+            &JsValue::from(scope.input.budget.charged() as u32),
+            &JsValue::from_str(&scope.input.form),
+        ))
     }
 }
