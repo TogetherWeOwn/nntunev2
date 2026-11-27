@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     admin_policy::{evaluate_positions, Position, PositionalEligibility},
     album_retrieval_query, normalize_match_text, pick_release_mbid, split_artist_album,
-    validate_match_query, MbRecording, MbSearchHit,
+    validate_match_query, MbRecording, MbSearchHit, MIN_MATCH_SCORE,
 };
 use crate::queue::validate_mbid;
 
@@ -105,9 +105,17 @@ pub fn select_release(
             return Err(NeedsReview::SearchEvidence);
         }
     }
-    pick_release_mbid(query.trim(), &hits)
-        .map(ReleaseCandidate)
-        .ok_or(NeedsReview::ReleaseUnresolved)
+    let mbid = pick_release_mbid(query.trim(), &hits).ok_or(NeedsReview::ReleaseUnresolved)?;
+    // The shared artist/title picker requires a unique identity and ignores
+    // similarity. Admin evidence scores the album title separately, so check
+    // the winner's score after resolving identity against all candidates.
+    if !hits
+        .iter()
+        .any(|hit| hit.mbid == mbid && hit.score >= MIN_MATCH_SCORE)
+    {
+        return Err(NeedsReview::ReleaseUnresolved);
+    }
+    Ok(ReleaseCandidate(mbid))
 }
 
 #[derive(Deserialize)]
@@ -217,4 +225,63 @@ pub fn decide_publish_match(
             .map(|row| row.recording)
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const QUERY: &str = "Paper Moons - Tin Skies";
+    const RELEASE: &str = "aaaaaaaa-1111-4111-8111-111111111111";
+    const OTHER_RELEASE: &str = "bbbbbbbb-2222-4222-8222-222222222222";
+
+    fn hit(mbid: &str, title: &str, artist: &str, score: f32) -> MbSearchHit {
+        MbSearchHit {
+            mbid: mbid.into(),
+            title: title.into(),
+            artist_name: Some(artist.into()),
+            artist_mbid: None,
+            score,
+        }
+    }
+
+    #[test]
+    fn exact_artist_album_release_requires_minimum_confidence() {
+        let lookup = release_lookup(QUERY).unwrap();
+        let other = hit(OTHER_RELEASE, "Tin Sk'ies", "Another Artist", 1.0);
+        let below_floor = f32::from_bits(0.6_f32.to_bits() - 1);
+        for (score, expected) in [
+            (below_floor, Err(NeedsReview::ReleaseUnresolved)),
+            (0.6, Ok(RELEASE)),
+        ] {
+            let evidence = CompleteReleaseCandidates {
+                lookup: &lookup,
+                hits: vec![
+                    hit(RELEASE, "Tin Skies", "Paper Moons", score),
+                    other.clone(),
+                ],
+            };
+            let result = select_release(QUERY, Some(evidence));
+            assert_eq!(
+                result.as_ref().map(ReleaseCandidate::mbid).map_err(|e| *e),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn below_floor_exact_artist_album_rival_still_requires_review() {
+        let lookup = release_lookup(QUERY).unwrap();
+        let evidence = CompleteReleaseCandidates {
+            lookup: &lookup,
+            hits: vec![
+                hit(RELEASE, "Tin Skies", "Paper Moons", 1.0),
+                hit(OTHER_RELEASE, "Tin Sk'ies", "Paper Moons", 0.2),
+            ],
+        };
+        assert_eq!(
+            select_release(QUERY, Some(evidence)).unwrap_err(),
+            NeedsReview::ReleaseUnresolved
+        );
+    }
 }
