@@ -221,36 +221,22 @@ mod tests {
             status: 204,
             writes: Vec::new(),
         };
-        for invalid in [
-            QueueMsg {
-                job_id: "a".repeat(65),
-                ..msg.clone()
-            },
-            QueueMsg {
-                job_id: "../job".into(),
-                ..msg.clone()
-            },
-            QueueMsg {
-                user_id: "é".repeat(65),
-                ..msg.clone()
-            },
-            QueueMsg {
-                user_id: "bad:user".into(),
-                ..msg.clone()
-            },
-            QueueMsg {
-                attempt: 0,
-                ..msg.clone()
-            },
-            QueueMsg {
-                attempt: MAX_ATTEMPTS + 1,
-                ..msg.clone()
-            },
-            QueueMsg {
-                attempt: u32::MAX,
-                ..msg.clone()
-            },
+        let (job, user) = (msg.job_id.as_str(), msg.user_id.as_str());
+        for (job_id, user_id, attempt) in [
+            ("a".repeat(65).as_str(), user, 1),
+            ("../job", user, 1),
+            (job, "é".repeat(65).as_str(), 1),
+            (job, "bad:user", 1),
+            (job, user, 0),
+            (job, user, MAX_ATTEMPTS + 1),
+            (job, user, u32::MAX),
         ] {
+            let invalid = QueueMsg {
+                job_id: job_id.into(),
+                user_id: user_id.into(),
+                attempt,
+                ..msg.clone()
+            };
             let err = emit_meter(&mut sink, &invalid, "probe", MeterOutcome::Ok).unwrap_err();
             assert_eq!(err, MeterWriteError::InvalidEvent);
             assert_eq!(err.http_status(), 503);

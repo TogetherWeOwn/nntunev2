@@ -257,20 +257,24 @@ fn validate_verify_progress(progress: &VerifyProgress) -> Result<()> {
     Ok(())
 }
 
-/// Load one job's Verifying resume state (see the module docs).
+fn resume_verify(loaded: Result<Option<VerifyProgress>>) -> Result<Option<VerifyProgress>> {
+    // Invalid cached progress can be rebuilt from scratch object metadata.
+    // An unavailable KV read still propagates so the consumer retries it.
+    Ok(loaded?.filter(|progress| validate_verify_progress(progress).is_ok()))
+}
+
+/// Load one job's valid Verifying resume state (see the module docs).
 pub async fn get_verify(env: &Env, job_id: &str) -> Result<Option<VerifyProgress>> {
     let key =
         verify_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
     let store = env.kv(STATE_KV_BINDING)?;
-    let loaded = store
-        .get(&key)
-        .json::<VerifyProgress>()
-        .await
-        .map_err(|_| worker::Error::RustError("verify progress unavailable".into()))?;
-    if let Some(progress) = &loaded {
-        validate_verify_progress(progress)?;
-    }
-    Ok(loaded)
+    resume_verify(
+        store
+            .get(&key)
+            .json::<VerifyProgress>()
+            .await
+            .map_err(|_| worker::Error::RustError("verify progress unavailable".into())),
+    )
 }
 
 /// Store one job's Verifying resume state. The consumer's Verifying step
@@ -483,6 +487,39 @@ mod tests {
         progress.spool.clear();
         progress.round += 1;
         assert!(validate_verify_progress(&progress).is_err());
+    }
+
+    #[test]
+    fn bounds_resume_verify_recovers_from_invalid_progress_but_propagates_read_errors() {
+        let valid = VerifyProgress::new(MAX_REPAIR_ROUNDS + 1);
+        assert_eq!(resume_verify(Ok(Some(valid.clone()))).unwrap(), Some(valid));
+        assert!(resume_verify(Ok(Some(VerifyProgress::new(u32::MAX))))
+            .unwrap()
+            .is_none());
+        assert!(resume_verify(Err(worker::Error::RustError(
+            "synthetic read failure".into()
+        )))
+        .is_err());
+    }
+
+    #[test]
+    fn bounds_storage_entry_points_call_the_progress_guards() {
+        // Native tests exercise the validators without a Workers KV binding.
+        let source = include_str!("checkpoint.rs");
+        for (name, guard) in [
+            ("get", "validate_checkpoint(cp, job_id)?"),
+            (
+                "put",
+                "validate_checkpoint(checkpoint, &checkpoint.job_id)?",
+            ),
+            ("get_verify", "resume_verify("),
+            ("put_verify", "validate_verify_progress(progress)?"),
+        ] {
+            let (_, signature_and_body) =
+                source.split_once(&format!("pub async fn {name}(")).unwrap();
+            let (function, _) = signature_and_body.split_once("\n}\n").unwrap();
+            assert!(function.contains(guard), "{name} must call {guard}");
+        }
     }
 
     #[test]
