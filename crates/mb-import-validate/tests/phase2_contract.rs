@@ -4,6 +4,10 @@
 //! publication set. It is deliberately test-only. No generation, network,
 //! storage, selector, or staging path is exercised here.
 
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
+
 use mb_import_validate::{aliases, relationships, release_credits, release_labels, works};
 
 const RELEASE: &str = "55555555-5555-4555-8555-555555555555";
@@ -130,6 +134,19 @@ fn fixture_inventory_is_the_closed_phase2_publication_set() {
     for name in RETIRED_OUTPUTS {
         assert!(!PUBLISHED.contains(name), "retired output leaked: {name}");
     }
+
+    let expected: BTreeSet<_> = PUBLISHED
+        .iter()
+        .chain(RETIRED_OUTPUTS)
+        .map(|name| (*name).to_owned())
+        .collect();
+    let fixture_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../containers/mb-import/tests/expected");
+    let actual: BTreeSet<_> = fs::read_dir(fixture_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(actual, expected);
 }
 
 #[test]
@@ -251,4 +268,11 @@ fn readers_fail_closed_on_truncated_or_malformed_synthetic_inputs() {
     .is_err());
     let works = fixture("mbdump-work.tsv");
     assert!(works::lookup(&works[..works.len() - 1], WORK).is_err());
+    let labels = fixture("mbdump-label.tsv");
+    let release_labels = fixture("mbdump-release_label.tsv");
+    assert!(release_labels::lookup(&labels[..labels.len() - 1], release_labels, RELEASE).is_err());
+    assert!(
+        release_labels::lookup(labels, &release_labels[..release_labels.len() - 1], RELEASE)
+            .is_err()
+    );
 }

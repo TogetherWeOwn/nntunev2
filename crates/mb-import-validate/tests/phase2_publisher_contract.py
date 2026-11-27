@@ -49,7 +49,9 @@ def inventory() -> dict[str, bytes]:
     objects = {name: (EXPECTED / name).read_bytes() for name in PUBLISHED}
     rows = []
     for line in objects["mbdump-release.tsv"].splitlines(keepends=True):
-        fields = line.rstrip(b"\n").split(b"\t")
+        if not line.endswith(b"\n") or b"\r" in line:
+            raise ValueError("release fixture must be LF terminated")
+        fields = line[:-1].split(b"\t")
         if len(fields) != 8:
             raise ValueError("release fixture must have the source eight-field shape")
         rows.append(b"\t".join(fields[:5] + fields[6:]) + b"\n")
@@ -63,8 +65,13 @@ def canonical_manifest(objects: dict[str, bytes]) -> tuple[bytes, str]:
     entries = []
     for name in sorted(objects):
         body = objects[name]
-        if not body or not body.endswith(b"\n"):
+        if not body or not body.endswith(b"\n") or b"\r" in body:
             raise ValueError(f"invalid TSV envelope: {name}")
+        if name == "mbdump-release.tsv":
+            for row in body.splitlines(keepends=True):
+                fields = row[:-1].split(b"\t")
+                if len(fields) != 7 or b"coverartarchive.org" in row:
+                    raise ValueError("release projection contains an unstripped artwork field")
         entries.append(
             {
                 "key": name,
@@ -80,10 +87,19 @@ def canonical_manifest(objects: dict[str, bytes]) -> tuple[bytes, str]:
     return raw, hashlib.sha256(raw).hexdigest()
 
 
+def admit_bundle(
+    objects: dict[str, bytes], expected_manifest: bytes, expected_digest: str
+) -> None:
+    manifest, digest = canonical_manifest(objects)
+    if manifest != expected_manifest or digest != expected_digest:
+        raise ValueError("bundle does not match the pinned manifest")
+
+
 class Phase2PublisherContract(unittest.TestCase):
     def test_inventory_is_deterministic_and_excludes_retired_outputs(self) -> None:
         objects = inventory()
         raw, digest = canonical_manifest(objects)
+        admit_bundle(objects, raw, digest)
         reversed_objects = dict(reversed(list(objects.items())))
         self.assertEqual(canonical_manifest(reversed_objects), (raw, digest))
         self.assertEqual(set(objects), PUBLISHED)
@@ -96,6 +112,7 @@ class Phase2PublisherContract(unittest.TestCase):
 
     def test_missing_extra_and_mutated_objects_refuse_admission(self) -> None:
         objects = inventory()
+        raw, digest = canonical_manifest(objects)
         missing = dict(objects)
         missing.pop("mbdump-work.tsv")
         with self.assertRaises(ValueError):
@@ -108,9 +125,18 @@ class Phase2PublisherContract(unittest.TestCase):
 
         mutated = dict(objects)
         mutated["mbdump-work.tsv"] += b"tampered\n"
-        _, original_digest = canonical_manifest(objects)
-        _, mutated_digest = canonical_manifest(mutated)
-        self.assertNotEqual(mutated_digest, original_digest)
+        with self.assertRaises(ValueError):
+            admit_bundle(mutated, raw, digest)
+
+        truncated = dict(objects)
+        truncated["mbdump-work.tsv"] = truncated["mbdump-work.tsv"][:-1]
+        with self.assertRaises(ValueError):
+            admit_bundle(truncated, raw, digest)
+
+        artwork = dict(objects)
+        artwork["mbdump-release.tsv"] = (EXPECTED / "mbdump-release.tsv").read_bytes()
+        with self.assertRaises(ValueError):
+            admit_bundle(artwork, raw, digest)
 
 
 if __name__ == "__main__":
