@@ -46,16 +46,12 @@ const PROJECT_RELEASE: &str =
 const PROJECT_RECORDING: &str =
     ", CASE WHEN octet_length(recording_mbid) <= 36 THEN recording_mbid ELSE '' END";
 
-async fn preflight(
-    tx: &PgTransaction<'_>,
+fn admission_sql(
     budget: &mut ConstructionBudget,
     statement: &str,
-    user_id: &str,
-    limit: i64,
     pairs: bool,
-    remaining: &mut i32,
-) -> Result<usize, StoreError> {
-    let query = sql(
+) -> Result<String, StoreError> {
+    sql(
         budget,
         &[
             "SELECT CASE WHEN row_count < $2 AND fields_ok AND used <= $3 AND \
@@ -69,7 +65,19 @@ async fn preflight(
             statement,
             " LIMIT $2) AS membership) AS admission",
         ],
-    )?;
+    )
+}
+
+async fn preflight(
+    tx: &PgTransaction<'_>,
+    budget: &mut ConstructionBudget,
+    statement: &str,
+    user_id: &str,
+    limit: i64,
+    pairs: bool,
+    remaining: &mut i32,
+) -> Result<usize, StoreError> {
+    let query = admission_sql(budget, statement, pairs)?;
     let row = tx
         .query_typed_one(
             &query,
@@ -144,23 +152,6 @@ fn copy_id(budget: &mut ConstructionBudget, value: &str) -> Result<String, Store
     String::from_utf8(bytes).map_err(|_| StoreError)
 }
 
-fn copy_pair(
-    budget: &mut ConstructionBudget,
-    release: &str,
-    recording: Option<&str>,
-) -> Result<Option<(String, String)>, StoreError> {
-    let Some(recording) = recording.filter(|id| is_catalogue_mbid(id)) else {
-        return Ok(None);
-    };
-    if !is_catalogue_mbid(release) {
-        return Ok(None);
-    }
-    Ok(Some((
-        copy_id(budget, release)?,
-        copy_id(budget, recording)?,
-    )))
-}
-
 fn normalize_order<T: Ord>(ids: &mut Vec<T>) {
     // Unstable sort is in-place. Deduplicate after ASCII normalization.
     ids.sort_unstable();
@@ -215,11 +206,15 @@ pub(super) async fn read_membership(
         #[cfg(test)]
         fetches,
         |budget, row| {
-            copy_pair(
-                budget,
-                row.try_get(0).map_err(|_| StoreError)?,
-                row.try_get(1).map_err(|_| StoreError)?,
-            )
+            let release: &str = row.try_get(0).map_err(|_| StoreError)?;
+            let recording: &str = row.try_get(1).map_err(|_| StoreError)?;
+            if !is_catalogue_mbid(release) || !is_catalogue_mbid(recording) {
+                return Ok(None);
+            }
+            Ok(Some((
+                copy_id(budget, release)?,
+                copy_id(budget, recording)?,
+            )))
         },
     )
     .await?;
@@ -233,17 +228,17 @@ pub(super) async fn read_membership(
 
 #[cfg(test)]
 #[test]
-fn nullable_membership_pairs_are_never_projected() {
-    const UPPER: &str = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
-    const LOWER: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    let mut budget = ConstructionBudget::new(0);
-    assert_eq!(copy_pair(&mut budget, UPPER, None).unwrap(), None);
-    assert_eq!(copy_pair(&mut budget, UPPER, Some("")).unwrap(), None);
-    let mut budget = ConstructionBudget::new(1024);
-    assert_eq!(
-        copy_pair(&mut budget, UPPER, Some(UPPER)).unwrap(),
-        Some((LOWER.to_owned(), LOWER.to_owned()))
-    );
+fn both_membership_probes_require_utf8_before_returning_a_count() {
+    let mut budget = ConstructionBudget::new(4096);
+    for (statement, pairs) in [
+        (catalogue_member_releases_statement(), false),
+        (catalogue_member_track_pairs_statement(), true),
+    ] {
+        let query = admission_sql(&mut budget, statement, pairs).unwrap();
+        assert!(query.contains(
+            "getdatabaseencoding() = 'UTF8' AND pg_client_encoding() = 'UTF8' THEN row_count END"
+        ));
+    }
 }
 
 pub(crate) async fn load_staging_membership(
