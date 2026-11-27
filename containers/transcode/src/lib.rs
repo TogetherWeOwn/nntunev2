@@ -726,7 +726,8 @@ fn handle(stream: &mut TcpStream, config: &ServerConfig, gate: &RwLock<()>) {
                 let dir = staging_dir(config, &cleanup.job_id, &cleanup.staging_id);
                 if let Err(err) = fs::remove_dir_all(&dir) {
                     if err.kind() != io::ErrorKind::NotFound {
-                        eprintln!("transcode cleanup failed job={}", cleanup.job_id);
+                        let job_id = &cleanup.job_id;
+                        let _ = writeln!(io::stderr(), "transcode cleanup failed job={job_id}");
                         return Err(err.into());
                     }
                 }
