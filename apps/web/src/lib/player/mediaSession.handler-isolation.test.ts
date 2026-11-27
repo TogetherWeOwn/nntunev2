@@ -168,7 +168,6 @@ describe('mediaSession early handler isolation', () => {
 			expect((session.metadata as FakeMetadata).init.artwork?.[0]?.src).toBe(`${BASE}/placeholder-artwork.svg`);
 		}
 	);
-
 	it('clears the old OS state before binding a successor source', ({ onTestFinished }) => {
 		const { session, handlers } = isolatedSession(null, []);
 		vi.stubGlobal('navigator', { mediaSession: session });

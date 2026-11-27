@@ -17,16 +17,14 @@ export function readyResponse(): Response {
 }
 
 export function notReadyResponse(retryAfterSeconds: number): Response {
-	const seconds = Number.isFinite(retryAfterSeconds)
-		? Math.min(2_147_483_647, Math.max(0, Math.floor(retryAfterSeconds)))
-		: 1;
+	const seconds = Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : 1;
 	return Response.json(
 		{ ok: false },
 		{
 			status: 503,
 			headers: {
 				'cache-control': 'no-store',
-				'retry-after': String(seconds)
+				'retry-after': String(Math.min(2_147_483_647, Math.max(0, Math.floor(seconds))))
 			}
 		}
 	);
