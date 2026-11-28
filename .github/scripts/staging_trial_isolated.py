@@ -17,7 +17,7 @@ ROUTES = {"OWNER": "direct", "EXECUTOR": "direct", "READER": "routed", "WRITER":
 KIND = "selfhost-pg18"
 HOSTS = {"direct": "nntune-trial-db-op.nntune.com", "routed": "nntune-trial-db-hd.nntune.com"}
 FIXTURE_HOSTS = {"direct": "op.trial.invalid", "routed": "routed.trial.invalid"}
-NAMES = ("nntune_trial_reader", "nntune_trial_writer")  # PlanetScale lifecycle
+NAMES = ("nntune_trial_reader", "nntune_trial_writer")
 SERVING = tuple(role.lower() for role in TRIAL_DATABASES)
 ROLES = {role: f"nntune_trial_{role}" for role in ("owner", "executor", *SERVING)}
 

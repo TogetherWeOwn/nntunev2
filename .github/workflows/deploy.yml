@@ -299,12 +299,7 @@ jobs:
   staging-api:
     name: staging-api
     needs: [gate]
-    if: >-
-      ${{ (github.event_name == 'push' && needs.gate.outputs.enabled == 'true') ||
-          (github.event_name == 'workflow_dispatch' && github.repository == 'TogetherWeOwn/nntunev2' &&
-           github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha &&
-           github.run_attempt == 1 && contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode) &&
-           inputs.private_trial_cleanup_scope_sha256 == '') }}
+    if: ${{ (github.event_name == 'push' && needs.gate.outputs.enabled == 'true') || (github.event_name == 'workflow_dispatch' && github.repository == 'TogetherWeOwn/nntunev2' && github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha && github.run_attempt == 1 && contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode) && inputs.private_trial_cleanup_scope_sha256 == '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Protected staging environment. Deploy uses repository credentials;

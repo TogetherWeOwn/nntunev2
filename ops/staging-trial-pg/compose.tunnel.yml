@@ -12,10 +12,7 @@ services:
          read_only: true, bind: {create_host_path: false}}
     networks:
       trial: {}
-      egress:
-        gw_priority: 1
+      egress: {gw_priority: 1}
 networks:
-  trial:
-    name: nntune-trial-pg-net
-  egress:
-    driver: bridge
+  trial: {name: nntune-trial-pg-net}
+  egress: {driver: bridge}
