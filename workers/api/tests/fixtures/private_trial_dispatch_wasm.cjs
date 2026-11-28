@@ -13,6 +13,19 @@ const request = (length) => new Request(origin + '/v1/admin/private-trial/upload
   headers: { origin, 'content-length': String(length) },
   body: new Uint8Array(length),
 });
+const identityUrl = origin + '/v1/admin/private-trial/db-identity';
+const identityToken = Buffer.alloc(32, 45).toString('base64url');
+const identityRequest = (method = 'POST', bearer = identityToken, url = identityUrl) =>
+  new Request(url, { method, headers: { authorization: `Bearer ${bearer}` } });
+
+function identityEnv(mode) {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    QA_CODE_SEAM: '1',
+    PRIVATE_TRIAL_IDENTITY_MODE: mode,
+    PRIVATE_TRIAL_IDENTITY_RUNNER: `v1:${now - 60}:${now + 60}:${identityToken}`,
+  };
+}
 
 test('private trial requires every staging arm before reading its bounded body', async () => {
   const key = Buffer.alloc(32, 31).toString('base64url');
@@ -45,17 +58,11 @@ test('private trial requires every staging arm before reading its bounded body',
 });
 
 test('the database identity probe requires the disarmed mode, exact staging URL and runner bearer', async () => {
-  const token = Buffer.alloc(32, 45).toString('base64url');
-  const now = Math.floor(Date.now() / 1000);
-  const env = {
-    QA_CODE_SEAM: '1',
-    PRIVATE_TRIAL_IDENTITY_MODE: 'all',
-    PRIVATE_TRIAL_IDENTITY_RUNNER: `v1:${now - 60}:${now + 60}:${token}`,
-  };
-  const endpoint = '/v1/admin/private-trial/db-identity';
-  const call = (overrides = {}, method = 'POST', bearer = token, url = origin + endpoint) =>
-    dispatch(new Request(url, { method, headers: { authorization: `Bearer ${bearer}` } }), { ...env, ...overrides });
+  const env = identityEnv('all');
+  const call = (overrides = {}, method, bearer, url) =>
+    dispatch(identityRequest(method, bearer, url), { ...env, ...overrides });
 
+  assert.equal((await call({ QA_CODE_SEAM: '' })).status, 404);
   assert.equal((await call({ PRIVATE_TRIAL_IDENTITY_MODE: '' })).status, 404);
   assert.equal((await call({ PRIVATE_TRIAL_UPLOAD_ENABLED: 'true' })).status, 404);
   assert.equal((await call({ PRIVATE_PLAYBACK_ENABLED: 'true' })).status, 404);
@@ -63,7 +70,7 @@ test('the database identity probe requires the disarmed mode, exact staging URL 
   const unauthorized = await call({}, 'POST', 'a'.repeat(43));
   assert.equal(unauthorized.status, 404);
   assert.equal(Object.hasOwn(await unauthorized.json(), 'diagnostic'), false);
-  assert.equal((await call({}, 'POST', token, 'https://other.example.test' + endpoint)).status, 404);
+  assert.equal((await call({}, 'POST', identityToken, identityUrl.replace(origin, 'https://other.example.test'))).status, 404);
   const admitted = await call();
   assert.equal(admitted.status, 503);
   assert.equal(admitted.headers.get('cache-control'), 'no-store');
@@ -77,18 +84,14 @@ test('the protected upload probe diagnoses the native Hyperdrive socket and star
   const binding = 'PRIVATE_TRIAL_UPLOAD_DB';
   const role = 'synthetic_worker_role';
   const privateDetail = 'synthetic-only-postgres-error-detail';
-  const token = Buffer.alloc(32, 45).toString('base64url');
-  const now = Math.floor(Date.now() / 1000);
   const sha = '1'.repeat(40);
   const env = {
-    BUILD_SHA: sha, PRIVATE_TRIAL_IDENTITY_MODE: 'upload',
-    PRIVATE_TRIAL_IDENTITY_RUNNER: `v1:${now - 60}:${now + 60}:${token}`,
+    ...identityEnv('upload'),
+    BUILD_SHA: sha,
     PRIVATE_TRIAL_IDENTITY_VERSION: { id: 'test-version' },
   };
   const call = async (phase, error_class, sqlstate = null) => {
-    const response = await dispatch(new Request(origin + '/v1/admin/private-trial/db-identity', {
-      method: 'POST', headers: { authorization: `Bearer ${token}` },
-    }), env);
+    const response = await dispatch(identityRequest(), env);
     assert.equal(response.status, 503);
     const diagnostic = { binding, phase, error_class, sqlstate };
     assert.deepEqual(await response.json(), {
@@ -147,8 +150,6 @@ test('the native Hyperdrive socket returns the disposable PostgreSQL identity', 
   assert.notEqual(databaseOid, roleOid);
   const sha = '1'.repeat(40);
   const version = 'test-version';
-  const token = Buffer.alloc(32, 45).toString('base64url');
-  const now = Math.floor(Date.now() / 1000);
   let socket;
   t.after(() => socket?.close());
   class Hyperdrive {
@@ -161,11 +162,9 @@ test('the native Hyperdrive socket returns the disposable PostgreSQL identity', 
       return { ...socket, opened: Promise.resolve({}) };
     }
   }
-  const response = await dispatch(new Request(origin + '/v1/admin/private-trial/db-identity', {
-    method: 'POST', headers: { authorization: `Bearer ${token}` },
-  }), {
-    BUILD_SHA: sha, PRIVATE_TRIAL_IDENTITY_MODE: 'upload',
-    PRIVATE_TRIAL_IDENTITY_RUNNER: `v1:${now - 60}:${now + 60}:${token}`,
+  const response = await dispatch(identityRequest(), {
+    ...identityEnv('upload'),
+    BUILD_SHA: sha,
     PRIVATE_TRIAL_IDENTITY_VERSION: { id: version },
     [binding + '_ROLE']: user,
     [binding]: new Hyperdrive(),
