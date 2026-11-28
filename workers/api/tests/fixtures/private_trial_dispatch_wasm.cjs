@@ -110,8 +110,8 @@ test('the protected upload probe diagnoses the native Hyperdrive socket and star
   let startup;
   let connectionAttempts = 0;
   class Hyperdrive {
-    user = 'wrong_role';
-    database = 'nntunev2_staging';
+    user = 'edge_user';
+    database = 'edge_db';
     password = 'synthetic-only-password-with-@:[]';
     connect() {
       if (++connectionAttempts === 1) throw new Error(privateDetail);
@@ -131,18 +131,27 @@ test('the protected upload probe diagnoses the native Hyperdrive socket and star
     }
   }
   const target = env[binding] = new Hyperdrive();
-  await call('binding_identity', 'identity_mismatch');
+  target.database = '';
+  await call('binding_identity', 'invalid_binding_database');
+  target.database = 'edge\0db';
+  await call('binding_identity', 'invalid_binding_database');
+  target.database = 'edge_db';
+  target.user = undefined;
+  await call('binding_identity', 'invalid_binding_user');
+  target.user = 'edge\0user';
+  await call('binding_identity', 'invalid_binding_user');
   assert.equal(connectionAttempts, 0);
-  target.user = role;
+  target.user = 'edge_user';
   await call('edge_connect', 'socket');
   await call('postgres_startup_auth', 'authentication', '28P01');
   assert.equal(startup.readUInt32BE(4), 196608, 'send a PostgreSQL startup frame on the edge socket');
-  assert.ok(startup.includes(Buffer.from(`user\0${role}\0database\0nntunev2_staging\0`)));
+  assert.ok(startup.includes(Buffer.from('user\0edge_user\0database\0edge_db\0')));
 });
 
 test('the native Hyperdrive socket returns the disposable PostgreSQL identity', async (t) => {
   const binding = 'PRIVATE_TRIAL_UPLOAD_DB';
   const user = 'trial_identity_fixture';
+  const switchedLogin = 'trial_identity_switched_login';
   const database = 'nntunev2_staging';
   const pins = process.env.TRIAL_IDENTITY_OIDS ?? '';
   assert.match(pins, /^[1-9][0-9]*\|[1-9][0-9]*$/);
@@ -150,28 +159,69 @@ test('the native Hyperdrive socket returns the disposable PostgreSQL identity', 
   assert.notEqual(databaseOid, roleOid);
   const sha = '1'.repeat(40);
   const version = 'test-version';
-  let socket;
-  t.after(() => socket?.close());
   class Hyperdrive {
-    user = user;
-    database = database;
+    user = 'edge_user';
+    database = 'edge_db';
     password = 'ci-throwaway';
+
+    constructor(originDatabase, originUser, test) {
+      this.originDatabase = originDatabase;
+      this.originUser = originUser;
+      this.test = test;
+    }
+
     connect() {
-      assert.equal(socket, undefined);
-      socket = connect({ hostname: '127.0.0.1', port: 5432 }, { secureTransport: 'off' });
-      return { ...socket, opened: Promise.resolve({}) };
+      const socket = connect({ hostname: '127.0.0.1', port: 5432 }, { secureTransport: 'off' });
+      this.test.after(() => socket.close());
+      const writer = socket.writable.getWriter();
+      let started = false;
+      const writable = new WritableStream({
+        write: (chunk) => {
+          if (started) return writer.write(chunk);
+          started = true;
+          // Model the edge mapping startup credentials to the configured origin.
+          const frame = Buffer.from(chunk);
+          assert.equal(frame.readUInt32BE(4), 196608);
+          const edge = 'user\0edge_user\0database\0edge_db\0';
+          const params = frame.subarray(8).toString();
+          assert.ok(params.includes(edge));
+          const mapped = Buffer.concat([frame.subarray(0, 8), Buffer.from(params.replace(
+            edge, `user\0${this.originUser}\0database\0${this.originDatabase}\0`,
+          ))]);
+          mapped.writeUInt32BE(mapped.length, 0);
+          return writer.write(mapped);
+        },
+      });
+      return { ...socket, writable, opened: Promise.resolve({}) };
     }
   }
-  const response = await dispatch(identityRequest(), {
+  const call = (test, originDatabase, originUser, pinnedUser) => dispatch(identityRequest(), {
     ...identityEnv('upload'),
     BUILD_SHA: sha,
     PRIVATE_TRIAL_IDENTITY_VERSION: { id: version },
-    [binding + '_ROLE']: user,
-    [binding]: new Hyperdrive(),
+    [binding + '_ROLE']: pinnedUser,
+    [binding]: new Hyperdrive(originDatabase, originUser, test),
   });
+  const response = await call(t, database, user, user);
   const body = await response.json();
   assert.equal(response.status, 200, JSON.stringify(body));
   assert.deepEqual(body, {
     build_sha: sha, version_id: version, rows: [[binding, [database, databaseOid, user, roleOid, user, roleOid]]],
   });
+  // The switched login has trial_identity_fixture as its default effective role.
+  for (const [name, originDatabase, originUser, pinnedUser, errorClass] of [
+    ['wrong database', 'postgres', user, user, 'database_mismatch'],
+    ['wrong session user', database, switchedLogin, user, 'user_mismatch'],
+    ['wrong current user', database, switchedLogin, switchedLogin, 'user_mismatch'],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const response = await call(subtest, originDatabase, originUser, pinnedUser);
+      assert.equal(response.status, 503);
+      assert.deepEqual(await response.json(), {
+        code: 'service_unavailable', message: 'service unavailable', retryable: true,
+        build_sha: sha,
+        diagnostic: { binding, phase: 'role_query', error_class: errorClass, sqlstate: null },
+      });
+    });
+  }
 });
