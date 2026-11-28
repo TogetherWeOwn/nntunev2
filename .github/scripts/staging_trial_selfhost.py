@@ -68,7 +68,7 @@ def check_session(pins, role, env, *, query=psql_output):
     # The owner is the sole SQL control-identity probe. Serving roles prove
     # their own canonical session and role OIDs without control-file privileges.
     guard = session_guard(pins, role)
-    if role in ("reader", "writer"):
+    if role not in ("owner", "executor"):
         guard += require(f"NOT EXISTS ({other_database_connections('current_user', include_closed=True)})")
     query(env, "BEGIN READ ONLY;\n" + target(pins, ROLES[role], False) + guard + "COMMIT;\n",
           "isolated session continuity")

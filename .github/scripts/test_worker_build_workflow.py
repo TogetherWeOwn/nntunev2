@@ -168,7 +168,7 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         self.assertLess(generate, cache)
         self.assertLess(cache, deploy)
         self.assertIn("needs.gate.outputs.private_trial_upload == '1'", items[cache])
-        self.assertIn("if len(ids) != 4:", items[cache])
+        self.assertIn('expected = 1 if os.environ.get("PRIVATE_TRIAL_IDENTITY_MODE") == "upload" else 4', items[cache])
         self.assertIn('while IFS= read -r id; do\n            ./check_hyperdrive_cache.sh --config-id "$id"', items[cache])
 
     def test_private_upload_requires_explicitly_disabled_cache_on_each_connection(self):
@@ -476,7 +476,7 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
                     self.assertNotIn("secrets.", step)
                     if worker == "api" and step == items[build]:
                         self.assertEqual(step.split("        env:\n")[1].split("        run:")[0],
-                                         "          PRIVATE_TRIAL_BUILD: ${{ needs.gate.outputs.private_trial_upload }}\n")
+                                         """          PRIVATE_TRIAL_BUILD: ${{ contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode) && '1' || needs.gate.outputs.private_trial_upload }}\n""")
                     else:
                         self.assertNotIn("env:", step)
                     self.assertIn("if: steps.config.outputs.configured == 'true'", step)

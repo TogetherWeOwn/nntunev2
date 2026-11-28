@@ -1074,19 +1074,21 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     const mainRef = 'refs/heads/main';
     const lanes = ['staging-web', 'staging-api', 'staging-mb', 'staging-ingest', 'staging-stream', 'post-deploy-e2e', 'post-deploy-private-music'];
     const dispatchFormat = "format('{0}-gate-{1}', github.workflow, github.ref)";
+    const identityWriter = `contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode)`;
     const lockPattern = /^concurrency:\n  group: \$\{\{ (.+) \}\}\n  cancel-in-progress: false\n  queue: max$/m;
     const assertDeployLock = (body: string) => {
       const header = body.split('\njobs:\n')[0]!;
-      expect(header).toMatch(/^on:\n  push:\n    branches: \[main\]\n  workflow_dispatch:\n    inputs:\n      private_trial_cleanup_scope_sha256:\n        description: [^\n]+\n        type: string\n        default: ''\n\n/m);
+      expect(header).toMatch(/^on:\n  push:\n    branches: \[main\]\n  workflow_dispatch:\n    inputs:\n      private_trial_identity_mode:\n        description: [^\n]+\n        type: choice\n        options: \[off, upload, all\]\n        default: off\n      private_trial_cleanup_scope_sha256:\n        description: [^\n]+\n        type: string\n        default: ''\n\n/m);
       const lock = header.match(lockPattern);
       expect(lock, 'queued workflow-level lock').not.toBeNull();
       expect(lock![1], 'dispatch key must use the workflow and ref').toContain(dispatchFormat);
       const workflowName = header.match(/^name: ([\w-]+)$/m)?.[1];
       expect(workflowName).toBe('deploy');
-      const groupFor = (event: string, hasScope: boolean, ref = mainRef): string => {
+      const groupFor = (event: string, hasScope: boolean, ref = mainRef, identity = false): string => {
         const expression = lock![1]!
           .replace("github.event_name == 'push'", String(event === 'push'))
           .replace("inputs.private_trial_cleanup_scope_sha256 != ''", String(hasScope))
+          .replace(identityWriter, String(identity))
           .replace(dispatchFormat, "'diagnostic'");
         expect(expression, 'supported staging lock expression').toMatch(
           /^(?:true|false|'deploy-staging-main'|'diagnostic'|[\s()&|])+$/,
@@ -1096,6 +1098,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
       };
       expect(groupFor('push', false), 'next candidate waits for the older writer').toBe(olderWriterGroup);
       expect(groupFor('workflow_dispatch', true), 'scoped cleanup waits for writers').toBe(olderWriterGroup);
+      expect(groupFor('workflow_dispatch', false, mainRef, true)).toBe(olderWriterGroup);
       expect(groupFor('workflow_dispatch', false)).toBe('deploy-gate-refs/heads/main');
       expect(groupFor('workflow_dispatch', false, 'refs/heads/topic')).toBe('deploy-gate-refs/heads/topic');
 
@@ -1121,6 +1124,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
       deployWorkflow.replace(lock, lock.replace(dispatchFormat, "'diagnostic'")),
       deployWorkflow.replace(lock, lock.replace("github.event_name == 'push'", 'false')),
       deployWorkflow.replace(lock, lock.replace(" || inputs.private_trial_cleanup_scope_sha256 != ''", '')),
+      deployWorkflow.replace(lock, lock.replace(` || ${identityWriter}`, '')),
       ...['gate', ...lanes, PRIVATE_TRIAL_CLEANUP_JOB].map(name =>
         deployWorkflow.replace(
           `\n  ${name}:\n`,

@@ -3,7 +3,7 @@
 use nntune_subsonic::staging_rejection::{RejectionFormat, StagingRejection, StagingRejection::*};
 use subtle::ConstantTimeEq;
 use worker::js_sys::JsString;
-use worker::{web_sys, Env, Response, Result as WorkerResult};
+use worker::{web_sys, web_sys::Request, Env, Response, Result as WorkerResult};
 use zeroize::Zeroizing;
 
 use crate::subsonic_experiment_gate::{Deployment, Lease};
@@ -74,9 +74,9 @@ fn admitted<'a>(
 const MAX_RUNNER_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const RUNNER_BEARER_LEN: usize = 43; // Unpadded base64url of 32 random bytes.
 
-fn authorized_runner(request: &web_sys::Request, env: &Env, now: u64) -> Option<()> {
+pub(crate) fn authorized_runner(request: &Request, env: &Env, now: u64, key: &str) -> Option<()> {
     (var(env, "QA_CODE_SEAM").as_deref() == Some("1")).then_some(())?;
-    let binding = Zeroizing::new(env.secret("SUBSONIC_MEASUREMENT_RUNNER").ok()?.to_string());
+    let binding = Zeroizing::new(env.secret(key).ok()?.to_string());
     // v1:<issued>:<expires>:<bearer>, with at most two 20-digit u64s.
     let mut fields = (binding.len() <= 45 + RUNNER_BEARER_LEN)
         .then_some(binding.strip_prefix("v1:")?)?
@@ -115,7 +115,7 @@ fn runner_case(
     schedule: Schedule,
     now: u64,
 ) -> Option<schedule::Case> {
-    authorized_runner(request, env, now)?;
+    authorized_runner(request, env, now, "SUBSONIC_MEASUREMENT_RUNNER")?;
     // Match only a scheduled literal in JS; do not copy selector values into Rust.
     schedule.resolve(&request_header(request, "x-subsonic-measurement-case")?)
 }

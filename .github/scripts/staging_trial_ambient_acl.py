@@ -10,7 +10,7 @@ import sys
 
 from apply_migration import ADVISORY_LOCK_KEY, ApplyError
 from staging_apply import StagingApplyError, evidence_child_env, quote_literal as literal
-from staging_trial_isolated import KIND, ROLES, SHARED_OID
+from staging_trial_isolated import KIND, ROLES, SERVING, SHARED_OID
 from staging_trial_role_acl import audit, isolated_extensions, require
 from staging_trial_role_lifecycle import NAMES, baseline, psql, target
 from staging_trial_role_preflight import DATABASE, ROLE_RE, oid
@@ -187,7 +187,9 @@ def compose_selfhost(action, raw, digest, pins):
             or not oid(plan["database_oid"]) or plan["database_oid"] != pins["database_oid"]):
         raise ValueError
     return compose(action, plan["baseline"], plan["consumers"], pins["database_oid"], ROLES["owner"],
-                   owner_guard=session_guard(pins, "owner"), catalog=SELFHOST_CATALOG)
+                   owner_guard=session_guard(pins, "owner") + require(
+                       f"NOT EXISTS (SELECT FROM pg_roles WHERE rolname IN ({', '.join(literal(ROLES[role]) for role in SERVING)}))"),
+                   catalog=SELFHOST_CATALOG)
 
 
 def main():

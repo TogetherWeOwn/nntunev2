@@ -19,10 +19,14 @@ OPS = ROOT / "ops/staging-trial-pg"
 sys.path[:0] = [str(ROOT / ".github/scripts"), str(OPS)]
 from create_tls import create_tls
 from private_trial_catalog import apply_catalog, create_catalog
+from staging_api_identity import Unavailable
 from staging_apply import StagingApplyError
 from staging_trial_ambient_acl import SELFHOST_CATALOG, compose_selfhost
-from staging_trial_isolated import FIXTURE_HOSTS, HOSTS, KIND, ROLES, selfhost_target_config, target_config
-from staging_trial_role_preflight import BASELINE, DATABASE
+from staging_trial_identity import verify
+from staging_trial_isolated import FIXTURE_HOSTS, HOSTS, KIND, NAMES, ROLES, SERVING, selfhost_target_config, target_config
+from staging_stream_config import api_vars, trial_db_bindings
+from staging_trial_role_preflight import BASELINE, BINDINGS, DATABASE
+from staging_trial_selfhost_grants import install_sql
 from staging_trial_selfhost import (
     CONTROL, check_catalog, check_session, fingerprint, tls_connection,
 )
@@ -143,7 +147,7 @@ class Disposable:
                 "ca_sha256": fingerprint(self.ca.read_text(encoding="ascii")),
                 "server_sha256": fingerprint((self.path / "tls/server.crt").read_text(encoding="ascii")),
                 "routes": {key: [host, 5432] for key, host in FIXTURE_HOSTS.items()},
-                "role_oids": owners | {"reader": None, "writer": None}}
+                "role_oids": owners | dict.fromkeys(SERVING)}
 
     def role_oid(self, login):
         return int(self.admin(f"SELECT oid FROM pg_roles WHERE rolname = '{login}';"))
@@ -166,6 +170,7 @@ class Qualification(unittest.TestCase):
             "host:all:all:all:reject",
         ])
         self.assertEqual(cluster.admin("SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL OR options IS NOT NULL;"), "0")
+        self.assertEqual(cluster.admin("SHOW max_connections;"), "40")
 
     def exercise_catalog(self, cluster, pins, baseline_digest):
         owner = cluster.connect(pins, "direct", "owner")
@@ -232,7 +237,7 @@ class Qualification(unittest.TestCase):
             cluster.query(owner, statements["restrict-ambient"], "restrict ambient")
         self.assertNotIn(template_connect, json.loads(cluster.admin(SELFHOST_CATALOG))["acl"])
         self.assertEqual(cluster.admin(f"SELECT has_database_privilege('{ROLES['executor']}', 'postgres', 'CONNECT');"), "t")
-        for key in ("reader", "writer"):
+        for key in SERVING:
             role = ROLES[key]
             cluster.admin(f"CREATE ROLE {role} LOGIN NOINHERIT PASSWORD '{PASSWORD}'; GRANT CONNECT ON DATABASE {DATABASE} TO {role};")
             pins["role_oids"][key] = cluster.role_oid(role)
@@ -250,8 +255,68 @@ class Qualification(unittest.TestCase):
             check_session(pins, key, env, query=cluster.query)
         with self.assertRaises(StagingApplyError):
             cluster.query(owner, statements["restore-ambient"], "restore ambient with roles present")
-        for role in (ROLES["reader"], ROLES["writer"]):
-            cluster.admin(f"REVOKE CONNECT ON DATABASE {DATABASE} FROM {role}; DROP ROLE {role};")
+        executor = cluster.connect(pins, "direct", "executor")
+        recipe = install_sql(ROOT, pins)
+        for _ in range(2):
+            cluster.query(executor, recipe, "install stock caller ACLs")
+        for key, statement in {
+            "auth": "SELECT key_hmac FROM public.native_rest_credentials;",
+            "enroll": "SELECT id FROM public.ingest_jobs WHERE false FOR SHARE; "
+                      "SELECT public.reserve_storage_digest(NULL::uuid, 3600);",
+            "publish": "PREPARE guarded AS " + (ROOT / "workers/api/src/handlers/private_trial/lock.sql").read_text()
+                       + "; EXECUTE guarded(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
+            "upload": "SELECT wrapped_record FROM public.storage_object_envelope_intents;",
+        }.items():
+            child = cluster.connect(pins, "routed", key)
+            cluster.query(child, "BEGIN READ WRITE;\n" + statement + "\nROLLBACK;", f"{key} positive caller grants")
+        query = (ROOT / "workers/api/src/handlers/private_trial/identity.sql").read_text()
+        rows = [[binding, json.loads(cluster.query(cluster.connect(pins, "routed", key),
+                                                  "BEGIN READ ONLY;\n" + query + "\nROLLBACK;", "identity query"))]
+                for binding, key in zip(BINDINGS, SERVING, strict=True)]
+        deploy = {"identity": "matched", "build_sha": "a" * 40, "version_id": "version", "deployment_id": "deployment"}
+        self.assertEqual(verify("all", pins, deploy, {**deploy, "rows": rows})["bindings"],
+                         dict.fromkeys(BINDINGS, "matched"))
+
+        environment = "a0000000-0000-4000-8000-000000000001"
+        library = "b0000000-0000-4000-8000-000000000001"
+        obj = "c0000000-0000-4000-8000-000000000001"
+        root = "f0000000-0000-4000-8000-000000000001"
+        cluster.admin(f"""
+            INSERT INTO public.storage_environments VALUES ('{environment}');
+            INSERT INTO public.storage_library_namespaces VALUES ('{library}', '{environment}', NULL);
+        """)
+        inserted = cluster.query(cluster.connect(pins, "routed", "enroll"), f"""
+            BEGIN READ WRITE;
+            INSERT INTO public.storage_object_intents VALUES
+                ('{obj}', 'd0000000-0000-4000-8000-000000000001', '{environment}', '{library}',
+                 'e0000000-0000-4000-8000-000000000001', 1, 65, decode(repeat('ab', 48), 'hex'));
+            INSERT INTO public.storage_object_envelope_intents
+            SELECT object_id, '{root}', decode('4e4e544d454430310002', 'hex') || uuid_send('{root}')
+                 || uuid_send(environment_id) || uuid_send(library_id) || uuid_send(object_id) || uuid_send(generation_id)
+                 || uuid_send(provider_configuration_version_id) || int8send(plaintext_bytes) || int8send(envelope_bytes)
+                 || header_tag || decode(repeat('00', 60), 'hex')
+              FROM public.storage_object_intents WHERE object_id = '{obj}' RETURNING 1;
+            ROLLBACK;
+        """, "enrollment executes the wrapped-envelope trigger")
+        self.assertEqual(inserted.strip(), "1")
+        for key, denied in {
+            "auth": "INSERT INTO public.ingest_session_cleanup_intents (session_id, kind, due_at) SELECT NULL, NULL, NULL WHERE false",
+            "enroll": "UPDATE public.ingest_jobs SET id = id WHERE false",
+            "publish": "UPDATE public.ingest_jobs SET id = id WHERE false",
+            "upload": "SELECT key_hmac FROM public.native_rest_credentials",
+        }.items():
+            child = cluster.connect(pins, "routed", key)
+            result = cluster.psql(child, "BEGIN READ WRITE;\n" + denied + ";")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("may only lock this relation" if key in ("enroll", "publish") else "permission denied",
+                          result.stderr)
+        cluster.admin(f"GRANT CONNECT ON DATABASE template0 TO {ROLES['auth']};")
+        with self.assertRaises(StagingApplyError):
+            cluster.query(executor, recipe, "reject closed-template CONNECT drift")
+        cluster.admin(f"REVOKE CONNECT ON DATABASE template0 FROM {ROLES['auth']};")
+        for key in SERVING:
+            role = ROLES[key]
+            cluster.admin(f"DROP OWNED BY {role}; DROP ROLE {role};")
         for _ in range(2):
             cluster.query(owner, statements["restore-ambient"], "restore ambient")
         self.assertEqual(json.loads(cluster.admin(SELFHOST_CATALOG)), before)
@@ -309,11 +374,74 @@ class Qualification(unittest.TestCase):
                 self.exercise_acl(primary, pins, owner)
                 self.exercise_restart_and_channel_binding(alternate, alternate_pins, alternate_owner)
 
+    def test_tunnel_overlay_keeps_postgres_internal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = json.loads(subprocess.check_output([
+                "docker", "compose", "--env-file", "/dev/null", "-f", str(OPS / "compose.yml"),
+                "-f", str(OPS / "compose.tunnel.yml"), "config", "--format", "json",
+            ], env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "TRIAL_PG_DIR": directory,
+                    "TRIAL_TUNNEL_ID": "12345678-0000-4000-8000-123456789abc"}, timeout=10))
+        pg, tunnel = (config["services"][name] for name in (SERVICE, "nntune-trial-tunnel"))
+        self.assertEqual(set(pg["networks"]), {"trial"})
+        self.assertEqual(set(tunnel["networks"]), {"trial", "egress"})
+        self.assertEqual(config["networks"]["trial"]["name"], "nntune-trial-pg-net")
+        self.assertTrue(config["networks"]["trial"]["internal"])
+        self.assertEqual(config["networks"]["egress"]["driver"], "bridge")
+        self.assertFalse(config["networks"]["egress"].get("internal"))
+        self.assertFalse(pg.get("ports") or tunnel.get("ports"))
+        self.assertRegex(tunnel["image"], r"^cloudflare/cloudflared@sha256:[0-9a-f]{64}$")
+        ingress = (OPS / "tunnel.yml").read_text().split("ingress:\n", 1)[1]
+        self.assertEqual(ingress.splitlines(), [
+            line for host in HOSTS.values() for line in (
+                f"  - hostname: {host}", "    service: tcp://nntune-trial-pg:5432",
+            )
+        ] + ["  - service: http_status:404"])
+
+    def test_disarmed_dispatch_checks_access_before_deploy(self):
+        from check_worker_upload import job_text, run_script, step_text
+
+        workflow = (ROOT / ".github/workflows/deploy.yml").read_text()
+        api_job = job_text(workflow, "staging-api")
+        cache_gate = step_text(api_job, "Require uncached private trial connections")
+        self.assertLess(api_job.index(cache_gate), api_job.index("name: Deploy api to staging"))
+        script = run_script(cache_gate).split("ids=$(", 1)[0]
+        ready = {"PRIVATE_TRIAL_IDENTITY_MODE": "all", "PRIVATE_TRIAL_IDENTITY_TOKEN": "x" * 43,
+                 "CF_ACCESS_CLIENT_ID": "fixture-client", "CF_ACCESS_CLIENT_SECRET": "fixture-secret"}
+        for key in ("CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "PRIVATE_TRIAL_IDENTITY_TOKEN"):
+            for invalid in ("", "line\nbreak"):
+                result = subprocess.run(["bash", "--noprofile", "--norc", "-c", script],
+                                        env=ready | {key: invalid}, capture_output=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+        subprocess.run(["bash", "--noprofile", "--norc", "-c", script], env=ready, check=True)
+
+    def test_disarmed_identity_rejects_drift(self):
+        pins = {"database_oid": 20000, "role_oids": {key: 20001 + n for n, key in enumerate(ROLES)}}
+        deploy = {"identity": "matched", "build_sha": "a" * 40, "version_id": "version", "deployment_id": "deployment"}
+        rows = [[binding, [DATABASE, pins["database_oid"], ROLES[key], pins["role_oids"][key],
+                          ROLES[key], pins["role_oids"][key]]]
+                for binding, key in zip(BINDINGS, SERVING, strict=True)]
+        reply = {**deploy, "rows": rows}
+        self.assertEqual(verify("all", pins, deploy, reply)["bindings"], dict.fromkeys(BINDINGS, "matched"))
+        self.assertEqual(verify("upload", pins, deploy, reply | {"rows": rows[:1]})["bindings"], {BINDINGS[0]: "matched"})
+        for changed in ({"version_id": "other"}, {"rows": rows[:3]}, {"rows": rows[:3] + [rows[0]]}):
+            with self.assertRaises(Unavailable):
+                verify("all", pins, deploy, reply | changed)
+        env = {"PRIVATE_TRIAL_IDENTITY_MODE": "all", **{
+            binding + "_STAGING_ID": f"{index:032x}" for index, binding in enumerate(BINDINGS, 1)
+        }}
+        self.assertEqual(api_vars(env), ['PRIVATE_TRIAL_IDENTITY_MODE = "all"'])
+        self.assertEqual(trial_db_bindings(env).count("[[env.staging.hyperdrive]]"), 4)
+        for arm in ("PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED", "PRIVATE_MUSIC_STAGING_JOURNEY",
+                    "PRIVATE_PLAYBACK_STAGING_ENABLED"):
+            with self.assertRaises(ValueError):
+                api_vars(env | {arm: "true"})
+
     def test_target_kind_pins_are_disjoint(self):
         cfg = {"database_oid": 16494, "executor_oid": 20001, "direct": "direct.fixture.psdb.cloud",
                "direct_port": 5432, "routed": "routed.fixture.psdb.cloud", "routed_port": 6432,
-               "owner": "postgres.fixture", "executor": "executor.fixture", "reader": ROLES["reader"],
-               "writer": ROLES["writer"]}
+               "owner": "postgres.fixture", "executor": "executor.fixture", "reader": NAMES[0],
+               "writer": NAMES[1]}
         self.assertEqual(target_config(json.dumps(cfg), None, False), cfg)
         stock = {"kind": KIND, "database_oid": 20000, "system_identifier": 30000, "ca_sha256": "a" * 64,
                  "server_sha256": "b" * 64, "routes": {key: [host, 5432] for key, host in HOSTS.items()},

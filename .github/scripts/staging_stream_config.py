@@ -41,7 +41,18 @@ def private_vars(env, settings):
     return lines
 
 
+def identity_mode(env):
+    mode = env.get("PRIVATE_TRIAL_IDENTITY_MODE", "")
+    if mode and (mode not in ("upload", "all") or trial_upload(env)
+                 or env.get("PRIVATE_PLAYBACK_STAGING_ENABLED", "") not in ("", "false")
+                 or env.get("PRIVATE_MUSIC_STAGING_JOURNEY", "").lower() not in ("", "false")):
+        raise ValueError("Private trial identity readback requires a valid mode and disarmed serving")
+    return mode
+
+
 def api_vars(env):
+    if mode := identity_mode(env):
+        return [f'PRIVATE_TRIAL_IDENTITY_MODE = "{mode}"']
     lines = private_vars(env, API_SETTINGS)
     if lines and (env.get("STREAM_SERVICE_STAGING") != "nntune-stream-staging"
                   or env.get("STREAM_STAGING_DEPLOY_ENABLED") != "true"):
@@ -66,7 +77,8 @@ def trial_upload(env):
 
 
 def trial_db_bindings(env):
-    if not trial_upload(env):
+    mode = identity_mode(env)
+    if not mode and not trial_upload(env):
         return []
     manifest = tomllib.loads(Path(__file__).with_name("binding_manifest.toml").read_text())
     existing = {
@@ -74,13 +86,15 @@ def trial_db_bindings(env):
         if binding.get("type") == "hyperdrive" for stage in ("prod", "staging")
     }
     bindings = []
-    for role in TRIAL_DATABASES:
+    for role in (TRIAL_DATABASES[:1] if mode == "upload" else TRIAL_DATABASES):
         name = f"PRIVATE_TRIAL_{role}_DB"
         value = env.get(f"{name}_STAGING_ID", "")
         if not re.fullmatch(r"[0-9a-f]{32}", value) or value in existing:
             raise ValueError(f"{name}_STAGING_ID needs a distinct scoped binding")
         existing.add(value)
         bindings.extend(("", "[[env.staging.hyperdrive]]", f'binding = "{name}"', f'id = "{value}"'))
+    if mode:
+        bindings.extend(("", "[env.staging.version_metadata]", 'binding = "PRIVATE_TRIAL_IDENTITY_VERSION"'))
     return bindings
 
 
