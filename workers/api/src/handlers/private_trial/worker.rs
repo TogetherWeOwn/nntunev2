@@ -352,25 +352,20 @@ pub(crate) async fn probe_identity(
         Some("all") => &BINDINGS[..],
         _ => return handlers::not_found(),
     };
-    if req.method() != Method::Post
-        || !req.url().is_ok_and(|url| {
-            url.origin().ascii_serialization() == "https://staging.nntune.com"
-                && url.query().is_none()
-        })
-        || var(env, "SUBSONIC_MEASUREMENT_STAGE").as_deref() != Some("staging")
-        || ["PRIVATE_TRIAL_UPLOAD_ENABLED", "PRIVATE_PLAYBACK_ENABLED"]
-            .iter()
-            .any(|name| !matches!(var(env, name).as_deref(), None | Some("false")))
-    {
-        return handlers::not_found();
-    }
-    if crate::subsonic_measurement::authorized_runner(
+    let authorized = crate::subsonic_measurement::authorized_runner(
         req.inner(),
         env,
         now_millis() / 1000,
         "PRIVATE_TRIAL_IDENTITY_RUNNER",
-    )
-    .is_none()
+    );
+    if req.method() != Method::Post
+        || !req.url().is_ok_and(|url| {
+            url.as_str() == "https://staging.nntune.com/v1/admin/private-trial/db-identity"
+        })
+        || ["PRIVATE_TRIAL_UPLOAD_ENABLED", "PRIVATE_PLAYBACK_ENABLED"]
+            .iter()
+            .any(|name| !matches!(var(env, name).as_deref(), None | Some("false")))
+        || authorized.is_none()
     {
         return handlers::not_found();
     }
@@ -385,25 +380,17 @@ pub(crate) async fn probe_identity(
         };
         rows.push((binding, row));
     }
-    let mut response = handlers::json_response(
+    handlers::json_response(
         200,
         serde_json::json!({"build_sha": build_sha, "version_id": version.id(), "rows": rows}),
-    );
-    response
-        .extra_headers
-        .push(("cache-control".into(), "private, no-store".into()));
-    response
+    )
 }
 
 async fn read_identity(env: &Env, binding: &str) -> Result<serde_json::Value, TrialError> {
     let role = secret(env, &format!("{binding}_ROLE"))?;
     let mut client = connect_stage_role(env, binding, &role).await?;
-    let tx = client
-        .build_transaction()
-        .read_only(true)
-        .start()
-        .await
-        .map_err(|_| Unconfirmed)?;
+    let tx = client.build_transaction().read_only(true);
+    let tx = tx.start().await.map_err(|_| Unconfirmed)?;
     let row = tx
         .query_typed_one(include_str!("identity.sql"), &[])
         .await

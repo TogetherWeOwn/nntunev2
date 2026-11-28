@@ -476,7 +476,7 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
                     self.assertNotIn("secrets.", step)
                     if worker == "api" and step == items[build]:
                         self.assertEqual(step.split("        env:\n")[1].split("        run:")[0],
-                                         "          PRIVATE_TRIAL_BUILD: ${{ needs.gate.outputs.private_trial_upload }}\n")
+                                         """          PRIVATE_TRIAL_BUILD: ${{ contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode) && '1' || needs.gate.outputs.private_trial_upload }}\n""")
                     else:
                         self.assertNotIn("env:", step)
                     self.assertIn("if: steps.config.outputs.configured == 'true'", step)

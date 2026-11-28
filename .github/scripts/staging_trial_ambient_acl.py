@@ -109,7 +109,7 @@ def after_plan(original, consumers, database_oid):
     return dbs, after, sorted(public), sorted(added), sorted(identities)
 
 
-def compose(action, original, consumers, database_oid, login, *, fixture=False, owner_guard="", catalog=CATALOG, trial_names=NAMES):
+def compose(action, original, consumers, database_oid, login, *, fixture=False, owner_guard="", catalog=CATALOG):
     dbs, after, public, added, identities = after_plan(original, consumers, database_oid)
     owner = dbs[database_oid][1]
     affected = sorted({row[0] for row in public})
@@ -145,7 +145,7 @@ def compose(action, original, consumers, database_oid, login, *, fixture=False, 
     sql += target({"database_oid": database_oid}, login, fixture) + owner_guard + baseline()
     sql += f"SELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY});\n"
     sql += require(f"to_regrole(current_user)::oid = {owner}")
-    sql += require(f"NOT EXISTS (SELECT FROM pg_roles WHERE rolname IN ({', '.join(map(literal, trial_names))}))")
+    sql += require(f"NOT EXISTS (SELECT FROM pg_roles WHERE rolname IN ({', '.join(map(literal, NAMES))}))")
     for grantee, name in identities:
         sql += require(f"EXISTS (SELECT FROM pg_roles WHERE oid = {grantee} AND rolname = {literal(name)} AND rolcanlogin)")
     before, restricted = state(original), state(after)
@@ -187,8 +187,9 @@ def compose_selfhost(action, raw, digest, pins):
             or not oid(plan["database_oid"]) or plan["database_oid"] != pins["database_oid"]):
         raise ValueError
     return compose(action, plan["baseline"], plan["consumers"], pins["database_oid"], ROLES["owner"],
-                   owner_guard=session_guard(pins, "owner"), catalog=SELFHOST_CATALOG,
-                   trial_names=(*NAMES, *tuple(ROLES[role] for role in SERVING)))
+                   owner_guard=session_guard(pins, "owner") + require(
+                       f"NOT EXISTS (SELECT FROM pg_roles WHERE rolname IN ({', '.join(literal(ROLES[role]) for role in SERVING)}))"),
+                   catalog=SELFHOST_CATALOG)
 
 
 def main():

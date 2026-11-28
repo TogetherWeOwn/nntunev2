@@ -1,5 +1,4 @@
 credentials-file: /trial/credentials.json
-no-autoupdate: true
 ingress:
   - hostname: nntune-trial-db-op.nntune.com
     service: tcp://nntune-trial-pg:5432

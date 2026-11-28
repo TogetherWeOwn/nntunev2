@@ -73,20 +73,18 @@ FUNCTIONS = {
 
 def install_sql(root, pins):
     role_oids = pins["role_oids"]
-    if not all(oid(role_oids[role]) for role in SERVING):
-        raise ValueError
     scope = {"issuer_oid": 0, **{role: (ROLES[role], role_oids[role]) for role in SERVING}}
+    if not all(oid(scope[role][1]) for role in SERVING):
+        raise ValueError
     base = [(*scope[role], "DATABASE", DATABASE, "CONNECT", "") for role in SERVING]
     grants = [(*scope[role], "SCHEMA", "public", "USAGE", "") for role in ACCESS]
     for role, entries in ACCESS.items():
         grants.extend((*scope[role], "TABLE", f"public.{table}", privilege, columns)
                       for table, privileges, columns in entries for privilege in privileges.split())
         grants.extend((*scope[role], "FUNCTION", function, "EXECUTE", "") for function in FUNCTIONS[role])
-    publisher = [entry for entry in publication_grants(
+    grants.extend(entry for entry in publication_grants(
         DATABASE, {"reader": scope["auth"], "writer": scope["publish"]}, locks=True, overlay=True,
-    ) if entry[0] == ROLES["publish"] and entry[2] != "DATABASE"]
-    publish_locks = [entry for entry in publisher if entry[4:] == ("UPDATE", "id")]
-    grants.extend(entry for entry in publisher if entry not in publish_locks)
+    ) if entry[0] == ROLES["publish"] and entry[2] != "DATABASE")
     sources = [read_source(root, path) for path in (*SCHEMAS, ".github/scripts/staging_trial_selfhost_grants.py")]
     digest = hashlib.sha256(b"".join(hashlib.sha256(source).digest() for source in sources)).hexdigest()
     receipt = "selfhost-private-trial " + digest + " " + " ".join(str(role_oids[role]) for role in SERVING)
@@ -99,7 +97,6 @@ def install_sql(root, pins):
     sql += f"SELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY});\n"
     sql += isolated_extensions() + identities(scope, keys=SERVING)
     sql += f"SELECT {count} = 0 AS new_overlay \\gset\n\\if :new_overlay\n"
-    sql += audit(base, exact=True, include_closed=True)
     sql += "\n".join(transaction_body(source.decode()) for source in sources[:-1])
     sql += f"""
 SET LOCAL search_path = pg_catalog;
@@ -110,31 +107,25 @@ CREATE TRIGGER private_trial_enroll_lock_only BEFORE UPDATE ON public.ingest_job
 ALTER TABLE public.ingest_jobs ENABLE ALWAYS TRIGGER private_trial_enroll_lock_only;
 {change(grants, "GRANT")}
 COMMENT ON TABLE public.private_library_admissions IS '{receipt}';
+\\else
+{lock_contract({"writer": scope["publish"]}, "verify")}
 \\endif
 """
     sql += require(f"{count} = 4 AND obj_description('public.private_library_admissions'::regclass, 'pg_class') = '{receipt}'")
-    sql += lock_contract({"writer": scope["publish"]}, "verify")
     sql += require(f"""SELECT tgenabled = 'A' AND tgtype = 18 AND tgfoid = '{GUARD}'::regprocedure
         AND pg_get_expr(tgqual, tgrelid) = format('(CURRENT_USER = pg_get_userbyid(%L::oid))', '{enroll_oid}')
         FROM pg_trigger WHERE tgrelid = 'public.ingest_jobs'::regclass AND tgname = 'private_trial_enroll_lock_only'""")
-    sql += audit(base + grants + publish_locks, exact=True, include_closed=True)
+    sql += audit(base + grants, exact=True, include_closed=True)
     sql += require(f"NOT has_function_privilege('{ROLES['auth']}', '{RESERVE}', 'EXECUTE') AND "
                    f"NOT has_function_privilege('{ROLES['auth']}', 'public.release_storage_digest(uuid,bigint)', 'EXECUTE')")
     return sql + "COMMIT;\n"
 
 
-def main():
+if __name__ == "__main__":
     try:
         pins = selfhost_target_config(os.environ["SELFHOST_TRIAL_PINS"])
         child = tls_connection(os.environ["PRIVATE_TRIAL_EXECUTOR_URL"], pins, "direct", "executor",
                                Path(os.environ["SELFHOST_TRIAL_CA_FILE"]))
         psql(child, install_sql(Path(__file__).resolve().parents[2], pins), "stock trial ACL install")
     except (ApplyError, StagingApplyError, KeyError, ValueError, OSError, subprocess.TimeoutExpired):
-        print("Stock trial ACL installation refused.", file=sys.stderr)
-        return 1
-    print("Stock trial caller ACLs verified.")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        sys.exit("Stock trial ACL installation refused.")

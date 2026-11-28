@@ -51,15 +51,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      private_trial_identity_ref:
-        description: Full reviewed main SHA for disarmed trial database identity readback
-        type: string
-        default: ''
       private_trial_identity_mode:
-        description: Check the first Upload binding or the complete four-binding set
+        description: Disarmed database identity readback on protected main
         type: choice
-        options: [all, upload]
-        default: all
+        options: [off, upload, all]
+        default: off
       private_trial_cleanup_scope_sha256:
         description: Recorded SHA-256 of the contained tone A cleanup scope
         type: string
@@ -74,7 +70,7 @@ permissions:
 # Empty-scope dispatches only run the gate. Queue those by ref using the
 # existing gate group, including dispatches still using the old job-level lock.
 concurrency:
-  group: ${{ (github.event_name == 'push' || inputs.private_trial_cleanup_scope_sha256 != '' || inputs.private_trial_identity_ref != '') && 'deploy-staging-main' || format('{0}-gate-{1}', github.workflow, github.ref) }}
+  group: ${{ (github.event_name == 'push' || inputs.private_trial_cleanup_scope_sha256 != '' || contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode)) && 'deploy-staging-main' || format('{0}-gate-{1}', github.workflow, github.ref) }}
   cancel-in-progress: false
   queue: max
 
@@ -91,7 +87,7 @@ jobs:
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && github.repository == 'TogetherWeOwn/nntunev2' &&
           github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha &&
-          github.run_attempt == 1 && inputs.private_trial_cleanup_scope_sha256 != '' && inputs.private_trial_identity_ref == '' }}
+          github.run_attempt == 1 && inputs.private_trial_cleanup_scope_sha256 != '' && inputs.private_trial_identity_mode == 'off' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment:
@@ -304,11 +300,11 @@ jobs:
     name: staging-api
     needs: [gate]
     if: >-
-      ${{ needs.gate.outputs.enabled == 'true' && (github.event_name == 'push' ||
+      ${{ (github.event_name == 'push' && needs.gate.outputs.enabled == 'true') ||
           (github.event_name == 'workflow_dispatch' && github.repository == 'TogetherWeOwn/nntunev2' &&
            github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha &&
-           github.run_attempt == 1 && inputs.private_trial_identity_ref == github.sha &&
-           inputs.private_trial_cleanup_scope_sha256 == '')) }}
+           github.run_attempt == 1 && contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode) &&
+           inputs.private_trial_cleanup_scope_sha256 == '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Protected staging environment. Deploy uses repository credentials;
@@ -357,7 +353,7 @@ jobs:
         if: steps.config.outputs.configured == 'true'
         working-directory: workers/api
         env:
-          PRIVATE_TRIAL_BUILD: ${{ inputs.private_trial_identity_ref != '' && '1' || needs.gate.outputs.private_trial_upload }}
+          PRIVATE_TRIAL_BUILD: ${{ contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode) && '1' || needs.gate.outputs.private_trial_upload }}
         run: |
           set -euo pipefail
           cargo metadata --locked --format-version 1 > /dev/null
@@ -396,8 +392,8 @@ jobs:
           PRIVATE_PLAYBACK_STAGING_ROOT_VERSION: ${{ vars.PRIVATE_PLAYBACK_STAGING_ROOT_VERSION }}
           PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT }}
           PRIVATE_PLAYBACK_STAGING_S3_REGION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_REGION }}
-          PRIVATE_TRIAL_IDENTITY_MODE: ${{ inputs.private_trial_identity_ref != '' && inputs.private_trial_identity_mode || '' }}
-          PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED: ${{ (inputs.private_trial_identity_ref != '' && vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED) || (needs.gate.outputs.private_trial_upload == '1' && 'true' || 'false') }}
+          PRIVATE_TRIAL_IDENTITY_MODE: ${{ contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode) && inputs.private_trial_identity_mode || '' }}
+          PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED: ${{ (contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode) && vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED) || (needs.gate.outputs.private_trial_upload == '1' && 'true' || 'false') }}
           PRIVATE_TRIAL_UPLOAD_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_UPLOAD_DB_STAGING_ID }}
           PRIVATE_TRIAL_AUTH_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_AUTH_DB_STAGING_ID }}
           PRIVATE_TRIAL_PUBLISH_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_PUBLISH_DB_STAGING_ID }}
@@ -585,10 +581,10 @@ jobs:
             echo "stream: absent (Subsonic stream answers error 70)" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Require uncached private trial connections
-        if: steps.config.outputs.configured == 'true' && (needs.gate.outputs.private_trial_upload == '1' || inputs.private_trial_identity_ref != '')
+        if: steps.config.outputs.configured == 'true' && (needs.gate.outputs.private_trial_upload == '1' || contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode))
         working-directory: workers/api
         env:
-          PRIVATE_TRIAL_IDENTITY_MODE: ${{ inputs.private_trial_identity_ref != '' && inputs.private_trial_identity_mode || '' }}
+          PRIVATE_TRIAL_IDENTITY_MODE: ${{ contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode) && inputs.private_trial_identity_mode || '' }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
@@ -698,7 +694,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           printf 'staging-api provider identity: %s\n' "$receipt"
       - name: Verify disarmed private trial database identities
-        if: inputs.private_trial_identity_ref != ''
+        if: contains(fromJSON('["upload","all"]'), inputs.private_trial_identity_mode)
         env:
           API_IDENTITY: ${{ steps.deployment.outputs.identity_pin }}
           PRIVATE_TRIAL_IDENTITY_MODE: ${{ inputs.private_trial_identity_mode }}
@@ -706,7 +702,10 @@ jobs:
           SELFHOST_TRIAL_PINS: ${{ secrets.SELFHOST_TRIAL_PINS }}
         run: |
           set -euo pipefail
-          timeout -k 2s 25s python3 -E -s .github/scripts/staging_trial_identity.py | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ -n "$API_IDENTITY" && "$PRIVATE_TRIAL_IDENTITY_TOKEN" =~ ^[A-Za-z0-9_-]{43}$ ]]
+          printf 'Authorization: Bearer %s\n' "$PRIVATE_TRIAL_IDENTITY_TOKEN" |
+            curl -qfsS --max-time 20 --max-filesize 4096 -H @- -X POST https://staging.nntune.com/v1/admin/private-trial/db-identity |
+            python3 -E -s .github/scripts/staging_trial_identity.py | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Bind private API deployment to this attempt
         id: private-pin
         if: vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true'

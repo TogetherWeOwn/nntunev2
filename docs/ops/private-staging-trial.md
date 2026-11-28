@@ -759,9 +759,8 @@ and Worker query.
    since creation. Query caching is disabled while origin pooling remains
    active, including across new Worker-side connections.
 
-The checked-in Worker verifies these bindings in the upload flow, which can
-write. The exact protected check that can supply a read-only result for each
-binding is still pending. [Worker upload flow](../../workers/api/src/handlers/private_trial/worker.rs)
+Dispatch `deploy.yml` on protected main with `private_trial_identity_mode=upload`
+for the first config or `all` for Stage C2. Use the passing attempt's Worker identity receipt.
 
 Record one independently verified result per binding in the protected C2
 handoff. Include evidence references and match or pass outcomes. Keep
