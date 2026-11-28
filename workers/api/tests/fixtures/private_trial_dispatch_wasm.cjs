@@ -133,8 +133,12 @@ test('the protected upload probe diagnoses the native Hyperdrive socket and star
   const target = env[binding] = new Hyperdrive();
   target.database = '';
   await call('binding_identity', 'invalid_binding_database');
+  target.database = 'edge\0db';
+  await call('binding_identity', 'invalid_binding_database');
   target.database = 'edge_db';
   target.user = undefined;
+  await call('binding_identity', 'invalid_binding_user');
+  target.user = 'edge\0user';
   await call('binding_identity', 'invalid_binding_user');
   assert.equal(connectionAttempts, 0);
   target.user = 'edge_user';
