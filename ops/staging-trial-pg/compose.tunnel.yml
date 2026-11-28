@@ -1,0 +1,24 @@
+services:
+  nntune-trial-tunnel:
+    image: cloudflare/cloudflared@sha256:55c7e3e8d89d5e8d20b75a82f3602cbf98e06db406e73e282073cfdc5a9a3af6 # 2026.11.2
+    user: "${TRIAL_PG_UID:-24186}:${TRIAL_PG_GID:-24186}"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    command: [tunnel, --config, /trial/tunnel.yml, run, "${TRIAL_TUNNEL_ID:?set the dedicated Tunnel UUID}"]
+    volumes:
+      - {type: bind, source: ./tunnel.yml, target: /trial/tunnel.yml, read_only: true, bind: {create_host_path: false}}
+      - type: bind
+        source: ${TRIAL_PG_DIR}/tunnel/credentials.json
+        target: /trial/credentials.json
+        read_only: true
+        bind: {create_host_path: false}
+    networks:
+      trial: {}
+      egress:
+        gw_priority: 1
+networks:
+  trial:
+    name: nntune-trial-pg-net
+  egress:
+    driver: bridge

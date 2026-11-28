@@ -74,9 +74,14 @@ fn admitted<'a>(
 const MAX_RUNNER_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const RUNNER_BEARER_LEN: usize = 43; // Unpadded base64url of 32 random bytes.
 
-fn authorized_runner(request: &web_sys::Request, env: &Env, now: u64) -> Option<()> {
+pub(crate) fn authorized_runner(
+    request: &web_sys::Request,
+    env: &Env,
+    now: u64,
+    secret: &str,
+) -> Option<()> {
     (var(env, "QA_CODE_SEAM").as_deref() == Some("1")).then_some(())?;
-    let binding = Zeroizing::new(env.secret("SUBSONIC_MEASUREMENT_RUNNER").ok()?.to_string());
+    let binding = Zeroizing::new(env.secret(secret).ok()?.to_string());
     // v1:<issued>:<expires>:<bearer>, with at most two 20-digit u64s.
     let mut fields = (binding.len() <= 45 + RUNNER_BEARER_LEN)
         .then_some(binding.strip_prefix("v1:")?)?
@@ -115,7 +120,7 @@ fn runner_case(
     schedule: Schedule,
     now: u64,
 ) -> Option<schedule::Case> {
-    authorized_runner(request, env, now)?;
+    authorized_runner(request, env, now, "SUBSONIC_MEASUREMENT_RUNNER")?;
     // Match only a scheduled literal in JS; do not copy selector values into Rust.
     schedule.resolve(&request_header(request, "x-subsonic-measurement-case")?)
 }

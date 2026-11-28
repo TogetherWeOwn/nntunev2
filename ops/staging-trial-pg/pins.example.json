@@ -8,5 +8,5 @@
     "direct": ["nntune-trial-db-op.nntune.com", 5432],
     "routed": ["nntune-trial-db-hd.nntune.com", 5432]
   },
-  "role_oids": {"owner": 0, "executor": 0, "reader": null, "writer": null}
+  "role_oids": {"owner": 0, "executor": 0, "upload": null, "auth": null, "publish": null, "enroll": null}
 }

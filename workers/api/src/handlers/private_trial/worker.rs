@@ -11,16 +11,17 @@ use nntune_ingest::{
 };
 use serde::Deserialize;
 use std::time::{Duration, UNIX_EPOCH};
-use worker::Env;
+use worker::{Env, Method, Request as WorkerRequest, WorkerVersionMetadata};
 use zeroize::Zeroizing;
 
 use crate::{
+    handlers,
     ingest_session_auth::Job,
     ingest_session_caller::{Authorization, PreparedUpload},
     ingest_session_request::Request,
     native_rest::Pepper,
     storage_digest_read::uuid_text,
-    worker_entry::{now_millis, private_browser_worker::hex},
+    worker_entry::{now_millis, private_browser_worker::hex, with_deadline},
 };
 
 use super::super::{
@@ -32,6 +33,13 @@ use super::{
     CommittedPublication, MatchEvidence, Permit, Target,
     TrialError::{self, Refused, Unconfirmed},
 };
+
+const BINDINGS: [&str; 4] = [
+    "PRIVATE_TRIAL_UPLOAD_DB",
+    "PRIVATE_TRIAL_AUTH_DB",
+    "PRIVATE_TRIAL_PUBLISH_DB",
+    "PRIVATE_TRIAL_ENROLL_DB",
+];
 
 const BUCKET: &str = "nntunev2-private-fixtures-staging";
 
@@ -144,12 +152,7 @@ impl Selection {
             secret(env, "PRIVATE_TRIAL_S3_SECRET_ACCESS_KEY")?.to_string(),
         )
         .map_err(|_| Unconfirmed)?;
-        let bindings = [
-            "PRIVATE_TRIAL_UPLOAD_DB",
-            "PRIVATE_TRIAL_AUTH_DB",
-            "PRIVATE_TRIAL_PUBLISH_DB",
-            "PRIVATE_TRIAL_ENROLL_DB",
-        ];
+        let bindings = BINDINGS;
         let roles = bindings
             .iter()
             .map(|name| secret(env, &format!("{name}_ROLE")))
@@ -336,4 +339,76 @@ struct MirrorEvidence {
     title: String,
     exact_title_candidates: Vec<MbSearchHit>,
     recordings: Vec<serde_json::Value>,
+}
+pub(crate) const IDENTITY_PATH: &str = "/v1/admin/private-trial/db-identity";
+
+pub(crate) async fn probe_identity(
+    req: &WorkerRequest,
+    env: &Env,
+    build_sha: &str,
+) -> handlers::Response {
+    let bindings = match var(env, "PRIVATE_TRIAL_IDENTITY_MODE").as_deref() {
+        Some("upload") => &BINDINGS[..1],
+        Some("all") => &BINDINGS[..],
+        _ => return handlers::not_found(),
+    };
+    if req.method() != Method::Post
+        || !req.url().is_ok_and(|url| {
+            url.origin().ascii_serialization() == "https://staging.nntune.com"
+                && url.query().is_none()
+        })
+        || var(env, "SUBSONIC_MEASUREMENT_STAGE").as_deref() != Some("staging")
+        || ["PRIVATE_TRIAL_UPLOAD_ENABLED", "PRIVATE_PLAYBACK_ENABLED"]
+            .iter()
+            .any(|name| !matches!(var(env, name).as_deref(), None | Some("false")))
+    {
+        return handlers::not_found();
+    }
+    if crate::subsonic_measurement::authorized_runner(
+        req.inner(),
+        env,
+        now_millis() / 1000,
+        "PRIVATE_TRIAL_IDENTITY_RUNNER",
+    )
+    .is_none()
+    {
+        return handlers::not_found();
+    }
+    let Ok(version) = env.get_binding::<WorkerVersionMetadata>("PRIVATE_TRIAL_IDENTITY_VERSION")
+    else {
+        return handlers::unavailable();
+    };
+    let mut rows = Vec::with_capacity(bindings.len());
+    for &binding in bindings {
+        let Ok(row) = with_deadline(read_identity(env, binding), 4_000, Unconfirmed).await else {
+            return handlers::unavailable();
+        };
+        rows.push((binding, row));
+    }
+    let mut response = handlers::json_response(
+        200,
+        serde_json::json!({"build_sha": build_sha, "version_id": version.id(), "rows": rows}),
+    );
+    response
+        .extra_headers
+        .push(("cache-control".into(), "private, no-store".into()));
+    response
+}
+
+async fn read_identity(env: &Env, binding: &str) -> Result<serde_json::Value, TrialError> {
+    let role = secret(env, &format!("{binding}_ROLE"))?;
+    let mut client = connect_stage_role(env, binding, &role).await?;
+    let tx = client
+        .build_transaction()
+        .read_only(true)
+        .start()
+        .await
+        .map_err(|_| Unconfirmed)?;
+    let row = tx
+        .query_typed_one(include_str!("identity.sql"), &[])
+        .await
+        .map_err(|_| Unconfirmed)?;
+    tx.rollback().await.map_err(|_| Unconfirmed)?;
+    let json: &str = row.try_get(0).map_err(|_| Unconfirmed)?;
+    serde_json::from_str(json).map_err(|_| Unconfirmed)
 }

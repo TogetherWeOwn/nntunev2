@@ -5,6 +5,7 @@ import re
 
 from apply_migration import transaction_body
 from staging_apply import quote_literal as literal
+from staging_stream_config import TRIAL_DATABASES
 from staging_trial_role_acl import LOCK_TABLES, ROUTINES, require
 from staging_trial_role_preflight import DATABASE, LOGIN_RE, oid
 from staging_trial_schema import LOCATOR_CHECK, TABLES, compose, read_source
@@ -16,9 +17,9 @@ ROUTES = {"OWNER": "direct", "EXECUTOR": "direct", "READER": "routed", "WRITER":
 KIND = "selfhost-pg18"
 HOSTS = {"direct": "nntune-trial-db-op.nntune.com", "routed": "nntune-trial-db-hd.nntune.com"}
 FIXTURE_HOSTS = {"direct": "op.trial.invalid", "routed": "routed.trial.invalid"}
-NAMES = ("nntune_trial_reader", "nntune_trial_writer")
-ROLES = {"owner": "nntune_trial_owner", "executor": "nntune_trial_executor",
-         "reader": NAMES[0], "writer": NAMES[1]}
+NAMES = ("nntune_trial_reader", "nntune_trial_writer")  # PlanetScale lifecycle
+SERVING = tuple(role.lower() for role in TRIAL_DATABASES)
+ROLES = {role: f"nntune_trial_{role}" for role in ("owner", "executor", *SERVING)}
 
 
 def target_config(raw, scope, fixture):
@@ -71,7 +72,7 @@ def selfhost_target_config(raw, *, fixture=False):
                    for key, host in hosts.items())
             or not isinstance(roles, dict) or roles.keys() != ROLES.keys()
             or not all(oid(roles[key]) for key in ("owner", "executor"))
-            or any(roles[key] is not None and not oid(roles[key]) for key in ("reader", "writer"))
+            or any(roles[key] is not None and not oid(roles[key]) for key in SERVING)
             or len({value for value in roles.values() if value is not None}) != sum(
                 value is not None for value in roles.values())):
         raise ValueError

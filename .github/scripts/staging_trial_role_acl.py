@@ -115,7 +115,7 @@ def other_database_connections(role, *, include_closed=False):
               AND has_database_privilege({role}, d.oid, 'CONNECT')"""
 
 
-def audit(entries, *, exact, database_preparation=False):
+def audit(entries, *, exact, database_preparation=False, include_closed=False):
     """Without role inheritance or ownership, direct plus PUBLIC is effective."""
     expected = []
     for _, oid, kind, obj, privilege, columns in entries:
@@ -169,17 +169,17 @@ SELECT NOT EXISTS (SELECT * FROM direct EXCEPT SELECT * FROM expected)
                     AND (a.class_id, a.obj, a.sub) = (d.classid, d.objid, d.objsubid)))
     )
   AND NOT EXISTS (
-    SELECT FROM pg_roles r WHERE r.oid IN ({ids}) AND EXISTS ({other_database_connections('r.oid')})
+    SELECT FROM pg_roles r WHERE r.oid IN ({ids}) AND EXISTS ({other_database_connections('r.oid', include_closed=include_closed)})
     )
   AND NOT EXISTS (SELECT FROM pg_proc WHERE oid IN ({routines})
                   AND (prosecdef OR prokind <> 'f' OR proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog, public']))
 """)
 
 
-def identities(scope, *, missing=False, login=True):
-    reader, writer = scope["reader"], scope["writer"]
-    ids = f"{reader[1]}, {writer[1]}"
-    requested = f"(VALUES ('{reader[0]}',{reader[1]}::oid),('{writer[0]}',{writer[1]}::oid))"
+def identities(scope, *, missing=False, login=True, keys=("reader", "writer")):
+    roles = [scope[key] for key in keys]
+    ids = ", ".join(str(role_oid) for _, role_oid in roles)
+    requested = "(VALUES " + ", ".join(f"({literal(name)},{role_oid}::oid)" for name, role_oid in roles) + ")"
     return require(f"""
 WITH requested(name, id) AS ({requested})
 SELECT NOT EXISTS (

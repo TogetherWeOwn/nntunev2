@@ -8521,6 +8521,12 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // fail-closed paths. An absent or invalid var becomes explicit
     // `"unknown"`, never a missing key.
     let build_sha = build_sha_from_env(&env);
+    #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
+    if req.path() == handlers::private_trial::worker::IDENTITY_PATH {
+        let response =
+            handlers::private_trial::worker::probe_identity(&req, &env, &build_sha).await;
+        return render(&response, &[], &trace_id);
+    }
     let Some(config) = config_from_env(&env) else {
         // Misconfiguration is an operator problem; clients only ever see
         // the generic internal error (never which variable is wrong).

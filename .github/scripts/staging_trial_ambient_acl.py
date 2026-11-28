@@ -10,7 +10,7 @@ import sys
 
 from apply_migration import ADVISORY_LOCK_KEY, ApplyError
 from staging_apply import StagingApplyError, evidence_child_env, quote_literal as literal
-from staging_trial_isolated import KIND, ROLES, SHARED_OID
+from staging_trial_isolated import KIND, ROLES, SERVING, SHARED_OID
 from staging_trial_role_acl import audit, isolated_extensions, require
 from staging_trial_role_lifecycle import NAMES, baseline, psql, target
 from staging_trial_role_preflight import DATABASE, ROLE_RE, oid
@@ -109,7 +109,7 @@ def after_plan(original, consumers, database_oid):
     return dbs, after, sorted(public), sorted(added), sorted(identities)
 
 
-def compose(action, original, consumers, database_oid, login, *, fixture=False, owner_guard="", catalog=CATALOG):
+def compose(action, original, consumers, database_oid, login, *, fixture=False, owner_guard="", catalog=CATALOG, trial_names=NAMES):
     dbs, after, public, added, identities = after_plan(original, consumers, database_oid)
     owner = dbs[database_oid][1]
     affected = sorted({row[0] for row in public})
@@ -145,7 +145,7 @@ def compose(action, original, consumers, database_oid, login, *, fixture=False, 
     sql += target({"database_oid": database_oid}, login, fixture) + owner_guard + baseline()
     sql += f"SELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY});\n"
     sql += require(f"to_regrole(current_user)::oid = {owner}")
-    sql += require(f"NOT EXISTS (SELECT FROM pg_roles WHERE rolname IN ({', '.join(map(literal, NAMES))}))")
+    sql += require(f"NOT EXISTS (SELECT FROM pg_roles WHERE rolname IN ({', '.join(map(literal, trial_names))}))")
     for grantee, name in identities:
         sql += require(f"EXISTS (SELECT FROM pg_roles WHERE oid = {grantee} AND rolname = {literal(name)} AND rolcanlogin)")
     before, restricted = state(original), state(after)
@@ -187,7 +187,8 @@ def compose_selfhost(action, raw, digest, pins):
             or not oid(plan["database_oid"]) or plan["database_oid"] != pins["database_oid"]):
         raise ValueError
     return compose(action, plan["baseline"], plan["consumers"], pins["database_oid"], ROLES["owner"],
-                   owner_guard=session_guard(pins, "owner"), catalog=SELFHOST_CATALOG)
+                   owner_guard=session_guard(pins, "owner"), catalog=SELFHOST_CATALOG,
+                   trial_names=(*NAMES, *tuple(ROLES[role] for role in SERVING)))
 
 
 def main():

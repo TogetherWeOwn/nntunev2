@@ -21,8 +21,9 @@ from create_tls import create_tls
 from private_trial_catalog import apply_catalog, create_catalog
 from staging_apply import StagingApplyError
 from staging_trial_ambient_acl import SELFHOST_CATALOG, compose_selfhost
-from staging_trial_isolated import FIXTURE_HOSTS, HOSTS, KIND, ROLES, selfhost_target_config, target_config
+from staging_trial_isolated import FIXTURE_HOSTS, HOSTS, KIND, NAMES, ROLES, SERVING, selfhost_target_config, target_config
 from staging_trial_role_preflight import BASELINE, DATABASE
+from staging_trial_selfhost_grants import install_sql
 from staging_trial_selfhost import (
     CONTROL, check_catalog, check_session, fingerprint, tls_connection,
 )
@@ -143,7 +144,7 @@ class Disposable:
                 "ca_sha256": fingerprint(self.ca.read_text(encoding="ascii")),
                 "server_sha256": fingerprint((self.path / "tls/server.crt").read_text(encoding="ascii")),
                 "routes": {key: [host, 5432] for key, host in FIXTURE_HOSTS.items()},
-                "role_oids": owners | {"reader": None, "writer": None}}
+                "role_oids": owners | dict.fromkeys(SERVING)}
 
     def role_oid(self, login):
         return int(self.admin(f"SELECT oid FROM pg_roles WHERE rolname = '{login}';"))
@@ -166,6 +167,7 @@ class Qualification(unittest.TestCase):
             "host:all:all:all:reject",
         ])
         self.assertEqual(cluster.admin("SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL OR options IS NOT NULL;"), "0")
+        self.assertEqual(cluster.admin("SHOW max_connections;"), "40")
 
     def exercise_catalog(self, cluster, pins, baseline_digest):
         owner = cluster.connect(pins, "direct", "owner")
@@ -232,7 +234,7 @@ class Qualification(unittest.TestCase):
             cluster.query(owner, statements["restrict-ambient"], "restrict ambient")
         self.assertNotIn(template_connect, json.loads(cluster.admin(SELFHOST_CATALOG))["acl"])
         self.assertEqual(cluster.admin(f"SELECT has_database_privilege('{ROLES['executor']}', 'postgres', 'CONNECT');"), "t")
-        for key in ("reader", "writer"):
+        for key in SERVING:
             role = ROLES[key]
             cluster.admin(f"CREATE ROLE {role} LOGIN NOINHERIT PASSWORD '{PASSWORD}'; GRANT CONNECT ON DATABASE {DATABASE} TO {role};")
             pins["role_oids"][key] = cluster.role_oid(role)
@@ -250,8 +252,28 @@ class Qualification(unittest.TestCase):
             check_session(pins, key, env, query=cluster.query)
         with self.assertRaises(StagingApplyError):
             cluster.query(owner, statements["restore-ambient"], "restore ambient with roles present")
-        for role in (ROLES["reader"], ROLES["writer"]):
-            cluster.admin(f"REVOKE CONNECT ON DATABASE {DATABASE} FROM {role}; DROP ROLE {role};")
+        executor = cluster.connect(pins, "direct", "executor")
+        recipe = install_sql(ROOT, pins)
+        for _ in range(2):
+            cluster.query(executor, recipe, "install stock caller ACLs")
+        for key, denied in {
+            "auth": "INSERT INTO public.ingest_session_cleanup_intents (session_id, kind, due_at) SELECT NULL, NULL, NULL WHERE false",
+            "enroll": "UPDATE public.ingest_jobs SET id = id WHERE false",
+            "publish": "UPDATE public.ingest_jobs SET id = id WHERE false",
+            "upload": "SELECT key_hmac FROM public.native_rest_credentials",
+        }.items():
+            child = cluster.connect(pins, "routed", key)
+            result = cluster.psql(child, denied + ";")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("may only lock this relation" if key in ("enroll", "publish") else "permission denied",
+                          result.stderr)
+        cluster.admin(f"GRANT CONNECT ON DATABASE template0 TO {ROLES['auth']};")
+        with self.assertRaises(StagingApplyError):
+            cluster.query(executor, recipe, "reject closed-template CONNECT drift")
+        cluster.admin(f"REVOKE CONNECT ON DATABASE template0 FROM {ROLES['auth']};")
+        for key in SERVING:
+            role = ROLES[key]
+            cluster.admin(f"DROP OWNED BY {role}; DROP ROLE {role};")
         for _ in range(2):
             cluster.query(owner, statements["restore-ambient"], "restore ambient")
         self.assertEqual(json.loads(cluster.admin(SELFHOST_CATALOG)), before)
@@ -309,11 +331,34 @@ class Qualification(unittest.TestCase):
                 self.exercise_acl(primary, pins, owner)
                 self.exercise_restart_and_channel_binding(alternate, alternate_pins, alternate_owner)
 
+    def test_tunnel_overlay_keeps_postgres_internal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = json.loads(subprocess.check_output([
+                "docker", "compose", "--env-file", "/dev/null", "-f", str(OPS / "compose.yml"),
+                "-f", str(OPS / "compose.tunnel.yml"), "config", "--format", "json",
+            ], env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "TRIAL_PG_DIR": directory,
+                    "TRIAL_TUNNEL_ID": "12345678-0000-4000-8000-123456789abc"}, timeout=10))
+        pg, tunnel = (config["services"][name] for name in (SERVICE, "nntune-trial-tunnel"))
+        self.assertEqual(set(pg["networks"]), {"trial"})
+        self.assertEqual(set(tunnel["networks"]), {"trial", "egress"})
+        self.assertEqual(config["networks"]["trial"]["name"], "nntune-trial-pg-net")
+        self.assertTrue(config["networks"]["trial"]["internal"])
+        self.assertEqual(config["networks"]["egress"]["driver"], "bridge")
+        self.assertFalse(config["networks"]["egress"].get("internal"))
+        self.assertFalse(pg.get("ports") or tunnel.get("ports"))
+        self.assertRegex(tunnel["image"], r"^cloudflare/cloudflared@sha256:[0-9a-f]{64}$")
+        ingress = (OPS / "tunnel.yml").read_text().split("ingress:\n", 1)[1]
+        self.assertEqual(ingress.splitlines(), [
+            line for host in HOSTS.values() for line in (
+                f"  - hostname: {host}", "    service: tcp://nntune-trial-pg:5432",
+            )
+        ] + ["  - service: http_status:404"])
+
     def test_target_kind_pins_are_disjoint(self):
         cfg = {"database_oid": 16494, "executor_oid": 20001, "direct": "direct.fixture.psdb.cloud",
                "direct_port": 5432, "routed": "routed.fixture.psdb.cloud", "routed_port": 6432,
-               "owner": "postgres.fixture", "executor": "executor.fixture", "reader": ROLES["reader"],
-               "writer": ROLES["writer"]}
+               "owner": "postgres.fixture", "executor": "executor.fixture", "reader": NAMES[0],
+               "writer": NAMES[1]}
         self.assertEqual(target_config(json.dumps(cfg), None, False), cfg)
         stock = {"kind": KIND, "database_oid": 20000, "system_identifier": 30000, "ca_sha256": "a" * 64,
                  "server_sha256": "b" * 64, "routes": {key: [host, 5432] for key, host in HOSTS.items()},
