@@ -708,7 +708,7 @@ jobs:
           test -n "$API_IDENTITY"
           printf 'Authorization: Bearer %s\nCF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\n' \
             "$PRIVATE_TRIAL_IDENTITY_TOKEN" "$CF_ACCESS_CLIENT_ID" "$CF_ACCESS_CLIENT_SECRET" |
-            curl -qfsS --max-time 20 --max-filesize 4096 -H @- -X POST https://staging.nntune.com/v1/admin/private-trial/db-identity |
+            curl -qsS --fail-with-body --max-time 20 --max-filesize 4096 -H @- -X POST https://staging.nntune.com/v1/admin/private-trial/db-identity |
             python3 -E -s .github/scripts/staging_trial_identity.py | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Bind private API deployment to this attempt
         id: private-pin

@@ -59,9 +59,79 @@ test('the database identity probe requires the disarmed mode, exact staging URL 
   assert.equal((await call({ PRIVATE_TRIAL_UPLOAD_ENABLED: 'true' })).status, 404);
   assert.equal((await call({ PRIVATE_PLAYBACK_ENABLED: 'true' })).status, 404);
   assert.equal((await call({}, 'GET')).status, 404);
-  assert.equal((await call({}, 'POST', 'a'.repeat(43))).status, 404);
+  const unauthorized = await call({}, 'POST', 'a'.repeat(43));
+  assert.equal(unauthorized.status, 404);
+  assert.equal(Object.hasOwn(await unauthorized.json(), 'diagnostic'), false);
   assert.equal((await call({}, 'POST', token, 'https://other.example.test' + endpoint)).status, 404);
   const admitted = await call();
-  assert.equal(admitted.status, 503, 'admitted requests reach the missing binding');
+  assert.equal(admitted.status, 503);
   assert.equal(admitted.headers.get('cache-control'), 'no-store');
+  assert.deepEqual((await admitted.json()).diagnostic, {
+    binding: null, phase: 'version_metadata', error_class: 'missing_or_invalid_binding', sqlstate: null,
+  });
+});
+
+test('the protected upload probe diagnoses the native Hyperdrive socket and startup', async (t) => {
+  const logs = t.mock.method(console, 'log', () => {});
+  const binding = 'PRIVATE_TRIAL_UPLOAD_DB';
+  const role = 'synthetic_worker_role';
+  const privateDetail = 'synthetic-only-postgres-error-detail';
+  const token = Buffer.alloc(32, 45).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  const sha = '1'.repeat(40);
+  const env = {
+    BUILD_SHA: sha, PRIVATE_TRIAL_IDENTITY_MODE: 'upload',
+    PRIVATE_TRIAL_IDENTITY_RUNNER: `v1:${now - 60}:${now + 60}:${token}`,
+    PRIVATE_TRIAL_IDENTITY_VERSION: { id: 'test-version' },
+  };
+  const call = async (phase, error_class, sqlstate = null) => {
+    const response = await dispatch(new Request(origin + '/v1/admin/private-trial/db-identity', {
+      method: 'POST', headers: { authorization: `Bearer ${token}` },
+    }), env);
+    assert.equal(response.status, 503);
+    const diagnostic = { binding, phase, error_class, sqlstate };
+    assert.deepEqual(await response.json(), {
+      code: 'service_unavailable', message: 'service unavailable', retryable: true,
+      build_sha: sha, diagnostic,
+    });
+    const line = JSON.parse(logs.mock.calls.at(-1).arguments[0]);
+    assert.equal(line.event, 'api.private_trial.identity_failed');
+    assert.deepEqual(line.fields, { ...diagnostic, build_sha: sha });
+  };
+
+  await call('role_env', 'missing_or_invalid_binding');
+  env[binding + '_ROLE'] = role;
+  await call('hyperdrive_binding', 'missing_or_invalid_binding');
+
+  let startup;
+  let connectionAttempts = 0;
+  class Hyperdrive {
+    user = 'wrong_role';
+    database = 'nntunev2_staging';
+    password = 'synthetic-only-password-with-@:[]';
+    connect() {
+      if (++connectionAttempts === 1) throw new Error(privateDetail);
+      const error = Buffer.from(`SFATAL\0C28P01\0M${privateDetail}\0\0`);
+      const frame = Buffer.alloc(5 + error.length);
+      frame[0] = 'E'.charCodeAt(0);
+      frame.writeUInt32BE(error.length + 4, 1);
+      error.copy(frame, 5);
+      const readable = new ReadableStream({
+        start(controller) { controller.enqueue(frame); controller.close(); },
+      });
+      return {
+        opened: Promise.resolve({}),
+        readable,
+        writable: new WritableStream({ write(chunk) { startup = Buffer.from(chunk); } }),
+      };
+    }
+  }
+  const target = env[binding] = new Hyperdrive();
+  await call('binding_identity', 'identity_mismatch');
+  assert.equal(connectionAttempts, 0);
+  target.user = role;
+  await call('edge_connect', 'socket');
+  await call('postgres_startup_auth', 'authentication', '28P01');
+  assert.equal(startup.readUInt32BE(4), 196608, 'send a PostgreSQL startup frame on the edge socket');
+  assert.ok(startup.includes(Buffer.from(`user\0${role}\0database\0nntunev2_staging\0`)));
 });

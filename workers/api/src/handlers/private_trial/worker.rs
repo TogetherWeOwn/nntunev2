@@ -10,7 +10,10 @@ use nntune_ingest::{
     multipart::{s3_completion::S3CompletionSender, session_outcome::CompletionScope},
 };
 use serde::Deserialize;
-use std::time::{Duration, UNIX_EPOCH};
+use std::{
+    cell::Cell,
+    time::{Duration, UNIX_EPOCH},
+};
 use worker::{Env, Method, Request as WorkerRequest, WorkerVersionMetadata};
 use zeroize::Zeroizing;
 
@@ -19,14 +22,18 @@ use crate::{
     ingest_session_auth::Job,
     ingest_session_caller::{Authorization, PreparedUpload},
     ingest_session_request::Request,
+    logging::Level,
     native_rest::Pepper,
     storage_digest_read::uuid_text,
-    worker_entry::{now_millis, private_browser_worker::hex, with_deadline},
+    worker_entry::{emit_record, now_millis, private_browser_worker::hex, with_deadline},
 };
 
 use super::super::{
     registered::registered_header,
-    registration::{authorize_enrollment, connect_stage_role, load_authority, Enrollment},
+    registration::{
+        authorize_enrollment, connect_stage_role, connect_stage_role_with_phase, load_authority,
+        Enrollment, IdentityProbeError,
+    },
     FIXTURE_BYTES,
 };
 use super::{
@@ -346,6 +353,7 @@ pub(crate) async fn probe_identity(
     req: &WorkerRequest,
     env: &Env,
     build_sha: &str,
+    trace_id: &str,
 ) -> handlers::Response {
     let bindings = match var(env, "PRIVATE_TRIAL_IDENTITY_MODE").as_deref() {
         Some("upload") => &BINDINGS[..1],
@@ -369,16 +377,45 @@ pub(crate) async fn probe_identity(
     {
         return handlers::not_found();
     }
+    let phase = Cell::new("version_metadata");
+    let failure = |binding: Option<&str>, error: IdentityProbeError| {
+        let diagnostic = serde_json::json!({
+            "binding": binding, "phase": phase.get(), "error_class": error.class,
+            "sqlstate": error.sqlstate,
+        });
+        let mut fields = diagnostic.clone();
+        fields["build_sha"] = serde_json::json!(build_sha);
+        let _ = emit_record(
+            Level::Warn,
+            "api.private_trial.identity_failed",
+            trace_id,
+            fields,
+        );
+        handlers::json_response(
+            503,
+            serde_json::json!({
+                "code": "service_unavailable", "message": "service unavailable", "retryable": true,
+                "build_sha": build_sha, "diagnostic": diagnostic,
+            }),
+        )
+    };
     let Ok(version) = env.get_binding::<WorkerVersionMetadata>("PRIVATE_TRIAL_IDENTITY_VERSION")
     else {
-        return handlers::unavailable();
+        return failure(None, IdentityProbeError::new("missing_or_invalid_binding"));
     };
     let mut rows = Vec::with_capacity(bindings.len());
     for &binding in bindings {
-        let Ok(row) = with_deadline(read_identity(env, binding), 4_000, Unconfirmed).await else {
-            return handlers::unavailable();
-        };
-        rows.push((binding, row));
+        phase.set("role_env");
+        match with_deadline(
+            read_identity(env, binding, &phase),
+            4_000,
+            IdentityProbeError::new("deadline"),
+        )
+        .await
+        {
+            Ok(row) => rows.push((binding, row)),
+            Err(error) => return failure(Some(binding), error),
+        }
     }
     handlers::json_response(
         200,
@@ -386,16 +423,26 @@ pub(crate) async fn probe_identity(
     )
 }
 
-async fn read_identity(env: &Env, binding: &str) -> Result<serde_json::Value, TrialError> {
-    let role = secret(env, &format!("{binding}_ROLE"))?;
-    let mut client = connect_stage_role(env, binding, &role).await?;
+async fn read_identity(
+    env: &Env,
+    binding: &str,
+    phase: &Cell<&'static str>,
+) -> Result<serde_json::Value, IdentityProbeError> {
+    let role = secret(env, &format!("{binding}_ROLE"))
+        .ok()
+        .filter(|role| !role.is_empty())
+        .ok_or(IdentityProbeError::new("missing_or_invalid_binding"))?;
+    let mut client = connect_stage_role_with_phase(env, binding, &role, phase).await?;
+    phase.set("identity_begin");
     let tx = client.build_transaction().read_only(true);
-    let tx = tx.start().await.map_err(|_| Unconfirmed)?;
+    let tx = tx.start().await?;
+    phase.set("identity_query");
     let row = tx
         .query_typed_one(include_str!("identity.sql"), &[])
-        .await
-        .map_err(|_| Unconfirmed)?;
-    tx.rollback().await.map_err(|_| Unconfirmed)?;
-    let json: &str = row.try_get(0).map_err(|_| Unconfirmed)?;
-    serde_json::from_str(json).map_err(|_| Unconfirmed)
+        .await?;
+    phase.set("identity_rollback");
+    tx.rollback().await?;
+    phase.set("identity_decode");
+    let json: &str = row.try_get(0)?;
+    serde_json::from_str(json).map_err(|_| IdentityProbeError::new("invalid_identity"))
 }

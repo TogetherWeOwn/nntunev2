@@ -11,6 +11,8 @@ import unittest
 from unittest.mock import patch
 
 from staging_apply import StagingApplyError
+from staging_api_identity import Unavailable
+from staging_trial_identity import failure_diagnostic
 import staging_trial_role_lifecycle as lifecycle
 import staging_trial_role_preflight as preflight
 from test_apply_migration_postgres import run_psql
@@ -38,6 +40,26 @@ def require_disposable_runner():
 
 
 class TrialBindingIdentityTests(unittest.TestCase):
+    def test_worker_failure_diagnostic_is_bound_to_source_and_allowlisted(self):
+        sha = "1" * 40
+        deployment = {"identity": "matched", "build_sha": sha}
+        binding = next(iter(BINDING_ROLES))
+        diagnostic = {"binding": binding, "phase": "postgres_startup_auth",
+                      "error_class": "authentication", "sqlstate": "28P01"}
+        reply = {"build_sha": sha, "code": "service_unavailable",
+                 "diagnostic": {**diagnostic, "detail": "synthetic-private-detail"}}
+        self.assertEqual(failure_diagnostic("upload", deployment, reply), diagnostic)
+        for bad in (
+            {"binding": "PRIVATE_TRIAL_AUTH_DB"},
+            {"phase": "provider-controlled-message"},
+            {"error_class": "provider-controlled-class"},
+            {"sqlstate": "provider-controlled-code"},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(Unavailable):
+                failure_diagnostic("upload", deployment, {**reply, "diagnostic": diagnostic | bad})
+        with self.assertRaises(Unavailable):
+            failure_diagnostic("upload", deployment, {**reply, "build_sha": "2" * 40})
+
     def test_fixed_binding_verdicts(self):
         database_oid = 40200
         pins = {binding: (name, number) for number, (binding, name) in

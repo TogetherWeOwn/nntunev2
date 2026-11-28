@@ -246,51 +246,123 @@ async fn load(
 }
 
 #[cfg(target_arch = "wasm32")]
+pub(crate) struct IdentityProbeError {
+    pub class: &'static str,
+    pub sqlstate: Option<String>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl IdentityProbeError {
+    pub const fn new(class: &'static str) -> Self {
+        Self {
+            class,
+            sqlstate: None,
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl From<tokio_postgres::Error> for IdentityProbeError {
+    fn from(error: tokio_postgres::Error) -> Self {
+        if let Some(code) = error.code() {
+            let code = code.code();
+            let sqlstate = (code.len() == 5
+                && code
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
+            .then(|| code.to_owned());
+            return Self {
+                class: if code.starts_with("28") {
+                    "authentication"
+                } else {
+                    "postgres"
+                },
+                sqlstate,
+            };
+        }
+        // tokio-postgres 0.7.18 exposes no authentication-kind accessor.
+        // Match only its fixed Display label, which excludes the error cause.
+        Self::new(if error.is_closed() {
+            "connection_closed"
+        } else if error.to_string() == "authentication error" {
+            "authentication"
+        } else {
+            "driver"
+        })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 pub(crate) async fn connect_stage_role(
     env: &worker::Env,
     binding: &str,
     role: &str,
 ) -> Result<Client, TrialError> {
+    connect_stage_role_with_phase(env, binding, role, &std::cell::Cell::new(""))
+        .await
+        .map_err(|err| match err.class {
+            "identity_mismatch" => TrialError::Refused,
+            _ => TrialError::Unconfirmed,
+        })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn connect_stage_role_with_phase(
+    env: &worker::Env,
+    binding: &str,
+    role: &str,
+    phase: &std::cell::Cell<&'static str>,
+) -> Result<Client, IdentityProbeError> {
     use crate::worker_entry::with_deadline;
-    use worker::{SecureTransport, Socket};
-    use TrialError::{Refused, Unconfirmed};
+    use tokio_postgres::{config::SslMode, Config, NoTls};
 
     with_deadline(
         async {
-            let target = env.hyperdrive(binding).map_err(|_| Unconfirmed)?;
-            let config: tokio_postgres::Config = target
-                .connection_string()
-                .parse()
-                .map_err(|_| Unconfirmed)?;
-            if config.get_dbname() != Some("nntunev2_staging") || config.get_user() != Some(role) {
-                return Err(Refused);
+            phase.set("hyperdrive_binding");
+            let target = env
+                .hyperdrive(binding)
+                .map_err(|_| IdentityProbeError::new("missing_or_invalid_binding"))?;
+            phase.set("binding_identity");
+            let database = target.database();
+            let user = target.user();
+            if database != "nntunev2_staging" || user != role {
+                return Err(IdentityProbeError::new("identity_mismatch"));
             }
-            let socket = Socket::builder()
-                .secure_transport(SecureTransport::StartTls)
-                .connect(target.host(), target.port())
-                .map_err(|_| Unconfirmed)?;
-            socket.opened().await.map_err(|_| Unconfirmed)?;
-            let (client, connection) = config
-                .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+            // The native binding socket terminates at the Hyperdrive edge.
+            // Hyperdrive owns origin TLS and PostgreSQL authentication.
+            let mut config = Config::new();
+            config
+                .dbname(database)
+                .user(user)
+                .password(zeroize::Zeroizing::new(target.password()).as_bytes())
+                .ssl_mode(SslMode::Disable);
+            phase.set("edge_connect");
+            let socket = target
+                .connect()
+                .map_err(|_| IdentityProbeError::new("socket"))?;
+            socket
+                .opened()
                 .await
-                .map_err(|_| Unconfirmed)?;
+                .map_err(|_| IdentityProbeError::new("socket"))?;
+            phase.set("postgres_startup_auth");
+            let (client, connection) = config.connect_raw(socket, NoTls).await?;
             wasm_bindgen_futures::spawn_local(async move {
                 let _ = connection.await;
             });
+            phase.set("role_query");
             let identity = client
                 .query_typed_one(
                     "SELECT current_user::text = $1 AND current_database() = 'nntunev2_staging'",
                     &[(&role, Type::TEXT)],
                 )
-                .await
-                .map_err(|_| Unconfirmed)?;
-            if !identity.try_get::<_, bool>(0).map_err(|_| Unconfirmed)? {
-                return Err(Refused);
+                .await?;
+            if !identity.try_get::<_, bool>(0)? {
+                return Err(IdentityProbeError::new("identity_mismatch"));
             }
             Ok(client)
         },
         3_000,
-        Unconfirmed,
+        IdentityProbeError::new("deadline"),
     )
     .await
 }

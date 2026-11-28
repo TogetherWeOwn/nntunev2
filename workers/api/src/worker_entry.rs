@@ -8093,7 +8093,7 @@ pub(crate) fn now_millis() -> u64 {
 /// value passed here is a code-controlled constant or a validated route
 /// label, so a drop indicates a programming error. Returns the rendered
 /// line so native tests can pin the shape without a Worker console.
-fn emit_record(
+pub(crate) fn emit_record(
     level: crate::logging::Level,
     event: &str,
     trace_id: &str,
@@ -8524,7 +8524,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
     if req.path() == handlers::private_trial::worker::IDENTITY_PATH {
         let response =
-            handlers::private_trial::worker::probe_identity(&req, &env, &build_sha).await;
+            handlers::private_trial::worker::probe_identity(&req, &env, &build_sha, &trace_id)
+                .await;
         return render(&response, &[], &trace_id);
     }
     let Some(config) = config_from_env(&env) else {
