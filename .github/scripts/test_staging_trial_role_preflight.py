@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
+from textwrap import dedent
 import unittest
 from unittest.mock import patch
 
@@ -38,6 +39,53 @@ def require_disposable_runner():
 
 
 class TrialBindingIdentityTests(unittest.TestCase):
+    def test_worker_failure_diagnostic_is_bound_to_source_and_allowlisted(self):
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github/workflows/deploy.yml").read_text()
+        step = workflow.split("- name: Verify disarmed private trial database identities\n", 1)[1]
+        script = dedent(step.split("\n      - ", 1)[0].split("        run: |\n", 1)[1])
+        sha = "1" * 40
+        deployment = {"identity": "matched", "build_sha": sha}
+        binding = next(iter(BINDING_ROLES))
+        diagnostic = {"binding": binding, "phase": "postgres_startup_auth",
+                      "error_class": "authentication", "sqlstate": "28P01"}
+        reply = {"build_sha": sha, "code": "service_unavailable",
+                 "diagnostic": {**diagnostic, "detail": "synthetic-private-detail"}}
+        refused = "Disarmed trial identity check refused."
+        cases = [(reply, f"{refused} {json.dumps(diagnostic)}"),
+                 (reply | {"build_sha": "2" * 40}, refused)]
+        invalid_diagnostics = (
+            {"binding": "PRIVATE_TRIAL_AUTH_DB"},
+            {"phase": "provider-controlled-message"},
+            {"error_class": "provider-controlled-class"},
+            {"sqlstate": "provider-controlled-code"},
+        )
+        cases.extend((reply | {"diagnostic": diagnostic | bad}, refused) for bad in invalid_diagnostics)
+        with TemporaryDirectory() as temp:
+            curl, payload, summary = (Path(temp, name) for name in ("curl", "reply", "summary"))
+            curl.write_text(
+                '#!/bin/sh\ncat >/dev/null\n'
+                'case " $* " in *" --fail-with-body "*) cat "$WORKER_REPLY";; esac\nexit 22\n'
+            )
+            curl.chmod(0o700)
+            env = {
+                "PATH": f"{temp}:{os.defpath}", "WORKER_REPLY": str(payload),
+                "GITHUB_STEP_SUMMARY": str(summary), "API_IDENTITY": json.dumps(deployment),
+                "PRIVATE_TRIAL_IDENTITY_MODE": "upload", "PRIVATE_TRIAL_IDENTITY_TOKEN": "fixture",
+                "CF_ACCESS_CLIENT_ID": "fixture", "CF_ACCESS_CLIENT_SECRET": "fixture",
+            }
+            for body, expected in cases:
+                with self.subTest(body=body):
+                    payload.write_text(json.dumps(body))
+                    result = subprocess.run(
+                        ["bash", "-c", script], cwd=root, env=env,
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stderr, expected + "\n")
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(summary.read_text(), "")
+
     def test_fixed_binding_verdicts(self):
         database_oid = 40200
         pins = {binding: (name, number) for number, (binding, name) in

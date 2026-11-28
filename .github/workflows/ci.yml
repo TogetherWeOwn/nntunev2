@@ -2310,6 +2310,14 @@ jobs:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
         run: |
           set -euo pipefail
+          command -v psql >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client)
+          bash workers/api/tests/run_migration_tests.sh --migrate-only
+          # Snapshot the disposable schema before the fixture jobs write their own data.
+          TRIAL_IDENTITY_OIDS=$(env -i PATH="$PATH" PGPASSWORD=ci-throwaway psql -XwqAt -h 127.0.0.1 -p 5432 -U postgres -d postgres \
+            -v ON_ERROR_STOP=1 -c 'CREATE DATABASE nntunev2_staging TEMPLATE nntune_ci' \
+            -c "CREATE ROLE trial_identity_fixture LOGIN NOINHERIT PASSWORD 'ci-throwaway'" \
+            -c "SELECT oid, 'trial_identity_fixture'::regrole::oid FROM pg_catalog.pg_database WHERE datname = 'nntunev2_staging'")
+          export TRIAL_IDENTITY_OIDS
           cargo build --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features staging-body-wasm-test,encrypted-upload-caller --target-dir "$RUNNER_TEMP/upload-caller-target"
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/upload-caller-js" "$RUNNER_TEMP/upload-caller-target/wasm32-unknown-unknown/debug/nntune_api.wasm"
           PRIVATE_TRIAL_DISPATCH_WASM_JS="$RUNNER_TEMP/upload-caller-js/nntune_api.js" node --test workers/api/tests/fixtures/private_trial_dispatch_wasm.cjs workers/api/tests/fixtures/private_trial_cleanup_wasm.cjs
@@ -2327,11 +2335,6 @@ jobs:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
         run: |
           set -euo pipefail
-          command -v psql >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client)
-          bash workers/api/tests/run_migration_tests.sh --migrate-only
-          # Snapshot the disposable schema before this fixture writes its own data.
-          env -i PATH="$PATH" PGPASSWORD=ci-throwaway psql -Xw -h 127.0.0.1 -p 5432 -U postgres -d postgres \
-            -v ON_ERROR_STOP=1 -c 'CREATE DATABASE nntunev2_staging TEMPLATE nntune_ci'
           cargo build --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features catalogue-playback-wasm-test --target-dir "$RUNNER_TEMP/staging-body-target"
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/catalogue-playback-js" "$RUNNER_TEMP/staging-body-target/wasm32-unknown-unknown/debug/nntune_api.wasm"
           # The stream and ingest lockfiles pin different wasm-bindgen versions.
