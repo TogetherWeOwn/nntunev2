@@ -301,9 +301,22 @@ pub(crate) async fn connect_stage_role(
     connect_stage_role_with_phase(env, binding, role, &std::cell::Cell::new(""))
         .await
         .map_err(|err| match err.class {
-            "identity_mismatch" => TrialError::Refused,
+            "database_mismatch" | "user_mismatch" => TrialError::Refused,
             _ => TrialError::Unconfirmed,
         })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn startup_field(
+    target: &worker::Hyperdrive,
+    field: &str,
+    error_class: &'static str,
+) -> Result<String, IdentityProbeError> {
+    worker::js_sys::Reflect::get(target.as_ref(), &field.into())
+        .ok()
+        .and_then(|value| value.as_string())
+        .filter(|value| !value.is_empty() && !value.contains('\0'))
+        .ok_or_else(|| IdentityProbeError::new(error_class))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -323,13 +336,10 @@ pub(crate) async fn connect_stage_role_with_phase(
                 .hyperdrive(binding)
                 .map_err(|_| IdentityProbeError::new("missing_or_invalid_binding"))?;
             phase.set("binding_identity");
-            let database = target.database();
-            let user = target.user();
-            if database != "nntunev2_staging" || user != role {
-                return Err(IdentityProbeError::new("identity_mismatch"));
-            }
-            // The native binding socket terminates at the Hyperdrive edge.
-            // Hyperdrive owns origin TLS and PostgreSQL authentication.
+            let database = startup_field(&target, "database", "invalid_binding_database")?;
+            let user = startup_field(&target, "user", "invalid_binding_user")?;
+            // These are startup fields for the Hyperdrive edge. Verify the
+            // independently pinned origin identities with SQL after startup.
             let mut config = Config::new();
             config
                 .dbname(database)
@@ -352,12 +362,16 @@ pub(crate) async fn connect_stage_role_with_phase(
             phase.set("role_query");
             let identity = client
                 .query_typed_one(
-                    "SELECT current_user::text = $1 AND current_database() = 'nntunev2_staging'",
+                    "SELECT pg_catalog.current_database()::text = 'nntunev2_staging',
+                            session_user::text = $1 AND current_user::text = $1",
                     &[(&role, Type::TEXT)],
                 )
                 .await?;
             if !identity.try_get::<_, bool>(0)? {
-                return Err(IdentityProbeError::new("identity_mismatch"));
+                return Err(IdentityProbeError::new("database_mismatch"));
+            }
+            if !identity.try_get::<_, bool>(1)? {
+                return Err(IdentityProbeError::new("user_mismatch"));
             }
             Ok(client)
         },

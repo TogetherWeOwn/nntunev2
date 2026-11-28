@@ -54,6 +54,14 @@ class TrialBindingIdentityTests(unittest.TestCase):
         refused = "Disarmed trial identity check refused."
         cases = [(reply, f"{refused} {json.dumps(diagnostic)}"),
                  (reply | {"build_sha": "2" * 40}, refused)]
+        for phase, error_class in (
+            ("binding_identity", "invalid_binding_database"),
+            ("binding_identity", "invalid_binding_user"),
+            ("role_query", "database_mismatch"),
+            ("role_query", "user_mismatch"),
+        ):
+            mismatch = dict(diagnostic, phase=phase, error_class=error_class, sqlstate=None)
+            cases.append((reply | {"diagnostic": mismatch}, f"{refused} {json.dumps(mismatch)}"))
         invalid_diagnostics = (
             {"binding": "PRIVATE_TRIAL_AUTH_DB"},
             {"phase": "provider-controlled-message"},

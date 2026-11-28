@@ -26,7 +26,8 @@ def failure_diagnostic(mode, deployment, reply):
             "identity_rollback", "identity_decode",
         )), "diagnostic-phase",
     )
-    require(error_class in ("missing_or_invalid_binding", "identity_mismatch", "socket", "deadline",
+    require(error_class in ("missing_or_invalid_binding", "invalid_binding_database", "invalid_binding_user",
+                            "database_mismatch", "user_mismatch", "socket", "deadline",
                             "authentication", "postgres", "connection_closed", "driver", "invalid_identity"),
             "diagnostic-class")
     require(sqlstate is None or (isinstance(sqlstate, str) and re.fullmatch(r"[A-Z0-9]{5}", sqlstate)),
