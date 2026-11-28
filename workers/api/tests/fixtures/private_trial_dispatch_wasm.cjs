@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
+const { connect } = require('../../../ingest/tests/fixtures/catalogue_postgres_socket.cjs');
 const loadWorker = require('../../../ingest/tests/fixtures/worker_fixture_wasm.cjs');
 const { private_trial_dispatch_test: dispatch } = loadWorker(process.env.PRIVATE_TRIAL_DISPATCH_WASM_JS);
 
@@ -134,4 +135,43 @@ test('the protected upload probe diagnoses the native Hyperdrive socket and star
   await call('postgres_startup_auth', 'authentication', '28P01');
   assert.equal(startup.readUInt32BE(4), 196608, 'send a PostgreSQL startup frame on the edge socket');
   assert.ok(startup.includes(Buffer.from(`user\0${role}\0database\0nntunev2_staging\0`)));
+});
+
+test('the native Hyperdrive socket returns the disposable PostgreSQL identity', async (t) => {
+  const binding = 'PRIVATE_TRIAL_UPLOAD_DB';
+  const user = 'trial_identity_fixture';
+  const database = 'nntunev2_staging';
+  const sha = '1'.repeat(40);
+  const version = 'test-version';
+  const token = Buffer.alloc(32, 45).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  let socket;
+  t.after(() => socket?.close());
+  class Hyperdrive {
+    user = user;
+    database = database;
+    password = 'ci-throwaway';
+    connect() {
+      assert.equal(socket, undefined);
+      socket = connect({ hostname: '127.0.0.1', port: 5432 }, { secureTransport: 'off' });
+      return { ...socket, opened: Promise.resolve({}) };
+    }
+  }
+  const response = await dispatch(new Request(origin + '/v1/admin/private-trial/db-identity', {
+    method: 'POST', headers: { authorization: `Bearer ${token}` },
+  }), {
+    BUILD_SHA: sha, PRIVATE_TRIAL_IDENTITY_MODE: 'upload',
+    PRIVATE_TRIAL_IDENTITY_RUNNER: `v1:${now - 60}:${now + 60}:${token}`,
+    PRIVATE_TRIAL_IDENTITY_VERSION: { id: version },
+    [binding + '_ROLE']: user,
+    [binding]: new Hyperdrive(),
+  });
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  const [, databaseOid, , roleOid] = body.rows[0][1];
+  assert.ok(Number.isInteger(databaseOid) && databaseOid > 0);
+  assert.ok(Number.isInteger(roleOid) && roleOid > 0);
+  assert.deepEqual(body, {
+    build_sha: sha, version_id: version, rows: [[binding, [database, databaseOid, user, roleOid, user, roleOid]]],
+  });
 });
