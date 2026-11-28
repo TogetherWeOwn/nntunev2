@@ -147,6 +147,7 @@ test('the protected upload probe diagnoses the native Hyperdrive socket and star
 test('the native Hyperdrive socket returns the disposable PostgreSQL identity', async (t) => {
   const binding = 'PRIVATE_TRIAL_UPLOAD_DB';
   const user = 'trial_identity_fixture';
+  const switchedLogin = 'trial_identity_switched_login';
   const database = 'nntunev2_staging';
   const pins = process.env.TRIAL_IDENTITY_OIDS ?? '';
   assert.match(pins, /^[1-9][0-9]*\|[1-9][0-9]*$/);
@@ -159,8 +160,9 @@ test('the native Hyperdrive socket returns the disposable PostgreSQL identity', 
     database = 'edge_db';
     password = 'ci-throwaway';
 
-    constructor(originDatabase, test) {
+    constructor(originDatabase, originUser, test) {
       this.originDatabase = originDatabase;
+      this.originUser = originUser;
       this.test = test;
     }
 
@@ -180,7 +182,7 @@ test('the native Hyperdrive socket returns the disposable PostgreSQL identity', 
           const params = frame.subarray(8).toString();
           assert.ok(params.includes(edge));
           const mapped = Buffer.concat([frame.subarray(0, 8), Buffer.from(params.replace(
-            edge, `user\0${user}\0database\0${this.originDatabase}\0`,
+            edge, `user\0${this.originUser}\0database\0${this.originDatabase}\0`,
           ))]);
           mapped.writeUInt32BE(mapped.length, 0);
           return writer.write(mapped);
@@ -189,25 +191,27 @@ test('the native Hyperdrive socket returns the disposable PostgreSQL identity', 
       return { ...socket, writable, opened: Promise.resolve({}) };
     }
   }
-  const call = (test, originDatabase, pinnedUser) => dispatch(identityRequest(), {
+  const call = (test, originDatabase, originUser, pinnedUser) => dispatch(identityRequest(), {
     ...identityEnv('upload'),
     BUILD_SHA: sha,
     PRIVATE_TRIAL_IDENTITY_VERSION: { id: version },
     [binding + '_ROLE']: pinnedUser,
-    [binding]: new Hyperdrive(originDatabase, test),
+    [binding]: new Hyperdrive(originDatabase, originUser, test),
   });
-  const response = await call(t, database, user);
+  const response = await call(t, database, user, user);
   const body = await response.json();
   assert.equal(response.status, 200, JSON.stringify(body));
   assert.deepEqual(body, {
     build_sha: sha, version_id: version, rows: [[binding, [database, databaseOid, user, roleOid, user, roleOid]]],
   });
-  for (const [originDatabase, pinnedUser, errorClass] of [
-    ['postgres', user, 'database_mismatch'],
-    [database, 'other_origin_role', 'user_mismatch'],
+  // The switched login has trial_identity_fixture as its default effective role.
+  for (const [name, originDatabase, originUser, pinnedUser, errorClass] of [
+    ['wrong database', 'postgres', user, user, 'database_mismatch'],
+    ['wrong session user', database, switchedLogin, user, 'user_mismatch'],
+    ['wrong current user', database, switchedLogin, switchedLogin, 'user_mismatch'],
   ]) {
-    await t.test(errorClass, async (subtest) => {
-      const response = await call(subtest, originDatabase, pinnedUser);
+    await t.test(name, async (subtest) => {
+      const response = await call(subtest, originDatabase, originUser, pinnedUser);
       assert.equal(response.status, 503);
       assert.deepEqual(await response.json(), {
         code: 'service_unavailable', message: 'service unavailable', retryable: true,
