@@ -269,6 +269,36 @@ class Qualification(unittest.TestCase):
         }.items():
             child = cluster.connect(pins, "routed", key)
             cluster.query(child, "BEGIN READ WRITE;\n" + statement + "\nROLLBACK;", f"{key} positive caller grants")
+        query = (ROOT / "workers/api/src/handlers/private_trial/identity.sql").read_text()
+        rows = [[binding, json.loads(cluster.query(cluster.connect(pins, "routed", key),
+                                                  "BEGIN READ ONLY;\n" + query + "\nROLLBACK;", "identity query"))]
+                for binding, key in zip(BINDINGS, SERVING, strict=True)]
+        deploy = {"identity": "matched", "build_sha": "a" * 40, "version_id": "version", "deployment_id": "deployment"}
+        self.assertEqual(verify("all", pins, deploy, {**deploy, "rows": rows})["bindings"],
+                         dict.fromkeys(BINDINGS, "matched"))
+
+        environment = "a0000000-0000-4000-8000-000000000001"
+        library = "b0000000-0000-4000-8000-000000000001"
+        obj = "c0000000-0000-4000-8000-000000000001"
+        root = "f0000000-0000-4000-8000-000000000001"
+        cluster.admin(f"""
+            INSERT INTO public.storage_environments VALUES ('{environment}');
+            INSERT INTO public.storage_library_namespaces VALUES ('{library}', '{environment}', NULL);
+        """)
+        inserted = cluster.query(cluster.connect(pins, "routed", "enroll"), f"""
+            BEGIN READ WRITE;
+            INSERT INTO public.storage_object_intents VALUES
+                ('{obj}', 'd0000000-0000-4000-8000-000000000001', '{environment}', '{library}',
+                 'e0000000-0000-4000-8000-000000000001', 1, 65, decode(repeat('ab', 48), 'hex'));
+            INSERT INTO public.storage_object_envelope_intents
+            SELECT object_id, '{root}', decode('4e4e544d454430310002', 'hex') || uuid_send('{root}')
+                 || uuid_send(environment_id) || uuid_send(library_id) || uuid_send(object_id) || uuid_send(generation_id)
+                 || uuid_send(provider_configuration_version_id) || int8send(plaintext_bytes) || int8send(envelope_bytes)
+                 || header_tag || decode(repeat('00', 60), 'hex')
+              FROM public.storage_object_intents WHERE object_id = '{obj}' RETURNING 1;
+            ROLLBACK;
+        """, "enrollment executes the wrapped-envelope trigger")
+        self.assertEqual(inserted.strip(), "1")
         for key, denied in {
             "auth": "INSERT INTO public.ingest_session_cleanup_intents (session_id, kind, due_at) SELECT NULL, NULL, NULL WHERE false",
             "enroll": "UPDATE public.ingest_jobs SET id = id WHERE false",

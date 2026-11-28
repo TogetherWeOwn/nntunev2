@@ -43,12 +43,10 @@ def private_vars(env, settings):
 
 def identity_mode(env):
     mode = env.get("PRIVATE_TRIAL_IDENTITY_MODE", "")
-    if mode not in ("", "upload", "all"):
-        raise ValueError("Invalid private trial identity mode")
-    if mode and (trial_upload(env)
+    if mode and (mode not in ("upload", "all") or trial_upload(env)
                  or env.get("PRIVATE_PLAYBACK_STAGING_ENABLED", "") not in ("", "false")
                  or env.get("PRIVATE_MUSIC_STAGING_JOURNEY", "").lower() not in ("", "false")):
-        raise ValueError("Private trial identity readback requires disarmed serving")
+        raise ValueError("Private trial identity readback requires a valid mode and disarmed serving")
     return mode
 
 

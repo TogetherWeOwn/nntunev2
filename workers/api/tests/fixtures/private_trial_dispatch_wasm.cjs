@@ -42,3 +42,26 @@ test('private trial requires every staging arm before reading its bounded body',
   assert.equal((await dispatch(over, env)).status, 400);
   assert.equal(over.bodyUsed, false);
 });
+
+test('the database identity probe requires the disarmed mode, exact staging URL and runner bearer', async () => {
+  const token = Buffer.alloc(32, 45).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  const env = {
+    QA_CODE_SEAM: '1',
+    PRIVATE_TRIAL_IDENTITY_MODE: 'all',
+    PRIVATE_TRIAL_IDENTITY_RUNNER: `v1:${now - 60}:${now + 60}:${token}`,
+  };
+  const endpoint = '/v1/admin/private-trial/db-identity';
+  const call = (overrides = {}, method = 'POST', bearer = token, url = origin + endpoint) =>
+    dispatch(new Request(url, { method, headers: { authorization: `Bearer ${bearer}` } }), { ...env, ...overrides });
+
+  assert.equal((await call({ PRIVATE_TRIAL_IDENTITY_MODE: '' })).status, 404);
+  assert.equal((await call({ PRIVATE_TRIAL_UPLOAD_ENABLED: 'true' })).status, 404);
+  assert.equal((await call({ PRIVATE_PLAYBACK_ENABLED: 'true' })).status, 404);
+  assert.equal((await call({}, 'GET')).status, 404);
+  assert.equal((await call({}, 'POST', 'a'.repeat(43))).status, 404);
+  assert.equal((await call({}, 'POST', token, 'https://other.example.test' + endpoint)).status, 404);
+  const admitted = await call();
+  assert.equal(admitted.status, 503, 'admitted requests reach the missing binding');
+  assert.equal(admitted.headers.get('cache-control'), 'no-store');
+});

@@ -8,11 +8,6 @@ services:
     command: [tunnel, --no-autoupdate, --config, /trial/tunnel.yml, run, "${TRIAL_TUNNEL_ID:?set the dedicated Tunnel UUID}"]
     volumes:
       - {type: bind, source: ./tunnel.yml, target: /trial/tunnel.yml, read_only: true, bind: {create_host_path: false}}
-      - {type: bind, source: "${TRIAL_PG_DIR}/tunnel/credentials.json", target: /trial/credentials.json,
-         read_only: true, bind: {create_host_path: false}}
-    networks:
-      trial: {}
-      egress: {gw_priority: 1}
-networks:
-  trial: {name: nntune-trial-pg-net}
-  egress: {driver: bridge}
+      - {type: bind, source: "${TRIAL_PG_DIR}/tunnel/credentials.json", target: /trial/credentials.json, read_only: true, bind: {create_host_path: false}}
+    networks: {trial: {}, egress: {gw_priority: 1}}
+networks: {trial: {name: nntune-trial-pg-net}, egress: {driver: bridge}}

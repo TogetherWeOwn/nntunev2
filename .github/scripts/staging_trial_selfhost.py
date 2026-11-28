@@ -7,7 +7,7 @@ import subprocess
 from urllib.parse import parse_qs, urlsplit
 
 from staging_apply import StagingApplyError, evidence_child_env
-from staging_trial_isolated import ROLES, SERVING
+from staging_trial_isolated import ROLES
 from staging_trial_role_acl import other_database_connections, require
 from staging_trial_role_lifecycle import check_catalog_connections, psql_output, target
 from staging_trial_role_preflight import DATABASE, oid
@@ -68,7 +68,7 @@ def check_session(pins, role, env, *, query=psql_output):
     # The owner is the sole SQL control-identity probe. Serving roles prove
     # their own canonical session and role OIDs without control-file privileges.
     guard = session_guard(pins, role)
-    if role in SERVING:
+    if role not in ("owner", "executor"):
         guard += require(f"NOT EXISTS ({other_database_connections('current_user', include_closed=True)})")
     query(env, "BEGIN READ ONLY;\n" + target(pins, ROLES[role], False) + guard + "COMMIT;\n",
           "isolated session continuity")

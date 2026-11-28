@@ -33,7 +33,7 @@ ACCESS = {
         ("ingest_session_reservations", "SELECT", "id absolute_deadline"),
         ("ingest_session_reservations", "INSERT", "id library_id principal_id idempotency_key fingerprint absolute_deadline idle_deadline"),
         ("ingest_session_cleanup_intents", "INSERT", "session_id kind due_at"),
-        ("storage_object_intents", "INSERT",
+        ("storage_object_intents", "INSERT SELECT",
          "object_id generation_id environment_id library_id provider_configuration_version_id plaintext_bytes envelope_bytes header_tag"),
         ("storage_plaintext_digest_claim_intents", "INSERT SELECT", "object_id environment_id library_id plaintext_bytes plaintext_sha256"),
         ("storage_digest_reservations", "SELECT INSERT", "environment_id library_id plaintext_sha256 plaintext_bytes object_id generation expires_at"),

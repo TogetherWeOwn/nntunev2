@@ -74,7 +74,7 @@ fn admitted<'a>(
 const MAX_RUNNER_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const RUNNER_BEARER_LEN: usize = 43; // Unpadded base64url of 32 random bytes.
 
-pub(crate) fn authorized_runner(req: &Request, env: &Env, now: u64, key: &str) -> Option<()> {
+pub(crate) fn authorized_runner(request: &Request, env: &Env, now: u64, key: &str) -> Option<()> {
     (var(env, "QA_CODE_SEAM").as_deref() == Some("1")).then_some(())?;
     let binding = Zeroizing::new(env.secret(key).ok()?.to_string());
     // v1:<issued>:<expires>:<bearer>, with at most two 20-digit u64s.
@@ -100,7 +100,7 @@ pub(crate) fn authorized_runner(req: &Request, env: &Env, now: u64, key: &str) -
     }
     // Cap the normalized JS header before copying into Rust. Compare only
     // the fixed-length bearer bytes in constant time.
-    let value = request_header(req, "authorization")?;
+    let value = request_header(request, "authorization")?;
     if value.length() as usize != "Bearer ".len() + RUNNER_BEARER_LEN {
         return None;
     }

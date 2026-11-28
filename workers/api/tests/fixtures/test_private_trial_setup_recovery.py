@@ -11,7 +11,7 @@ from create_tls import create_tls
 from private_trial_catalog import apply_catalog, create_catalog
 from staging_apply import StagingApplyError
 from staging_trial_ambient_acl import SELFHOST_CATALOG
-from staging_trial_isolated import ROLES, selfhost_target_config
+from staging_trial_isolated import ROLES, SERVING, selfhost_target_config
 from staging_trial_selfhost import check_catalog, check_session
 
 
@@ -19,9 +19,8 @@ class SetupRecovery(unittest.TestCase):
     def test_resume_unsent_apply_on_original_database(self):
         owner, executor = ROLES["owner"], ROLES["executor"]
         ledger = "SELECT file || ':' || sha256 FROM public.schema_migrations ORDER BY file;"
-        runtime_roles = "SELECT count(*) FROM pg_roles WHERE rolname IN ('{}', '{}');".format(
-            ROLES["reader"], ROLES["writer"],
-        )
+        runtime_names = ", ".join(f"'{ROLES[role]}'" for role in SERVING)
+        runtime_roles = f"SELECT count(*) FROM pg_roles WHERE rolname IN ({runtime_names});"
         ledger_absent = "SELECT to_regclass('public.schema_migrations') IS NULL;"
         public_tables = "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;"
         with tempfile.TemporaryDirectory(prefix="nntune-trial-recovery-") as directory:
@@ -44,8 +43,8 @@ class SetupRecovery(unittest.TestCase):
                 cluster.admin("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC;"
                               f"GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO {owner};")
                 pins = selfhost_target_config(json.dumps(cluster.pins()), fixture=True)
-                self.assertIsNone(pins["role_oids"]["reader"])
-                self.assertIsNone(pins["role_oids"]["writer"])
+                for role in SERVING:
+                    self.assertIsNone(pins["role_oids"][role])
                 before_apply = cluster.admin(SELFHOST_CATALOG)
                 before_tables = cluster.admin(public_tables)
                 (cluster.path / "init-password").write_bytes(b"")

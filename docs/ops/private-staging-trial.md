@@ -760,7 +760,9 @@ and Worker query.
    active, including across new Worker-side connections.
 
 Dispatch `deploy.yml` on protected main with `private_trial_identity_mode=upload`
-for the first config or `all` for Stage C2. Use the passing attempt's Worker identity receipt.
+for the first config or `all` for Stage C2. If readback fails, correct the cause
+and start a fresh dispatch on the reviewed revision, or restore the recorded
+disarmed deploy via the [staging rollback procedure](../ops.md#staging-deploy-lock-cutover-and-rollback).
 
 Record one independently verified result per binding in the protected C2
 handoff. Include evidence references and match or pass outcomes. Keep
@@ -830,8 +832,8 @@ origin TLS evidence keeps the handoff pending. [Offline role checker](../../.git
 Hosted execution requires a protected, read-only Worker probe using the same
 four dedicated bindings while the trial is disarmed, and a hosted caller
 that verifies the config and deployed-version receipts and supplies the
-rows to the checker. The current deploy renders these bindings only with
-upload armed. The existing hosted role preflight accepts a database OID,
+rows to the checker. Use the dispatch above while all trial arms are off.
+The existing hosted role preflight accepts a database OID,
 issuer OID and two pre-grant roles and uses the staging migrator connection.
 The hosted provider preflight accepts an S3 fixture scope for exact-version
 HEAD and DELETE. The example is input to the offline identity checker only.
