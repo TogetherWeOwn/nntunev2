@@ -141,6 +141,10 @@ test('the native Hyperdrive socket returns the disposable PostgreSQL identity', 
   const binding = 'PRIVATE_TRIAL_UPLOAD_DB';
   const user = 'trial_identity_fixture';
   const database = 'nntunev2_staging';
+  const pins = process.env.TRIAL_IDENTITY_OIDS ?? '';
+  assert.match(pins, /^[1-9][0-9]*\|[1-9][0-9]*$/);
+  const [databaseOid, roleOid] = pins.split('|').map(Number);
+  assert.notEqual(databaseOid, roleOid);
   const sha = '1'.repeat(40);
   const version = 'test-version';
   const token = Buffer.alloc(32, 45).toString('base64url');
@@ -168,9 +172,6 @@ test('the native Hyperdrive socket returns the disposable PostgreSQL identity', 
   });
   const body = await response.json();
   assert.equal(response.status, 200, JSON.stringify(body));
-  const [, databaseOid, , roleOid] = body.rows[0][1];
-  assert.ok(Number.isInteger(databaseOid) && databaseOid > 0);
-  assert.ok(Number.isInteger(roleOid) && roleOid > 0);
   assert.deepEqual(body, {
     build_sha: sha, version_id: version, rows: [[binding, [database, databaseOid, user, roleOid, user, roleOid]]],
   });
