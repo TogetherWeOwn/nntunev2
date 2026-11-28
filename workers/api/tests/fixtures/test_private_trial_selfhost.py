@@ -397,6 +397,24 @@ class Qualification(unittest.TestCase):
             )
         ] + ["  - service: http_status:404"])
 
+    def test_disarmed_dispatch_checks_access_before_deploy(self):
+        from check_worker_upload import job_text, run_script, step_text
+
+        workflow = (ROOT / ".github/workflows/deploy.yml").read_text()
+        api_job = job_text(workflow, "staging-api")
+        cache_gate = step_text(api_job, "Require uncached private trial connections")
+        self.assertLess(api_job.index(cache_gate), api_job.index("name: Deploy api to staging"))
+        script = run_script(cache_gate).split("ids=$(", 1)[0]
+        ready = {"PRIVATE_TRIAL_IDENTITY_MODE": "all", "PRIVATE_TRIAL_IDENTITY_TOKEN": "x" * 43,
+                 "CF_ACCESS_CLIENT_ID": "fixture-client", "CF_ACCESS_CLIENT_SECRET": "fixture-secret"}
+        for key in ("CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "PRIVATE_TRIAL_IDENTITY_TOKEN"):
+            for invalid in ("", "line\nbreak"):
+                result = subprocess.run(["bash", "--noprofile", "--norc", "-c", script],
+                                        env=ready | {key: invalid}, capture_output=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+        subprocess.run(["bash", "--noprofile", "--norc", "-c", script], env=ready, check=True)
+
     def test_disarmed_identity_rejects_drift(self):
         pins = {"database_oid": 20000, "role_oids": {key: 20001 + n for n, key in enumerate(ROLES)}}
         deploy = {"identity": "matched", "build_sha": "a" * 40, "version_id": "version", "deployment_id": "deployment"}

@@ -1010,6 +1010,8 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
   });
 
   test('deploy calls e2e-staging only after successful push staging-web and staging-api (evaluated)', () => {
+    // The deploy being sequenced after is itself push-only and gated on
+    // the Cloudflare token; when it skips, dependents must skip too.
     expect(jobIf(deployWorkflow, 'staging-web')).toContain("github.event_name == 'push'");
     expect(jobIf(deployWorkflow, 'staging-web')).toContain("needs.gate.outputs.enabled == 'true'");
 

@@ -18,8 +18,7 @@ from staging_trial_schema import LOCATOR_CHECK, SCHEMAS, TABLES, read_source
 from staging_trial_selfhost import session_guard, tls_connection
 
 
-# Entries describe the callers' SQL, including the projections and lock-only
-# columns required by invoker routines. The same entries drive the ACL audit.
+# Use the callers' column and lock grants for installation and the exact ACL audit.
 ACCESS = {
     "auth": [
         ("native_rest_credentials", "SELECT", "id user_id key_prefix key_hmac pepper_version scopes created_at expires_at revoked_at"),
@@ -65,7 +64,6 @@ ACCESS = {
 }
 RESERVE = "public.reserve_storage_digest(uuid,integer)"
 FUNCTIONS = {
-    "auth": (),
     "enroll": (RESERVE, "public.store_storage_digest_candidate(uuid,uuid,uuid,uuid,bigint,bytea[])"),
     "upload": ROUTINES[:1],
 }
@@ -81,7 +79,7 @@ def install_sql(root, pins):
     for role, entries in ACCESS.items():
         grants.extend((*scope[role], "TABLE", f"public.{table}", privilege, columns)
                       for table, privileges, columns in entries for privilege in privileges.split())
-        grants.extend((*scope[role], "FUNCTION", function, "EXECUTE", "") for function in FUNCTIONS[role])
+        grants.extend((*scope[role], "FUNCTION", function, "EXECUTE", "") for function in FUNCTIONS.get(role, ()))
     grants.extend(entry for entry in publication_grants(
         DATABASE, {"reader": scope["auth"], "writer": scope["publish"]}, locks=True, overlay=True,
     ) if entry[0] == ROLES["publish"] and entry[2] != "DATABASE")

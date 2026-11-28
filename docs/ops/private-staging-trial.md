@@ -760,9 +760,9 @@ and Worker query.
    active, including across new Worker-side connections.
 
 Dispatch `deploy.yml` on protected main with `private_trial_identity_mode=upload`
-for the first config or `all` for Stage C2. If readback fails, correct the cause
-and start a fresh dispatch on the reviewed revision, or restore the recorded
-disarmed deploy via the [staging rollback procedure](../ops.md#staging-deploy-lock-cutover-and-rollback).
+for the first config or `all` for Stage C2. Supply the protected `CF_ACCESS_CLIENT_ID`
+and `CF_ACCESS_CLIENT_SECRET`. If readback fails, correct the cause and dispatch
+again, or restore the recorded pre-probe disarmed push using the [staging rollback procedure](../ops.md#staging-deploy-lock-cutover-and-rollback).
 
 Record one independently verified result per binding in the protected C2
 handoff. Include evidence references and match or pass outcomes. Keep
